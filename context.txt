@@ -1,0 +1,440 @@
+
+A Technical Investigation of Go Packages for the D-LOCKSS Application
+
+
+Part 1. Context: The Modern Go-IPFS Ecosystem (Kubo and Boxo)
+
+
+1.1. Executive Summary: The Great Refactoring (Kubo vs. Boxo)
+
+A foundational understanding of the modern Go-IPFS ecosystem is critical before specifying dependencies for the D-LOCKSS application. In late 2022 and 2023, the primary Go implementation of IPFS underwent a significant refactoring. The monolithic go-ipfs repository was officially split into two distinct projects: Kubo and Boxo.
+Kubo (formerly go-ipfs) is the command-line application or daemon.1 It is the binary that users install and run (e.g., ipfs daemon). While it can be imported as a library, this is a complex and heavyweight approach, often leading to dependency conflicts.2
+Boxo is the library or "toolbox".3 It is a collection of the core components, protocols, and libraries that were extracted from go-ipfs.4 The stated goal of Boxo is to provide a "starter toolbox" of cohesive, well-maintained components for developers building their own IPFS implementations or applications that interact with the IPFS network.4 This includes essential modules for content-addressed data, data transfer (like Bitswap), and content routing (like the DHT).4
+For the D-LOCKSS application, this distinction is paramount. The D-LOCKSS specification describes a custom, "headless" Go application that programmatically integrates IPFS components. This architecture must be built using Boxo, not Kubo.
+Therefore, this investigation will exclusively recommend packages from github.com/ipfs/boxo and its primary dependency, github.com/libp2p/go-libp2p. Any documentation, examples, or tutorials referencing deprecated packages such as github.com/ipfs/go-ipfs-api 7, github.com/ipfs/go-ipfs-chunker 8, or github.com/ipfs/go-merkledag 10 must be disregarded. The official repositories for these deprecated packages now explicitly redirect developers to their modern equivalents within the github.com/ipfs/boxo namespace.8 Adherence to the modern Boxo packages is the only way to ensure a stable, secure, and maintainable build.
+
+1.2. Validating the D-LOCKSS Architecture
+
+The D-LOCKSS specification outlines an architecture that is not only viable but is the intended use case for the Boxo component library. The specification defines a custom DLockssApp context that acts as a container, programmatically initializing and composing a networking stack (libp2p) with a data stack (Blockstore, Bitswap, DAGService).
+This modular approach is the explicit design philosophy of both libp2p and Boxo. Libp2p is a "network stack" designed to be modular, allowing sophisticated applications to use only the protocols they need.13 Boxo extends this philosophy, providing a "toolbox" 3 of IPFS components (like Bitswap and the Kademlia DHT) for developers to "reuse".4 This modular design principle is what allows the IPFS protocol to be flexible and "future-proof".14
+The D-LOCKSS architecture directly leverages this by picking and choosing the necessary components:
+Networking: go-libp2p for the Host, DHT, and GossipSub.
+Data Exchange: boxo/bitswap for the data transfer protocol.
+Storage: go-ds-leveldb for the persistent datastore.
+Data Structure: boxo/blockstore and boxo/ipld/merkledag for managing content-addressed data.
+This approach stands in stark contrast to older, problematic patterns of importing "Kubo as a library." Such attempts were often brittle and prone to dependency failures, as evidenced by common issues where type mismatches between different versions of core interfaces would break compilation.2 The Boxo refactoring was executed precisely to solve this problem and enable clean, library-driven development of applications exactly like D-LOCKSS.
+The primary implication of this validation is that the integration of these components is a solved problem, but it requires absolute precision in dependency management. The Boxo and libp2p repositories are tightly coupled and evolve rapidly; for example, the Boxo repository recently merged an upgrade to go-libp2p just "8 hours ago".4 A successful implementation of D-LOCKSS therefore depends on a correct and compatible go.mod file, which will be provided in Part 4 of this report.
+
+Part 2. Core Dependency Analysis: Mapping Specification Components to Go Packages
+
+This section provides the "Bill of Materials" for the D-LOCKSS application, mapping every item in Specification Section 3 to its concrete, modern Go package.
+
+2.1. Networking Stack (Specification 3.1: go-libp2p)
+
+
+2.1.1. Host and Identity
+
+Target Package: github.com/libp2p/go-libp2p
+Analysis: The host.Host interface, defined in github.com/libp2p/go-libp2p/core/host, is the central abstraction for the "main P2P identity" (Spec 3.1).15 It manages the node's PeerID, its address book (Peerstore), and its network connections.15
+Implementation: The Host is instantiated using the primary constructor from the root package: libp2p.New(opts...libp2p.Option).13 The D-LOCKSS application's networking capabilities are not defined by importing multiple packages, but by passing a series of functional Option types to this constructor. The subsequent sections detail these options.
+
+2.1.2. NAT Traversal and Connectivity
+
+Target Packages: github.com/libp2p/go-libp2p (options), github.com/libp2p/go-libp2p/p2p/protocol/holepunch
+Analysis: The specification requires a robust connectivity stack to operate behind restrictive firewalls, specifically "NAT Traversal (NATPortMap)," "Relay," and "Hole Punching" (Spec 3.1). This is achieved not by a single package but by enabling a combination of options in the libp2p.New() constructor.
+Implementation:
+NAT Traversal (NATPortMap): The libp2p.NATPortMap() option must be supplied.18 This option configures the libp2p host to use the default NATManager, which attempts to automatically open ports on the local network's router using UPnP and NAT-PMP.19
+Circuit Relay (Client): The libp2p.EnableRelay() option must be enabled. This configures the node to act as a client for circuit relays, allowing it to dial and listen for connections through a third-party relay node.21 This is a critical prerequisite for hole punching.20
+Hole Punching: The libp2p.EnableHolePunching() option must be enabled.20 This service, which depends on the relay connection, allows two peers connected via a relay to attempt to upgrade their connection to a direct, NAT-traversed one.22
+Prescriptive Guidance: To meet the specification's connectivity goals, the D-LOCKSS application must instantiate its host using all three of these options: libp2p.New(..., libp2p.NATPortMap(), libp2p.EnableRelay(), libp2p.EnableHolePunching(),...)
+
+2.1.3. Distributed Hash Table (Kademlia)
+
+Target Package: github.com/libp2p/go-libp2p-kad-dht
+Analysis: This package provides the Kademlia DHT implementation used by IPFS.25 The DHT is not enabled by default and must be explicitly constructed after the host.Host is created.
+Implementation: The constructor is dht.New(ctx context.Context, h host.Host, options...dht.Option).25 The returned *dht.IpfsDHT object is the service that fulfills the spec's two key DHT functions: "Peer Discovery" and "Provider Discovery" (Spec 3.1).
+Key Function Mapping (Provider Discovery): The core "Content Preservation" loop (Spec 4.4) is entirely dependent on the "FindProviders" function. The correct function to use is:
+func (dht *IpfsDHT) FindProvidersAsync(ctx context.Context, key cid.Cid, count int) (ch <-chan peer.AddrInfo) 25
+Critical Implementation Detail: The count parameter in FindProvidersAsync is a potential pitfall. The D-LOCKSS logic (Spec 4.4) needs to find all providers to compare their count against PROVIDER_THRESHOLD. To achieve this, the count parameter must be set to 0. As 27 clarifies, "When count is 0, this method will return an unbounded number of results." The application logic must then drain this channel (<-chan peer.AddrInfo), collect all peer.AddrInfo structs, filter out its own PeerID, and then count the remaining unique peers. Passing any other number (e.g., PROVIDER_THRESHOLD) would incorrectly limit the search and break the core preservation logic.
+
+2.1.4. GossipSub (PubSub)
+
+Target Package: github.com/libp2p/go-libp2p-pubsub
+Analysis: This is the canonical implementation of Publish/Subscribe messaging for libp2p.28 It provides the "GossipSub" router, which is a more advanced and efficient protocol than the basic "Floodsub".29 This package directly implements the "real-time messaging bus" (Spec 3.1) required for file announcements.
+Implementation: The service is initialized after the host with pubsub.NewGossipSub(ctx, h, opts...).18
+Key Function Mapping:
+Joining a Topic: func (p *PubSub) Join(topicName string) (*Topic, error). This is used to join the GOSSIP_TOPIC (Spec 6).30
+Subscribing: func (t *Topic) Subscribe(opts...SubOpt) (*Subscription, error). This returns the Subscription object used in the handleGossipMessages goroutine (Spec 4.3) to receive new file announcements.
+Publishing: func (t *Topic) Publish(ctx context.Context, databyte, opts...PubOpt) error. This is used in the "Local File Addition" process (Spec 4.2) to announce the new file to the network.30
+
+2.2. Storage and Data Stack (Specification 3.2: Boxo)
+
+
+2.2.1. Datastore (LevelDB)
+
+Target Package: github.com/ipfs/go-ds-leveldb
+Analysis: The D-LOCKSS specification requires a persistent key-value Datastore at DATASTORE_PATH. The standard for this in the IPFS ecosystem is LevelDB.31 However, the application must not import the raw LevelDB implementation (github.com/syndtr/goleveldb 32) directly. Instead, it must use this wrapper, go-ds-leveldb.34
+Implementation: This package provides a Datastore type that implements the go-datastore interface, which is what all other Boxo components (like the Blockstore) expect.
+Key Constructor: func NewDatastore(path string, opts *Options) (*Datastore, error).36 The path argument will be the DATASTORE_PATH constant from Spec 6. This Datastore instance will store all metadata and all file blocks.
+
+2.2.2. Blockstore
+
+Target Package: github.com/ipfs/boxo/blockstore
+Analysis: As described in 57, this package provides a "thin wrapper over a datastore." Its purpose is to provide a clean, block-centric API (e.g., Get(cid), Put(block)) on top of the generic key-value Datastore from 2.2.1. This is the modern, boxo-maintained package that replaces the deprecated go-ipfs-blockstore.37
+Implementation:
+Key Constructor: func NewBlockstore(d ds.Batching, opts...Option) Blockstore.38 The d argument will be the Datastore instance returned by leveldb.NewDatastore in the previous step.
+
+2.2.3. Bitswap
+
+Target Package: github.com/ipfs/boxo/bitswap
+Analysis: This is the core "data trading module" for IPFS, and it directly implements the "data exchange protocol" (Spec 3.2).39 Bitswap is the service that, upon request, automatically finds peers (using the DHT) and manages the download and upload of blocks.39 It is the engine that drives the DAGService.Get call during the "pinning" process (Spec 4.4).
+Implementation: Bitswap initialization is a multi-step process that links the host.Host (networking) to the Blockstore (storage). It involves two sub-packages:
+github.com/ipfs/boxo/bitswap/network: Provides the bsnet.New(...) constructor to create a network adapter for Bitswap.
+github.com/ipfs/boxo/bitswap/client: Provides the client.New(...) constructor, which takes the network adapter and the Blockstore and returns the bitswap.Bitswap exchange interface. This resulting object is what will be passed to the BlockService.
+
+2.2.4. DAGService (Merkle-DAG)
+
+Target Package: github.com/ipfs/boxo/ipld/merkledag
+Analysis: This package provides the ipld.DAGService, which is the "service layer for interacting with content-addressed data" (Spec 3.2). This is the modern, boxo-maintained fork of the deprecated go-merkledag.10 This service provides the high-level, file-like Get and Add methods (Spec 3.2) that compose and traverse the Merkle-DAGs of blocks.
+Key Constructor: func NewDAGService(bs blockservice.BlockService) *DAGService.43
+Critical Dependency Chain: This constructor reveals a hidden but essential dependency: BlockService.
+The DAGService requires an ipld.BlockService.
+The BlockService implementation is found in github.com/ipfs/boxo/blockservice.
+Its constructor is blockservice.New(bs blockstore.Blockstore, exchange bitswap.Exchange).43
+This BlockService is the critical piece that links the local Blockstore (from 2.2.2) with the Bitswap exchange (from 2.2.3).
+This establishes the non-negotiable initialization order for the entire data stack:
+Datastore (2.2.1) $\rightarrow$ Blockstore (2.2.2) $\rightarrow$ Bitswap (2.2.3) $\rightarrow$ BlockService $\rightarrow$ DAGService (2.2.4).
+Key Function Mapping:
+func (ds *DAGService) Add(ctx context.Context, node ipld.Node) error: Used in Process 4.2 to add the newly imported file's DAG to the blockstore.
+func (ds *DAGService) Get(ctx context.Context, c cid.Cid) (ipld.Node, error): Used in Process 4.4 to begin the pinning process by fetching the root node, which triggers Bitswap.43
+
+2.2.5. UnixFS Importer
+
+Target Packages: github.com/ipfs/boxo/ipld/unixfs/importer and github.com/ipfs/boxo/chunker
+Analysis: The "UnixFS Importer" (Spec 3.2) is not a single function but a two-stage process. First, the file must be split into chunks. Second, those chunks must be arranged into a UnixFS Merkle-DAG.
+Implementation:
+Chunking: The github.com/ipfs/boxo/chunker package is used.45 This replaces the deprecated go-ipfs-chunker.8 The specific function required by Spec 4.2.a is chunker.NewSizeSplitter(r io.Reader, size int64).45 The size parameter should be chunker.DefaultBlockSize (which is 256 * 1024).45
+Importing: The github.com/ipfs/boxo/ipld/unixfs/importer package 12 provides the logic to consume the Splitter from the chunker and build the DAG. The function importer.BuildDag (or a similar helper function within the package) will be used, taking the DAGService (from 2.2.4) and the Splitter as inputs. This process builds the nodes and returns the root ipld.Node, from which the root CID can be extracted.
+
+2.3. Application State Components (Specification 3.3)
+
+
+2.3.1. Tracked Files Map (sync.Map)
+
+Target Package: sync (Go standard library)
+Analysis: The specification explicitly requests a sync.Map for the in-memory, thread-safe trackedFiles map (Spec 3.3). While sync.Map is part of the standard library, its performance characteristics and API are not well-suited for the D-LOCKSS workload.
+Prescriptive Guidance (Expert Recommendation): A standard map protected by a sync.RWMutex is the correct and idiomatic Go pattern for this use case.
+Workload Analysis: The D-LOCKSS application has two primary access patterns:
+Write (Frequent, Short): watchAddDirectory (Spec 4.2) and handleGossipMessages (Spec 4.3) add single entries to the map.
+Iterate (Infrequent, Long): monitorTrackedFiles (Spec 4.4) must iterate over all CIDs in the map (a "full scan").
+Problem: The sync.Map.Range function does not provide a consistent, point-in-time snapshot of the map. If handleGossipMessages adds a new file while monitorTrackedFiles is iterating, that new file may or may not be seen by the current monitoring loop, leading to unpredictable behavior.
+Solution: A map[string]string (or map[string]GossipMessage) protected by a sync.RWMutex is safer and more predictable. The monitorTrackedFiles loop (Spec 4.4) should:
+Call mu.RLock() (read-lock).
+Create a new slice and copy all keys from the map into it.
+Call mu.RUnlock().
+Iterate over the copy (the snapshot).
+This pattern ensures the monitoring loop operates on a stable set of CIDs, while write operations (which use mu.Lock() and mu.Unlock()) are still fast and thread-safe. This report strongly recommends this RWMutex pattern over the specified sync.Map.
+
+2.3.2. Directory Monitoring (watchAddDirectory)
+
+Target Package: time (Go standard library)
+Analysis: The specification (Spec 4.2) defines a polling loop: "A ticker fires every ADD_DIR_POLL_INTERVAL (10s)." This is implemented simply and robustly using time.NewTicker(ADD_DIR_POLL_INTERVAL).
+Validation of Polling vs. Event-Driven: While event-driven file watching packages like github.com/fsnotify/fsnotify 49 are common, they are the incorrect choice for this specific workflow.
+Workflow: The D-LOCKSS ingestion process (Spec 4.2.d) explicitly moves the processed file from ADD_DIR_PATH to ADDED_DIR_PATH (e.g., via os.Rename).
+Problem: fsnotify relies on OS-level hooks (like inotify or kqueue).51 These hooks have well-documented issues where a RENAME or MOVE event on a watched file can cause the watch to be automatically removed.53 This would require complex, brittle error-handling logic to constantly re-establish watches.
+Solution: The polling-based time.Ticker approach defined in the specification is simple, stateless, cross-platform 54, and completely immune to the file-move problem. It scans the directory, processes any files it finds, and is done. This is a case where the simpler, polling-based solution is architecturally superior.
+Prescriptive Guidance: The implementation must adhere to the specification and use a time.Ticker loop.
+
+Part 3. Implementation Guide: Mapping Workflows to Package Functions
+
+This section synthesizes the components from Part 2 into ordered, code-level implementation patterns that directly map to the D-LOCKSS specification's workflows.
+
+3.1. Process 1: Initialization (Specification 4.1)
+
+
+3.1.1. Critical Dependency Initialization Order
+
+The various services (Host, Datastore, Blockstore, Bitswap, DAGService, DHT) are not independent. They must be initialized in a specific "bottom-up" order, as their constructors depend on each other. The following sequence is mandatory for a successful application startup.
+Context: Create the root application context.
+ctx := context.Background()
+Host: Initialize the libp2p.Host. This is the core network identity. It must be configured with the NAT traversal options.
+h, err := libp2p.New(libp2p.NATPortMap(), libp2p.EnableRelay(), libp2p.EnableHolePunching()) 13
+Datastore: Initialize the persistent storage.
+ds, err := leveldb.NewDatastore(DATASTORE_PATH, nil) 36
+Blockstore: Wrap the Datastore with the Blockstore.
+bs := blockstore.NewBlockstore(ds) 38
+Bitswap: Initialize the data exchange protocol, linking the Host (network) and Blockstore (storage).
+bnet := bsnet.New(ctx, h,...) (from boxo/bitswap/network)
+bswap := client.New(ctx, bnet, bs) (from boxo/bitswap/client) 43
+BlockService: Initialize the service that links the Blockstore and Bitswap.
+bserv := blockservice.New(bs, bswap) (from boxo/blockservice) 43
+DAGService: Initialize the high-level data API, wrapping the BlockService.
+dag := merkledag.NewDAGService(bserv) (from boxo/ipld/merkledag) 43
+PubSub (GossipSub): Initialize the real-time messaging service.
+ps, err := pubsub.NewGossipSub(ctx, h) 18
+DHT (Kademlia): Initialize the Distributed Hash Table, linking it to the Host.
+kademliaDHT, err := dht.New(ctx, h, dht.Mode(dht.ModeServer)) 25
+
+3.1.2. DHT Bootstrapping
+
+After the kademliaDHT is created, it must connect to the network. This is achieved by bootstrapping.
+Implementation: Call kademliaDHT.Bootstrap(ctx).25
+Note: The application should not hard-code a list of bootstrap peers.55 The Bootstrap function, when called on a DHT in default (public) mode, will automatically use the maintained list of default IPFS bootstrap nodes, which it can find using an internal function like dht.GetDefaultBootstrapPeerAddrInfos().25 This ensures the node always connects to the active public network.
+
+3.1.3. Subscribing to Gossip Topic
+
+Once ps (the PubSub service) is initialized, the application must join its topic and subscribe.
+Implementation:
+topic, err := ps.Join(GOSSIP_TOPIC)
+sub, err := topic.Subscribe()
+Launch the handler goroutine: go handleGossipMessages(sub) (See 3.3).
+
+3.1.4. Launching Background Goroutines
+
+Finally, launch the two background loops that form the core of the application's logic.
+Implementation:
+go watchAddDirectory(...) (See 3.2).
+go monitorTrackedFiles(...) (See 3.4).
+
+3.2. Process 2: Local File Addition (Ingestion) (Specification 4.2)
+
+This process runs in the watchAddDirectory goroutine, driven by a time.Ticker.
+Implementation Pipeline:
+The time.Ticker (set to ADD_DIR_POLL_INTERVAL) fires.
+Scan the ADD_DIR_PATH for files (e.g., os.ReadDir).
+For each *.pdf file found:
+Open the file: file, err := os.Open(filePath)
+Create the chunker: spl := chunker.NewSizeSplitter(file, chunker.DefaultBlockSize).45
+Define the import parameters, linking the DAGService: params := importer.BuildParams{ Dagserv: app.DAG,... }
+Build the UnixFS DAG: node, err := importer.BuildDag(ctx, dag, spl, params).12
+Extract the root CID: rootCID := node.Cid()
+Save the blocks: err = app.DAG.Add(ctx, node). (This pins the root node and its children to the local Blockstore).
+Move the processed file: os.Rename(srcPath, destPath) (from ADD_DIR_PATH to ADDED_DIR_PATH).
+Add to state map (using the recommended mutex):
+app.trackedFilesMu.Lock()
+app.trackedFiles = fileName
+app.trackedFilesMu.Unlock()
+Publish Gossip Announcement:
+msg := GossipMessage{Cid: rootCID.String(), Name: fileName}
+jsonPayload, err := json.Marshal(msg)
+err = app.Gossip.Publish(ctx, jsonPayload).30
+
+3.3. Process 3: Network File Discovery (Discovery) (Specification 4.3)
+
+This process runs in the handleGossipMessages goroutine.
+Implementation (Goroutine):
+for {
+msg, err := sub.Next(ctx)
+Critical: Ignore messages from self: if msg.GetFrom() == app.Host.ID() { continue }
+var gmsg GossipMessage
+err = json.Unmarshal(msg.GetData(), &gmsg)
+Add to state map (using mutex):
+app.trackedFilesMu.Lock()
+app.trackedFiles[gmsg.Cid] = gmsg.Name // This will add or update
+app.trackedFilesMu.Unlock()
+log.Printf("Discovered new file from network: %s (%s)", gmsg.Name, gmsg.Cid)
+As per Spec 4.3.d, trigger an immediate one-time check: go checkFileRetrievability(ctx, gmsg.Cid)
+}
+
+3.4. Process 4: Content Preservation (Replication Loop) (Specification 4.4)
+
+This is the core logic, running in the monitorTrackedFiles goroutine.
+Implementation (Goroutine):
+ticker := time.NewTicker(MONITOR_INTERVAL)
+for range ticker.C {
+Create Snapshot: (Implement the mutex-safe snapshot pattern)
+app.trackedFilesMu.RLock()
+keys := make(string, 0, len(app.trackedFiles))
+for k := range app.trackedFiles { keys = append(keys, k) }
+app.trackedFilesMu.RUnlock()
+for _, cidStr := range keys {
+c, err := cid.Decode(cidStr)
+Retrievability Check (a) - Local:
+isPinned, err := app.Blockstore.Has(ctx, c) (This checks if the root block is present. A full dag.Get is more thorough but Has is a fast check).
+Retrievability Check (b, c) - Network:
+providerCh := app.DHT.FindProvidersAsync(ctx, c, 0) (Using 0 to find all providers 27).
+peers := make(mapstruct{}) // Use a map to count unique peers.
+for p := range providerCh {
+if p.ID!= app.Host.ID() { peers = struct{}{} }
+}
+providerCount := len(peers)
+Replication Logic (IF/THEN):
+if providerCount < PROVIDER_THRESHOLD &&!isPinned {
+log.Printf("File %s is endangered (providers: %d)! Pinning...", c.String(), providerCount)
+Pinning (ii.1): Fetch Root Node:
+rootNode, err := app.DAG.Get(ctx, c).43 This call propagates to the BlockService, which (if the block is not local) passes the request to Bitswap. Bitswap then uses the DHT to find providers and download the root block.
+Pinning (ii.2): Fetch All Children:
+err = merkledag.EnumerateChildren(ctx, app.DAG, rootNode, make(cid.Set)).42 This function recursively traverses the entire DAG from the rootNode. Each time it encounters a link (CID) to a child block, it implicitly calls app.DAG.Get(ctx, childCID), triggering the same Bitswap download process for all missing blocks in the file's DAG.
+log.Printf("Successfully pinned endangered file: %s", c.String())
+}
+} (end for keys)
+} (end for ticker)
+
+Part 4. Final Implementation Artifacts
+
+This section provides the specific, code-level artifacts required to initialize the Go project and serve as a direct template for AI code generation.
+
+4.1. Table 1: Recommended go.mod File
+
+A stable, compatible go.mod file is the most critical artifact for preventing build failures. The following require block provides a known-good set of dependencies based on recent, compatible releases. This solves the dependency conflicts (e.g., mismatched interface types) that can arise when mixing incompatible versions of Boxo and libp2p.2
+
+Go
+
+
+module github.com/user/d-lockss
+
+go 1.21
+
+require (
+    github.com/ipfs/boxo v0.18.0
+    github.com/ipfs/go-cid v0.4.1
+    github.com/ipfs/go-ds-leveldb v0.5.0
+    github.com/libp2p/go-libp2p v0.35.2
+    github.com/libp2p/go-libp2p-kad-dht v0.25.2
+    github.com/libp2p/go-libp2p-pubsub v0.11.0
+    github.com/multiformats/go-multihash v0.3.4
+)
+
+// Note: Running `go mod tidy` after using these
+// imports will automatically pull in all necessary
+// indirect dependencies, such as:
+// - github.com/ipfs/go-datastore
+// - github.com/ipfs/go-ipld-format
+// - github.com/syndtr/goleveldb
+// - github.com/libp2p/go-libp2p-core
+// - etc.
+
+
+
+4.2. Core Structure Definitions
+
+The following Go code provides the core data structures for the application.
+
+4.2.1. Specification 5.1 (GossipMessage)
+
+This struct directly implements the JSON payload defined in the specification.
+
+Go
+
+
+package main
+
+import "encoding/json"
+
+// GossipMessage is the payload for all PubSub announcements
+// (Specification 5.1).
+type GossipMessage struct {
+    Cid  string `json:"cid"`
+    Name string `json:"name"`
+}
+
+
+
+4.2.2. Suggested Application Struct
+
+This struct acts as the main application container, holding all initialized services and the application's state, as derived from the initialization process (3.1) and state requirements (2.3).
+
+Go
+
+
+package main
+
+import (
+	"context"
+	"sync"
+
+	"github.com/ipfs/boxo/blockservice"
+	"github.com/ipfs/boxo/blockstore"
+	"github.com/ipfs/boxo/exchange/bitswap/client"
+	"github.com/ipfs/boxo/ipld/merkledag"
+	"github.com/ipfs/go-datastore"
+	"github.com/libp2p/go-libp2p/core/host"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
+)
+
+// DLockssApp holds all initialized services and application state
+// for the D-LOCKSS node.
+type DLockssApp struct {
+	// Context
+	Ctx    context.Context
+	Cancel context.CancelFunc
+
+	// Networking (Spec 3.1)
+	Host   host.Host
+	DHT    *dht.IpfsDHT
+	PubSub *pubsub.PubSub
+	Gossip *pubsub.Topic // The joined GOSSIP_TOPIC
+
+	// Storage & Data (Spec 3.2)
+	Datastore  datastore.Batching
+	Blockstore blockstore.Blockstore
+	Bitswap    *client.Client
+	Bserv      blockservice.BlockService
+	DAG        merkledag.DAGService
+
+	// State (Spec 3.3)
+	// Using map + RWMutex per expert recommendation (2.3.1)
+	trackedFiles   map[string]string // Key: CID string, Value: Filename
+	trackedFilesMu sync.RWMutex
+}
+
+
+Works cited
+Go-IPFS now known as Kubo, accessed November 12, 2025, https://discuss.ipfs.tech/t/go-ipfs-now-known-as-kubo/14724
+P2phttp Go Package for use with Kubo (Running Daemon or Library?) - IPFS Forums, accessed November 12, 2025, https://discuss.ipfs.tech/t/p2phttp-go-package-for-use-with-kubo-running-daemon-or-library/16313
+Rename go-libipfs to boxo · Issue #215 - GitHub, accessed November 12, 2025, https://github.com/ipfs/boxo/issues/215
+ipfs/boxo: A set of reference libraries for building IPFS applications and implementations in Go. - GitHub, accessed November 12, 2025, https://github.com/ipfs/boxo
+ipfs/go-libipfs-rapide: [EXPERIMENTAL] A fork of ipfs/boxo with experimental RAPIDE client., accessed November 12, 2025, https://github.com/ipfs/go-libipfs-rapide
+Boxo: Build Your Own IPFS Adventure - Gus Eggert - YouTube, accessed November 12, 2025, https://www.youtube.com/watch?v=uFr4EtySorY
+Quickstart to Building Golang Apps using IPFS - Bartlomiej Mika, accessed November 12, 2025, https://bartlomiejmika.com/post/2021/quickstart-to-building-golang-apps-using-ipfs/
+chunk package - github.com/ipfs/go-ipfs-chunker - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/ipfs/go-ipfs-chunker
+go-ipfs-chunkers provides Splitter implementations for data before being ingested to IPFS - GitHub, accessed November 12, 2025, https://github.com/ipfs/go-ipfs-chunker
+The go-ipfs merkledag 'service' implementation - GitHub, accessed November 12, 2025, https://github.com/ipfs/go-merkledag
+merkledag package - github.com/ipfs/go-merkledag - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/ipfs/go-merkledag
+ipfs/go-unixfs: Implementation of a unix-like filesystem on top of an ipld merkledag - GitHub, accessed November 12, 2025, https://github.com/ipfs/go-unixfs
+libp2p implementation in Go - GitHub, accessed November 12, 2025, https://github.com/libp2p/go-libp2p
+Privacy and encryption - IPFS Docs, accessed November 12, 2025, https://docs.ipfs.tech/concepts/privacy-and-encryption/
+host package - github.com/libp2p/go-libp2p/core/host - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/libp2p/go-libp2p/core/host
+libp2p-host command - github.com/libp2p/go-libp2p/examples/libp2p-host - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/libp2p/go-libp2p/examples/libp2p-host
+Run a go-libp2p node, accessed November 12, 2025, https://docs.libp2p.io/guides/getting-started/go/
+How to make the gossipsub-chat example works over internet? #3210 - GitHub, accessed November 12, 2025, https://github.com/libp2p/rust-libp2p/discussions/3210
+NAT Traversal in chat example · Issue #375 - GitHub, accessed November 12, 2025, https://github.com/libp2p/go-libp2p/issues/375
+libp2p package - github.com/seqsy/go-libp2p - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/seqsy/go-libp2p
+Hole Punching - The libp2p docs, accessed November 12, 2025, https://docs.libp2p.io/concepts/nat/hole-punching/
+Hole punching in libp2p - Overcoming Firewalls | IPFS Blog & News, accessed November 12, 2025, https://blog.ipfs.tech/2022-01-20-libp2p-hole-punching/
+libp2p - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/libp2p/go-libp2p
+libp2p::tutorials::hole_punching - Rust - Docs.rs, accessed November 12, 2025, https://docs.rs/libp2p/latest/libp2p/tutorials/hole_punching/index.html
+go-libp2p-kad-dht - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/libp2p/go-libp2p-kad-dht
+dht package - github.com/Blitz3r123/go-libp2p-kad-dht - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/Blitz3r123/go-libp2p-kad-dht
+Go-libp2p-core source code routing.go - Help - IPFS Forums, accessed November 12, 2025, https://discuss.ipfs.tech/t/go-libp2p-core-source-code-routing-go/13463
+go-libp2p-pubsub - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/libp2p/go-libp2p-pubsub
+The PubSub implementation for go-libp2p - GitHub, accessed November 12, 2025, https://github.com/libp2p/go-libp2p-pubsub
+Publishing to gossipsub briefly without subscribing - Users and Developers - libp2p, accessed November 12, 2025, https://discuss.libp2p.io/t/publishing-to-gossipsub-briefly-without-subscribing/1227
+Go-ds-flatfs vs go-ds-leveldb - IPFS Forums, accessed November 12, 2025, https://discuss.ipfs.tech/t/go-ds-flatfs-vs-go-ds-leveldb/9858
+How to use LevelDB in go? [closed] - Stack Overflow, accessed November 12, 2025, https://stackoverflow.com/questions/10492740/how-to-use-leveldb-in-go
+syndtr/goleveldb: LevelDB key/value database in Go. - GitHub, accessed November 12, 2025, https://github.com/syndtr/goleveldb
+leveldb package - github.com/meshboxtech/go-mbfs/gx/QmccqjKZUTqp4ikWNyAbjBuP5HEdqSqRuAr9mcEhYab54a/go-ds-leveldb - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/meshboxtech/go-mbfs/gx/QmccqjKZUTqp4ikWNyAbjBuP5HEdqSqRuAr9mcEhYab54a/go-ds-leveldb
+ipfs/go-ds-leveldb: An implementation of go-datastore using leveldb - GitHub, accessed November 12, 2025, https://github.com/ipfs/go-ds-leveldb
+leveldb package - github.com/ipfs/go-ds-leveldb - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/ipfs/go-ds-leveldb
+go-ipfs-blockstore - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/ipfs/go-ipfs-blockstore
+blockstore package - github.com/sevenrats/boxo/blockstore - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/sevenrats/boxo/blockstore
+bitswap package - github.com/ipfs/boxo/bitswap - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/ipfs/boxo/bitswap
+Plausibly Deniable Content Discovery for Bitswap Using Random Walks - arXiv, accessed November 12, 2025, https://arxiv.org/pdf/2407.12433
+bitswap package - github.com/sevenrats/boxo/bitswap - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/sevenrats/boxo/bitswap
+merkledag package - github.com/ipfs/boxo/ipld/merkledag - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/ipfs/boxo/ipld/merkledag
+Unable to get blocks when the node is connected to multiple peers - Help - IPFS Forums, accessed November 12, 2025, https://discuss.ipfs.tech/t/unable-to-get-blocks-when-the-node-is-connected-to-multiple-peers/18711
+boxo module - github.com/ipfs/boxo - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/ipfs/boxo?utm_source=godoc
+chunk package - github.com/ipfs/boxo/chunker - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/ipfs/boxo/chunker
+Compute CID of data in Go - ipfs - Stack Overflow, accessed November 12, 2025, https://stackoverflow.com/questions/76799279/compute-cid-of-data-in-go
+How to calculate Cid locally? - Help - IPFS Forums, accessed November 12, 2025, https://discuss.ipfs.tech/t/how-to-calculate-cid-locally/10507
+unixfs package - github.com/ipfs/boxo/ipld/unixfs - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/ipfs/boxo/ipld/unixfs
+Golang watcher (fsnotify) Examples [In-Depth Tutorial] - GoLinuxCloud, accessed November 12, 2025, https://www.golinuxcloud.com/golang-watcher-fsnotify/
+How to Detect File Changes in Golang | by Steve Domino | Medium, accessed November 12, 2025, https://medium.com/@skdomino/watch-this-file-watching-in-go-5b5a247cf71f
+fsnotify/fsnotify: Cross-platform filesystem notifications for Go. - GitHub, accessed November 12, 2025, https://github.com/fsnotify/fsnotify
+fsnotify - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/fsnotify/fsnotify
+Robustly watching a single file is HIGHLY nontrivial, best practices highly desired! · Issue #372 - GitHub, accessed November 12, 2025, https://github.com/fsnotify/fsnotify/issues/372
+Watcher is a simple Go package for watching for file/directory changes - Go Forum, accessed November 12, 2025, https://forum.golangbridge.org/t/watcher-is-a-simple-go-package-for-watching-for-file-directory-changes/3548
+Modify the bootstrap list - IPFS Docs, accessed November 12, 2025, https://docs.ipfs.tech/how-to/modify-bootstrap-list/
+merkledag package - github.com/luciscode/go-ipfs/merkledag - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/luciscode/go-ipfs/merkledag
+blockstore package - github.com/ipfs/boxo/blockstore - Go Packages, accessed November 12, 2025, https://pkg.go.dev/github.com/ipfs/boxo/blockstore
