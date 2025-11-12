@@ -94,3 +94,10 @@ This second peer will connect to the network, and within a minute, it will hear 
 
 
 The second peer saw the file had only 1 provider (peer 1), which is less than 5, so it automatically pinned the file itself. Now the file has 2 providers!
+
+
+
+TODO:
+
+- request replication by CID to spread content somewhat equally
+- provide a UI using helia to browse and retrieve PDFs

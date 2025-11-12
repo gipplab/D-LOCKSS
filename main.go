@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -32,7 +33,7 @@ const discoveryServiceTag = "dlockss-example"
 const fileWatchFolder = "./my-pdfs" // The folder to watch
 const minReplication = 5
 const maxReplication = 10
-const checkInterval = 1 * time.Minute // <-- NEW: How often to check replication
+const checkInterval = 1 * time.Minute // How often to check replication
 
 // --- Globals ---
 var pinnedFiles = struct {
@@ -42,7 +43,6 @@ var pinnedFiles = struct {
 	hashes: make(map[string]bool),
 }
 
-// NEW: A map of all files we know about, not just the ones we pin
 var knownFiles = struct {
 	sync.RWMutex
 	hashes map[string]bool
@@ -115,11 +115,18 @@ func main() {
 
 	// --- 6.5. Start the File Watcher ---
 	log.Println("Starting file watcher on:", fileWatchFolder)
+	// Ensure the folder exists
 	_ = os.Mkdir(fileWatchFolder, 0755)
+
+	// --- NEW: Scan for existing files before starting watcher ---
+	log.Println("Scanning for existing files in", fileWatchFolder, "...")
+	scanExistingFiles(ctx, topic)
+	// -----------------------------------------------------------
+
 	go watchFolder(ctx, topic)
 
 	// --- 6.6. Start the Replication Checker ---
-	go startReplicationChecker(ctx) // <-- NEW
+	go startReplicationChecker(ctx, topic)
 
 	// --- 7. Wait for Shutdown Signal ---
 	sigCh := make(chan os.Signal, 1)
@@ -180,12 +187,18 @@ func readMessages(ctx context.Context, sub *pubsub.Subscription, selfID peer.ID,
 			if len(data) > 4 && data[:4] == "NEW:" {
 				hash := data[4:]
 				fmt.Printf("\r[Network]: New file announced: %s\n> ", hash)
+				addKnownFile(hash)
+				go checkReplication(ctx, hash, topic)
 
-				// NEW: Add to our list of known files
+			} else if len(data) > 5 && data[:5] == "NEED:" {
+				hash := data[5:]
 				addKnownFile(hash)
 
-				// Run the check now
-				go checkReplication(ctx, hash)
+				if !isPinned(hash) {
+					fmt.Printf("\r[Network]: Received NEED for unpinned file, checking: %s\n> ", hash)
+					go checkReplication(ctx, hash, topic)
+				}
+
 			} else {
 				fmt.Printf("\r[%s]: %s\n> ", msg.GetFrom().ShortString(), data)
 			}
@@ -204,8 +217,8 @@ func publishMessages(ctx context.Context, topic *pubsub.Topic) {
 			continue
 		}
 
-		if len(line) > 4 && line[:4] == "NEW:" {
-			fmt.Println("Cannot send messages starting with 'NEW:'")
+		if (len(line) > 4 && line[:4] == "NEW:") || (len(line) > 5 && line[:5] == "NEED:") {
+			fmt.Println("Cannot send messages starting with 'NEW:' or 'NEED:'")
 			fmt.Print("> ")
 			continue
 		}
@@ -253,25 +266,17 @@ func hashToCid(hash string) (cid.Cid, error) {
 	return cid.NewCidV1(cid.Raw, mh), nil
 }
 
-func cidToHash(c cid.Cid) (string, error) {
-	mh := c.Hash()
-	decoded, err := multihash.Decode(mh)
-	if err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(decoded.Digest), nil
-}
+// --- FUNCTION REMOVED ---
+// func cidToHash(c cid.Cid) (string, error) { ... }
+// (This was the unused function)
 
 // ######################################################################
 // File Watching and Replication Logic
 // ######################################################################
 
-// NEW: A function to get a thread-safe copy of the known file list
 func getKnownFiles() []string {
 	knownFiles.RLock()
 	defer knownFiles.RUnlock()
-
-	// Create a copy of the keys
 	keys := make([]string, 0, len(knownFiles.hashes))
 	for k := range knownFiles.hashes {
 		keys = append(keys, k)
@@ -279,15 +284,13 @@ func getKnownFiles() []string {
 	return keys
 }
 
-// NEW: A function to add a file to the known list
 func addKnownFile(hash string) {
 	knownFiles.Lock()
 	defer knownFiles.Unlock()
 	knownFiles.hashes[hash] = true
 }
 
-// NEW: This function runs in the background and checks replication every minute
-func startReplicationChecker(ctx context.Context) {
+func startReplicationChecker(ctx context.Context, topic *pubsub.Topic) {
 	log.Println("Replication checker started, will run every", checkInterval)
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
@@ -299,8 +302,6 @@ func startReplicationChecker(ctx context.Context) {
 			return
 		case <-ticker.C:
 			log.Println("--- Running periodic replication check ---")
-
-			// Get a snapshot of the files we know about
 			filesToCheck := getKnownFiles()
 			if len(filesToCheck) == 0 {
 				log.Println("No known files to check.")
@@ -309,12 +310,43 @@ func startReplicationChecker(ctx context.Context) {
 
 			log.Printf("Checking replication for %d files...", len(filesToCheck))
 			for _, hash := range filesToCheck {
-				// Run each check in its own goroutine to avoid
-				// a slow check blocking the others
-				go checkReplication(ctx, hash)
+				go checkReplication(ctx, hash, topic)
 			}
 		}
 	}
+}
+
+// scanExistingFiles processes all files already in the folder at startup
+func scanExistingFiles(ctx context.Context, topic *pubsub.Topic) {
+	entries, err := os.ReadDir(fileWatchFolder)
+	if err != nil {
+		log.Printf("Error scanning folder: %s", err)
+		return
+	}
+
+	found := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		fullPath := filepath.Join(fileWatchFolder, entry.Name())
+		log.Printf("Processing existing file: %s", fullPath)
+
+		hash, err := calculateFileHash(fullPath)
+		if err != nil {
+			log.Printf("Error hashing existing file %s: %s", fullPath, err)
+			continue
+		}
+
+		// Treat it just like a newly created file
+		pinFile(hash)
+		addKnownFile(hash)
+		go provideFile(ctx, hash)
+		announceFile(ctx, topic, hash) // Announce "NEW"
+		found++
+	}
+	log.Printf("Finished processing %d existing files.", found)
 }
 
 func watchFolder(ctx context.Context, topic *pubsub.Topic) {
@@ -342,18 +374,10 @@ func watchFolder(ctx context.Context, topic *pubsub.Topic) {
 						log.Println("Error hashing file:", err)
 						continue
 					}
-
-					// 1. Pin it locally
 					pinFile(hash)
-
-					// 2. Add to known files (NEW)
 					addKnownFile(hash)
-
-					// 3. Provide it on the DHT
 					go provideFile(ctx, hash)
-
-					// 4. Announce it on gossipsub
-					announceFile(ctx, topic, hash)
+					announceFile(ctx, topic, hash) // Announce "NEW"
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {
@@ -410,6 +434,7 @@ func provideFile(ctx context.Context, hash string) {
 	}
 }
 
+// announceFile sends the initial "NEW" message
 func announceFile(ctx context.Context, topic *pubsub.Topic, hash string) {
 	msg := fmt.Sprintf("NEW:%s", hash)
 	if err := topic.Publish(ctx, []byte(msg)); err != nil {
@@ -417,14 +442,14 @@ func announceFile(ctx context.Context, topic *pubsub.Topic, hash string) {
 	}
 }
 
-func checkReplication(ctx context.Context, hash string) {
+// checkReplication is the core logic
+func checkReplication(ctx context.Context, hash string, topic *pubsub.Topic) {
 	c, err := hashToCid(hash)
 	if err != nil {
 		log.Println("Error converting hash to CID:", err)
 		return
 	}
 
-	// Add a child context with a timeout for this specific check
 	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -432,11 +457,11 @@ func checkReplication(ctx context.Context, hash string) {
 	providers := globalDHT.FindProvidersAsync(checkCtx, c, 0)
 
 	count := 0
-	for _ = range providers {
+	// FIXED: Simplified the range expression
+	for range providers {
 		count++
 	}
 
-	// Check if the check timed out
 	if checkCtx.Err() == context.DeadlineExceeded {
 		log.Println("Timeout checking replication for:", hash)
 		return
@@ -446,15 +471,26 @@ func checkReplication(ctx context.Context, hash string) {
 
 	amIPinning := isPinned(hash)
 
-	if count < minReplication && !amIPinning {
-		log.Println("Replication low! Must pin", hash)
+	if count < minReplication {
+		log.Println("Replication low! Announcing NEED for", hash)
+		msg := fmt.Sprintf("NEED:%s", hash)
+		go func() {
+			if err := topic.Publish(context.Background(), []byte(msg)); err != nil {
+				log.Println("Error publishing NEED announcement:", err)
+			}
+		}()
 
-		// --- CRITICAL TODO ---
-		log.Println("TODO: Fetch file from peer")
-		// ---------------------
+		if !amIPinning {
+			log.Println("Must pin", hash)
 
-		pinFile(hash)
-		go provideFile(ctx, hash)
+			// --- CRITICAL TODO ---
+			log.Println("TODO: Fetch file from peer")
+			// Example: go fetchFile(ctx, hash)
+			// ---------------------
+
+			pinFile(hash)
+			go provideFile(ctx, hash)
+		}
 
 	} else if count > maxReplication && amIPinning {
 		log.Println("Replication high! Unpinning", hash)
