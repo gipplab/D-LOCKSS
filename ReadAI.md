@@ -1,127 +1,86 @@
+Please generate a prompt that will enable any modern LLM to reproduce the exact program code. Do not include code snippets in the prompt.
+
 **Prompt:**
 
-Please write a complete, single-file Go program (package `main`) that implements a P2P distributed file replication system (a "LOCKSS" system). The code must match the following specific implementation details, variable names, and logic flow exactly.
+Act as an expert Systems Engineer. Write a complete, single-file Go program (package `main`) that implements a production-ready, self-healing, sharded P2P file preservation system called "D-LOCKSS".
 
-### Imports
-Include standard libraries: `bufio`, `context`, `crypto/sha256`, `encoding/hex`, `fmt`, `io`, `log`, `os`, `os/signal`, `path/filepath`, `sync`, `syscall`, `time`.
-Include third-party libraries:
-* `github.com/fsnotify/fsnotify`
-* `github.com/ipfs/go-cid`
-* `github.com/libp2p/go-libp2p`
-* `github.com/libp2p/go-libp2p-kad-dht` (aliased as `dht`)
-* `github.com/libp2p/go-libp2p-pubsub`
-* `github.com/libp2p/go-libp2p/core/host`
-* `github.com/libp2p/go-libp2p/core/peer`
-* `github.com/libp2p/go-libp2p/core/routing`
-* `github.com/libp2p/go-libp2p/p2p/discovery/mdns`
-* `github.com/multiformats/go-multihash`
+The code must adhere to the following strict specifications, logical structures, and variable naming conventions.
 
-### Configuration Constants
-Define these exact constants:
-* `TopicName`: "dlockss-topic"
-* `discoveryServiceTag`: "dlockss-example"
-* `fileWatchFolder`: "./my-pdfs"
-* `minReplication`: 5
-* `maxReplication`: 10
-* `checkInterval`: 1 * time.Minute
+### 1. Dependencies & Imports
+* Use standard libraries for context, crypto/sha256, hex encoding, file I/O, logging, OS signals, path manipulation, sync primitives, and time.
+* Use `github.com/fsnotify/fsnotify` for file watching.
+* Use the full suite of `libp2p` libraries: core host, network, peer, routing, `go-cid`, `go-multihash`, `go-libp2p-pubsub`, and `go-libp2p-kad-dht` (aliased as `dht`).
 
-### Global Variables
-1.  `pinnedFiles`: An anonymous struct containing `sync.RWMutex` and a map `hashes` (`map[string]bool`). Initialize the map.
-2.  `knownFiles`: Same structure as `pinnedFiles`. Initialize the map.
-3.  `globalDHT`: A pointer to `dht.IpfsDHT`.
+### 2. Configuration Constants
+Define the following specific constants:
+* Control Topic: "dlockss-control"
+* Discovery Tag: "dlockss-v2-prod"
+* Watch Folder: "./data"
+* **Replication Rules:** Minimum = 5, Maximum = 10.
+* **Intervals:** Check interval = 15 minutes.
+* **Load Balancing:** Max Shard Load = 2000.
 
-### Main Function Logic
-1.  Create a context with cancel. Defer cancel.
-2.  **Host Creation:** Initialize `libp2p.New` with:
-    * Listen addresses: `/ip4/0.0.0.0/tcp/0` and `/ip6/::/tcp/0`.
-    * Routing: A function that initializes `globalDHT` using `dht.New` in `dht.ModeServer` and returns it.
-    * Panic on error.
-3.  **Print Info:** Print "--- Your Node's Addresses ---", loop through `host.Addrs()` printing in format `%s/p2p/%s`, then print a separator and "Waiting for peers...".
-4.  **mDNS:** Create a `discoveryNotifee`, start `mdns.NewMdnsService`, and call `Start()`. Panic on error.
-5.  **Bootstrap:** Print "Bootstrapping DHT..." and call `globalDHT.Bootstrap(ctx)`. Panic on error.
-6.  **GossipSub:** Create `pubsub.NewGossipSub`. Panic on error.
-7.  **Topic:** Join `TopicName`. Subscribe to it. Panic on errors.
-8.  **Goroutines:** Launch `readMessages` and `publishMessages`.
-9.  **File Setup:**
-    * Log "Starting file watcher on:" with the folder path.
-    * Ensure the directory exists (`os.Mkdir`, 0755).
-    * **Important:** Log "Scanning for existing files in..." then call `scanExistingFiles(ctx, topic)`.
-    * Launch `watchFolder(ctx, topic)` in a goroutine.
-    * Launch `startReplicationChecker(ctx, topic)` in a goroutine.
-10. **Shutdown:** Wait for `os.Interrupt` or `syscall.SIGTERM`. Print "\nShutting down...", close the host, and print "Done."
+### 3. Global State
+Create two specific global thread-safe structures (using `sync.RWMutex` and `map[string]bool`):
+1.  `pinnedFiles`: Tracks files physically stored/pinned on the disk.
+2.  `knownFiles`: Tracks files we are monitoring/tracking (even if not currently pinned).
+3.  Include globals for the DHT pointer and a `ShardManager` pointer.
 
-### Discovery Notifee
-Define a struct `discoveryNotifee` with `h` (host) and `ctx`.
-Implement `HandlePeerFound`:
-* Print "\rDiscovered new peer: [ID]".
-* Attempt `n.h.Connect`. On error print "\rError connecting...", on success print "\rConnected to...".
+### 4. The ShardManager Struct
+Create a struct named `ShardManager` to handle dynamic topic switching. It must hold:
+* Context, Host, and PubSub pointers.
+* Mutex, current shard string (binary prefix), shard topic/subscription, and control topic/subscription.
+* `msgCounter` (int) to track load.
 
-### PubSub Logic
-**`readMessages` function:**
-* Loop reading `sub.Next(ctx)`. Handle context cancellation errors.
-* Ignore messages from self.
-* Check message data string:
-    * If it starts with "NEW:" (slice index 4), extract hash, print "\r[Network]: New file announced: [hash]", call `addKnownFile`, and launch `checkReplication`.
-    * If it starts with "NEED:" (slice index 5), extract hash, call `addKnownFile`. If `!isPinned(hash)`, print "\r[Network]: Received NEED for unpinned file...", and launch `checkReplication`.
-    * Else, print standard chat format: "\r[ShortID]: [data]".
+**ShardManager Methods:**
+* **New:** Factory function to initialize and join channels.
+* **joinChannels:** Subscribe to the static Control topic. Subscribe to the dynamic Shard topic (`dlockss-shard-{prefix}`). Reset `msgCounter` here.
+* **readControl:** Loop listening for "DELEGATE:{hash}:{prefix}" messages. If the target prefix matches the node's current shard prefix, add the hash to `knownFiles` and launch a replication check.
+* **readShard:** Loop listening for messages.
+    * *Load Balancing:* Increment `msgCounter`. If it exceeds `MaxShardLoad`, **immediately** reset the counter to zero and trigger `splitShard`.
+    * *Message Handling:* Listen for "NEED:{hash}" and "NEW:{hash}". For both, add to `knownFiles` and launch a replication check.
+* **splitShard:** Calculate the next binary bit based on the node's Peer ID hash at the next depth. Update the current shard prefix and call `joinChannels`.
+* **AmIResponsibleFor:** Boolean check comparing a file hash's binary prefix against the node's current shard prefix.
+* **Publish helpers:** Methods to publish strings to the current shard or control topic.
 
-**`publishMessages` function:**
-* Use `bufio.Scanner` on `os.Stdin`. Print prompt "> ".
-* If line is empty, reprint prompt.
-* If line starts with "NEW:" or "NEED:", print a warning that these cannot be sent manually.
-* Otherwise, `topic.Publish` the line. handle scanner errors.
+### 5. File Handling & Custodial Logic
+Implement `processNewFile(path)` with "Custodial" logic:
+1.  Calculate SHA256 hash.
+2.  **Immediate Pin:** Always pin the file locally and provide it to the DHT immediately.
+3.  Add to `knownFiles`.
+4.  **Routing:**
+    * If responsible: Announce "NEW:{hash}" to the Shard.
+    * If *not* responsible: Announce "DELEGATE:{hash}:{target_prefix}" to Control, but keep the file pinned (Custodial Mode).
 
-### Hashing Helpers
-* `calculateFileHash(filePath)`: Open file, use `sha256`, copy `io.Copy`, return hex string.
-* `hashToCid(hash)`: Decode hex string. Use `multihash.Sum` with code `0x12` (SHA2-256) and length 32. Return `cid.NewCidV1(cid.Raw, mh)`.
-* **Important:** Include a comment block labeled `--- FUNCTION REMOVED ---` mentioning that `cidToHash` was the unused function.
+### 6. The Replication Checker (Core Logic)
+Implement `checkReplication(ctx, hash)` with the following logic flow:
+1.  Determine if the node is `responsible` and if the file is `pinned`.
+2.  **Tracking Cleanup:** If the node is neither responsible nor pinning the file, remove it from `knownFiles` and return.
+3.  **DHT Query:** Find providers with a 2-minute timeout context.
+4.  **Case 1 (Low Redundancy):** If count < MinReplication:
+    * If responsible (or custodial), re-pin the file locally and provide to DHT.
+    * Broadcast "NEED:{hash}" to the shard.
+5.  **Case 2 (Garbage Collection):**
+    * If responsible AND count > MaxReplication AND pinned: Unpin the file (log as "Monitoring only").
+    * If *not* responsible (Custodial) AND count >= MinReplication AND pinned: Unpin the file (log as "Handoff Complete").
 
-### File Watching & Replication Logic
-Implement the following helper functions:
+### 7. Helper Functions
+* **Pinning:** Thread-safe `pinFile` and `unpinFile` (updates `pinnedFiles`).
+* **Tracking:** Thread-safe `addKnownFile` and `removeKnownFile` (updates `knownFiles`).
+* **Binary Math:** Helper functions to convert a hex string or a raw string into a binary string (0s and 1s) of a specific depth.
+* **Hashing:** File to SHA256 hex string; Hex string to CID.
 
-1.  `getKnownFiles`: RLock `knownFiles`, return slice of keys.
-2.  `addKnownFile`: Lock `knownFiles`, set hash to true.
-3.  `startReplicationChecker`:
-    * Log "Replication checker started...".
-    * Ticker loop (`checkInterval`). On tick:
-    * Log "--- Running periodic replication check ---".
-    * Get `filesToCheck`. If empty, log "No known files...".
-    * Log count of files, loop through them, and launch `checkReplication` for each.
-4.  `scanExistingFiles`:
-    * `os.ReadDir`. Log errors.
-    * Loop entries. Skip directories.
-    * Log "Processing existing file: [path]".
-    * Calculate hash. Call `pinFile`, `addKnownFile`, `go provideFile`, `announceFile`.
-    * Log "Finished processing [count] existing files."
-5.  `watchFolder`:
-    * `fsnotify.NewWatcher`.
-    * Loop events. If `Op` is `Create`:
-    * Log "New file detected". Sleep 100ms. Calculate hash. Call `pinFile`, `addKnownFile`, `go provideFile`, `announceFile`.
-    * Handle watcher errors. Add watch folder path.
-6.  `pinFile` / `unpinFile`: Lock `pinnedFiles` and add/remove hash. Log "[PINNING] [hash]" or "[UNPINNING] [hash]" only if the state changes.
-7.  `isPinned`: RLock return bool.
-8.  `provideFile`: Convert hash to CID. Log "Telling DHT we are a provider...". Call `globalDHT.Provide`.
-9.  `announceFile`: Publish string "NEW:[hash]".
+### 8. Main Function Execution Flow
+1.  Setup Context with Cancel.
+2.  Initialize libp2p Host (Listen on all TCP).
+3.  Initialize and start mDNS.
+4.  Bootstrap DHT (Server mode).
+5.  Initialize GossipSub.
+6.  **Shard Init:** Calculate initial shard (depth 1) from Peer ID and create `ShardManager`.
+7.  Start `shardMgr.Run()` and `inputLoop` (reading stdin to publish to shard).
+8.  **FileSystem:** Ensure directory exists.
+9.  **Startup Scan:** Call `scanExistingFiles` (iterating the folder and calling `processNewFile`) **before** starting the watcher.
+10. Start `watchFolder` (fsnotify loop) and `runReplicationChecker` (ticker loop iterating `knownFiles`) in goroutines.
+11. Wait for termination signal (SIGTERM/Interrupt).
 
-**`checkReplication` (Core Logic):**
-* Convert hash to CID.
-* Create context with timeout (30s).
-* Log "Checking replication for: [hash]".
-* Call `globalDHT.FindProvidersAsync`.
-* Count the providers from the channel. **Include a comment exactly saying:** `// FIXED: Simplified the range expression` above the loop.
-* Check for `DeadlineExceeded` error.
-* Log "Found [count] providers...".
-* Logic:
-    * If `count < minReplication`:
-        * Log "Replication low! Announcing NEED...". Publish "NEED:[hash]".
-        * If `!amIPinning`:
-            * Log "Must pin [hash]".
-            * **Include a comment:** `// --- CRITICAL TODO ---` followed by `log.Println("TODO: Fetch file from peer")`.
-            * Call `pinFile` and `go provideFile`.
-    * Else if `count > maxReplication` AND `amIPinning`:
-        * Log "Replication high! Unpinning". Call `unpinFile`.
-
-***
-
-### Instructions for the LLM
-Use the prompt above. It maps 1:1 to your source code structure, variable naming conventions, and even includes the specific comments and "TODOs" found in your code snippet.
+**Important:** Ensure the code handles "Split Storms" by resetting the message counter immediately upon detection, and handles "Zombie Records" by verifying counts before unpinning.
