@@ -4,4 +4,5 @@ context.txt
 
 my-pdfs
 
-testnet
+testnet/dlockss-node
+testnet/testnet_data
