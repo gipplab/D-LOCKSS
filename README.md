@@ -101,3 +101,20 @@ TODO:
 
 - request replication by CID to spread content somewhat equally
 - provide a UI using helia to browse and retrieve PDFs
+- sharding via channels and CIDs
+    - CID prefix defines the channel to join
+    - 64 channels maximum to join
+    - Every peer joins channels and asks for content in this channel 
+    - First channel where no content is available prevents going deeper until content for this channel is available
+    - The main channel has no prefix. 
+    - to check replication factor, it start with the deepest channel and makes it way up until main channel. 
+     - only nodes with a common CID overlap qualify as replicators. 
+     - potential relicators meet at a certain prefix channel. Once this channel has 16*16 (256) members, the channel is not used anymore. Instead the next deeper channel is used. 
+     - PROBLEM: If you host a millon CIDs, you would need to join a million channels - SHOWSTOPPER
+    - alternatvely we could hold everyone in the same channel
+        - now we have a limited bandwith. 
+        - we could control who is allowed to post at what time through their PeerID
+        - But everyone would have a diffent bandwidth. Therefore SHOWSTOPPER as well
+    - are we okay with missing messages?
+        - I guess yes. That would mean that we get an update eventually later, but propabilistically some day
+    - similar then block size in Blockhain, we need to fine tune message frequency in the gossipsub channel
