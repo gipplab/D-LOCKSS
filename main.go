@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -19,8 +20,9 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
-	"github.com/libp2p/go-libp2p-pubsub"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
@@ -28,37 +30,45 @@ import (
 )
 
 // --- Configuration ---
-const TopicName = "dlockss-topic"
-const discoveryServiceTag = "dlockss-example"
-const fileWatchFolder = "./my-pdfs" // The folder to watch
-const minReplication = 5
-const maxReplication = 10
-const checkInterval = 1 * time.Minute // How often to check replication
+const (
+	ControlTopicName    = "dlockss-control"
+	DiscoveryServiceTag = "dlockss-v2-prod" // Changed tag to avoid finding dev nodes
+	FileWatchFolder     = "./data"          // Production usually avoids "my-pdfs"
+	MinReplication      = 5
+	MaxReplication      = 10
+
+	// 15 Minutes is standard for DHT provider refresh cycles.
+	CheckInterval = 15 * time.Minute
+
+	// If more messages came in in the last 60s --> new shards
+	MaxShardLoad = 2000
+)
 
 // --- Globals ---
-var pinnedFiles = struct {
-	sync.RWMutex
-	hashes map[string]bool
-}{
-	hashes: make(map[string]bool),
-}
+var (
+	// State for what we are physically storing
+	pinnedFiles = struct {
+		sync.RWMutex
+		hashes map[string]bool
+	}{hashes: make(map[string]bool)}
 
-var knownFiles = struct {
-	sync.RWMutex
-	hashes map[string]bool
-}{
-	hashes: make(map[string]bool),
-}
+	// FIX: State for what we are tracking/monitoring
+	knownFiles = struct {
+		sync.RWMutex
+		hashes map[string]bool
+	}{hashes: make(map[string]bool)}
 
-var globalDHT *dht.IpfsDHT
+	globalDHT *dht.IpfsDHT
+	shardMgr  *ShardManager
+)
 
+// --- Main ---
 func main() {
-	// Create a context that gracefully handles termination signals
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// --- 1. Create a libp2p Host (MODIFIED) ---
-	host, err := libp2p.New(
+	// 1. Host Setup
+	h, err := libp2p.New(
 		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0", "/ip6/::/tcp/0"),
 		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
 			var err error
@@ -67,340 +77,415 @@ func main() {
 		}),
 	)
 	if err != nil {
-		panic(fmt.Errorf("failed to create libp2p host: %w", err))
+		panic(err)
 	}
 
-	// Print this node's multiaddresses
-	fmt.Println("--- Your Node's Addresses ---")
-	for _, addr := range host.Addrs() {
-		fmt.Printf("%s/p2p/%s\n", addr, host.ID().String())
-	}
-	fmt.Println("-------------------------------")
-	fmt.Println("Waiting for peers... (Run another instance of this app on your network)")
+	fmt.Printf("--- Node ID: %s ---\n", h.ID().String())
+	fmt.Printf("--- Addresses: %v ---\n", h.Addrs())
 
-	// --- 2. Set up mDNS Discovery ---
-	notifee := &discoveryNotifee{h: host, ctx: ctx}
-	mdnsService := mdns.NewMdnsService(host, discoveryServiceTag, notifee)
-	if err := mdnsService.Start(); err != nil {
-		panic(fmt.Errorf("failed to start mDNS service: %w", err))
+	// 2. MDNS
+	mdnsSvc := mdns.NewMdnsService(h, DiscoveryServiceTag, &discoveryNotifee{h: h, ctx: ctx})
+	if err := mdnsSvc.Start(); err != nil {
+		panic(err)
 	}
 
-	// --- 2.5. Bootstrap the DHT ---
-	fmt.Println("Bootstrapping DHT...")
+	// 3. DHT Bootstrap
 	if err = globalDHT.Bootstrap(ctx); err != nil {
-		panic(fmt.Errorf("failed to bootstrap DHT: %w", err))
+		panic(err)
 	}
 
-	// --- 3. Set up GossipSub ---
-	ps, err := pubsub.NewGossipSub(ctx, host)
+	// 4. GossipSub
+	ps, err := pubsub.NewGossipSub(ctx, h)
 	if err != nil {
-		panic(fmt.Errorf("failed to create pubsub service: %w", err))
+		panic(err)
 	}
 
-	// --- 4. Join the Topic ---
-	topic, err := ps.Join(TopicName)
-	if err != nil {
-		panic(fmt.Errorf("failed to join topic: %w", err))
+	// 5. Initialize Shard Manager
+	initialShard := getBinaryPrefix(h.ID().String(), 1)
+	shardMgr = NewShardManager(ctx, h, ps, initialShard)
+
+	// 6. Start Message Handlers
+	go shardMgr.Run()
+	go inputLoop(shardMgr)
+
+	// 7. File System Setup
+	if err := os.Mkdir(FileWatchFolder, 0755); err != nil && !os.IsExist(err) {
+		log.Printf("Error creating folder: %v", err)
 	}
 
-	// --- 5. Subscribe to the Topic ---
-	sub, err := topic.Subscribe()
-	if err != nil {
-		panic(fmt.Errorf("failed to subscribe to topic: %w", err))
-	}
+	log.Println("Scanning for existing files...")
+	scanExistingFiles()
 
-	// --- 6. Handle Incoming and Outgoing Messages ---
-	go readMessages(ctx, sub, host.ID(), topic)
-	go publishMessages(ctx, topic)
+	go watchFolder(ctx)
 
-	// --- 6.5. Start the File Watcher ---
-	log.Println("Starting file watcher on:", fileWatchFolder)
-	// Ensure the folder exists
-	_ = os.Mkdir(fileWatchFolder, 0755)
+	// 8. Periodic Maintenance
+	go runReplicationChecker(ctx)
 
-	// --- NEW: Scan for existing files before starting watcher ---
-	log.Println("Scanning for existing files in", fileWatchFolder, "...")
-	scanExistingFiles(ctx, topic)
-	// -----------------------------------------------------------
-
-	go watchFolder(ctx, topic)
-
-	// --- 6.6. Start the Replication Checker ---
-	go startReplicationChecker(ctx, topic)
-
-	// --- 7. Wait for Shutdown Signal ---
+	// 9. Shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
 
 	fmt.Println("\nShutting down...")
-
-	if err := host.Close(); err != nil {
-		fmt.Println("Error closing host:", err)
-	}
-	fmt.Println("Done.")
 }
 
 // ######################################################################
-// discoveryNotifee (mDNS)
+// Shard Manager
 // ######################################################################
 
-type discoveryNotifee struct {
-	h   host.Host
+type ShardManager struct {
 	ctx context.Context
+	h   host.Host
+	ps  *pubsub.PubSub
+
+	mu           sync.RWMutex
+	currentShard string
+	shardTopic   *pubsub.Topic
+	shardSub     *pubsub.Subscription
+
+	controlTopic *pubsub.Topic
+	controlSub   *pubsub.Subscription
+
+	msgCounter int
 }
 
-func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
-	fmt.Printf("\rDiscovered new peer: %s\n> ", pi.ID.String())
-	if err := n.h.Connect(n.ctx, pi); err != nil {
-		fmt.Printf("\rError connecting to peer %s: %s\n> ", pi.ID.String(), err)
-	} else {
-		fmt.Printf("\rConnected to: %s\n> ", pi.ID.String())
+func NewShardManager(ctx context.Context, h host.Host, ps *pubsub.PubSub, startShard string) *ShardManager {
+	sm := &ShardManager{
+		ctx:          ctx,
+		h:            h,
+		ps:           ps,
+		currentShard: startShard,
 	}
+	sm.joinChannels()
+	return sm
 }
 
-// ######################################################################
-// PubSub (Chat & Announcements)
-// ######################################################################
+func (sm *ShardManager) joinChannels() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
-func readMessages(ctx context.Context, sub *pubsub.Subscription, selfID peer.ID, topic *pubsub.Topic) {
+	// 1. Join Control Channel
+	if sm.controlTopic == nil {
+		t, _ := sm.ps.Join(ControlTopicName)
+		s, _ := t.Subscribe()
+		sm.controlTopic = t
+		sm.controlSub = s
+		log.Printf("[System] Joined Control Channel: %s", ControlTopicName)
+	}
+
+	// 2. Join Data Shard
+	topicName := fmt.Sprintf("dlockss-shard-%s", sm.currentShard)
+	t, err := sm.ps.Join(topicName)
+	if err != nil {
+		log.Printf("Failed to join shard %s: %v", topicName, err)
+		return
+	}
+	sub, _ := t.Subscribe()
+
+	if sm.shardTopic != nil {
+		sm.shardSub.Cancel()
+		sm.shardTopic.Close()
+	}
+
+	sm.shardTopic = t
+	sm.shardSub = sub
+	sm.msgCounter = 0
+	log.Printf("[Sharding] Active Data Shard: %s (Topic: %s)", sm.currentShard, topicName)
+}
+
+func (sm *ShardManager) Run() {
+	go sm.readControl()
+	go sm.readShard()
+}
+
+func (sm *ShardManager) readControl() {
 	for {
-		select {
-		case <-ctx.Done():
+		msg, err := sm.controlSub.Next(sm.ctx)
+		if err != nil {
 			return
-		default:
-			msg, err := sub.Next(ctx)
-			if err != nil {
-				if ctx.Err() == context.Canceled {
-					return
-				}
-				fmt.Fprintln(os.Stderr, "Error reading from subscription:", err)
-				return
-			}
-
-			if msg.GetFrom() == selfID {
-				continue
-			}
-
-			data := string(msg.Data)
-
-			if len(data) > 4 && data[:4] == "NEW:" {
-				hash := data[4:]
-				fmt.Printf("\r[Network]: New file announced: %s\n> ", hash)
-				addKnownFile(hash)
-				go checkReplication(ctx, hash, topic)
-
-			} else if len(data) > 5 && data[:5] == "NEED:" {
-				hash := data[5:]
-				addKnownFile(hash)
-
-				if !isPinned(hash) {
-					fmt.Printf("\r[Network]: Received NEED for unpinned file, checking: %s\n> ", hash)
-					go checkReplication(ctx, hash, topic)
-				}
-
-			} else {
-				fmt.Printf("\r[%s]: %s\n> ", msg.GetFrom().ShortString(), data)
-			}
 		}
-	}
-}
-
-func publishMessages(ctx context.Context, topic *pubsub.Topic) {
-	scanner := bufio.NewScanner(os.Stdin)
-	fmt.Print("> ")
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			fmt.Print("> ")
+		if msg.GetFrom() == sm.h.ID() {
 			continue
 		}
 
-		if (len(line) > 4 && line[:4] == "NEW:") || (len(line) > 5 && line[:5] == "NEED:") {
-			fmt.Println("Cannot send messages starting with 'NEW:' or 'NEED:'")
-			fmt.Print("> ")
+		data := string(msg.Data)
+		if strings.HasPrefix(data, "DELEGATE:") {
+			parts := strings.Split(data, ":")
+			if len(parts) < 3 {
+				continue
+			}
+			targetHash := parts[1]
+			targetShard := parts[2]
+
+			sm.mu.RLock()
+			myShard := sm.currentShard
+			sm.mu.RUnlock()
+
+			if strings.HasPrefix(targetShard, myShard) || strings.HasPrefix(myShard, targetShard) {
+				log.Printf("[Delegate] Accepted delegation for %s (I am %s)", targetHash, myShard)
+				// FIX: Track this file so we monitor it
+				addKnownFile(targetHash)
+				go checkReplication(sm.ctx, targetHash)
+			}
+		}
+	}
+}
+
+func (sm *ShardManager) readShard() {
+	for {
+		sm.mu.RLock()
+		sub := sm.shardSub
+		sm.mu.RUnlock()
+
+		if sub == nil {
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 
-		if err := topic.Publish(ctx, []byte(line)); err != nil {
-			fmt.Fprintln(os.Stderr, "Error publishing message:", err)
-		}
-		fmt.Print("> ")
-	}
-
-	if err := scanner.Err(); err != nil {
-		if ctx.Err() != context.Canceled {
-			fmt.Fprintln(os.Stderr, "Error reading from stdin:", err)
-		}
-	}
-}
-
-// ######################################################################
-// Hashing and CID Helpers
-// ######################################################################
-
-func calculateFileHash(filePath string) (string, error) {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
-func hashToCid(hash string) (cid.Cid, error) {
-	hashBytes, err := hex.DecodeString(hash)
-	if err != nil {
-		return cid.Undef, err
-	}
-	mh, err := multihash.Sum(hashBytes, 0x12, 32)
-	if err != nil {
-		return cid.Undef, err
-	}
-	return cid.NewCidV1(cid.Raw, mh), nil
-}
-
-// --- FUNCTION REMOVED ---
-// func cidToHash(c cid.Cid) (string, error) { ... }
-// (This was the unused function)
-
-// ######################################################################
-// File Watching and Replication Logic
-// ######################################################################
-
-func getKnownFiles() []string {
-	knownFiles.RLock()
-	defer knownFiles.RUnlock()
-	keys := make([]string, 0, len(knownFiles.hashes))
-	for k := range knownFiles.hashes {
-		keys = append(keys, k)
-	}
-	return keys
-}
-
-func addKnownFile(hash string) {
-	knownFiles.Lock()
-	defer knownFiles.Unlock()
-	knownFiles.hashes[hash] = true
-}
-
-func startReplicationChecker(ctx context.Context, topic *pubsub.Topic) {
-	log.Println("Replication checker started, will run every", checkInterval)
-	ticker := time.NewTicker(checkInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("Stopping replication checker...")
+		msg, err := sub.Next(sm.ctx)
+		if err != nil {
 			return
-		case <-ticker.C:
-			log.Println("--- Running periodic replication check ---")
-			filesToCheck := getKnownFiles()
-			if len(filesToCheck) == 0 {
-				log.Println("No known files to check.")
-				continue
-			}
+		}
 
-			log.Printf("Checking replication for %d files...", len(filesToCheck))
-			for _, hash := range filesToCheck {
-				go checkReplication(ctx, hash, topic)
-			}
+		sm.mu.Lock()
+		sm.msgCounter++
+		shouldSplit := false
+		if sm.msgCounter > MaxShardLoad {
+			sm.msgCounter = 0
+			shouldSplit = true
+		}
+		sm.mu.Unlock()
+
+		if shouldSplit {
+			sm.splitShard()
+		}
+
+		if msg.GetFrom() == sm.h.ID() {
+			continue
+		}
+
+		data := string(msg.Data)
+		if strings.HasPrefix(data, "NEED:") {
+			hash := strings.TrimPrefix(data, "NEED:")
+			// FIX: Track announced files
+			addKnownFile(hash)
+			go checkReplication(sm.ctx, hash)
+		} else if strings.HasPrefix(data, "NEW:") {
+			hash := strings.TrimPrefix(data, "NEW:")
+			// FIX: Track announced files
+			addKnownFile(hash)
+			log.Printf("[Network] New content announced in my shard: %s", hash)
+			go checkReplication(sm.ctx, hash)
 		}
 	}
 }
 
-// scanExistingFiles processes all files already in the folder at startup
-func scanExistingFiles(ctx context.Context, topic *pubsub.Topic) {
-	entries, err := os.ReadDir(fileWatchFolder)
-	if err != nil {
-		log.Printf("Error scanning folder: %s", err)
+func (sm *ShardManager) splitShard() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	nextBit := getBinaryPrefix(sm.h.ID().String(), len(sm.currentShard)+1)
+
+	if nextBit == sm.currentShard {
 		return
 	}
 
-	found := 0
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
+	oldShard := sm.currentShard
+	sm.currentShard = nextBit
 
-		fullPath := filepath.Join(fileWatchFolder, entry.Name())
-		log.Printf("Processing existing file: %s", fullPath)
-
-		hash, err := calculateFileHash(fullPath)
-		if err != nil {
-			log.Printf("Error hashing existing file %s: %s", fullPath, err)
-			continue
-		}
-
-		// Treat it just like a newly created file
-		pinFile(hash)
-		addKnownFile(hash)
-		go provideFile(ctx, hash)
-		announceFile(ctx, topic, hash) // Announce "NEW"
-		found++
-	}
-	log.Printf("Finished processing %d existing files.", found)
+	log.Printf("!!! SHARD OVERLOAD (%s) !!! Splitting from %s -> %s", oldShard, oldShard, sm.currentShard)
+	go sm.joinChannels()
 }
 
-func watchFolder(ctx context.Context, topic *pubsub.Topic) {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		log.Fatal("Failed to create file watcher:", err)
+func (sm *ShardManager) PublishToShard(msg string) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if sm.shardTopic != nil {
+		sm.shardTopic.Publish(sm.ctx, []byte(msg))
 	}
+}
+
+func (sm *ShardManager) PublishToControl(msg string) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if sm.controlTopic != nil {
+		sm.controlTopic.Publish(sm.ctx, []byte(msg))
+	}
+}
+
+func (sm *ShardManager) AmIResponsibleFor(hash string) bool {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	hashPrefix := getHexBinaryPrefix(hash, len(sm.currentShard))
+	return hashPrefix == sm.currentShard
+}
+
+// ######################################################################
+// Logic & Utils
+// ######################################################################
+
+func getBinaryPrefix(s string, depth int) string {
+	h := sha256.Sum256([]byte(s))
+	return bytesToBinaryString(h[:], depth)
+}
+
+func getHexBinaryPrefix(hexStr string, depth int) string {
+	b, _ := hex.DecodeString(hexStr)
+	return bytesToBinaryString(b, depth)
+}
+
+func bytesToBinaryString(b []byte, length int) string {
+	var sb strings.Builder
+	for _, byteVal := range b {
+		for i := 7; i >= 0; i-- {
+			if length <= 0 {
+				return sb.String()
+			}
+			if (byteVal>>i)&1 == 1 {
+				sb.WriteRune('1')
+			} else {
+				sb.WriteRune('0')
+			}
+			length--
+		}
+	}
+	return sb.String()
+}
+
+// ######################################################################
+// File Handling
+// ######################################################################
+
+func scanExistingFiles() {
+	files, err := os.ReadDir(FileWatchFolder)
+	if err != nil {
+		log.Printf("Error scanning existing files: %v", err)
+		return
+	}
+
+	log.Printf("[System] Found %d existing files.", len(files))
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+		fullPath := filepath.Join(FileWatchFolder, file.Name())
+		processNewFile(fullPath)
+	}
+}
+
+func watchFolder(ctx context.Context) {
+	watcher, _ := fsnotify.NewWatcher()
 	defer watcher.Close()
+	watcher.Add(FileWatchFolder)
 
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-watcher.Events:
+			if !ok {
 				return
-			case event, ok := <-watcher.Events:
-				if !ok {
-					return
-				}
-				if event.Op&fsnotify.Create == fsnotify.Create {
-					log.Println("New file detected:", event.Name)
-					time.Sleep(100 * time.Millisecond)
-
-					hash, err := calculateFileHash(event.Name)
-					if err != nil {
-						log.Println("Error hashing file:", err)
-						continue
-					}
-					pinFile(hash)
-					addKnownFile(hash)
-					go provideFile(ctx, hash)
-					announceFile(ctx, topic, hash) // Announce "NEW"
-				}
-			case err, ok := <-watcher.Errors:
-				if !ok {
-					return
-				}
-				log.Println("File watcher error:", err)
+			}
+			if event.Op&fsnotify.Create == fsnotify.Create {
+				time.Sleep(100 * time.Millisecond)
+				processNewFile(event.Name)
 			}
 		}
-	}()
-
-	err = watcher.Add(fileWatchFolder)
-	if err != nil {
-		log.Fatal("Failed to add folder to watcher:", err)
 	}
-	<-ctx.Done()
 }
+
+func processNewFile(path string) {
+	hash, err := calculateFileHash(path)
+	if err != nil {
+		return
+	}
+
+	pinFile(hash)
+	go provideFile(context.Background(), hash)
+
+	// FIX: Ensure we track this file
+	addKnownFile(hash)
+
+	if shardMgr.AmIResponsibleFor(hash) {
+		log.Printf("[Core] I am responsible for %s. Announcing to Shard.", hash)
+		shardMgr.PublishToShard("NEW:" + hash)
+	} else {
+		targetPrefix := getHexBinaryPrefix(hash, len(shardMgr.currentShard))
+		log.Printf("[Core] Custodial Mode: %s belongs to shard %s. Delegating but holding...", hash, targetPrefix)
+		msg := fmt.Sprintf("DELEGATE:%s:%s", hash, targetPrefix)
+		shardMgr.PublishToControl(msg)
+	}
+}
+
+func checkReplication(ctx context.Context, hash string) {
+	responsible := shardMgr.AmIResponsibleFor(hash)
+	pinned := isPinned(hash)
+
+	// FIX: If we are not responsible AND not pinning, we don't need to track this anymore.
+	if !responsible && !pinned {
+		removeKnownFile(hash)
+		return
+	}
+
+	c, _ := hashToCid(hash)
+	provs := globalDHT.FindProvidersAsync(ctx, c, 0)
+	count := 0
+	for range provs {
+		count++
+	}
+
+	// CASE 1: Replication is too low
+	if count < MinReplication {
+		if responsible && !pinned {
+			log.Printf("[Replication] Low Redundancy (%d/%d). RE-PINNING %s", count, MinReplication, hash)
+			pinFile(hash)
+			provideFile(ctx, hash)
+		}
+		// If custodial, keep holding.
+
+		// Ask for help
+		shardMgr.PublishToShard("NEED:" + hash)
+	}
+
+	// CASE 2: Garbage Collection
+	// Sub-case A: I am responsible, but it's over-replicated
+	if responsible && count > MaxReplication && pinned {
+		log.Printf("[Replication] High Redundancy (%d/%d). Unpinning %s (Monitoring only)", count, MaxReplication, hash)
+		unpinFile(hash) // Remove from storage, but KEPT in knownFiles for tracking
+	}
+
+	// Sub-case B: I am NOT responsible (Custodial Mode), and it is Safe to Handoff
+	if !responsible && count >= MinReplication && pinned {
+		log.Printf("[Replication] Handoff Complete (%d/%d copies found). Unpinning custodial file %s", count, MinReplication, hash)
+		unpinFile(hash)
+	}
+}
+
+func runReplicationChecker(ctx context.Context) {
+	ticker := time.NewTicker(CheckInterval)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// FIX: Iterate over KnownFiles (Tracking List) instead of PinnedFiles (Storage List)
+			knownFiles.RLock()
+			for hash := range knownFiles.hashes {
+				go checkReplication(ctx, hash)
+			}
+			knownFiles.RUnlock()
+		}
+	}
+}
+
+// ######################################################################
+// Helpers
+// ######################################################################
 
 func pinFile(hash string) {
 	pinnedFiles.Lock()
 	defer pinnedFiles.Unlock()
-
 	if !pinnedFiles.hashes[hash] {
-		log.Println("[PINNING]", hash)
 		pinnedFiles.hashes[hash] = true
 	}
 }
@@ -408,9 +493,7 @@ func pinFile(hash string) {
 func unpinFile(hash string) {
 	pinnedFiles.Lock()
 	defer pinnedFiles.Unlock()
-
 	if pinnedFiles.hashes[hash] {
-		log.Println("[UNPINNING]", hash)
 		delete(pinnedFiles.hashes, hash)
 	}
 }
@@ -421,79 +504,54 @@ func isPinned(hash string) bool {
 	return pinnedFiles.hashes[hash]
 }
 
+// FIX: Helper to track files we care about
+func addKnownFile(hash string) {
+	knownFiles.Lock()
+	defer knownFiles.Unlock()
+	knownFiles.hashes[hash] = true
+}
+
+// FIX: Helper to stop tracking files
+func removeKnownFile(hash string) {
+	knownFiles.Lock()
+	defer knownFiles.Unlock()
+	delete(knownFiles.hashes, hash)
+}
+
 func provideFile(ctx context.Context, hash string) {
-	c, err := hashToCid(hash)
-	if err != nil {
-		log.Println("Error converting hash to CID:", err)
-		return
-	}
+	c, _ := hashToCid(hash)
+	_ = globalDHT.Provide(ctx, c, true)
+}
 
-	log.Println("Telling DHT we are a provider for:", hash)
-	if err := globalDHT.Provide(ctx, c, true); err != nil {
-		log.Println("Error providing to DHT:", err)
+func calculateFileHash(filePath string) (string, error) {
+	f, _ := os.Open(filePath)
+	defer f.Close()
+	h := sha256.New()
+	io.Copy(h, f)
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func hashToCid(hash string) (cid.Cid, error) {
+	b, _ := hex.DecodeString(hash)
+	mh, _ := multihash.Sum(b, 0x12, 32)
+	return cid.NewCidV1(cid.Raw, mh), nil
+}
+
+type discoveryNotifee struct {
+	h   host.Host
+	ctx context.Context
+}
+
+func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	if n.h.Network().Connectedness(pi.ID) != network.Connected {
+		n.h.Connect(n.ctx, pi)
 	}
 }
 
-// announceFile sends the initial "NEW" message
-func announceFile(ctx context.Context, topic *pubsub.Topic, hash string) {
-	msg := fmt.Sprintf("NEW:%s", hash)
-	if err := topic.Publish(ctx, []byte(msg)); err != nil {
-		log.Println("Error publishing file announcement:", err)
-	}
-}
-
-// checkReplication is the core logic
-func checkReplication(ctx context.Context, hash string, topic *pubsub.Topic) {
-	c, err := hashToCid(hash)
-	if err != nil {
-		log.Println("Error converting hash to CID:", err)
-		return
-	}
-
-	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	log.Println("Checking replication for:", hash)
-	providers := globalDHT.FindProvidersAsync(checkCtx, c, 0)
-
-	count := 0
-	// FIXED: Simplified the range expression
-	for range providers {
-		count++
-	}
-
-	if checkCtx.Err() == context.DeadlineExceeded {
-		log.Println("Timeout checking replication for:", hash)
-		return
-	}
-
-	log.Printf("Found %d providers for %s", count, hash)
-
-	amIPinning := isPinned(hash)
-
-	if count < minReplication {
-		log.Println("Replication low! Announcing NEED for", hash)
-		msg := fmt.Sprintf("NEED:%s", hash)
-		go func() {
-			if err := topic.Publish(context.Background(), []byte(msg)); err != nil {
-				log.Println("Error publishing NEED announcement:", err)
-			}
-		}()
-
-		if !amIPinning {
-			log.Println("Must pin", hash)
-
-			// --- CRITICAL TODO ---
-			log.Println("TODO: Fetch file from peer")
-			// Example: go fetchFile(ctx, hash)
-			// ---------------------
-
-			pinFile(hash)
-			go provideFile(ctx, hash)
-		}
-
-	} else if count > maxReplication && amIPinning {
-		log.Println("Replication high! Unpinning", hash)
-		unpinFile(hash)
+func inputLoop(sm *ShardManager) {
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		line := scanner.Text()
+		sm.PublishToShard(line)
 	}
 }
