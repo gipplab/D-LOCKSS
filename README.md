@@ -1,120 +1,137 @@
-D-LOCKSS (Go Edition)
+# Project Name: D-LOCKSS (v2)
 
-This is a Go-based implementation of the Decentralized "Lots of Copies Keep Stuff Safe" concept using IPFS and Gossipsub.
+## 1\. Summary & Vision
 
-Each running instance of this application acts as a peer in a decentralized network, collectively ensuring the preservation of PDF documents.
+**D-LOCKSS** (Distributed Lots of Copies Keep Stuff Safe) is a decentralized storage network designed to ensure the long-term preservation and authenticity of research data and documents.
 
-Features
+  * **Core Philosophy:** "Networked RAID." Just as RAID protects data across multiple hard drives, D-LOCKSS protects data across a distributed network of peers.
+  * **Authenticity:** Relying on Content Addressing (CIDs) to guarantee that the data retrieved is bit-for-bit identical to the data published.
+  * **Scope:** The system focuses purely on fundamental storage technology—replication, redundancy, and availability. Rights management and ownership are explicitly out of scope for this phase.
 
-Embedded IPFS Node: Runs a full Kubo (IPFS) node as part of the application.
+-----
 
-Directory Watching: Automatically adds PDFs placed in the ./pdfs_to_add directory.
+## 2\. Technical Architecture
 
-Gossipsub Discovery: Announces new files to peers and discovers files from peers using a shared Gossipsub topic.
+The system acts as a self-healing, sharded storage cluster using the IPFS/Libp2p stack.
 
-Health Monitoring: Periodically checks the number of providers for every file it tracks.
+### A. The "Networked RAID" Logic
 
-Self-Healing (Auto-Pinning): If a file's provider count drops below a threshold (default: 5), the node will automatically download and pin it to increase redundancy.
+Instead of a central controller, the network uses a Distributed Hash Table (DHT) and dynamic sharding to distribute "ownership" of files.
 
-How to Run
+[Image of distributed hash table architecture]
 
-1. Prerequisites
+| RAID Concept | D-LOCKSS Equivalent | Implementation Details |
+| :--- | :--- | :--- |
+| **Striping** | **Sharding** | The `ShardManager` assigns binary prefixes (e.g., `01*`, `11*`) to nodes. A node only permanently stores files whose SHA-256 hash matches its assigned prefix. |
+| **Redundancy** | **Replication** | The system enforces a `MinReplication` of 5 and `MaxReplication` of 10. |
+| **Scrubbing** | **Replication Checker** | A background process (`runReplicationChecker`) scans known CIDs every 15 minutes. If redundancy \< 5, it triggers a `NEED` broadcast; if \> 10, it drops the file to save space. |
+| **Write Cache** | **Custodial Mode** | If a node receives a file it *should not* own, it holds it temporarily ("Custodial Mode") and broadcasts a `DELEGATE` message to find the correct owner, ensuring no data loss during transit. |
 
-You must have Go 1.19 or later installed.
+### B. Core Components
 
-A working internet connection and an environment that allows P2P connections (e.g., not behind a highly restrictive firewall).
+1.  **Shard Manager:**
+      * Monitors network load (`MaxShardLoad`).
+      * Dynamically splits responsibilities (e.g., if handling `0*` becomes too heavy, it splits into `00*` and `01*`).
+      * Manages PubSub topics: `dlockss-control` (delegation) and `dlockss-shard-{prefix}` (data announcements).
+2.  **File Watcher:**
+      * Monitors the `./data` directory using `fsnotify`.
+      * Automatically hashes, pins, and announces new files dropped into the folder.
+3.  **Discovery:**
+      * Uses MDNS for local peer discovery (`dlockss-v2-prod`).
+      * Uses Kademlia DHT for global routing and provider record storage.
 
-2. Setup
+-----
 
-Create a Directory:
+## 3\. How to Run
 
-mkdir d-lockss-go
-cd d-lockss-go
+### Prerequisites
 
+  * **Go 1.20** or later installed.
+  * A working internet connection.
+  * An environment allowing P2P connections (ports 4001/tcp/udp and multicast enabled for MDNS).
 
-Save the Files:
-Save the main.go and go.mod files from this response into the d-lockss-go directory.
+### Setup
 
-Install Dependencies:
-Open a terminal in the directory and run go mod tidy. This will download all the required IPFS and libp2p modules specified in go.mod.
+1.  **Initialize Project:**
+    Create a directory and initialize the module.
 
-go mod tidy
+    ```bash
+    mkdir dlockss-v2
+    cd dlockss-v2
+    # Paste main.go here
+    go mod init dlockss
+    go mod tidy
+    ```
 
+2.  **Create Watch Directory:**
+    The application watches a directory for incoming files.
 
-3. Running the Application
+    ```bash
+    mkdir data
+    ```
 
-Create the "Add" Directory:
-The application watches a directory named pdfs_to_add. Create it.
+### Running the Node
 
-mkdir pdfs_to_add
-
-
-Run the Node:
 Start the application from your terminal:
 
+```bash
 go run .
+```
 
+You will see logs indicating the node is online, the shard it is managing, and the topics it has joined:
 
-You're Live!
-The application will first initialize an IPFS repository (in a new folder named .dlockss_repo) and then start the node. You will see logs indicating it's online and subscribed to the Gossipsub topic.
+```text
+--- Node ID: 12D3KooW... ---
+--- Addresses: [/ip4/192.168.1.5/tcp/34567 ...] ---
+[System] Joined Control Channel: dlockss-control
+[Sharding] Active Data Shard: 0 (Topic: dlockss-shard-0)
+Scanning for existing files...
+[System] Found 0 existing files.
+```
 
-2025/11/12 10:30:00 No IPFS repo found. Initializing new one at ./.dlockss_repo
-...
-2025/11/12 10:30:05 Node is online. Peer ID: 12D3KooW...
-2025/11/12 10:30:05 Subscribed to Gossipsub topic: /d-lockss-pdf-archive/1.0.0
-2025/11/12 10:30:05 Watching for new files in: ./pdfs_to_add
-2025/11/12 10:30:05 Starting content monitoring loop...
-2025/11/12 10:30:05 Running periodic retrievability check...
+### Usage Workflow
 
+1.  **Add a File:**
+    Copy any PDF document into the `./data` directory.
+2.  **Ingestion:**
+    Within seconds, the application will detect the file, hash it, and determine responsibility.
+      * **If Responsible:** It pins the file and announces "NEW:{hash}" to its shard.
+      * **If Not Responsible:** It enters **Custodial Mode**, announcing "DELEGATE:{hash}" to the control topic.
+3.  **Run a Second Peer:**
+    Run `go run .` in a separate terminal (ensure a separate directory if testing on the same machine to avoid lock conflicts, or use containerization). The new peer will auto-discover the first peer, negotiate shards, and begin replication if the redundancy count is below 5.
 
-4. How to Use
+-----
 
-Add a File:
-Find any PDF document on your computer and copy it into the ./pdfs_to_add directory.
+## 4\. Roadmap & Engineering Challenges (TODO)
 
-Watch the Logs:
-Within 10 seconds, the application will detect the file, add it to IPFS, pin it, and broadcast it to the network. The original file will be moved to a new ./added_pdfs directory.
+### Feature Goals
 
-2025/11/12 10:31:00 Found new PDF to add: my-document.pdf
-2025/11/12 10:31:01 Added and pinned file my-document.pdf. CID: Qm...
-2025/11/12 10:31:01 Tracking locally added file: my-document.pdf (Qm...)
-2025/11/12 10:31:01 Announcing new file to network: my-document.pdf
+  * **Targeted Replication:** Request replication by CID to spread content equally across the topology.
+  * **User Interface:** Provide a browser-based UI using **Helia** (JS IPFS) to browse and retrieve PDFs without a CLI.
 
+### Architectural Challenge: Scalable Sharding
 
-Run a Second Peer:
-To see the decentralized part in action, open a new terminal window. Copy the entire d-lockss-go directory to a new location (e.g., d-lockss-go-peer2), cd into it, and run go run . there.
+We are currently evaluating the following strategies for scaling the Sharding logic beyond simple prefixes:
 
-This second peer will connect to the network, and within a minute, it will hear the gossip message from the first peer:
+**Strategy A: Channel-based Sharding (Deep Hierarchy)**
 
-2025/11/12 10:32:15 Tracking new file from peer: my-document.pdf (Qm...)
-2025/11/12 10:32:15 Checking providers for: my-document.pdf (Qm...)
-2025/11/12 10:32:16 Found 1 other providers for my-document.pdf
-2CSS/11/12 10:32:16 Provider count for my-document.pdf is low (1). Pinning now...
-2025/11/12 10:32:18 Successfully pinned my-document.pdf to ensure availability.
+  * *Concept:* CID prefix defines the PubSub channel to join (up to 64 channels).
+  * *Logic:* Peers join channels matching their prefix. If a channel is empty, they move up to the parent channel.
+  * *Replication Check:* Start at the deepest channel (e.g., prefix `1011`) and bubble up to `main` if needed.
+  * *SHOWSTOPPER:* If a node hosts 1 million CIDs, it cannot join 1 million specific channels. The overhead is untenable.
 
+**Strategy B: Single Global Channel**
 
-The second peer saw the file had only 1 provider (peer 1), which is less than 5, so it automatically pinned the file itself. Now the file has 2 providers!
+  * *Concept:* Keep all peers in one channel to avoid subscription overhead.
+  * *Logic:* Control message flow via PeerID bandwidth allocation.
+  * *SHOWSTOPPER:* Bandwidth variance between peers makes synchronization unreliable.
 
+**Strategy C: Probabilistic Gossip (Selected Approach)**
 
+  * *Concept:* Similar to Block propagation in Blockchains.
+  * *Logic:* Fine-tune the GossipSub message frequency. We accept that some `NEW` or `NEED` messages may be missed (probabilistic delivery).
+  * *Result:* Updates are eventually consistent; the system heals over longer timeframes rather than instantaneously.
 
-TODO:
+### Next Step
 
-- request replication by CID to spread content somewhat equally
-- provide a UI using helia to browse and retrieve PDFs
-- sharding via channels and CIDs
-    - CID prefix defines the channel to join
-    - 64 channels maximum to join
-    - Every peer joins channels and asks for content in this channel 
-    - First channel where no content is available prevents going deeper until content for this channel is available
-    - The main channel has no prefix. 
-    - to check replication factor, it start with the deepest channel and makes it way up until main channel. 
-     - only nodes with a common CID overlap qualify as replicators. 
-     - potential relicators meet at a certain prefix channel. Once this channel has 16*16 (256) members, the channel is not used anymore. Instead the next deeper channel is used. 
-     - PROBLEM: If you host a millon CIDs, you would need to join a million channels - SHOWSTOPPER
-    - alternatvely we could hold everyone in the same channel
-        - now we have a limited bandwith. 
-        - we could control who is allowed to post at what time through their PeerID
-        - But everyone would have a diffent bandwidth. Therefore SHOWSTOPPER as well
-    - are we okay with missing messages?
-        - I guess yes. That would mean that we get an update eventually later, but propabilistically some day
-    - similar then block size in Blockhain, we need to fine tune message frequency in the gossipsub channel
+Implement **Strategy C** by tuning `pubsub.GossipSubParams` to handle higher message throughput while accepting eventual consistency for replication events.
