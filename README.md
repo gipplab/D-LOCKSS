@@ -18,8 +18,6 @@ The system acts as a self-healing, sharded storage cluster using the IPFS/Libp2p
 
 Instead of a central controller, the network uses a Distributed Hash Table (DHT) and dynamic sharding to distribute "ownership" of files.
 
-[Image of distributed hash table architecture]
-
 | RAID Concept | D-LOCKSS Equivalent | Implementation Details |
 | :--- | :--- | :--- |
 | **Striping** | **Sharding** | The `ShardManager` assigns binary prefixes (e.g., `01*`, `11*`) to nodes. A node only permanently stores files whose SHA-256 hash matches its assigned prefix. |
