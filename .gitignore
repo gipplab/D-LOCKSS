@@ -6,3 +6,9 @@ my-pdfs
 
 testnet/dlockss-node
 testnet/testnet_data
+
+mardi-pdfs
+
+scripts/__pycache__
+
+charts

@@ -8,6 +8,8 @@
   * **Authenticity:** Relying on Content Addressing (CIDs) to guarantee that the data retrieved is bit-for-bit identical to the data published.
   * **Scope:** The system focuses purely on fundamental storage technology—replication, redundancy, and availability. Rights management and ownership are explicitly out of scope for this phase.
 
+GOAL: Combining the Speed of IPFS Cluster with the Satety of LOCKSS (Fast enough for millions of files but smart enough to ensure enought copies exist without human intervention.)
+
 -----
 
 ## 2\. Technical Architecture
@@ -133,3 +135,65 @@ We are currently evaluating the following strategies for scaling the Sharding lo
 ### Next Step
 
 Implement **Strategy C** by tuning `pubsub.GossipSubParams` to handle higher message throughput while accepting eventual consistency for replication events.
+
+
+
+
+### Comparative Feature Matrix
+
++=======================+==================+==================+==================+==================+
+| FEATURE               | IPFS CLUSTER     | SAFE NETWORK     | PEERBIT          | LOCKSS           |
++=======================+==================+==================+==================+==================+
+| Network Stack         | [x] libp2p + DHT | [ ] Custom (QUIC)| [x] libp2p       | [ ] Custom/HTTP  |
+| (SR-1, SR-2)          |     (Exact Match)|     (XOR Route)  |     (Exact Match)|     (LCAP/REST)  |
++-----------------------+------------------+------------------+------------------+------------------+
+| Content Addressing    | [x] IPFS CIDs    | [x] XOR Hash     | [x] IPFS CIDs    | [~] URL-Based    |
+| (SR-4, FM-2)          |     (Multihash)  |     (Cnt Addr)   |     (Multihash)  |     (Hash verify)|
++-----------------------+------------------+------------------+------------------+------------------+
+| Messaging Protocol    | [x] GossipSub    | [~] Hop Routing  | [x] GossipSub    | [ ] Direct/Poll  |
+| (SR-3, MP-1)          |     (PubSub)     |     (Custom Msg) |     (PubSub)     |     (Unicast)    |
++-----------------------+------------------+------------------+------------------+------------------+
+| Prefix Sharding       | [ ] Consensus    | [x] XOR Distance | [~] DB Sharding  | [ ] Static       |
+| (SH-1, SH-3)          |     (Raft/CRDT)  |     (Prefix Mat) |     (Filter)     |     (Manual List)|
++-----------------------+------------------+------------------+------------------+------------------+
+| Auto-Replication      | [x] Min/Max      | [x] Managed      | [x] Configurable | [x] Polling      |
+| (RP-1, RP-2)          |     (Configured) |     (Net force)  |     (Rep Factor) |     (Voting)     |
++-----------------------+------------------+------------------+------------------+------------------+
+| Custodial Handoff     | [ ] Manual       | [x] Automatic    | [~] Partial      | [ ] None         |
+| (RP-5, CM-1)          |     (User pins)  |     (Churn hdl)  |     (Sync Logic) |     (Static)     |
++-----------------------+------------------+------------------+------------------+------------------+
+| File System Watcher   | [ ] None         | [ ] None         | [ ] None         | [~] Crawler      |
+| (FM-1)                |     (API Only)   |     (Virt Drive) |     (DB Only)    |     (HTTP only)  |
++=======================+==================+==================+==================+==================+
+
+Legend:
+[x] = Feature Match / Native Support
+[~] = Partial Match / Different Approach
+[ ] = No Support / Fundamental Mismatch
+
+
+
+Library Use-Case: 
++==================+======================+======================+======================+======================+
+| FEATURE          | LOCKSS (Classic)     | IPFS CLUSTER         | D-LOCKSS (Your Spec) | SAFE NETWORK         |
++==================+======================+======================+======================+======================+
+| Best For         | Regulatory Compliance| Raw Performance      | Modern Preservation  | Anonymity            |
+|                  | (Dark archives,      | (Big Data transfer,  | (Hybrid of Safety    | (Censorship          |
+|                  | audits)              | fast sync)           | & Speed)             | resistance)          |
++------------------+----------------------+----------------------+----------------------+----------------------+
+| Architecture     | Poll-based           | Push-based           | Reactive P2P         | Autonomous           |
+|                  | (HTTP Crawling,      | (Consensus/Raft,     | (GossipSub events,   | (XOR Math,           |
+|                  | static peers)        | manual pinning)      | auto-sharding)       | self-encrypting)     |
++------------------+----------------------+----------------------+----------------------+----------------------+
+| Integrity Check  | Active Voting        | Passive              | Hybrid               | Self-Encryption      |
+|                  | (Constant polls,     | (Manual trigger:     | (Periodic checks     | (Network relocates   |
+|                  | consensus repairs)   | 'ipfs repo verify')  | + DHT repair)        | & verifies chunks)   |
++------------------+----------------------+----------------------+----------------------+----------------------+
+| Scale (Millions) | [ ] Poor             | [x] Excellent        | [~] Good             | [x] Excellent        |
+|                  | (Slow crawling,      | (Bitswap is fast,    | (GossipSub handles   | (Global scale, but   |
+|                  | bandwidth heavy)     | deduplicates data)   | high throughput)     | retrieval is slow)   |
++------------------+----------------------+----------------------+----------------------+----------------------+
+| Setup Cost       | High                 | Medium               | Low                  | Zero                 |
+|                  | (Complex config,     | (DevOps needed for   | (Single binary,      | (Just run client,    |
+|                  | static IPs, XML)     | shared keys)         | auto-discovery)      | no control)          |
++==================+======================+======================+======================+======================+

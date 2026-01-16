@@ -29,7 +29,7 @@ function cleanup {
 trap cleanup EXIT
 
 echo -e "${YELLOW}--- Building Binary ---${NC}"
-go build -o $BINARY_NAME ../main.go
+(cd .. && go build -o testnet/$BINARY_NAME)
 if [ $? -ne 0 ]; then
     echo "Build failed."
     exit 1
@@ -52,7 +52,8 @@ for i in $(seq 1 $NODE_COUNT); do
     
     # Run the node in background, redirect logs
     # We cd into the dir so "./my-pdfs" is created inside node_X/
-    (cd "$NODE_DIR" && ./$BINARY_NAME > "../node_$i.log" 2>&1 & echo $! >> "../../$PID_FILE")
+    # Enable metrics export for each node
+    (cd "$NODE_DIR" && DLOCKSS_METRICS_EXPORT="metrics.csv" ./$BINARY_NAME > "../node_$i.log" 2>&1 & echo $! >> "../../$PID_FILE")
     
     # Don't start all at exact same millisecond, helps mDNS storm
     # aggressive start: 0.1s delay
@@ -67,6 +68,22 @@ echo "Active PIDs stored in $PID_FILE"
 echo -e "\n${YELLOW}--- TEST INSTRUCTIONS ---${NC}"
 echo "1. To trigger replication: cp your-file.pdf $BASE_DIR/node_1/my-pdfs/"
 echo "2. Watch logs: tail -f $BASE_DIR/node_*.log"
-echo "3. Press [ENTER] to kill the network."
+echo "3. Metrics are exported to: $BASE_DIR/node_X/metrics.csv"
+echo "4. Press [ENTER] to kill the network and generate charts."
 
 read -p ""
+
+echo -e "\n${YELLOW}--- Generating Charts ---${NC}"
+# Check if Python script exists
+if [ -f "../scripts/generate_charts.py" ]; then
+    # Use auto-discovery mode to process all nodes with timestamped output
+    echo "Auto-discovering and processing all metrics CSV files..."
+    if command -v uv &> /dev/null; then
+        uv run --with-requirements ../scripts/requirements.txt ../scripts/generate_charts.py --auto --search-dir "$BASE_DIR" --base-output "$BASE_DIR/charts" 2>/dev/null || python3 ../scripts/generate_charts.py --auto --search-dir "$BASE_DIR" --base-output "$BASE_DIR/charts" 2>/dev/null || echo "  (Python dependencies not installed - install with: uv pip install -r ../scripts/requirements.txt)"
+    else
+        python3 ../scripts/generate_charts.py --auto --search-dir "$BASE_DIR" --base-output "$BASE_DIR/charts" 2>/dev/null || echo "  (Python dependencies not installed - install with: uv pip install -r ../scripts/requirements.txt)"
+    fi
+    echo -e "${GREEN}Charts generated in $BASE_DIR/charts/charts_YYYYMMDD_HHMMSS/${NC}"
+else
+    echo "Chart generation script not found at ../scripts/generate_charts.py"
+fi
