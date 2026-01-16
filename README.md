@@ -10,6 +10,8 @@
 
 GOAL: Combining the Speed of IPFS Cluster with the Satety of LOCKSS (Fast enough for millions of files but smart enough to ensure enought copies exist without human intervention.)
 
+GOAL: Combining the Speed of IPFS Cluster with the Satety of LOCKSS (Fast enough for millions of files but smart enough to ensure enought copies exist without human intervention.)
+
 -----
 
 ## 2\. Technical Architecture
@@ -24,7 +26,7 @@ Instead of a central controller, the network uses a Distributed Hash Table (DHT)
 | :--- | :--- | :--- |
 | **Striping** | **Sharding** | The `ShardManager` assigns binary prefixes (e.g., `01*`, `11*`) to nodes. A node only permanently stores files whose SHA-256 hash matches its assigned prefix. |
 | **Redundancy** | **Replication** | The system enforces a `MinReplication` of 5 and `MaxReplication` of 10. |
-| **Scrubbing** | **Replication Checker** | A background process (`runReplicationChecker`) scans known CIDs every 15 minutes. If redundancy \< 5, it triggers a `NEED` broadcast; if \> 10, it drops the file to save space. |
+| **Scrubbing** | **Replication Checker** | A background process (`runReplicationChecker`) scans known CIDs every 1 minute. If redundancy < 5, it triggers a `NEED` broadcast; if > 10, it drops the file to save space. |
 | **Write Cache** | **Custodial Mode** | If a node receives a file it *should not* own, it holds it temporarily ("Custodial Mode") and broadcasts a `DELEGATE` message to find the correct owner, ensuring no data loss during transit. |
 
 ### B. Core Components
@@ -141,30 +143,15 @@ Implement **Strategy C** by tuning `pubsub.GossipSubParams` to handle higher mes
 
 ### Comparative Feature Matrix
 
-+=======================+==================+==================+==================+==================+
-| FEATURE               | IPFS CLUSTER     | SAFE NETWORK     | PEERBIT          | LOCKSS           |
-+=======================+==================+==================+==================+==================+
-| Network Stack         | [x] libp2p + DHT | [ ] Custom (QUIC)| [x] libp2p       | [ ] Custom/HTTP  |
-| (SR-1, SR-2)          |     (Exact Match)|     (XOR Route)  |     (Exact Match)|     (LCAP/REST)  |
-+-----------------------+------------------+------------------+------------------+------------------+
-| Content Addressing    | [x] IPFS CIDs    | [x] XOR Hash     | [x] IPFS CIDs    | [~] URL-Based    |
-| (SR-4, FM-2)          |     (Multihash)  |     (Cnt Addr)   |     (Multihash)  |     (Hash verify)|
-+-----------------------+------------------+------------------+------------------+------------------+
-| Messaging Protocol    | [x] GossipSub    | [~] Hop Routing  | [x] GossipSub    | [ ] Direct/Poll  |
-| (SR-3, MP-1)          |     (PubSub)     |     (Custom Msg) |     (PubSub)     |     (Unicast)    |
-+-----------------------+------------------+------------------+------------------+------------------+
-| Prefix Sharding       | [ ] Consensus    | [x] XOR Distance | [~] DB Sharding  | [ ] Static       |
-| (SH-1, SH-3)          |     (Raft/CRDT)  |     (Prefix Mat) |     (Filter)     |     (Manual List)|
-+-----------------------+------------------+------------------+------------------+------------------+
-| Auto-Replication      | [x] Min/Max      | [x] Managed      | [x] Configurable | [x] Polling      |
-| (RP-1, RP-2)          |     (Configured) |     (Net force)  |     (Rep Factor) |     (Voting)     |
-+-----------------------+------------------+------------------+------------------+------------------+
-| Custodial Handoff     | [ ] Manual       | [x] Automatic    | [~] Partial      | [ ] None         |
-| (RP-5, CM-1)          |     (User pins)  |     (Churn hdl)  |     (Sync Logic) |     (Static)     |
-+-----------------------+------------------+------------------+------------------+------------------+
-| File System Watcher   | [ ] None         | [ ] None         | [ ] None         | [~] Crawler      |
-| (FM-1)                |     (API Only)   |     (Virt Drive) |     (DB Only)    |     (HTTP only)  |
-+=======================+==================+==================+==================+==================+
+| FEATURE | IPFS CLUSTER | SAFE NETWORK | PEERBIT | LOCKSS |
+| :--- | :--- | :--- | :--- | :--- |
+| **Network Stack**<br>(SR-1, SR-2) | [x] libp2p + DHT<br>(Exact Match) | [ ] Custom (QUIC)<br>(XOR Route) | [x] libp2p<br>(Exact Match) | [ ] Custom/HTTP<br>(LCAP/REST) |
+| **Content Addressing**<br>(SR-4, FM-2) | [x] IPFS CIDs<br>(Multihash) | [x] XOR Hash<br>(Cnt Addr) | [x] IPFS CIDs<br>(Multihash) | [~] URL-Based<br>(Hash verify) |
+| **Messaging Protocol**<br>(SR-3, MP-1) | [x] GossipSub<br>(PubSub) | [~] Hop Routing<br>(Custom Msg) | [x] GossipSub<br>(PubSub) | [ ] Direct/Poll<br>(Unicast) |
+| **Prefix Sharding**<br>(SH-1, SH-3) | [ ] Consensus<br>(Raft/CRDT) | [x] XOR Distance<br>(Prefix Mat) | [~] DB Sharding<br>(Filter) | [ ] Static<br>(Manual List) |
+| **Auto-Replication**<br>(RP-1, RP-2) | [x] Min/Max<br>(Configured) | [x] Managed<br>(Net force) | [x] Configurable<br>(Rep Factor) | [x] Polling<br>(Voting) |
+| **Custodial Handoff**<br>(RP-5, CM-1) | [ ] Manual<br>(User pins) | [x] Automatic<br>(Churn hdl) | [~] Partial<br>(Sync Logic) | [ ] None<br>(Static) |
+| **File System Watcher**<br>(FM-1) | [ ] None<br>(API Only) | [ ] None<br>(Virt Drive) | [ ] None<br>(DB Only) | [~] Crawler<br>(HTTP only) |
 
 Legend:
 [x] = Feature Match / Native Support
@@ -173,27 +160,12 @@ Legend:
 
 
 
-Library Use-Case: 
-+==================+======================+======================+======================+======================+
-| FEATURE          | LOCKSS (Classic)     | IPFS CLUSTER         | D-LOCKSS (Your Spec) | SAFE NETWORK         |
-+==================+======================+======================+======================+======================+
-| Best For         | Regulatory Compliance| Raw Performance      | Modern Preservation  | Anonymity            |
-|                  | (Dark archives,      | (Big Data transfer,  | (Hybrid of Safety    | (Censorship          |
-|                  | audits)              | fast sync)           | & Speed)             | resistance)          |
-+------------------+----------------------+----------------------+----------------------+----------------------+
-| Architecture     | Poll-based           | Push-based           | Reactive P2P         | Autonomous           |
-|                  | (HTTP Crawling,      | (Consensus/Raft,     | (GossipSub events,   | (XOR Math,           |
-|                  | static peers)        | manual pinning)      | auto-sharding)       | self-encrypting)     |
-+------------------+----------------------+----------------------+----------------------+----------------------+
-| Integrity Check  | Active Voting        | Passive              | Hybrid               | Self-Encryption      |
-|                  | (Constant polls,     | (Manual trigger:     | (Periodic checks     | (Network relocates   |
-|                  | consensus repairs)   | 'ipfs repo verify')  | + DHT repair)        | & verifies chunks)   |
-+------------------+----------------------+----------------------+----------------------+----------------------+
-| Scale (Millions) | [ ] Poor             | [x] Excellent        | [~] Good             | [x] Excellent        |
-|                  | (Slow crawling,      | (Bitswap is fast,    | (GossipSub handles   | (Global scale, but   |
-|                  | bandwidth heavy)     | deduplicates data)   | high throughput)     | retrieval is slow)   |
-+------------------+----------------------+----------------------+----------------------+----------------------+
-| Setup Cost       | High                 | Medium               | Low                  | Zero                 |
-|                  | (Complex config,     | (DevOps needed for   | (Single binary,      | (Just run client,    |
-|                  | static IPs, XML)     | shared keys)         | auto-discovery)      | no control)          |
-+==================+======================+======================+======================+======================+
+### Library Use-Case Comparison
+
+| FEATURE | LOCKSS (Classic) | IPFS CLUSTER | D-LOCKSS (Your Spec) | SAFE NETWORK |
+| :--- | :--- | :--- | :--- | :--- |
+| **Best For** | Regulatory Compliance<br>(Dark archives, audits) | Raw Performance<br>(Big Data transfer, fast sync) | Modern Preservation<br>(Hybrid of Safety & Speed) | Anonymity<br>(Censorship resistance) |
+| **Architecture** | Poll-based<br>(HTTP Crawling, static peers) | Push-based<br>(Consensus/Raft, manual pinning) | Reactive P2P<br>(GossipSub events, auto-sharding) | Autonomous<br>(XOR Math, self-encrypting) |
+| **Integrity Check** | Active Voting<br>(Constant polls, consensus repairs) | Passive<br>(Manual trigger: 'ipfs repo verify') | Hybrid<br>(Periodic checks + DHT repair) | Self-Encryption<br>(Network relocates & verifies chunks) |
+| **Scale (Millions)** | Poor<br>(Slow crawling, bandwidth heavy) | Excellent<br>(Bitswap is fast, deduplicates data) | Good<br>(GossipSub handles high throughput) | Excellent<br>(Global scale, but retrieval is slow) |
+| **Setup Cost** | High<br>(Complex config, static IPs, XML) | Medium<br>(DevOps needed for shared keys) | Low<br>(Single binary, auto-discovery) | Zero<br>(Just run client, no control) |
