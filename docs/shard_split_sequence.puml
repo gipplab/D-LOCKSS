@@ -1,0 +1,24 @@
+@startuml Shard Split Sequence
+
+participant "ShardManager" as ShardMgr
+participant "PubSub" as PubSub
+participant "Storage" as Storage
+
+ShardMgr -> ShardMgr: readShard() receives message
+ShardMgr -> ShardMgr: Increment msgCounter
+
+alt msgCounter > MaxShardLoad
+    ShardMgr -> ShardMgr: splitShard()
+    ShardMgr -> ShardMgr: Calculate new depth\ncurrentDepth + 1
+    ShardMgr -> ShardMgr: Get peerIDHash at new depth
+    ShardMgr -> ShardMgr: Update currentShard = peerIDHash
+    ShardMgr -> Storage: Increment shardSplits metric
+    
+    ShardMgr -> PubSub: Cancel old shard subscription
+    ShardMgr -> PubSub: Join new shard topic\n("dlockss-shard-" + newShard)
+    
+    Note over ShardMgr: Responsibility changed\nOld: "0" -> New: "01"
+    Note over ShardMgr: Files matching old prefix\nmay no longer be tracked
+end
+
+@enduml

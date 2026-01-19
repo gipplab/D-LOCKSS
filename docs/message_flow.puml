@@ -1,0 +1,48 @@
+@startuml Message Flow Diagram
+
+participant "Node A" as A
+participant "GossipSub" as GS
+participant "Node B" as B
+participant "Node C" as C
+participant "DHT" as DHT
+
+== File Ingestion ==
+A -> GS: NEW:<hash> (shard topic)
+GS -> B: Forward message
+GS -> C: Forward message
+B -> B: Add to knownFiles
+C -> C: Add to knownFiles
+
+== Replication Request ==
+A -> GS: NEED:<hash> (shard topic)
+GS -> B: Forward message
+GS -> C: Forward message
+B -> DHT: Check if I have file
+C -> DHT: Check if I have file
+B -> DHT: provideFile(hash) [if available]
+
+== Delegation ==
+A -> GS: DELEGATE:<hash>:<prefix> (control topic)
+GS -> B: Forward message
+GS -> C: Forward message
+B -> B: Check if prefix matches
+C -> C: Check if prefix matches
+alt Prefix matches (Node C)
+    C -> C: Accept delegation
+    C -> DHT: provideFile(hash)
+else Prefix doesn't match
+    B -> B: Ignore message
+end
+
+== Rate Limiting ==
+A -> GS: Message
+GS -> B: Forward
+B -> B: checkRateLimit(A)
+alt Rate limit OK
+    B -> B: Process message
+else Rate limit exceeded
+    B -> B: Drop message
+    B -> B: Increment messagesDropped
+end
+
+@enduml

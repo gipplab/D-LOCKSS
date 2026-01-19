@@ -1,0 +1,79 @@
+@startuml D-LOCKSS Data Structures
+skinparam classAttributeIconSize 0
+skinparam linetype ortho
+
+class ShardManager {
+    - ctx: context.Context
+    - h: host.Host
+    - ps: *pubsub.PubSub
+    - mu: sync.RWMutex
+    - currentShard: string
+    - shardTopic: *pubsub.Topic
+    - shardSub: *pubsub.Subscription
+    - controlTopic: *pubsub.Topic
+    - controlSub: *pubsub.Subscription
+    - msgCounter: int
+    - shardDone: chan struct{}
+    --
+    + NewShardManager(...): *ShardManager
+    + Run()
+    + AmIResponsibleFor(hash): bool
+    + PublishToShard(msg)
+    + PublishToControl(msg)
+    + splitShard()
+    + Close()
+}
+
+class StorageState {
+    + pinnedFiles: map[string]bool
+    + knownFiles: map[string]bool
+    + fileReplicationLevels: map[string]int
+    + fileConvergenceTime: map[string]time.Time
+    + recentlyRemoved: map[string]time.Time
+    + checkingFiles: map[string]bool
+    + lastCheckTime: map[string]time.Time
+}
+
+class Metrics {
+    + pinnedFilesCount: int
+    + knownFilesCount: int
+    + messagesReceived: int64
+    + messagesDropped: int64
+    + replicationChecks: int64
+    + replicationSuccess: int64
+    + replicationFailures: int64
+    + shardSplits: int64
+    + replicationDistribution: [11]int
+    + filesAtTargetReplication: int
+    + avgReplicationLevel: float64
+    + filesConvergedTotal: int64
+    + cumulativeMessagesReceived: int64
+    + cumulativeDhtQueries: int64
+    + ...
+}
+
+class RateLimiter {
+    + peers: map[peer.ID]*peerRateLimit
+}
+
+class peerRateLimit {
+    + messages: []time.Time
+    + mu: sync.Mutex
+}
+
+class BackoffManager {
+    + hashes: map[string]*operationBackoff
+}
+
+class operationBackoff {
+    + nextRetry: time.Time
+    + delay: time.Duration
+    + mu: sync.Mutex
+}
+
+ShardManager --> StorageState : reads/writes
+StorageState --> Metrics : updates
+RateLimiter --> peerRateLimit : contains
+BackoffManager --> operationBackoff : contains
+
+@enduml

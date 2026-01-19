@@ -1,0 +1,60 @@
+@startuml Replication Check Sequence
+
+participant "Replication Checker" as ReplChecker
+participant "Storage" as Storage
+participant "ShardManager" as ShardMgr
+participant "Backoff Manager" as Backoff
+participant "DHT" as DHT
+participant "PubSub" as PubSub
+participant "Other Nodes" as Nodes
+
+ReplChecker -> ReplChecker: runReplicationChecker()\n(periodic ticker)
+
+loop For each known file
+    ReplChecker -> Backoff: shouldSkipDueToBackoff(hash)
+    alt In backoff period
+        ReplChecker -> ReplChecker: Skip this file
+    else Not in backoff
+        ReplChecker -> Storage: isPinned(hash)
+        ReplChecker -> ShardMgr: AmIResponsibleFor(hash)
+        
+        alt Not responsible AND not pinned
+            ReplChecker -> Storage: removeKnownFile(hash)
+        else Responsible OR pinned
+            ReplChecker -> DHT: FindProvidersAsync(cid)
+            DHT -> DHT: Query network
+            DHT -> ReplChecker: Provider count
+            
+            ReplChecker -> Storage: Update fileReplicationLevels
+            
+            alt count < MinReplication
+                alt Responsible AND not pinned
+                    ReplChecker -> Storage: pinFile(hash)
+                    ReplChecker -> DHT: provideFile(hash)
+                end
+                ReplChecker -> PubSub: PublishToShard("NEED:" + hash)
+                PubSub -> Nodes: Broadcast NEED message
+                Nodes -> Nodes: Check if they can replicate
+            else count > MaxReplication
+                alt Responsible AND pinned
+                    ReplChecker -> Storage: unpinFile(hash)
+                    alt count > MaxReplication + 3
+                        ReplChecker -> Storage: removeKnownFile(hash)
+                    end
+                end
+            else count >= MinReplication AND count <= MaxReplication
+                alt Not responsible BUT pinned (custodial)
+                    ReplChecker -> Storage: unpinFile(hash)
+                end
+            end
+            
+            alt DHT query failed
+                ReplChecker -> Backoff: recordFailedOperation(hash)
+            else DHT query succeeded
+                ReplChecker -> Backoff: clearBackoff(hash)
+            end
+        end
+    end
+end
+
+@enduml

@@ -1,0 +1,38 @@
+@startuml File Ingestion Sequence
+
+actor User
+participant "File System" as FS
+participant "File Watcher" as Watcher
+participant "File Ops" as FileOps
+participant "Storage" as Storage
+participant "ShardManager" as ShardMgr
+participant "DHT" as DHT
+participant "PubSub" as PubSub
+participant "Other Nodes" as Nodes
+
+User -> FS: Drop file into ./data
+FS -> Watcher: File created event
+Watcher -> FileOps: processNewFile(path)
+
+FileOps -> FileOps: calculateFileHash(path)
+FileOps -> Storage: pinFile(hash)
+Storage -> Storage: Add to pinnedFiles 
+
+FileOps -> DHT: provideFile(hash)
+FileOps -> Storage: addKnownFile(hash)
+
+FileOps -> ShardMgr: AmIResponsibleFor(hash)
+
+alt Node is responsible
+    FileOps -> PubSub: PublishToShard("NEW:" + hash)
+    PubSub -> Nodes: Broadcast NEW message
+    Nodes -> Nodes: Add to knownFiles, check replication
+else Node is NOT responsible (Custodial Mode)
+    FileOps -> ShardMgr: getHexBinaryPrefix(hash)
+    FileOps -> PubSub: PublishToControl("DELEGATE:" + hash + ":" + prefix)
+    PubSub -> Nodes: Broadcast DELEGATE message
+    Nodes -> Nodes: Responsible node accepts delegation
+    Nodes -> Nodes: checkReplication(hash)
+end
+
+@enduml

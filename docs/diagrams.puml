@@ -1,0 +1,480 @@
+@startuml D-LOCKSS System Architecture
+
+!define RECTANGLE class
+
+package "D-LOCKSS Node" {
+    [Main] as main
+    [ShardManager] as shardMgr
+    [File Operations] as fileOps
+    [Replication Checker] as replChecker
+    [Storage Manager] as storage
+    [Metrics Reporter] as metrics
+    [Rate Limiter] as rateLimit
+    [Backoff Manager] as backoff
+    [Discovery Service] as discovery
+}
+
+package "libp2p Stack" {
+    [libp2p Host] as host
+    [Kademlia DHT] as dht
+    [GossipSub PubSub] as pubsub
+    [mDNS Discovery] as mdns
+}
+
+package "File System" {
+    [./data Directory] as dataDir
+    [File Watcher] as watcher
+}
+
+package "External" {
+    [Other D-LOCKSS Nodes] as peers
+    [IPFS Network] as ipfsNet
+}
+
+main --> shardMgr : manages
+main --> fileOps : orchestrates
+main --> replChecker : starts
+main --> storage : uses
+main --> metrics : collects
+main --> rateLimit : uses
+main --> backoff : uses
+main --> discovery : initializes
+
+shardMgr --> pubsub : subscribes/publishes
+shardMgr --> host : uses
+
+fileOps --> storage : pins/unpins
+fileOps --> shardMgr : checks responsibility
+fileOps --> dht : provides files
+fileOps --> watcher : triggered by
+
+replChecker --> dht : queries providers
+replChecker --> shardMgr : publishes NEED
+replChecker --> storage : manages pins
+replChecker --> backoff : checks backoff
+
+storage --> dht : provides files
+
+metrics --> storage : reads state
+metrics --> replChecker : tracks stats
+metrics --> shardMgr : reads shard info
+
+rateLimit --> pubsub : filters messages
+
+backoff --> replChecker : controls retries
+
+discovery --> mdns : uses
+discovery --> host : connects peers
+
+host --> dht : provides routing
+host --> pubsub : provides messaging
+host --> peers : connects
+
+dht --> ipfsNet : queries providers
+pubsub --> peers : broadcasts messages
+mdns --> peers : discovers locally
+
+watcher --> dataDir : monitors
+
+@enduml
+
+@startuml D-LOCKSS Component Diagram
+
+package "Core Components" {
+    component ShardManager {
+        note right
+            Manages shard assignment
+            and PubSub topics
+        end note
+    }
+    
+    component "Storage Manager" as StorageManager {
+        note right
+            Manages pinned files
+            and known files tracking
+        end note
+    }
+    
+    component "Replication Checker" as ReplicationChecker {
+        note right
+            Periodic replication
+            level verification
+        end note
+    }
+    
+    component "File Operations" as FileOperations {
+        note right
+            File ingestion
+            and hash calculation
+        end note
+    }
+    
+    component Metrics {
+        note right
+            Metrics collection
+            and CSV export
+        end note
+    }
+    
+    component "Rate Limiter" as RateLimiter {
+        note right
+            Per-peer message
+            rate limiting
+        end note
+    }
+    
+    component "Backoff Manager" as BackoffManager {
+        note right
+            Exponential backoff
+            for failed operations
+        end note
+    }
+}
+
+ShardManager --> StorageManager : checks responsibility
+ReplicationChecker --> StorageManager : manages pins
+ReplicationChecker --> ShardManager : publishes NEED
+FileOperations --> StorageManager : pins files
+FileOperations --> ShardManager : checks responsibility
+ReplicationChecker --> BackoffManager : checks backoff
+ShardManager --> RateLimiter : filters messages
+Metrics --> StorageManager : reads state
+Metrics --> ReplicationChecker : tracks stats
+
+@enduml
+
+@startuml D-LOCKSS Data Structures
+skinparam classAttributeIconSize 0
+skinparam linetype ortho
+
+class ShardManager {
+    - ctx: context.Context
+    - h: host.Host
+    - ps: *pubsub.PubSub
+    - mu: sync.RWMutex
+    - currentShard: string
+    - shardTopic: *pubsub.Topic
+    - shardSub: *pubsub.Subscription
+    - controlTopic: *pubsub.Topic
+    - controlSub: *pubsub.Subscription
+    - msgCounter: int
+    - shardDone: chan struct{}
+    --
+    + NewShardManager(...): *ShardManager
+    + Run()
+    + AmIResponsibleFor(hash): bool
+    + PublishToShard(msg)
+    + PublishToControl(msg)
+    + splitShard()
+    + Close()
+}
+
+class StorageState {
+    + pinnedFiles: map[string]bool
+    + knownFiles: map[string]bool
+    + fileReplicationLevels: map[string]int
+    + fileConvergenceTime: map[string]time.Time
+    + recentlyRemoved: map[string]time.Time
+    + checkingFiles: map[string]bool
+    + lastCheckTime: map[string]time.Time
+}
+
+class Metrics {
+    + pinnedFilesCount: int
+    + knownFilesCount: int
+    + messagesReceived: int64
+    + messagesDropped: int64
+    + replicationChecks: int64
+    + replicationSuccess: int64
+    + replicationFailures: int64
+    + shardSplits: int64
+    + replicationDistribution: [11]int
+    + filesAtTargetReplication: int
+    + avgReplicationLevel: float64
+    + filesConvergedTotal: int64
+    + cumulativeMessagesReceived: int64
+    + cumulativeDhtQueries: int64
+    + ...
+}
+
+class RateLimiter {
+    + peers: map[peer.ID]*peerRateLimit
+}
+
+class peerRateLimit {
+    + messages: []time.Time
+    + mu: sync.Mutex
+}
+
+class BackoffManager {
+    + hashes: map[string]*operationBackoff
+}
+
+class operationBackoff {
+    + nextRetry: time.Time
+    + delay: time.Duration
+    + mu: sync.Mutex
+}
+
+ShardManager --> StorageState : reads/writes
+StorageState --> Metrics : updates
+RateLimiter --> peerRateLimit : contains
+BackoffManager --> operationBackoff : contains
+
+@enduml
+
+@startuml File Ingestion Sequence
+
+actor User
+participant "File System" as FS
+participant "File Watcher" as Watcher
+participant "File Ops" as FileOps
+participant "Storage" as Storage
+participant "ShardManager" as ShardMgr
+participant "DHT" as DHT
+participant "PubSub" as PubSub
+participant "Other Nodes" as Nodes
+
+User -> FS: Drop file into ./data
+FS -> Watcher: File created event
+Watcher -> FileOps: processNewFile(path)
+
+FileOps -> FileOps: calculateFileHash(path)
+FileOps -> Storage: pinFile(hash)
+Storage -> Storage: Add to pinnedFiles 
+
+FileOps -> DHT: provideFile(hash)
+FileOps -> Storage: addKnownFile(hash)
+
+FileOps -> ShardMgr: AmIResponsibleFor(hash)
+
+alt Node is responsible
+    FileOps -> PubSub: PublishToShard("NEW:" + hash)
+    PubSub -> Nodes: Broadcast NEW message
+    Nodes -> Nodes: Add to knownFiles, check replication
+else Node is NOT responsible (Custodial Mode)
+    FileOps -> ShardMgr: getHexBinaryPrefix(hash)
+    FileOps -> PubSub: PublishToControl("DELEGATE:" + hash + ":" + prefix)
+    PubSub -> Nodes: Broadcast DELEGATE message
+    Nodes -> Nodes: Responsible node accepts delegation
+    Nodes -> Nodes: checkReplication(hash)
+end
+
+@enduml
+
+@startuml Replication Check Sequence
+
+participant "Replication Checker" as ReplChecker
+participant "Storage" as Storage
+participant "ShardManager" as ShardMgr
+participant "Backoff Manager" as Backoff
+participant "DHT" as DHT
+participant "PubSub" as PubSub
+participant "Other Nodes" as Nodes
+
+ReplChecker -> ReplChecker: runReplicationChecker()\n(periodic ticker)
+
+loop For each known file
+    ReplChecker -> Backoff: shouldSkipDueToBackoff(hash)
+    alt In backoff period
+        ReplChecker -> ReplChecker: Skip this file
+    else Not in backoff
+        ReplChecker -> Storage: isPinned(hash)
+        ReplChecker -> ShardMgr: AmIResponsibleFor(hash)
+        
+        alt Not responsible AND not pinned
+            ReplChecker -> Storage: removeKnownFile(hash)
+        else Responsible OR pinned
+            ReplChecker -> DHT: FindProvidersAsync(cid)
+            DHT -> DHT: Query network
+            DHT -> ReplChecker: Provider count
+            
+            ReplChecker -> Storage: Update fileReplicationLevels
+            
+            alt count < MinReplication
+                alt Responsible AND not pinned
+                    ReplChecker -> Storage: pinFile(hash)
+                    ReplChecker -> DHT: provideFile(hash)
+                end
+                ReplChecker -> PubSub: PublishToShard("NEED:" + hash)
+                PubSub -> Nodes: Broadcast NEED message
+                Nodes -> Nodes: Check if they can replicate
+            else count > MaxReplication
+                alt Responsible AND pinned
+                    ReplChecker -> Storage: unpinFile(hash)
+                    alt count > MaxReplication + 3
+                        ReplChecker -> Storage: removeKnownFile(hash)
+                    end
+                end
+            else count >= MinReplication AND count <= MaxReplication
+                alt Not responsible BUT pinned (custodial)
+                    ReplChecker -> Storage: unpinFile(hash)
+                end
+            end
+            
+            alt DHT query failed
+                ReplChecker -> Backoff: recordFailedOperation(hash)
+            else DHT query succeeded
+                ReplChecker -> Backoff: clearBackoff(hash)
+            end
+        end
+    end
+end
+
+@enduml
+
+@startuml Delegation Sequence
+
+participant "Custodial Node" as Custodial
+participant "PubSub Control" as Control
+participant "Responsible Node" as Responsible
+participant "Storage" as Storage
+participant "Replication Checker" as ReplChecker
+participant "DHT" as DHT
+
+Custodial -> Custodial: processNewFile()\nFile hash doesn't match shard
+Custodial -> Custodial: pinFile(hash) [temporary]
+Custodial -> DHT: provideFile(hash)
+Custodial -> Control: PublishToControl("DELEGATE:" + hash + ":" + prefix)
+
+Control -> Responsible: Broadcast DELEGATE message
+Responsible -> Responsible: Check if targetPrefix == myShard
+
+alt Prefix matches
+    Responsible -> Storage: addKnownFile(hash)
+    Responsible -> ReplChecker: checkReplication(hash)
+    ReplChecker -> DHT: FindProvidersAsync(cid)
+    DHT -> ReplChecker: Provider count
+    
+    alt count < MinReplication
+        ReplChecker -> Storage: pinFile(hash)
+        ReplChecker -> DHT: provideFile(hash)
+    end
+    
+    Note over Responsible: File now properly replicated
+    
+    alt Replication reaches MinReplication
+        Custodial -> Custodial: checkReplication(hash)
+        Custodial -> DHT: FindProvidersAsync(cid)
+        DHT -> Custodial: count >= MinReplication
+        Custodial -> Storage: unpinFile(hash)
+        Note over Custodial: Custodial handoff complete
+    end
+else Prefix doesn't match
+    Responsible -> Responsible: Ignore message
+end
+
+@enduml
+
+@startuml Shard Split Sequence
+
+participant "ShardManager" as ShardMgr
+participant "PubSub" as PubSub
+participant "Storage" as Storage
+
+ShardMgr -> ShardMgr: readShard() receives message
+ShardMgr -> ShardMgr: Increment msgCounter
+
+alt msgCounter > MaxShardLoad
+    ShardMgr -> ShardMgr: splitShard()
+    ShardMgr -> ShardMgr: Calculate new depth\ncurrentDepth + 1
+    ShardMgr -> ShardMgr: Get peerIDHash at new depth
+    ShardMgr -> ShardMgr: Update currentShard = peerIDHash
+    ShardMgr -> Storage: Increment shardSplits metric
+    
+    ShardMgr -> PubSub: Cancel old shard subscription
+    ShardMgr -> PubSub: Join new shard topic\n("dlockss-shard-" + newShard)
+    
+    Note over ShardMgr: Responsibility changed\nOld: "0" -> New: "01"
+    Note over ShardMgr: Files matching old prefix\nmay no longer be tracked
+end
+
+@enduml
+
+@startuml File Lifecycle State Diagram
+
+[*] --> Discovered: File detected in ./data
+
+Discovered --> Pinned: pinFile(hash)
+Discovered --> Custodial: Not responsible\nbut holds temporarily
+
+Pinned --> Responsible: AmIResponsibleFor() == true
+Pinned --> Custodial: AmIResponsibleFor() == false
+
+Custodial --> Delegated: DELEGATE message sent
+Delegated --> HandoffComplete: Replication >= MinReplication
+HandoffComplete --> [*]: unpinFile()
+
+Responsible --> Monitoring: Replication in range\n[MinReplication, MaxReplication]
+Monitoring --> UnderReplicated: count < MinReplication
+Monitoring --> OverReplicated: count > MaxReplication
+Monitoring --> Removed: count > MaxReplication + 3
+
+UnderReplicated --> Monitoring: Replication restored
+OverReplicated --> Monitoring: Replication reduced
+
+Responsible --> Removed: File no longer tracked
+Removed --> [*]
+
+note right of Custodial
+    Temporary storage
+    until responsible
+    node takes over
+end note
+
+note right of Monitoring
+    Periodic checks
+    ensure replication
+    stays in range
+end note
+
+@enduml
+
+@startuml Message Flow Diagram
+
+participant "Node A" as A
+participant "GossipSub" as GS
+participant "Node B" as B
+participant "Node C" as C
+participant "DHT" as DHT
+
+== File Ingestion ==
+A -> GS: NEW:<hash> (shard topic)
+GS -> B: Forward message
+GS -> C: Forward message
+B -> B: Add to knownFiles
+C -> C: Add to knownFiles
+
+== Replication Request ==
+A -> GS: NEED:<hash> (shard topic)
+GS -> B: Forward message
+GS -> C: Forward message
+B -> DHT: Check if I have file
+C -> DHT: Check if I have file
+B -> DHT: provideFile(hash) [if available]
+
+== Delegation ==
+A -> GS: DELEGATE:<hash>:<prefix> (control topic)
+GS -> B: Forward message
+GS -> C: Forward message
+B -> B: Check if prefix matches
+C -> C: Check if prefix matches
+alt Prefix matches (Node C)
+    C -> C: Accept delegation
+    C -> DHT: provideFile(hash)
+else Prefix doesn't match
+    B -> B: Ignore message
+end
+
+== Rate Limiting ==
+A -> GS: Message
+GS -> B: Forward
+B -> B: checkRateLimit(A)
+alt Rate limit OK
+    B -> B: Process message
+else Rate limit exceeded
+    B -> B: Drop message
+    B -> B: Increment messagesDropped
+end
+
+@enduml
