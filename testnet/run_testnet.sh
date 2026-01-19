@@ -29,10 +29,25 @@ function cleanup {
 trap cleanup EXIT
 
 echo -e "${YELLOW}--- Building Binary ---${NC}"
-(cd .. && go build -o testnet/$BINARY_NAME)
-if [ $? -ne 0 ]; then
-    echo "Build failed."
-    exit 1
+# Check if binary exists and is newer than all Go source files
+NEED_REBUILD=true
+if [ -f "$BINARY_NAME" ]; then
+    # Check if any .go file is newer than the binary
+    if find .. -name "*.go" -newer "$BINARY_NAME" 2>/dev/null | grep -q .; then
+        NEED_REBUILD=true
+    else
+        NEED_REBUILD=false
+        echo "Binary is up-to-date, skipping rebuild."
+    fi
+fi
+
+if [ "$NEED_REBUILD" = true ]; then
+    (cd .. && go build -o testnet/$BINARY_NAME)
+    if [ $? -ne 0 ]; then
+        echo "Build failed."
+        exit 1
+    fi
+    echo "Build completed."
 fi
 
 echo -e "${YELLOW}--- Cleaning old data ---${NC}"

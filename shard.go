@@ -75,10 +75,10 @@ func (sm *ShardManager) joinChannels() {
 	oldShardName := sm.oldShardName
 	oldShardTopicName := ""
 	if oldShardSub != nil && oldShardName != "" {
-		oldShardTopicName = fmt.Sprintf("dlockss-shard-%s", oldShardName)
+		oldShardTopicName = fmt.Sprintf("dlockss-creative-commons-shard-%s", oldShardName)
 	}
 
-	topicName := fmt.Sprintf("dlockss-shard-%s", sm.currentShard)
+	topicName := fmt.Sprintf("dlockss-creative-commons-shard-%s", sm.currentShard)
 	t, err := sm.ps.Join(topicName)
 	if err != nil {
 		log.Printf("[Error] Failed to subscribe to shard topic %s: %v", topicName, err)

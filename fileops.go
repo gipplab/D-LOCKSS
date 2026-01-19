@@ -18,20 +18,24 @@ import (
 )
 
 func scanExistingFiles() {
-	files, err := os.ReadDir(FileWatchFolder)
+	var fileCount int
+	err := filepath.Walk(FileWatchFolder, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			log.Printf("[Warning] Error accessing %s: %v", path, err)
+			return nil
+		}
+		if info.IsDir() {
+			return nil
+		}
+		processNewFile(path)
+		fileCount++
+		return nil
+	})
 	if err != nil {
-		log.Printf("Error scanning existing files: %v", err)
+		log.Printf("[Error] Error scanning existing files: %v", err)
 		return
 	}
-
-	log.Printf("[System] Found %d existing files.", len(files))
-	for _, file := range files {
-		if file.IsDir() {
-			continue
-		}
-		fullPath := filepath.Join(FileWatchFolder, file.Name())
-		processNewFile(fullPath)
-	}
+	log.Printf("[System] Found %d existing files (recursive scan).", fileCount)
 }
 
 func watchFolder(ctx context.Context) {
@@ -42,10 +46,35 @@ func watchFolder(ctx context.Context) {
 	}
 	defer watcher.Close()
 
-	if err := watcher.Add(FileWatchFolder); err != nil {
-		log.Printf("[Error] Failed to add watch folder %s: %v", FileWatchFolder, err)
+	addWatchDir := func(path string) error {
+		if err := watcher.Add(path); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	absWatch, err := filepath.Abs(FileWatchFolder)
+	if err != nil {
+		log.Printf("[Error] Failed to get absolute path for watch folder: %v", err)
 		return
 	}
+
+	if err := filepath.Walk(absWatch, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			if err := addWatchDir(path); err != nil {
+				log.Printf("[Warning] Failed to watch directory %s: %v", path, err)
+			}
+		}
+		return nil
+	}); err != nil {
+		log.Printf("[Error] Failed to initialize recursive watch: %v", err)
+		return
+	}
+
+	log.Printf("[FileWatcher] Watching %s recursively", FileWatchFolder)
 
 	for {
 		select {
@@ -57,8 +86,37 @@ func watchFolder(ctx context.Context) {
 			}
 			if event.Op&fsnotify.Create == fsnotify.Create {
 				time.Sleep(100 * time.Millisecond)
-				processNewFile(event.Name)
+				info, err := os.Stat(event.Name)
+				if err != nil {
+					continue
+				}
+				if info.IsDir() {
+					if err := addWatchDir(event.Name); err != nil {
+						log.Printf("[Warning] Failed to watch new directory %s: %v", event.Name, err)
+					} else {
+						log.Printf("[FileWatcher] Added watch for new directory: %s", event.Name)
+						go func(dirPath string) {
+							time.Sleep(200 * time.Millisecond)
+							filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+								if err != nil {
+									return nil
+								}
+								if !info.IsDir() {
+									processNewFile(path)
+								}
+								return nil
+							})
+						}(event.Name)
+					}
+				} else {
+					processNewFile(event.Name)
+				}
 			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Printf("[Error] File watcher error: %v", err)
 		}
 	}
 }

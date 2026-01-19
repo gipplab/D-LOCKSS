@@ -35,10 +35,11 @@ Instead of a central controller, the network uses a Distributed Hash Table (DHT)
       * Monitors network load (`MaxShardLoad`).
       * Dynamically splits responsibilities (e.g., if handling `0*` becomes too heavy, it splits into `00*` and `01*`).
       * Implements **Shard Overlap State**: During shard splits, maintains dual subscription to both old and new shard topics for a configurable duration to prevent message loss.
-      * Manages PubSub topics: `dlockss-control` (delegation) and `dlockss-shard-{prefix}` (data announcements).
+      * Manages PubSub topics: `dlockss-creative-commons-control` (delegation) and `dlockss-creative-commons-shard-{prefix}` (data announcements).
 2.  **File Watcher:**
-      * Monitors the `./data` directory using `fsnotify`.
-      * Automatically hashes, pins, and announces new files dropped into the folder.
+      * Monitors the `./data` directory recursively using `fsnotify`.
+      * Automatically watches all subdirectories and adds new ones as they are created.
+      * Automatically hashes, pins, and announces new files dropped anywhere in the directory tree.
       * Checks **BadBits** list before pinning to enforce DMCA takedowns.
 3.  **Discovery:**
       * Uses MDNS for local peer discovery (`dlockss-v2-prod`).
@@ -149,8 +150,8 @@ You will see logs indicating the node is online, the shard it is managing, and t
 ```text
 --- Node ID: 12D3KooW... ---
 --- Addresses: [/ip4/192.168.1.5/tcp/34567 ...] ---
-[System] Joined Control Channel: dlockss-control
-[Sharding] Active Data Shard: 0 (Topic: dlockss-shard-0)
+[System] Joined Control Channel: dlockss-creative-commons-control
+[Sharding] Active Data Shard: 0 (Topic: dlockss-creative-commons-shard-0)
 [BadBits] Loaded 3 blocked CID entries from badBits.csv
 [StorageMonitor] Disk usage: 45.2% (Total: 500GB, Free: 275GB). Pressure: false
 Scanning for existing files...

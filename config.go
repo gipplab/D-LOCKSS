@@ -68,7 +68,7 @@ func logConfiguration() {
 }
 
 var (
-	ControlTopicName               = getEnvString("DLOCKSS_CONTROL_TOPIC", "dlockss-control")
+	ControlTopicName               = getEnvString("DLOCKSS_CONTROL_TOPIC", "dlockss-creative-commons-control")
 	DiscoveryServiceTag            = getEnvString("DLOCKSS_DISCOVERY_TAG", "dlockss-v2-prod")
 	FileWatchFolder                = getEnvString("DLOCKSS_DATA_DIR", "./data")
 	MinReplication                 = getEnvInt("DLOCKSS_MIN_REPLICATION", 5)

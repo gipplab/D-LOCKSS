@@ -17,7 +17,7 @@ alt msgCounter > MaxShardLoad
     
     Note over ShardMgr: Entering Overlap State
     
-    ShardMgr -> PubSub: Join new shard topic\n("dlockss-shard-" + newShard)
+    ShardMgr -> PubSub: Join new shard topic\n("dlockss-creative-commons-shard-" + newShard)
     ShardMgr -> ShardMgr: Keep old shard subscription active
     ShardMgr -> ShardMgr: Set overlap end time\n(currentTime + ShardOverlapDuration)
     ShardMgr -> OldReader: Start readOldShard() goroutine

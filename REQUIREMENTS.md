@@ -36,11 +36,13 @@ This document lists all functional and non-functional requirements that form the
 ## File Management Requirements
 
 ### FM-1: File Watching
-- Must watch a designated folder (`./data` by default) for new files
-- Must automatically detect new files when they are created
-- Must scan existing files in the watch folder on startup
-- Must ignore subdirectories (only process files)
+- Must watch a designated folder (`./data` by default) for new files recursively
+- Must automatically detect new files when they are created in any subdirectory
+- Must scan existing files in the watch folder and all subdirectories on startup
+- Must recursively watch all subdirectories
+- Must automatically add new subdirectories to the watcher when they are created
 - Must wait 100ms after file creation before processing (to handle file writes)
+- Must only process files (ignore directory creation events for processing, but watch them)
 
 ### FM-2: File Hashing
 - Must calculate SHA-256 hash of each file
@@ -76,8 +78,8 @@ This document lists all functional and non-functional requirements that form the
 
 ### SH-2: Shard Management
 - Must maintain current shard assignment in thread-safe manner
-- Must join a control topic (`dlockss-control`) for delegation messages
-- Must join a data shard topic (`dlockss-shard-{prefix}`) based on current shard
+- Must join a control topic (`dlockss-creative-commons-control`) for delegation messages
+- Must join a data shard topic (`dlockss-creative-commons-shard-{prefix}`) based on current shard
 - Must support switching shards dynamically
 - Must clean up old subscriptions when switching shards
 
@@ -242,7 +244,7 @@ This document lists all functional and non-functional requirements that form the
 ## Configuration Requirements
 
 ### CF-1: Configuration Variables (Environment Variables)
-- Control topic name: "dlockss-control" (`DLOCKSS_CONTROL_TOPIC`)
+- Control topic name: "dlockss-creative-commons-control" (`DLOCKSS_CONTROL_TOPIC`)
 - Discovery service tag: "dlockss-v2-prod" (`DLOCKSS_DISCOVERY_TAG`)
 - File watch folder: "./data" (`DLOCKSS_DATA_DIR`)
 - Minimum replication: 5 (`DLOCKSS_MIN_REPLICATION`)

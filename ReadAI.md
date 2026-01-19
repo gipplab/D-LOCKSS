@@ -16,7 +16,7 @@ The code must adhere to the following strict specifications, logical structures,
 All configuration must be environment-variable driven with sensible defaults. Implement helper functions `getEnvString`, `getEnvInt`, `getEnvDuration`, and `getEnvFloat` that read environment variables and return defaults if not set. Log all active configuration on startup using `logConfiguration()`.
 
 **Configuration Variables:**
-* Control Topic: "dlockss-control" (env: `DLOCKSS_CONTROL_TOPIC`)
+* Control Topic: "dlockss-creative-commons-control" (env: `DLOCKSS_CONTROL_TOPIC`)
 * Discovery Tag: "dlockss-v2-prod" (env: `DLOCKSS_DISCOVERY_TAG`)
 * Watch Folder: "./data" (env: `DLOCKSS_DATA_DIR`)
 * **Replication Rules:** Minimum = 5, Maximum = 10 (env: `DLOCKSS_MIN_REPLICATION`, `DLOCKSS_MAX_REPLICATION`)
@@ -82,7 +82,7 @@ Create a struct named `ShardManager` to handle dynamic topic switching. It must 
 
 **ShardManager Methods:**
 * **New:** Factory function to initialize and join channels
-* **joinChannels:** Subscribe to static Control topic. Subscribe to dynamic Shard topic (`dlockss-shard-{prefix}`). Reset `msgCounter`. Must properly clean up old subscriptions before creating new ones using synchronization (shardDone channel) to prevent resource leaks
+* **joinChannels:** Subscribe to static Control topic. Subscribe to dynamic Shard topic (`dlockss-creative-commons-shard-{prefix}`). Reset `msgCounter`. Must properly clean up old subscriptions before creating new ones using synchronization (shardDone channel) to prevent resource leaks
 * **readControl:** Loop listening for "DELEGATE:{hash}:{prefix}" messages. Validate message format. Apply rate limiting. If target prefix matches node's current shard prefix, add hash to `knownFiles` and launch replication check
 * **readShard:** Loop listening for messages. Validate message format. Apply rate limiting. Increment `msgCounter`. If it exceeds `MaxShardLoad`, immediately reset counter to zero and trigger `splitShard` synchronously (not in goroutine). Handle "NEED:{hash}" and "NEW:{hash}" messages by adding to `knownFiles` and launching replication check
 * **splitShard:** Calculate next binary bit based on node's Peer ID hash at next depth. Update current shard prefix and call `joinChannels` synchronously
