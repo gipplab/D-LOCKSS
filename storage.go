@@ -6,7 +6,19 @@ import (
 	"time"
 )
 
-func pinFile(hash string) {
+func pinFile(hash string) bool {
+	fileCid, err := hashToCid(hash)
+	if err != nil {
+		log.Printf("[Storage] Failed to convert hash to CID: %v", err)
+		return false
+	}
+
+	cidStr := fileCid.String()
+	if isCIDBlocked(cidStr, NodeCountry) {
+		log.Printf("[Storage] Refused to pin blocked CID: %s (blocked in %s)", cidStr[:16]+"...", NodeCountry)
+		return false
+	}
+
 	pinnedFiles.Lock()
 	defer pinnedFiles.Unlock()
 	if !pinnedFiles.hashes[hash] {
@@ -15,7 +27,9 @@ func pinFile(hash string) {
 			metrics.pinnedFilesCount = len(pinnedFiles.hashes)
 		})
 		log.Printf("[Storage] Pinned file: %s (total pinned: %d)", hash[:16]+"...", len(pinnedFiles.hashes))
+		return true
 	}
+	return true
 }
 
 func unpinFile(hash string) {

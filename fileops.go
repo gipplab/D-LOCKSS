@@ -92,7 +92,11 @@ func processNewFile(path string) {
 		return
 	}
 
-	pinFile(hash)
+	if !pinFile(hash) {
+		log.Printf("[FileOps] Refused to process file %s (blocked CID)", hash[:16]+"...")
+		return
+	}
+
 	provideCtx, provideCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	go func() {
 		defer provideCancel()

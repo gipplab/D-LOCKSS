@@ -8,6 +8,7 @@ package "Core Components" {
     component Metrics
     component "Rate Limiter" as RateLimiter
     component "Backoff Manager" as BackoffManager
+    component "Storage Monitor" as StorageMonitor
 }
 
 ShardManager --> StorageManager : checks responsibility
@@ -17,6 +18,8 @@ FileOperations --> StorageManager : pins files
 FileOperations --> ShardManager : checks responsibility
 ReplicationChecker --> BackoffManager : checks backoff
 ShardManager --> RateLimiter : filters messages
+RateLimiter --> StorageMonitor : checks disk usage
+StorageMonitor --> StorageManager : monitors disk
 Metrics --> StorageManager : reads state
 Metrics --> ReplicationChecker : tracks stats
 
@@ -53,6 +56,12 @@ end note
 note right of BackoffManager
     Exponential backoff
     for failed operations
+end note
+
+note right of StorageMonitor
+    Monitors disk usage
+    and rejects custodial files
+    when disk is full
 end note
 
 @enduml

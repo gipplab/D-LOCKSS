@@ -64,6 +64,11 @@ func main() {
 		log.Printf("Error creating folder: %v", err)
 	}
 
+	log.Println("Loading badBits list...")
+	if err := loadBadBits(BadBitsPath); err != nil {
+		log.Printf("[Warning] Failed to load badBits: %v", err)
+	}
+
 	log.Println("Scanning for existing files...")
 	scanExistingFiles()
 
@@ -72,6 +77,7 @@ func main() {
 	go runReplicationChecker(ctx)
 	go runRateLimiterCleanup(ctx)
 	go runMetricsReporter(ctx)
+	go runDiskUsageMonitor(ctx)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)

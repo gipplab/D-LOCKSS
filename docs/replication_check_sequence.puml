@@ -28,13 +28,31 @@ loop For each known file
             ReplChecker -> Storage: Update fileReplicationLevels
             
             alt count < MinReplication
-                alt Responsible AND not pinned
-                    ReplChecker -> Storage: pinFile(hash)
-                    ReplChecker -> DHT: provideFile(hash)
+                ReplChecker -> ReplChecker: Check pendingVerifications
+                alt No pending verification
+                    Note over ReplChecker: Hysteresis: Verify before Act
+                    ReplChecker -> ReplChecker: Schedule verification\n(random delay ~30s)
+                    ReplChecker -> ReplChecker: Store firstCount, verifyTime
+                    ReplChecker -> ReplChecker: Wait for verification delay
+                else Verification time reached
+                    ReplChecker -> DHT: FindProvidersAsync(cid)\n(SECOND QUERY)
+                    DHT -> ReplChecker: Provider count (verification)
+                    alt Verification confirms under-replication
+                        alt Responsible AND not pinned
+                            ReplChecker -> Storage: pinFile(hash)
+                            ReplChecker -> DHT: provideFile(hash)
+                        end
+                        ReplChecker -> PubSub: PublishToShard("NEED:" + hash)
+                        PubSub -> Nodes: Broadcast NEED message
+                        Nodes -> Nodes: Check if they can replicate
+                        Note over ReplChecker: Both queries confirmed\nunder-replication
+                    else Verification shows adequate replication
+                        Note over ReplChecker: First query was false alarm\nCanceling NEED
+                        ReplChecker -> ReplChecker: Remove pending verification
+                    end
+                else Verification still pending
+                    Note over ReplChecker: Waiting for verification delay
                 end
-                ReplChecker -> PubSub: PublishToShard("NEED:" + hash)
-                PubSub -> Nodes: Broadcast NEED message
-                Nodes -> Nodes: Check if they can replicate
             else count > MaxReplication
                 alt Responsible AND pinned
                     ReplChecker -> Storage: unpinFile(hash)

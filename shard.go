@@ -22,6 +22,12 @@ type ShardManager struct {
 	shardTopic   *pubsub.Topic
 	shardSub     *pubsub.Subscription
 
+	oldShardName    string
+	oldShardTopic   *pubsub.Topic
+	oldShardSub     *pubsub.Subscription
+	oldShardEndTime time.Time
+	inOverlap       bool
+
 	controlTopic *pubsub.Topic
 	controlSub   *pubsub.Subscription
 
@@ -64,16 +70,12 @@ func (sm *ShardManager) joinChannels() {
 		log.Printf("[System] Joined Control Channel: %s", ControlTopicName)
 	}
 
-	if sm.shardSub != nil {
-		sm.shardSub.Cancel()
-		sm.mu.Unlock()
-
-		select {
-		case <-sm.shardDone:
-		case <-time.After(2 * time.Second):
-			log.Printf("[Warning] Timeout waiting for old shard subscription to close")
-		}
-		sm.mu.Lock()
+	oldShardSub := sm.shardSub
+	oldShardTopic := sm.shardTopic
+	oldShardName := sm.oldShardName
+	oldShardTopicName := ""
+	if oldShardSub != nil && oldShardName != "" {
+		oldShardTopicName = fmt.Sprintf("dlockss-shard-%s", oldShardName)
 	}
 
 	topicName := fmt.Sprintf("dlockss-shard-%s", sm.currentShard)
@@ -93,7 +95,29 @@ func (sm *ShardManager) joinChannels() {
 	}
 	sm.shardSub = sub
 	sm.msgCounter = 0
-	sm.mu.Unlock()
+
+	if oldShardSub != nil && oldShardTopicName != topicName && oldShardTopicName != "" {
+		sm.oldShardSub = oldShardSub
+		sm.oldShardTopic = oldShardTopic
+		sm.oldShardEndTime = time.Now().Add(ShardOverlapDuration)
+		sm.inOverlap = true
+		sm.mu.Unlock()
+		log.Printf("[Sharding] Entering overlap state: keeping old shard %s active until %v", oldShardTopicName, sm.oldShardEndTime)
+		go sm.readOldShard()
+	} else {
+		if oldShardSub != nil {
+			oldShardSub.Cancel()
+			sm.mu.Unlock()
+			select {
+			case <-sm.shardDone:
+			case <-time.After(2 * time.Second):
+				log.Printf("[Warning] Timeout waiting for old shard subscription to close")
+			}
+		} else {
+			sm.mu.Unlock()
+		}
+		sm.oldShardName = ""
+	}
 
 	log.Printf("[Sharding] Active Data Shard: %s (Topic: %s)", sm.currentShard, topicName)
 }
@@ -101,6 +125,7 @@ func (sm *ShardManager) joinChannels() {
 func (sm *ShardManager) Run() {
 	go sm.readControl()
 	go sm.readShard()
+	go sm.manageOverlap()
 }
 
 func (sm *ShardManager) readControl() {
@@ -130,9 +155,14 @@ func (sm *ShardManager) readControl() {
 			continue
 		}
 
-		if !checkRateLimit(msg.GetFrom()) {
+		if !checkRateLimitForMessage(msg.GetFrom(), "DELEGATE") {
 			incrementMetric(&metrics.messagesDropped)
-			log.Printf("[RateLimit] Dropped DELEGATE message from %s (rate limit exceeded)", msg.GetFrom().String())
+			if !canAcceptCustodialFile() {
+				usage := checkDiskUsage()
+				log.Printf("[Storage] Dropped DELEGATE message from %s (disk usage high: %.1f%%)", msg.GetFrom().String(), usage)
+			} else {
+				log.Printf("[RateLimit] Dropped DELEGATE message from %s (rate limit exceeded)", msg.GetFrom().String())
+			}
 			continue
 		}
 
@@ -254,28 +284,161 @@ func (sm *ShardManager) readShard() {
 
 func (sm *ShardManager) splitShard() {
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
 
 	currentDepth := len(sm.currentShard)
 	nextDepth := currentDepth + 1
 
+	oldShard := sm.currentShard
 	peerIDHash := getBinaryPrefix(sm.h.ID().String(), nextDepth)
 	sm.currentShard = peerIDHash
+	sm.oldShardName = oldShard
 
 	incrementMetric(&metrics.shardSplits)
-	log.Printf("[Sharding] Split shard to depth %d: %s", nextDepth, sm.currentShard)
+	log.Printf("[Sharding] Split shard to depth %d: %s -> %s (entering overlap state)", nextDepth, oldShard, sm.currentShard)
 
+	sm.mu.Unlock()
 	sm.joinChannels()
+}
+
+func (sm *ShardManager) readOldShard() {
+	sm.mu.RLock()
+	sub := sm.oldShardSub
+	endTime := sm.oldShardEndTime
+	sm.mu.RUnlock()
+
+	if sub == nil {
+		return
+	}
+
+	for {
+		select {
+		case <-sm.ctx.Done():
+			return
+		default:
+		}
+
+		if time.Now().After(endTime) {
+			sm.mu.Lock()
+			if sm.oldShardSub != nil {
+				log.Printf("[Sharding] Overlap period ended, closing old shard subscription")
+				sm.oldShardSub.Cancel()
+				sm.oldShardSub = nil
+				sm.oldShardTopic = nil
+				sm.inOverlap = false
+			}
+			sm.mu.Unlock()
+			return
+		}
+
+		ctx, cancel := context.WithDeadline(sm.ctx, endTime)
+		msg, err := sub.Next(ctx)
+		cancel()
+
+		if err != nil {
+			if err == context.DeadlineExceeded {
+				continue
+			}
+			return
+		}
+
+		if msg.GetFrom() == sm.h.ID() {
+			continue
+		}
+
+		if !checkRateLimit(msg.GetFrom()) {
+			incrementMetric(&metrics.messagesDropped)
+			continue
+		}
+
+		data := string(msg.Data)
+		if strings.HasPrefix(data, "NEED:") {
+			hash := strings.TrimPrefix(data, "NEED:")
+			if validateHash(hash) {
+				incrementMetric(&metrics.messagesReceived)
+				log.Printf("[Sharding] Received NEED message from old shard during overlap: %s", hash[:16]+"...")
+				addKnownFile(hash)
+				select {
+				case replicationWorkers <- struct{}{}:
+					go func(h string) {
+						defer func() { <-replicationWorkers }()
+						checkReplication(sm.ctx, h)
+					}(hash)
+				case <-sm.ctx.Done():
+					return
+				}
+			}
+		} else if strings.HasPrefix(data, "NEW:") {
+			hash := strings.TrimPrefix(data, "NEW:")
+			if validateHash(hash) {
+				incrementMetric(&metrics.messagesReceived)
+				log.Printf("[Sharding] Received NEW message from old shard during overlap: %s", hash[:16]+"...")
+				addKnownFile(hash)
+				select {
+				case replicationWorkers <- struct{}{}:
+					go func(h string) {
+						defer func() { <-replicationWorkers }()
+						checkReplication(sm.ctx, h)
+					}(hash)
+				case <-sm.ctx.Done():
+					return
+				}
+			}
+		}
+	}
+}
+
+func (sm *ShardManager) manageOverlap() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-sm.ctx.Done():
+			return
+		case <-ticker.C:
+			sm.mu.RLock()
+			inOverlap := sm.inOverlap
+			endTime := sm.oldShardEndTime
+			sm.mu.RUnlock()
+
+			if inOverlap && time.Now().After(endTime) {
+				sm.mu.Lock()
+				if sm.oldShardSub != nil {
+					log.Printf("[Sharding] Overlap period expired, closing old shard subscription")
+					sm.oldShardSub.Cancel()
+					sm.oldShardSub = nil
+					sm.oldShardTopic = nil
+					sm.oldShardName = ""
+					sm.inOverlap = false
+				}
+				sm.mu.Unlock()
+			}
+		}
+	}
 }
 
 func (sm *ShardManager) PublishToShard(msg string) {
 	sm.mu.RLock()
 	topic := sm.shardTopic
+	inOverlap := sm.inOverlap
+	oldTopic := sm.oldShardTopic
 	sm.mu.RUnlock()
 
 	if topic != nil {
 		_ = topic.Publish(sm.ctx, []byte(msg))
 	}
+
+	if inOverlap && oldTopic != nil {
+		_ = oldTopic.Publish(sm.ctx, []byte(msg))
+		log.Printf("[Sharding] Published to both shards during overlap: %s", msg[:min(20, len(msg))])
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (sm *ShardManager) PublishToControl(msg string) {
@@ -301,6 +464,9 @@ func (sm *ShardManager) Close() {
 
 	if sm.shardSub != nil {
 		sm.shardSub.Cancel()
+	}
+	if sm.oldShardSub != nil {
+		sm.oldShardSub.Cancel()
 	}
 	if sm.controlSub != nil {
 		sm.controlSub.Cancel()

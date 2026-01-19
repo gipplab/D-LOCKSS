@@ -8,6 +8,13 @@ import (
 )
 
 func checkRateLimit(peerID peer.ID) bool {
+	return checkRateLimitForMessage(peerID, "")
+}
+
+func checkRateLimitForMessage(peerID peer.ID, messageType string) bool {
+	if messageType == "DELEGATE" && !canAcceptCustodialFile() {
+		return false
+	}
 	rateLimiter.Lock()
 	defer rateLimiter.Unlock()
 

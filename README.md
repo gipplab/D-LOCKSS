@@ -26,7 +26,7 @@ Instead of a central controller, the network uses a Distributed Hash Table (DHT)
 | :--- | :--- | :--- |
 | **Striping** | **Sharding** | The `ShardManager` assigns binary prefixes (e.g., `01*`, `11*`) to nodes. A node only permanently stores files whose SHA-256 hash matches its assigned prefix. |
 | **Redundancy** | **Replication** | The system enforces a `MinReplication` of 5 and `MaxReplication` of 10. |
-| **Scrubbing** | **Replication Checker** | A background process (`runReplicationChecker`) scans known CIDs every 1 minute. If redundancy < 5, it triggers a `NEED` broadcast; if > 10, it drops the file to save space. |
+| **Scrubbing** | **Replication Checker** | A background process (`runReplicationChecker`) scans known CIDs every 1 minute. Uses hysteresis (dual-query verification) to prevent false alarms. If redundancy < 5, it triggers a `NEED` broadcast; if > 10, it drops the file to save space. |
 | **Write Cache** | **Custodial Mode** | If a node receives a file it *should not* own, it holds it temporarily ("Custodial Mode") and broadcasts a `DELEGATE` message to find the correct owner, ensuring no data loss during transit. |
 
 ### B. Core Components
@@ -34,13 +34,27 @@ Instead of a central controller, the network uses a Distributed Hash Table (DHT)
 1.  **Shard Manager:**
       * Monitors network load (`MaxShardLoad`).
       * Dynamically splits responsibilities (e.g., if handling `0*` becomes too heavy, it splits into `00*` and `01*`).
+      * Implements **Shard Overlap State**: During shard splits, maintains dual subscription to both old and new shard topics for a configurable duration to prevent message loss.
       * Manages PubSub topics: `dlockss-control` (delegation) and `dlockss-shard-{prefix}` (data announcements).
 2.  **File Watcher:**
       * Monitors the `./data` directory using `fsnotify`.
       * Automatically hashes, pins, and announces new files dropped into the folder.
+      * Checks **BadBits** list before pinning to enforce DMCA takedowns.
 3.  **Discovery:**
       * Uses MDNS for local peer discovery (`dlockss-v2-prod`).
       * Uses Kademlia DHT for global routing and provider record storage.
+4.  **Replication Checker:**
+      * Implements **Hysteresis**: Dual-query verification for under-replication to prevent false alarms from transient DHT issues.
+      * Uses exponential backoff for failed operations.
+      * Checks replication levels every 1 minute (configurable).
+5.  **Storage Monitor:**
+      * Monitors disk usage periodically.
+      * Implements **Storage-Aware Rate Limiting**: Rejects custodial file requests (`DELEGATE` messages) when disk usage exceeds high water mark (default: 90%).
+      * Continues accepting files for which the node is responsible even when disk is full.
+6.  **BadBits Manager:**
+      * Loads DMCA takedown list from CSV file (`badBits.csv`).
+      * Blocks pinning of CIDs that are restricted in the node's configured country.
+      * Country-specific blocking based on ISO country codes.
 
 -----
 
@@ -72,12 +86,62 @@ Instead of a central controller, the network uses a Distributed Hash Table (DHT)
     mkdir data
     ```
 
+3.  **Configure BadBits (Optional):**
+    Create a `badBits.csv` file to block specific CIDs in specific countries (DMCA takedowns).
+
+    ```bash
+    cp badBits.csv.example badBits.csv
+    # Edit badBits.csv with CID,Country pairs
+    ```
+
+    Format:
+    ```csv
+    CID,Country
+    QmYjtig7VJQ6XsnUjqqJvj7QaMcCAwtrgNdahSiFofrEgy,US
+    QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco,DE
+    ```
+
 ### Running the Node
 
 Start the application from your terminal:
 
 ```bash
 go run .
+```
+
+**Configuration Options:**
+
+The system supports extensive configuration via environment variables:
+
+```bash
+# Node country (for BadBits filtering)
+export DLOCKSS_NODE_COUNTRY=US
+
+# BadBits CSV file path
+export DLOCKSS_BADBITS_PATH=badBits.csv
+
+# Replication settings
+export DLOCKSS_MIN_REPLICATION=5
+export DLOCKSS_MAX_REPLICATION=10
+
+# Check intervals
+export DLOCKSS_CHECK_INTERVAL=1m
+export DLOCKSS_METRICS_INTERVAL=5s
+
+# Storage protection
+export DLOCKSS_DISK_USAGE_HIGH_WATER_MARK=90.0
+
+# Shard overlap duration (prevents message loss during splits)
+export DLOCKSS_SHARD_OVERLAP_DURATION=2m
+
+# Replication verification delay (hysteresis)
+export DLOCKSS_REPLICATION_VERIFICATION_DELAY=30s
+
+# Rate limiting
+export DLOCKSS_RATE_LIMIT_WINDOW=1m
+export DLOCKSS_MAX_MESSAGES_PER_WINDOW=100
+
+# See config.go for all available options
 ```
 
 You will see logs indicating the node is online, the shard it is managing, and the topics it has joined:
@@ -87,6 +151,8 @@ You will see logs indicating the node is online, the shard it is managing, and t
 --- Addresses: [/ip4/192.168.1.5/tcp/34567 ...] ---
 [System] Joined Control Channel: dlockss-control
 [Sharding] Active Data Shard: 0 (Topic: dlockss-shard-0)
+[BadBits] Loaded 3 blocked CID entries from badBits.csv
+[StorageMonitor] Disk usage: 45.2% (Total: 500GB, Free: 275GB). Pressure: false
 Scanning for existing files...
 [System] Found 0 existing files.
 ```
@@ -96,10 +162,21 @@ Scanning for existing files...
 1.  **Add a File:**
     Copy any PDF document into the `./data` directory.
 2.  **Ingestion:**
-    Within seconds, the application will detect the file, hash it, and determine responsibility.
+    Within seconds, the application will detect the file, hash it, check BadBits, and determine responsibility.
+      * **BadBits Check:** If the CID is blocked for the node's country, pinning is refused and logged.
       * **If Responsible:** It pins the file and announces "NEW:{hash}" to its shard.
       * **If Not Responsible:** It enters **Custodial Mode**, announcing "DELEGATE:{hash}" to the control topic.
-3.  **Run a Second Peer:**
+      * **Storage Protection:** If disk usage is high (>90%), custodial requests are rejected, but responsible files are still accepted.
+3.  **Replication:**
+    The replication checker runs every 1 minute:
+      * **Hysteresis:** Under-replication triggers a verification delay (default: 30s) before broadcasting NEED messages to prevent false alarms from transient DHT issues.
+      * **Dual Query:** Two DHT queries confirm under-replication before triggering replication requests.
+      * **Backoff:** Failed operations use exponential backoff to prevent network storms.
+4.  **Shard Splits:**
+    When a shard becomes overloaded (>2000 messages):
+      * **Overlap State:** Node maintains subscription to both old and new shard topics for 2 minutes to prevent message loss during transition.
+      * **Dual Publishing:** Messages are published to both topics during overlap period.
+5.  **Run a Second Peer:**
     Run `go run .` in a separate terminal (ensure a separate directory if testing on the same machine to avoid lock conflicts, or use containerization). The new peer will auto-discover the first peer, negotiate shards, and begin replication if the redundancy count is below 5.
 
 -----
@@ -151,6 +228,10 @@ Implement **Strategy C** by tuning `pubsub.GossipSubParams` to handle higher mes
 | **Prefix Sharding**<br>(SH-1, SH-3) | [ ] Consensus<br>(Raft/CRDT) | [x] XOR Distance<br>(Prefix Mat) | [~] DB Sharding<br>(Filter) | [ ] Static<br>(Manual List) |
 | **Auto-Replication**<br>(RP-1, RP-2) | [x] Min/Max<br>(Configured) | [x] Managed<br>(Net force) | [x] Configurable<br>(Rep Factor) | [x] Polling<br>(Voting) |
 | **Custodial Handoff**<br>(RP-5, CM-1) | [ ] Manual<br>(User pins) | [x] Automatic<br>(Churn hdl) | [~] Partial<br>(Sync Logic) | [ ] None<br>(Static) |
+| **DMCA Takedowns** | [ ] None | [ ] None | [x] BadBits CSV<br>(Country-specific) | [ ] None |
+| **Storage Protection** | [ ] None | [ ] None | [x] Disk-aware<br>(Rate limiting) | [ ] None |
+| **Hysteresis** | [ ] None | [ ] None | [x] Dual-query<br>(Verification) | [ ] None |
+| **Shard Overlap** | [ ] None | [ ] None | [x] Dual subscription<br>(Message safety) | [ ] None |
 | **File System Watcher**<br>(FM-1) | [ ] None<br>(API Only) | [ ] None<br>(Virt Drive) | [ ] None<br>(DB Only) | [~] Crawler<br>(HTTP only) |
 
 Legend:

@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"log"
+	"math/big"
 	"time"
 )
 
@@ -125,12 +127,60 @@ providerLoop:
 	}
 
 	if count < MinReplication {
-		if responsible && !pinned {
-			log.Printf("[Replication] Low Redundancy (%d/%d). RE-PINNING %s", count, MinReplication, hash)
-			pinFile(hash)
-			provideFile(ctx, hash)
+		pendingVerifications.RLock()
+		pending, hasPending := pendingVerifications.hashes[hash]
+		pendingVerifications.RUnlock()
+
+		if hasPending {
+			if time.Now().After(pending.verifyTime) {
+				log.Printf("[Replication] Verification check for %s (first count: %d, current count: %d)", hash[:16]+"...", pending.firstCount, count)
+				if count < MinReplication {
+					log.Printf("[Replication] Verified under-replication (%d/%d). Triggering NEED for %s", count, MinReplication, hash[:16]+"...")
+					if pending.responsible && !pending.pinned {
+						if pinFile(hash) {
+							provideFile(ctx, hash)
+						}
+					}
+					shardMgr.PublishToShard("NEED:" + hash)
+				} else {
+					log.Printf("[Replication] Verification shows adequate replication (%d/%d). Canceling NEED for %s", count, MinReplication, hash[:16]+"...")
+				}
+				pendingVerifications.Lock()
+				delete(pendingVerifications.hashes, hash)
+				pendingVerifications.Unlock()
+			} else {
+				log.Printf("[Replication] Under-replication detected (%d/%d) but verification pending for %s", count, MinReplication, hash[:16]+"...")
+			}
+		} else {
+			delay := getRandomVerificationDelay()
+			verifyTime := time.Now().Add(delay)
+			log.Printf("[Replication] Under-replication detected (%d/%d). Scheduling verification for %s in %v", count, MinReplication, hash[:16]+"...", delay)
+			
+			pendingVerifications.Lock()
+			pendingVerifications.hashes[hash] = &verificationPending{
+				firstCount:     count,
+				firstCheckTime: time.Now(),
+				verifyTime:     verifyTime,
+				responsible:    responsible,
+				pinned:         pinned,
+			}
+			pendingVerifications.Unlock()
+
+			go func(h string, verifyAt time.Time) {
+				time.Sleep(time.Until(verifyAt))
+				select {
+				case replicationWorkers <- struct{}{}:
+					defer func() { <-replicationWorkers }()
+					checkReplication(ctx, h)
+				case <-ctx.Done():
+					return
+				}
+			}(hash, verifyTime)
 		}
-		shardMgr.PublishToShard("NEED:" + hash)
+	} else {
+		pendingVerifications.Lock()
+		delete(pendingVerifications.hashes, hash)
+		pendingVerifications.Unlock()
 	}
 
 	if responsible && count > MaxReplication && pinned {
@@ -148,6 +198,20 @@ providerLoop:
 	}
 }
 
+func getRandomVerificationDelay() time.Duration {
+	baseDelay := ReplicationVerificationDelay
+	jitterRange := int64(baseDelay.Seconds() * 0.2)
+	if jitterRange < 1 {
+		jitterRange = 1
+	}
+	jitter, err := cryptorand.Int(cryptorand.Reader, big.NewInt(jitterRange*2))
+	if err != nil {
+		jitter = big.NewInt(0)
+	}
+	jitterSeconds := jitter.Int64() - jitterRange
+	return baseDelay + time.Duration(jitterSeconds)*time.Second
+}
+
 func runReplicationChecker(ctx context.Context) {
 	ticker := time.NewTicker(CheckInterval)
 	defer ticker.Stop()
@@ -159,6 +223,13 @@ func runReplicationChecker(ctx context.Context) {
 			knownFiles.RLock()
 			for hash := range knownFiles.hashes {
 				if shouldSkipDueToBackoff(hash) {
+					continue
+				}
+
+				pendingVerifications.RLock()
+				pending, hasPending := pendingVerifications.hashes[hash]
+				pendingVerifications.RUnlock()
+				if hasPending && time.Now().Before(pending.verifyTime) {
 					continue
 				}
 

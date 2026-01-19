@@ -13,9 +13,13 @@ Custodial -> DHT: provideFile(hash)
 Custodial -> Control: PublishToControl("DELEGATE:" + hash + ":" + prefix)
 
 Control -> Responsible: Broadcast DELEGATE message
-Responsible -> Responsible: Check if targetPrefix == myShard
+Responsible -> Responsible: checkRateLimitForMessage(peerID, "DELEGATE")
+Responsible -> Responsible: Check disk usage
 
-alt Prefix matches
+alt Rate limit OK AND disk usage OK
+    Responsible -> Responsible: Check if targetPrefix == myShard
+    
+    alt Prefix matches
     Responsible -> Storage: addKnownFile(hash)
     Responsible -> ReplChecker: checkReplication(hash)
     ReplChecker -> DHT: FindProvidersAsync(cid)
@@ -35,8 +39,12 @@ alt Prefix matches
         Custodial -> Storage: unpinFile(hash)
         Note over Custodial: Custodial handoff complete
     end
-else Prefix doesn't match
-    Responsible -> Responsible: Ignore message
+    else Prefix doesn't match
+        Responsible -> Responsible: Ignore message
+    end
+else Rate limit exceeded OR disk usage high
+    Responsible -> Responsible: Reject DELEGATE message
+    Note over Responsible: Disk usage protection\nprevents accepting custodial files
 end
 
 @enduml

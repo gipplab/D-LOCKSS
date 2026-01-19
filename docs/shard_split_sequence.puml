@@ -3,6 +3,7 @@
 participant "ShardManager" as ShardMgr
 participant "PubSub" as PubSub
 participant "Storage" as Storage
+participant "Old Shard Reader" as OldReader
 
 ShardMgr -> ShardMgr: readShard() receives message
 ShardMgr -> ShardMgr: Increment msgCounter
@@ -14,11 +15,32 @@ alt msgCounter > MaxShardLoad
     ShardMgr -> ShardMgr: Update currentShard = peerIDHash
     ShardMgr -> Storage: Increment shardSplits metric
     
-    ShardMgr -> PubSub: Cancel old shard subscription
+    Note over ShardMgr: Entering Overlap State
+    
     ShardMgr -> PubSub: Join new shard topic\n("dlockss-shard-" + newShard)
+    ShardMgr -> ShardMgr: Keep old shard subscription active
+    ShardMgr -> ShardMgr: Set overlap end time\n(currentTime + ShardOverlapDuration)
+    ShardMgr -> OldReader: Start readOldShard() goroutine
+    
+    Note over ShardMgr,OldReader: Overlap Period\n(Both subscriptions active)
+    
+    loop During Overlap Period
+        OldReader -> PubSub: Read messages from old shard
+        alt Message received
+            OldReader -> ShardMgr: Process NEED/NEW messages
+            ShardMgr -> Storage: addKnownFile(hash)
+            ShardMgr -> ShardMgr: checkReplication(hash)
+        end
+    end
+    
+    alt Overlap period expired
+        ShardMgr -> PubSub: Cancel old shard subscription
+        ShardMgr -> ShardMgr: Set inOverlap = false
+        Note over ShardMgr: Overlap complete\nOnly new shard active
+    end
     
     Note over ShardMgr: Responsibility changed\nOld: "0" -> New: "01"
-    Note over ShardMgr: Files matching old prefix\nmay no longer be tracked
+    Note over ShardMgr: Zero message loss\nguaranteed during transition
 end
 
 @enduml

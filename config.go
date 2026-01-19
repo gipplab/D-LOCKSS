@@ -60,6 +60,11 @@ func logConfiguration() {
 	}
 	log.Printf("[Config] Replication Cooldown: %v", ReplicationCheckCooldown)
 	log.Printf("[Config] Removed File Cooldown: %v", RemovedFileCooldown)
+	log.Printf("[Config] Node Country: %s", NodeCountry)
+	log.Printf("[Config] BadBits Path: %s", BadBitsPath)
+	log.Printf("[Config] Shard Overlap Duration: %v", ShardOverlapDuration)
+	log.Printf("[Config] Replication Verification Delay: %v", ReplicationVerificationDelay)
+	log.Printf("[Config] Disk Usage High Water Mark: %.1f%%", DiskUsageHighWaterMark)
 }
 
 var (
@@ -80,4 +85,9 @@ var (
 	ReplicationCheckCooldown       = getEnvDuration("DLOCKSS_REPLICATION_COOLDOWN", 15*time.Second)
 	RemovedFileCooldown            = getEnvDuration("DLOCKSS_REMOVED_COOLDOWN", 2*time.Minute)
 	MetricsExportPath              = getEnvString("DLOCKSS_METRICS_EXPORT", "")
+	NodeCountry                    = getEnvString("DLOCKSS_NODE_COUNTRY", "US")
+	BadBitsPath                    = getEnvString("DLOCKSS_BADBITS_PATH", "badBits.csv")
+	ShardOverlapDuration           = getEnvDuration("DLOCKSS_SHARD_OVERLAP_DURATION", 2*time.Minute)
+	ReplicationVerificationDelay   = getEnvDuration("DLOCKSS_REPLICATION_VERIFICATION_DELAY", 30*time.Second)
+	DiskUsageHighWaterMark         = getEnvFloat("DLOCKSS_DISK_USAGE_HIGH_WATER_MARK", 90.0)
 )

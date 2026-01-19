@@ -59,6 +59,11 @@ var (
 		times map[string]time.Time
 	}{times: make(map[string]time.Time)}
 
+	pendingVerifications = struct {
+		sync.RWMutex
+		hashes map[string]*verificationPending
+	}{hashes: make(map[string]*verificationPending)}
+
 	metrics = struct {
 		sync.RWMutex
 		pinnedFilesCount              int
@@ -106,4 +111,12 @@ type operationBackoff struct {
 type peerRateLimit struct {
 	messages []time.Time
 	mu       sync.Mutex
+}
+
+type verificationPending struct {
+	firstCount    int
+	firstCheckTime time.Time
+	verifyTime    time.Time
+	responsible   bool
+	pinned        bool
 }
