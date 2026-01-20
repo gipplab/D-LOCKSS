@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -15,16 +16,8 @@ func checkRateLimitForMessage(peerID peer.ID, messageType string) bool {
 	if messageType == "DELEGATE" && !canAcceptCustodialFile() {
 		return false
 	}
-	rateLimiter.Lock()
-	defer rateLimiter.Unlock()
 
-	prl, exists := rateLimiter.peers[peerID]
-	if !exists {
-		prl = &peerRateLimit{
-			messages: make([]time.Time, 0),
-		}
-		rateLimiter.peers[peerID] = prl
-	}
+	prl := rateLimiter.GetOrCreate(peerID)
 
 	prl.mu.Lock()
 	defer prl.mu.Unlock()
@@ -57,26 +50,12 @@ func runRateLimiterCleanup(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			rateLimiter.Lock()
 			now := time.Now()
 			cutoff := now.Add(-RateLimitWindow * 2)
-
-			for peerID, peerLimit := range rateLimiter.peers {
-				peerLimit.mu.Lock()
-				hasRecent := false
-				for _, msgTime := range peerLimit.messages {
-					if msgTime.After(cutoff) {
-						hasRecent = true
-						break
-					}
-				}
-				peerLimit.mu.Unlock()
-
-				if !hasRecent {
-					delete(rateLimiter.peers, peerID)
-				}
+			removed := rateLimiter.Cleanup(cutoff)
+			if removed > 0 {
+				log.Printf("[RateLimit] Cleaned up %d inactive peer rate limiters", removed)
 			}
-			rateLimiter.Unlock()
 		}
 	}
 }

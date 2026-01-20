@@ -14,9 +14,15 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/ipfs/go-cid"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multihash"
+
+	"dlockss/pkg/schema"
 )
 
+// scanExistingFiles walks the data directory and processes any existing files.
+// This is the legacy V1 path that ingests files by computing a SHA-256 hash.
+// In V2, new ingests go through ResearchObject manifests in processNewFile below.
 func scanExistingFiles() {
 	var fileCount int
 	err := filepath.Walk(FileWatchFolder, func(path string, info os.FileInfo, err error) error {
@@ -27,6 +33,9 @@ func scanExistingFiles() {
 		if info.IsDir() {
 			return nil
 		}
+		// In V2, file ingestion goes through the ResearchObject path in processNewFile
+		// which lives in the main package. Keep this call as-is for now; the symbol
+		// will be provided by the V2 implementation.
 		processNewFile(path)
 		fileCount++
 		return nil
@@ -38,6 +47,168 @@ func scanExistingFiles() {
 	log.Printf("[System] Found %d existing files (recursive scan).", fileCount)
 }
 
+// processNewFile imports a newly detected file into IPFS, builds a ResearchObject
+// manifest, pins it, and announces it to the D-LOCKSS network (V2 ingestion path).
+func processNewFile(path string) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		log.Printf("[Error] Invalid path: %v", err)
+		return
+	}
+
+	absWatch, err := filepath.Abs(FileWatchFolder)
+	if err != nil {
+		log.Printf("[Error] Invalid watch folder: %v", err)
+		return
+	}
+
+	if !strings.HasPrefix(absPath, absWatch) {
+		log.Printf("[Security] Rejected path outside watch folder: %s", path)
+		return
+	}
+
+	// Check if IPFS client is available
+	if ipfsClient == nil {
+		log.Printf("[Error] IPFS client not initialized. Cannot process file: %s", path)
+		return
+	}
+
+	// Step 1: Import file to IPFS (get PayloadCID)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	payloadCID, err := ipfsClient.ImportFile(ctx, path)
+	if err != nil {
+		log.Printf("[Error] Failed to import file to IPFS: %s: %v", path, err)
+		return
+	}
+
+	// Step 2: Get file size
+	fileInfo, err := os.Stat(path)
+	if err != nil {
+		log.Printf("[Error] Failed to stat file: %s: %v", path, err)
+		return
+	}
+	totalSize := uint64(fileInfo.Size())
+
+	// Step 3: Extract metadata (simple: filename as title, empty authors for now)
+	title := filepath.Base(path)
+	authors := []string{}     // TODO: Extract from file metadata or user input
+	references := []cid.Cid{} // TODO: Allow user to specify citations
+
+	// Step 4: Get ingester ID (current node's peer ID)
+	var ingesterID peer.ID
+	if shardMgr != nil && shardMgr.h != nil {
+		ingesterID = shardMgr.h.ID()
+	} else {
+		log.Printf("[Error] Cannot get ingester ID: shard manager not initialized")
+		return
+	}
+
+	// Step 5: Create ResearchObject
+	ro := schema.NewResearchObject(title, authors, ingesterID, payloadCID, references, totalSize)
+
+	// Step 6: Sign manifest (ResearchObject) and store in IPFS (dag-cbor) to obtain ManifestCID
+	unsigned, err := ro.MarshalCBORForSigning()
+	if err != nil {
+		log.Printf("[Error] Failed to marshal ResearchObject for signing: %v", err)
+		return
+	}
+	if selfPrivKey == nil {
+		log.Printf("[Sig] Warning: missing private key; ResearchObject manifest will not be signed")
+	} else {
+		sig, err := selfPrivKey.Sign(unsigned)
+		if err != nil {
+			log.Printf("[Sig] Failed to sign ResearchObject: %v", err)
+		} else {
+			ro.Signature = sig
+		}
+	}
+
+	manifestBytes, err := ro.MarshalCBOR()
+	if err != nil {
+		log.Printf("[Error] Failed to marshal ResearchObject: %v", err)
+		return
+	}
+
+	manifestCID, err := ipfsClient.PutDagCBOR(ctx, manifestBytes)
+	if err != nil {
+		log.Printf("[Error] Failed to store manifest block in IPFS: %v", err)
+		return
+	}
+
+	manifestCIDStr := manifestCID.String()
+
+	// Step 7: Check BadBits (on ManifestCID)
+	if isCIDBlocked(manifestCIDStr, NodeCountry) {
+		log.Printf("[FileOps] Refused to process file %s (blocked ManifestCID: %s)", path, manifestCIDStr[:16]+"...")
+		// Unpin the payload since we're rejecting it
+		_ = ipfsClient.UnpinRecursive(ctx, payloadCID)
+		return
+	}
+
+	// Step 8: Pin recursively (ManifestCID will pin PayloadCID)
+	if err := ipfsClient.PinRecursive(ctx, manifestCID); err != nil {
+		log.Printf("[Error] Failed to pin ManifestCID recursively: %v", err)
+		return
+	}
+
+	// Step 9: Store in our tracking (using ManifestCID string as key)
+	manifestKey := manifestCIDStr // Use ManifestCID string as the key for tracking
+	if !pinFileV2(manifestKey) {
+		log.Printf("[FileOps] Failed to track ManifestCID: %s", manifestCIDStr[:16]+"...")
+		return
+	}
+
+	// Step 10: Provide to DHT
+	provideCtx, provideCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	go func() {
+		defer provideCancel()
+		provideFile(provideCtx, manifestKey)
+	}()
+
+	addKnownFile(manifestKey)
+
+	// Step 11: Determine responsibility and announce
+	if shardMgr.AmIResponsibleFor(manifestKey) {
+		log.Printf("[Core] I am responsible for ManifestCID %s. Announcing to Shard.", manifestCIDStr[:16]+"...")
+		im := schema.IngestMessage{
+			Type:        schema.MessageTypeIngest,
+			ManifestCID: manifestCID,
+			ShardID:     shardMgr.currentShard,
+			HintSize:    totalSize,
+		}
+		if err := signProtocolMessage(&im); err != nil {
+			log.Printf("[Sig] Failed to sign IngestMessage: %v", err)
+		}
+		b, err := im.MarshalCBOR()
+		if err != nil {
+			log.Printf("[Error] Failed to marshal IngestMessage: %v", err)
+			return
+		}
+		shardMgr.PublishToShardCBOR(b)
+	} else {
+		targetPrefix := getHexBinaryPrefix(keyToStableHex(manifestKey), len(shardMgr.currentShard))
+		log.Printf("[Core] Custodial Mode: %s belongs to shard %s. Delegating but holding...", manifestCIDStr[:16]+"...", targetPrefix)
+		dm := schema.DelegateMessage{
+			Type:        schema.MessageTypeDelegate,
+			ManifestCID: manifestCID,
+			TargetShard: targetPrefix,
+		}
+		if err := signProtocolMessage(&dm); err != nil {
+			log.Printf("[Sig] Failed to sign DelegateMessage: %v", err)
+		}
+		b, err := dm.MarshalCBOR()
+		if err != nil {
+			log.Printf("[Error] Failed to marshal DelegateMessage: %v", err)
+			return
+		}
+		shardMgr.PublishToControlCBOR(b)
+	}
+}
+
+// watchFolder monitors the data directory recursively for new or updated files
+// and ingests them as ResearchObjects (V2 path).
 func watchFolder(ctx context.Context) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -84,13 +255,15 @@ func watchFolder(ctx context.Context) {
 			if !ok {
 				return
 			}
-			if event.Op&fsnotify.Create == fsnotify.Create {
+			// Treat Create, Write, and Rename as signals that new content is present.
+			if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Rename) != 0 {
 				time.Sleep(100 * time.Millisecond)
 				info, err := os.Stat(event.Name)
 				if err != nil {
 					continue
 				}
-				if info.IsDir() {
+				if info.IsDir() && event.Op&fsnotify.Create == fsnotify.Create {
+					// New directory: start watching it and scan existing files inside once.
 					if err := addWatchDir(event.Name); err != nil {
 						log.Printf("[Warning] Failed to watch new directory %s: %v", event.Name, err)
 					} else {
@@ -108,7 +281,8 @@ func watchFolder(ctx context.Context) {
 							})
 						}(event.Name)
 					}
-				} else {
+				} else if !info.IsDir() {
+					// New or updated file inside watched tree.
 					processNewFile(event.Name)
 				}
 			}
@@ -121,59 +295,10 @@ func watchFolder(ctx context.Context) {
 	}
 }
 
-func processNewFile(path string) {
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		log.Printf("[Error] Invalid path: %v", err)
-		return
-	}
+// Legacy V1 helpers below are kept for backward compatibility with hash-based keys.
 
-	absWatch, err := filepath.Abs(FileWatchFolder)
-	if err != nil {
-		log.Printf("[Error] Invalid watch folder: %v", err)
-		return
-	}
-
-	if !strings.HasPrefix(absPath, absWatch) {
-		log.Printf("[Security] Rejected path outside watch folder: %s", path)
-		return
-	}
-
-	hash, err := calculateFileHash(path)
-	if err != nil {
-		log.Printf("[Error] Failed to calculate hash for %s: %v", path, err)
-		return
-	}
-
-	if !validateHash(hash) {
-		log.Printf("[Error] Invalid hash format: %s", hash)
-		return
-	}
-
-	if !pinFile(hash) {
-		log.Printf("[FileOps] Refused to process file %s (blocked CID)", hash[:16]+"...")
-		return
-	}
-
-	provideCtx, provideCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	go func() {
-		defer provideCancel()
-		provideFile(provideCtx, hash)
-	}()
-
-	addKnownFile(hash)
-
-	if shardMgr.AmIResponsibleFor(hash) {
-		log.Printf("[Core] I am responsible for %s. Announcing to Shard.", hash)
-		shardMgr.PublishToShard("NEW:" + hash)
-	} else {
-		targetPrefix := getHexBinaryPrefix(hash, len(shardMgr.currentShard))
-		log.Printf("[Core] Custodial Mode: %s belongs to shard %s. Delegating but holding...", hash, targetPrefix)
-		msg := fmt.Sprintf("DELEGATE:%s:%s", hash, targetPrefix)
-		shardMgr.PublishToControl(msg)
-	}
-}
-
+// calculateFileHash computes a SHA-256 hash of a file on disk.
+// NOTE: This is only used for legacy V1 hash-based ingests; V2 uses ManifestCIDs.
 func calculateFileHash(filePath string) (string, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -188,6 +313,9 @@ func calculateFileHash(filePath string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// hashToCid converts a legacy V1 SHA-256 hex hash into a CID.
+// This is only used for backward compatibility with V1 hash-based keys.
+// V2 uses ManifestCID strings directly, which can be decoded with cid.Decode().
 func hashToCid(hash string) (cid.Cid, error) {
 	b, err := hex.DecodeString(hash)
 	if err != nil {
@@ -199,3 +327,4 @@ func hashToCid(hash string) (cid.Cid, error) {
 	}
 	return cid.NewCidV1(cid.Raw, mh), nil
 }
+

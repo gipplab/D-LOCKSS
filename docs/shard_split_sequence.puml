@@ -5,10 +5,10 @@ participant "PubSub" as PubSub
 participant "Storage" as Storage
 participant "Old Shard Reader" as OldReader
 
-ShardMgr -> ShardMgr: readShard() receives message
-ShardMgr -> ShardMgr: Increment msgCounter
+ShardMgr -> ShardMgr: runPeerCountChecker()\n(periodic ticker every ShardPeerCheckInterval)
+ShardMgr -> ShardMgr: getShardPeerCount()\n(topic.ListPeers() + 1)
 
-alt msgCounter > MaxShardLoad
+alt peerCount > MaxPeersPerShard\nAND estimatedPeersAfterSplit >= MinPeersPerShard
     ShardMgr -> ShardMgr: splitShard()
     ShardMgr -> ShardMgr: Calculate new depth\ncurrentDepth + 1
     ShardMgr -> ShardMgr: Get peerIDHash at new depth
@@ -17,7 +17,7 @@ alt msgCounter > MaxShardLoad
     
     Note over ShardMgr: Entering Overlap State
     
-    ShardMgr -> PubSub: Join new shard topic\n("dlockss-creative-commons-shard-" + newShard)
+    ShardMgr -> PubSub: Join new shard topic\n("dlockss-v2-creative-commons-shard-" + newShard)
     ShardMgr -> ShardMgr: Keep old shard subscription active
     ShardMgr -> ShardMgr: Set overlap end time\n(currentTime + ShardOverlapDuration)
     ShardMgr -> OldReader: Start readOldShard() goroutine

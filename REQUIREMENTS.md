@@ -26,9 +26,10 @@ This document lists all functional and non-functional requirements that form the
 - Must filter out messages from self (same node ID)
 
 ### SR-4: Content Addressing
-- Must use SHA-256 for file hashing
-- Must convert file hashes to IPFS CIDs (Content Identifiers)
-- Must use CIDs for content addressing and verification
+- Must use **IPFS CIDs** for content addressing and verification
+- Must represent a stored unit as a **ResearchObject**:
+  - Manifest: a **dag-cbor block** (ManifestCID)
+  - Payload: a **UnixFS DAG** (PayloadCID)
 - Must ensure bit-for-bit authenticity of stored content
 
 ---
@@ -44,27 +45,26 @@ This document lists all functional and non-functional requirements that form the
 - Must wait 100ms after file creation before processing (to handle file writes)
 - Must only process files (ignore directory creation events for processing, but watch them)
 
-### FM-2: File Hashing
-- Must calculate SHA-256 hash of each file
-- Must represent hash as 64-character hexadecimal string
-- Must handle file reading errors gracefully
+### FM-2: File Import
+- Must import each file into IPFS as UnixFS and obtain a **PayloadCID**
+- Must create a `ResearchObject` manifest (CBOR) referencing the PayloadCID and obtain a **ManifestCID**
+- Must store the manifest in IPFS as a **dag-cbor block** (not just computed locally)
 
 ### FM-3: File Pinning
-- Must maintain a thread-safe list of pinned files (by hash)
+- Must maintain a thread-safe list of pinned objects (by **ManifestCID string**)
 - Must support pinning a file (adding to storage)
 - Must support unpinning a file (removing from storage)
 - Must support checking if a file is pinned
 - Must track files in two states: pinned (physically stored) and known (monitored)
 - Must check BadBits list before pinning to enforce DMCA takedowns
-- Must convert file hash to CID for BadBits checking
-- Must refuse to pin CIDs that are blocked for the node's configured country
+- Must refuse to pin **ManifestCIDs** that are blocked for the node's configured country
 - Must log refusal when a CID is blocked
 
 ### FM-4: File Processing
 - Must process each new file found in the watch folder
-- Must pin every file locally when first discovered
-- Must provide file to DHT network immediately after pinning
-- Must track all processed files in knownFiles list
+- Must pin every ingested **ManifestCID** locally (recursive pin)
+- Must provide **ManifestCID** to DHT network immediately after pinning
+- Must track all processed manifests in knownFiles list
 
 ---
 
@@ -73,20 +73,21 @@ This document lists all functional and non-functional requirements that form the
 ### SH-1: Shard Assignment
 - Must assign each node a binary prefix shard based on node's Peer ID
 - Must calculate initial shard using SHA-256 hash of Peer ID at depth 1
-- Must determine file responsibility by comparing file hash prefix to node's shard prefix
+- Must determine responsibility using a **stable hash of the ManifestCID string** (since ManifestCID is not 64-hex)
 - Must support dynamic shard prefix matching (prefix-based routing)
 
 ### SH-2: Shard Management
 - Must maintain current shard assignment in thread-safe manner
-- Must join a control topic (`dlockss-creative-commons-control`) for delegation messages
-- Must join a data shard topic (`dlockss-creative-commons-shard-{prefix}`) based on current shard
+- Must join a control topic (`dlockss-v2-creative-commons-control`) for delegation messages
+- Must join a data shard topic (`dlockss-v2-creative-commons-shard-{prefix}`) based on current shard
 - Must support switching shards dynamically
 - Must clean up old subscriptions when switching shards
 
 ### SH-3: Shard Splitting
-- Must monitor message load on current shard
-- Must count messages received on shard topic
-- Must trigger shard split when message count exceeds threshold (2000 messages)
+- Must monitor peer count in current shard topic periodically (default: every 30 seconds)
+- Must use GossipSub `ListPeers()` API to estimate peer count in shard
+- Must trigger shard split when peer count exceeds `MaxPeersPerShard` threshold (default: 150 peers)
+- Must prevent over-splitting: only split if estimated peers after split >= `MinPeersPerShard` (default: 50 peers)
 - Must calculate next shard by increasing binary prefix depth
 - Must reset message counter after split
 - Must prevent infinite split loops (check if new shard equals old shard)
@@ -96,8 +97,7 @@ This document lists all functional and non-functional requirements that form the
 - Must clean up old subscription after overlap period expires
 
 ### SH-4: Responsibility Determination
-- Must determine if node is responsible for a file based on hash prefix matching
-- Must compare file hash binary prefix to node's current shard prefix
+- Must determine responsibility for a **ManifestCID** based on stable hashing and prefix matching
 - Must support prefix matching at variable depths
 
 ---
@@ -107,7 +107,7 @@ This document lists all functional and non-functional requirements that form the
 ### RP-1: Replication Targets
 - Must maintain minimum replication count of 5 copies
 - Must maintain maximum replication count of 10 copies
-- Must query DHT to count current number of providers for each file
+- Must query DHT to count current number of providers for each **ManifestCID**
 
 ### RP-2: Replication Checking
 - Must run periodic replication checks every 1 minute (configurable via `DLOCKSS_CHECK_INTERVAL`)
@@ -117,22 +117,24 @@ This document lists all functional and non-functional requirements that form the
 - Must implement hysteresis (dual-query verification) to prevent false alarms from transient DHT issues
 - Must wait a random delay (default: 30 seconds) between first and second DHT query when under-replication is detected
 - Must only trigger NEED messages if both queries confirm under-replication
+- Must bound each DHT lookup to a maximum sample size (`DLOCKSS_DHT_MAX_SAMPLE_SIZE`) rather than scanning all providers
+- Must cache successful replication counts per ManifestCID for a configurable TTL (`DLOCKSS_REPLICATION_CACHE_TTL`) to reduce redundant DHT queries
 
 ### RP-3: Low Replication Handling
 - If replication count < 5:
-  - If node is responsible and file is not pinned: must re-pin the file
-  - Must provide file to DHT network
-  - Must broadcast "NEED:{hash}" message to shard topic
+  - If node is responsible and manifest is not pinned: must re-pin the **ManifestCID** (recursive)
+  - Must provide the ManifestCID to DHT network
+  - Must broadcast a **CBOR `ReplicationRequest`** message to shard topic
   - If node is in custodial mode: must keep holding the file
 
 ### RP-4: High Replication Handling
 - If replication count > 10 and node is responsible and file is pinned:
-  - Must unpin the file (garbage collection)
+  - Must unpin the **ManifestCID** recursively (garbage collection)
   - Must keep file in knownFiles for continued monitoring
 
 ### RP-5: Custodial Handoff
 - If node is NOT responsible (custodial mode) and replication count >= 5:
-  - Must unpin the file (handoff complete)
+  - Must unpin the ManifestCID recursively (handoff complete)
   - Must remove from knownFiles if no longer needed
 
 ### RP-6: Tracking Cleanup
@@ -150,7 +152,7 @@ This document lists all functional and non-functional requirements that form the
 
 ### CM-2: Custodial Storage
 - Must pin files in custodial mode (temporary holding)
-- Must broadcast "DELEGATE:{hash}:{target_shard}" message to control topic
+- Must broadcast a **CBOR `DelegateMessage`** to control topic (includes ManifestCID + target shard)
 - Must keep file pinned until proper replication is achieved
 
 ### CM-3: Custodial Delegation
@@ -165,22 +167,46 @@ This document lists all functional and non-functional requirements that form the
 ## Message Protocol Requirements
 
 ### MP-1: Control Topic Messages
-- Must support "DELEGATE:{hash}:{shard_prefix}" message format
-- Must parse delegation messages correctly
-- Must validate message format (minimum 3 parts separated by colons)
-- Must ignore malformed messages
+- Must use **CBOR** messages (no string parsing)
+- Control topic must support `DelegateMessage` (fields: type, manifest_cid, target_shard, sender_id, timestamp, nonce, sig)
 
 ### MP-2: Shard Topic Messages
-- Must support "NEED:{hash}" message format (replication request)
-- Must support "NEW:{hash}" message format (new content announcement)
-- Must parse and extract hash from messages
-- Must track files mentioned in messages
+- Must use **CBOR** messages (no string parsing)
+- Shard topic must support:
+  - `IngestMessage` (fields: type, manifest_cid, shard_id, hint_size, sender_id, timestamp, nonce, sig)
+  - `ReplicationRequest` (fields: type, manifest_cid, priority, deadline, sender_id, timestamp, nonce, sig)
 
 ### MP-3: Message Publishing
-- Must publish "NEW:{hash}" when responsible node receives new file
-- Must publish "DELEGATE:{hash}:{prefix}" when non-responsible node receives file
-- Must publish "NEED:{hash}" when replication is low
+- Must publish `IngestMessage` when responsible node ingests a new ResearchObject
+- Must publish `DelegateMessage` when non-responsible node ingests a new ResearchObject
+- Must publish `ReplicationRequest` when replication is low
 - Must support publishing arbitrary messages from stdin (for testing)
+
+---
+
+## Knowledge Graph Requirements (V2)
+
+### KG-1: ResearchObject Schema
+- Must store a `ResearchObject` manifest (CBOR) containing:
+  - title, authors, ingester_id, signature, timestamp
+  - payload CID (UnixFS DAG)
+  - references (list of ManifestCIDs)
+  - total size hint
+ - Must support canonical CBOR serialization without the signature field for signing and verification
+
+### KG-2: Recursive Pinning
+- Pinning a ManifestCID must recursively pin:
+  - the manifest itself
+  - the entire payload DAG
+
+### KG-3: DAG Completeness Verification
+- Replication verification must confirm:
+  - manifest block decodes successfully
+  - manifest and payload are pinned locally
+
+### KG-4: Liar Detection
+- Must compare payload size to manifest `TotalSize`
+- On mismatch, must unpin the manifest recursively and mark local state as invalid
 
 ---
 
@@ -244,20 +270,26 @@ This document lists all functional and non-functional requirements that form the
 ## Configuration Requirements
 
 ### CF-1: Configuration Variables (Environment Variables)
-- Control topic name: "dlockss-creative-commons-control" (`DLOCKSS_CONTROL_TOPIC`)
+- Control topic name: "dlockss-v2-creative-commons-control" (`DLOCKSS_CONTROL_TOPIC`)
 - Discovery service tag: "dlockss-v2-prod" (`DLOCKSS_DISCOVERY_TAG`)
 - File watch folder: "./data" (`DLOCKSS_DATA_DIR`)
 - Minimum replication: 5 (`DLOCKSS_MIN_REPLICATION`)
 - Maximum replication: 10 (`DLOCKSS_MAX_REPLICATION`)
 - Replication check interval: 1 minute (`DLOCKSS_CHECK_INTERVAL`)
-- Maximum shard load: 2000 messages (`DLOCKSS_MAX_SHARD_LOAD`)
+- Maximum shard load: 2000 messages (`DLOCKSS_MAX_SHARD_LOAD`) - **Deprecated**: kept for backward compatibility, no longer used for splitting
+- Maximum peers per shard: 150 (`DLOCKSS_MAX_PEERS_PER_SHARD`) - Split threshold
+- Minimum peers per shard: 50 (`DLOCKSS_MIN_PEERS_PER_SHARD`) - Prevent over-splitting
+- Shard peer check interval: 30 seconds (`DLOCKSS_SHARD_PEER_CHECK_INTERVAL`) - How often to check peer count
 - File processing delay: 100ms (hardcoded)
 - Node country: "US" (`DLOCKSS_NODE_COUNTRY`)
 - BadBits CSV path: "badBits.csv" (`DLOCKSS_BADBITS_PATH`)
 - Shard overlap duration: 2 minutes (`DLOCKSS_SHARD_OVERLAP_DURATION`)
 - Replication verification delay: 30 seconds (`DLOCKSS_REPLICATION_VERIFICATION_DELAY`)
+- DHT max sample size: 50 (`DLOCKSS_DHT_MAX_SAMPLE_SIZE`)
+- Replication cache TTL: 5 minutes (`DLOCKSS_REPLICATION_CACHE_TTL`)
 - Disk usage high water mark: 90.0% (`DLOCKSS_DISK_USAGE_HIGH_WATER_MARK`)
 - Storage monitor interval: 30 seconds (`DLOCKSS_STORAGE_MONITOR_INTERVAL`)
+- IPFS API address: "/ip4/127.0.0.1/tcp/5001" (`DLOCKSS_IPFS_NODE`)
 - Metrics report interval: 5 seconds (`DLOCKSS_METRICS_INTERVAL`)
 - Rate limit window: 1 minute (`DLOCKSS_RATE_LIMIT_WINDOW`)
 - Max messages per window: 100 (`DLOCKSS_MAX_MESSAGES_PER_WINDOW`)
@@ -266,6 +298,10 @@ This document lists all functional and non-functional requirements that form the
 - Backoff multiplier: 2.0 (`DLOCKSS_BACKOFF_MULTIPLIER`)
 - Replication check cooldown: 15 seconds (`DLOCKSS_REPLICATION_COOLDOWN`)
 - Removed file cooldown: 2 minutes (`DLOCKSS_REMOVED_COOLDOWN`)
+- Trust mode: "open" (`DLOCKSS_TRUST_MODE`)
+- Trust store path: "trusted_peers.json" (`DLOCKSS_TRUST_STORE`)
+- Signature mode: "warn" (`DLOCKSS_SIGNATURE_MODE`)
+- Signature max age: 10 minutes (`DLOCKSS_SIGNATURE_MAX_AGE`)
 
 ### CF-2: Network Configuration
 - Listen on all interfaces: 0.0.0.0 (IPv4) and :: (IPv6)
@@ -394,6 +430,29 @@ This document lists all functional and non-functional requirements that form the
 - Must publish messages to both old and new topics during overlap
 - Must read messages from both old and new topics during overlap
 - Must prevent message loss during shard transitions
+
+## Security & Trust Requirements
+
+### ST-1: Signed Protocol Messages
+- All protocol messages (`IngestMessage`, `ReplicationRequest`, `DelegateMessage`) must include:
+  - a `Timestamp`,
+  - a random `Nonce`,
+  - and a cryptographic signature (`Sig`) produced with the sender's libp2p private key.
+- Nodes must verify signatures, timestamps, and nonces on incoming messages, according to `DLOCKSS_SIGNATURE_MODE`:
+  - `off`: no verification,
+  - `warn`: log failures but continue,
+  - `strict`: treat failures as hard errors.
+
+### ST-2: Signed ResearchObject Manifests
+- Each `ResearchObject` manifest must be signed by the ingester.
+- Nodes must verify manifest signatures and reject or warn on invalid manifests based on signature mode and trust configuration.
+
+### ST-3: Trust Store (Optional Allowlist)
+- When `DLOCKSS_TRUST_MODE=open`, all peers are accepted.
+- When `DLOCKSS_TRUST_MODE=allowlist`, only peers listed in `DLOCKSS_TRUST_STORE` must be accepted for:
+  - message processing,
+  - and ResearchObject verification.
+- The trust store must be loaded from a JSON file containing an array of peer IDs.
 
 ## Out of Scope (Explicitly Not Required)
 

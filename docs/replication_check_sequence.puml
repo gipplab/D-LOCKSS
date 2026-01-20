@@ -17,13 +17,25 @@ loop For each known file
     else Not in backoff
         ReplChecker -> Storage: isPinned(hash)
         ReplChecker -> ShardMgr: AmIResponsibleFor(hash)
+        ReplChecker -> IPFS: Verify manifest+payload pinned\n(and decode manifest)
+        alt Payload size mismatch (liar detection)
+            ReplChecker -> IPFS: UnpinRecursive(ManifestCID)
+            ReplChecker -> Storage: unpinFile(ManifestCID)
+            ReplChecker -> Storage: removeKnownFile(ManifestCID)
+        end
         
         alt Not responsible AND not pinned
             ReplChecker -> Storage: removeKnownFile(hash)
         else Responsible OR pinned
-            ReplChecker -> DHT: FindProvidersAsync(cid)
-            DHT -> DHT: Query network
-            DHT -> ReplChecker: Provider count
+            Note over ReplChecker: Check replicationCache first\n(use cached count if fresh)
+            alt Cache miss or expired
+                ReplChecker -> DHT: FindProvidersAsync(ManifestCID)\n(sample up to DHTMaxSampleSize)
+                DHT -> DHT: Query network
+                DHT -> ReplChecker: Provider count
+                ReplChecker -> ReplChecker: Store count in replicationCache\n(with TTL)
+            else Cache hit
+                ReplChecker -> ReplChecker: Use cached provider count
+            end
             
             ReplChecker -> Storage: Update fileReplicationLevels
             
@@ -39,11 +51,11 @@ loop For each known file
                     DHT -> ReplChecker: Provider count (verification)
                     alt Verification confirms under-replication
                         alt Responsible AND not pinned
-                            ReplChecker -> Storage: pinFile(hash)
-                            ReplChecker -> DHT: provideFile(hash)
+                            ReplChecker -> IPFS: PinRecursive(ManifestCID)
+                            ReplChecker -> DHT: provideFile(ManifestCID)
                         end
-                        ReplChecker -> PubSub: PublishToShard("NEED:" + hash)
-                        PubSub -> Nodes: Broadcast NEED message
+                        ReplChecker -> PubSub: PublishToShard(ReplicationRequest CBOR)
+                        PubSub -> Nodes: Broadcast ReplicationRequest
                         Nodes -> Nodes: Check if they can replicate
                         Note over ReplChecker: Both queries confirmed\nunder-replication
                     else Verification shows adequate replication

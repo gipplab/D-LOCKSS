@@ -5,12 +5,13 @@ participant "PubSub Control" as Control
 participant "Responsible Node" as Responsible
 participant "Storage" as Storage
 participant "Replication Checker" as ReplChecker
+participant "IPFS" as IPFS
 participant "DHT" as DHT
 
-Custodial -> Custodial: processNewFile()\nFile hash doesn't match shard
-Custodial -> Custodial: pinFile(hash) [temporary]
-Custodial -> DHT: provideFile(hash)
-Custodial -> Control: PublishToControl("DELEGATE:" + hash + ":" + prefix)
+Custodial -> Custodial: processNewFile()\nManifestCID not in my shard
+Custodial -> IPFS: PinRecursive(ManifestCID)\n[temporary custodial hold]
+Custodial -> DHT: provideFile(ManifestCID)
+Custodial -> Control: PublishToControl(DelegateMessage CBOR)\n{manifest_cid, target_shard}
 
 Control -> Responsible: Broadcast DELEGATE message
 Responsible -> Responsible: checkRateLimitForMessage(peerID, "DELEGATE")
@@ -20,23 +21,24 @@ alt Rate limit OK AND disk usage OK
     Responsible -> Responsible: Check if targetPrefix == myShard
     
     alt Prefix matches
-    Responsible -> Storage: addKnownFile(hash)
-    Responsible -> ReplChecker: checkReplication(hash)
-    ReplChecker -> DHT: FindProvidersAsync(cid)
+    Responsible -> Storage: addKnownFile(ManifestCID)
+    Responsible -> ReplChecker: checkReplication(ManifestCID)
+    ReplChecker -> DHT: FindProvidersAsync(ManifestCID)
     DHT -> ReplChecker: Provider count
     
     alt count < MinReplication
-        ReplChecker -> Storage: pinFile(hash)
-        ReplChecker -> DHT: provideFile(hash)
+        ReplChecker -> IPFS: PinRecursive(ManifestCID)
+        ReplChecker -> DHT: provideFile(ManifestCID)
     end
     
     Note over Responsible: File now properly replicated
     
     alt Replication reaches MinReplication
-        Custodial -> Custodial: checkReplication(hash)
-        Custodial -> DHT: FindProvidersAsync(cid)
+        Custodial -> Custodial: checkReplication(ManifestCID)
+        Custodial -> DHT: FindProvidersAsync(ManifestCID)
         DHT -> Custodial: count >= MinReplication
-        Custodial -> Storage: unpinFile(hash)
+        Custodial -> IPFS: UnpinRecursive(ManifestCID)
+        Custodial -> Storage: unpinFile(ManifestCID)
         Note over Custodial: Custodial handoff complete
     end
     else Prefix doesn't match

@@ -10,28 +10,89 @@ class ShardManager {
     - currentShard: string
     - shardTopic: *pubsub.Topic
     - shardSub: *pubsub.Subscription
+    - oldShardName: string
+    - oldShardTopic: *pubsub.Topic
+    - oldShardSub: *pubsub.Subscription
+    - oldShardEndTime: time.Time
+    - inOverlap: bool
     - controlTopic: *pubsub.Topic
     - controlSub: *pubsub.Subscription
     - msgCounter: int
+    - lastPeerCheck: time.Time
     - shardDone: chan struct{}
     --
     + NewShardManager(...): *ShardManager
     + Run()
-    + AmIResponsibleFor(hash): bool
-    + PublishToShard(msg)
-    + PublishToControl(msg)
+    + AmIResponsibleFor(key): bool
+    + PublishToShardCBOR(bytes)
+    + PublishToControlCBOR(bytes)
     + splitShard()
+    + getShardPeerCount(): int
+    + checkAndSplitIfNeeded()
+    + runPeerCountChecker()
+    + readOldShard()
+    + manageOverlap()
     + Close()
 }
 
+class ResearchObject {
+    + Title: string
+    + Authors: []string
+    + IngestedBy: peer.ID
+    + Signature: []byte
+    + Timestamp: int64
+    + Payload: cid.Cid
+    + References: []cid.Cid
+    + TotalSize: uint64
+}
+
+class IngestMessage {
+    + Type: uint8
+    + ManifestCID: cid.Cid
+    + ShardID: string
+    + HintSize: uint64
+    + SenderID: peer.ID
+    + Timestamp: int64
+    + Nonce: []byte
+    + Sig: []byte
+}
+
+class ReplicationRequest {
+    + Type: uint8
+    + ManifestCID: cid.Cid
+    + Priority: uint8
+    + Deadline: int64
+    + SenderID: peer.ID
+    + Timestamp: int64
+    + Nonce: []byte
+    + Sig: []byte
+}
+
+class DelegateMessage {
+    + Type: uint8
+    + ManifestCID: cid.Cid
+    + TargetShard: string
+    + SenderID: peer.ID
+    + Timestamp: int64
+    + Nonce: []byte
+    + Sig: []byte
+}
+
 class StorageState {
-    + pinnedFiles: map[string]bool
-    + knownFiles: map[string]bool
+    + pinnedFiles: map[string]bool  // ManifestCID strings
+    + knownFiles: map[string]bool   // ManifestCID strings
     + fileReplicationLevels: map[string]int
     + fileConvergenceTime: map[string]time.Time
     + recentlyRemoved: map[string]time.Time
     + checkingFiles: map[string]bool
     + lastCheckTime: map[string]time.Time
+    + replicationCache: map[string]*cachedReplication
+    + pendingVerifications: map[string]*verificationPending
+}
+
+class cachedReplication {
+    + count: int
+    + cachedAt: time.Time
 }
 
 class Metrics {
@@ -71,7 +132,21 @@ class operationBackoff {
     + mu: sync.Mutex
 }
 
+class PendingVerifications {
+    + m: map[string]*verificationPending
+}
+
+class verificationPending {
+    + firstCount: int
+    + firstCheckTime: time.Time
+    + verifyTime: time.Time
+    + responsible: bool
+    + pinned: bool
+}
+
 ShardManager --> StorageState : reads/writes
+StorageState --> PendingVerifications : contains
+PendingVerifications --> verificationPending : contains
 StorageState --> Metrics : updates
 RateLimiter --> peerRateLimit : contains
 BackoffManager --> operationBackoff : contains

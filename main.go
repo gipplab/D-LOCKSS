@@ -15,6 +15,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	
+	"dlockss/pkg/ipfs"
 )
 
 func main() {
@@ -50,9 +52,36 @@ func main() {
 		log.Fatalf("[Fatal] Failed to initialize GossipSub: %v", err)
 	}
 
+	selfPeerID = h.ID()
+	selfPrivKey = h.Peerstore().PrivKey(h.ID())
+	if selfPrivKey == nil {
+		log.Printf("[Warning] Missing private key for self peer ID; message signing will be unavailable")
+	}
+
 	replicationWorkers = make(chan struct{}, MaxConcurrentReplicationChecks)
 
 	logConfiguration()
+
+	// Initialize optional trust store (default trust mode is "open").
+	// In allowlist mode, only peers listed in TrustStorePath may send protocol messages.
+	if TrustStorePath != "" {
+		if err := loadTrustedPeers(TrustStorePath); err != nil {
+			log.Printf("[Trust] Trust store not loaded (%s): %v", TrustStorePath, err)
+		} else {
+			log.Printf("[Trust] Loaded trust store: %s", TrustStorePath)
+		}
+	}
+
+	// Initialize IPFS client
+	log.Println("Initializing IPFS client...")
+	ipfsClient, err = ipfs.NewClient(IPFSNodeAddress)
+	if err != nil {
+		log.Printf("[Warning] Failed to initialize IPFS client: %v", err)
+		log.Printf("[Warning] File operations will be disabled. Ensure IPFS node is running at %s", IPFSNodeAddress)
+		// Continue without IPFS - file operations will fail gracefully
+	} else {
+		log.Printf("[System] IPFS client initialized successfully")
+	}
 
 	initialShard := getBinaryPrefix(h.ID().String(), 1)
 	shardMgr = NewShardManager(ctx, h, ps, initialShard)
@@ -75,6 +104,7 @@ func main() {
 	go watchFolder(ctx)
 
 	go runReplicationChecker(ctx)
+	go runReplicationCacheCleanup(ctx)
 	go runRateLimiterCleanup(ctx)
 	go runMetricsReporter(ctx)
 	go runDiskUsageMonitor(ctx)

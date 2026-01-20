@@ -7,29 +7,29 @@ participant "Node C" as C
 participant "DHT" as DHT
 
 == File Ingestion ==
-A -> GS: NEW:<hash> (shard topic)
+A -> GS: IngestMessage(CBOR)\n{manifest_cid, shard_id, hint_size, ts, nonce, sig} (shard topic)
 GS -> B: Forward message
 GS -> C: Forward message
 B -> B: Add to knownFiles
 C -> C: Add to knownFiles
 
 == Replication Request ==
-A -> GS: NEED:<hash> (shard topic)
+A -> GS: ReplicationRequest(CBOR)\n{manifest_cid, priority, deadline, ts, nonce, sig} (shard topic)
 GS -> B: Forward message
 GS -> C: Forward message
 B -> DHT: Check if I have file
 C -> DHT: Check if I have file
-B -> DHT: provideFile(hash) [if available]
+B -> DHT: provideFile(manifest_cid) [if available]
 
 == Delegation ==
-A -> GS: DELEGATE:<hash>:<prefix> (control topic)
+A -> GS: DelegateMessage(CBOR)\n{manifest_cid, target_shard, ts, nonce, sig} (control topic)
 GS -> B: Forward message
 GS -> C: Forward message
 B -> B: Check if prefix matches
 C -> C: Check if prefix matches
 alt Prefix matches (Node C)
     C -> C: Accept delegation
-    C -> DHT: provideFile(hash)
+    C -> DHT: provideFile(manifest_cid)
 else Prefix doesn't match
     B -> B: Ignore message
 end

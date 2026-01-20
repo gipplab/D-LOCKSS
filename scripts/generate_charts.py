@@ -43,7 +43,8 @@ plt.rcParams.update({
 
 def load_metrics(csv_path):
     """Load metrics from CSV file."""
-    df = pd.read_csv(csv_path)
+    # Read CSV with current_shard as string to preserve values like "00", "01"
+    df = pd.read_csv(csv_path, dtype={'current_shard': str})
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     df = df.sort_values('timestamp')
     return df
@@ -69,9 +70,9 @@ def plot_storage_metrics(df, output_dir):
     axes[1].legend(loc='best', frameon=True, fancybox=True, shadow=True)
     axes[1].grid(True, alpha=0.3, linestyle='--')
     
-    # Format x-axis
+    # Format x-axis with regular 1-minute ticks for readability
     axes[1].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
-    axes[1].xaxis.set_major_locator(mdates.MinuteLocator(interval=max(1, len(df) // 10)))
+    axes[1].xaxis.set_major_locator(mdates.MinuteLocator(interval=1))
     plt.setp(axes[1].xaxis.get_majorticklabels(), rotation=45, ha='right')
     
     plt.tight_layout()
@@ -111,9 +112,9 @@ def plot_network_metrics(df, output_dir):
     axes[2].legend(loc='best', frameon=True, fancybox=True, shadow=True)
     axes[2].grid(True, alpha=0.3, linestyle='--')
     
-    # Format x-axis
+    # Format x-axis with regular 1-minute ticks for readability
     axes[2].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
-    axes[2].xaxis.set_major_locator(mdates.MinuteLocator(interval=max(1, len(df) // 10)))
+    axes[2].xaxis.set_major_locator(mdates.MinuteLocator(interval=1))
     plt.setp(axes[2].xaxis.get_majorticklabels(), rotation=45, ha='right')
     
     plt.tight_layout()
@@ -145,9 +146,9 @@ def plot_replication_metrics(df, output_dir):
     axes[1].legend(loc='best', frameon=True, fancybox=True, shadow=True)
     axes[1].grid(True, alpha=0.3, linestyle='--')
     
-    # Format x-axis
+    # Format x-axis with regular 1-minute ticks for readability
     axes[1].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
-    axes[1].xaxis.set_major_locator(mdates.MinuteLocator(interval=max(1, len(df) // 10)))
+    axes[1].xaxis.set_major_locator(mdates.MinuteLocator(interval=1))
     plt.setp(axes[1].xaxis.get_majorticklabels(), rotation=45, ha='right')
     
     plt.tight_layout()
@@ -177,9 +178,9 @@ def plot_performance_metrics(df, output_dir):
     axes[1].legend(loc='best', frameon=True, fancybox=True, shadow=True)
     axes[1].grid(True, alpha=0.3, linestyle='--')
     
-    # Format x-axis
+    # Format x-axis with regular 1-minute ticks for readability
     axes[1].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
-    axes[1].xaxis.set_major_locator(mdates.MinuteLocator(interval=max(1, len(df) // 10)))
+    axes[1].xaxis.set_major_locator(mdates.MinuteLocator(interval=1))
     plt.setp(axes[1].xaxis.get_majorticklabels(), rotation=45, ha='right')
     
     plt.tight_layout()
@@ -209,9 +210,9 @@ def plot_cumulative_metrics(df, output_dir):
     axes[1].legend(loc='best', frameon=True, fancybox=True, shadow=True)
     axes[1].grid(True, alpha=0.3, linestyle='--')
     
-    # Format x-axis
+    # Format x-axis with regular 1-minute ticks for readability
     axes[1].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
-    axes[1].xaxis.set_major_locator(mdates.MinuteLocator(interval=max(1, len(df) // 10)))
+    axes[1].xaxis.set_major_locator(mdates.MinuteLocator(interval=1))
     plt.setp(axes[1].xaxis.get_majorticklabels(), rotation=45, ha='right')
     
     plt.tight_layout()
@@ -321,7 +322,7 @@ def load_all_metrics(csv_files):
             df['node'] = node_name
             # Round timestamps to 10-second intervals for proper alignment
             # This ensures nodes reporting at slightly different times are grouped correctly
-            df['timestamp'] = df['timestamp'].dt.floor('10S')
+            df['timestamp'] = df['timestamp'].dt.floor('10s')  # Use 's' instead of deprecated 'S'
             all_data.append(df)
             node_names.append(node_name)
             print(f"  Loaded {len(df)} data points from {node_name}")
@@ -338,6 +339,12 @@ def load_all_metrics(csv_files):
 
 def plot_overview_storage_metrics(df, output_dir):
     """Plot aggregated storage metrics across all nodes."""
+    # Verify required columns exist
+    required_cols = ['pinned_files', 'known_files', 'low_replication_files', 'high_replication_files']
+    if not all(col in df.columns for col in required_cols):
+        print(f"⚠ Skipping storage metrics (missing columns)")
+        return
+    
     fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
     
     # Aggregate by timestamp (sum across all nodes)
@@ -369,9 +376,9 @@ def plot_overview_storage_metrics(df, output_dir):
     axes[1].legend(loc='best', frameon=True, fancybox=True, shadow=True)
     axes[1].grid(True, alpha=0.3, linestyle='--')
     
-    # Format x-axis
+    # Format x-axis with regular 1-minute ticks for readability
     axes[1].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
-    axes[1].xaxis.set_major_locator(mdates.MinuteLocator(interval=max(1, len(aggregated) // 10)))
+    axes[1].xaxis.set_major_locator(mdates.MinuteLocator(interval=1))
     plt.setp(axes[1].xaxis.get_majorticklabels(), rotation=45, ha='right')
     
     plt.tight_layout()
@@ -432,9 +439,9 @@ def plot_overview_network_metrics(df, output_dir):
     axes[2].legend(loc='best', frameon=True, fancybox=True, shadow=True)
     axes[2].grid(True, alpha=0.3, linestyle='--')
     
-    # Format x-axis
+    # Format x-axis with regular 1-minute ticks for readability
     axes[2].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
-    axes[2].xaxis.set_major_locator(mdates.MinuteLocator(interval=max(1, len(aggregated) // 10)))
+    axes[2].xaxis.set_major_locator(mdates.MinuteLocator(interval=1))
     plt.setp(axes[2].xaxis.get_majorticklabels(), rotation=45, ha='right')
     
     plt.tight_layout()
@@ -444,9 +451,17 @@ def plot_overview_network_metrics(df, output_dir):
 
 def plot_overview_replication_metrics(df, output_dir):
     """Plot aggregated replication metrics across all nodes."""
+    # Verify required columns exist
+    required_cols = ['replication_checks', 'replication_success', 'replication_failures',
+                     'cumulative_replication_checks', 'cumulative_replication_success', 
+                     'cumulative_replication_failures']
+    if not all(col in df.columns for col in required_cols):
+        print(f"⚠ Skipping replication metrics (missing columns)")
+        return
+    
     fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
     
-    # Aggregate by timestamp
+    # Aggregate by timestamp (sum across all nodes - these are per-period counts)
     aggregated = df.groupby('timestamp').agg({
         'replication_checks': 'sum',
         'replication_success': 'sum',
@@ -490,6 +505,123 @@ def plot_overview_replication_metrics(df, output_dir):
     plt.savefig(os.path.join(output_dir, 'overview_replication_metrics.png'), format='png', dpi=300)
     plt.close()
     print(f"✓ Generated overview_replication_metrics.png")
+
+def plot_overview_shard_metrics(df, output_dir):
+    """Plot per-shard file counts and replication metrics."""
+    # Require current_shard column to be present
+    if 'current_shard' not in df.columns:
+        print(f"⚠ Skipping shard metrics (missing current_shard column)")
+        return
+
+    # Ensure current_shard is string to preserve values like "00", "01"
+    df = df.copy()
+    df['current_shard'] = df['current_shard'].astype(str)
+    
+    # Filter out rows where current_shard is null, empty, or 'nan'
+    df_with_shards = df[(df['current_shard'].notna()) & 
+                         (df['current_shard'] != '') & 
+                         (df['current_shard'] != 'nan') &
+                         (df['current_shard'] != 'None')].copy()
+    if df_with_shards.empty:
+        print(f"⚠ Skipping shard metrics (no shard assignments found)")
+        return
+
+    # Use the last record per node as "final state", then aggregate by shard
+    final_per_node = df_with_shards.groupby('node').last()
+
+    # Find all unique shards that were ever active (across all time)
+    all_shards_ever = df_with_shards['current_shard'].unique().tolist()
+    print(f"  Found {len(all_shards_ever)} unique shards across all time: {sorted(all_shards_ever)}")
+
+    # Also check final state shards
+    final_shards = final_per_node['current_shard'].unique().tolist()
+    print(f"  Found {len(final_shards)} unique shards in final state: {sorted(final_shards)}")
+
+    # Aggregate metrics per shard from final state
+    per_shard = final_per_node.groupby('current_shard').agg({
+        'pinned_files': 'sum',
+        'known_files': 'sum',
+        'avg_replication_level': 'mean',
+        'files_at_target_replication': 'sum',
+        'low_replication_files': 'sum',
+        'high_replication_files': 'sum'
+    }).reset_index().rename(columns={'current_shard': 'shard'})
+
+    # Sort shards: try to sort naturally (0, 1, 00, 01, etc.), but handle any format
+    def shard_sort_key(s):
+        s_str = str(s)
+        # If it's a short binary string (1-2 chars), sort those first
+        if len(s_str) <= 2 and all(c in '01' for c in s_str):
+            return (0, len(s_str), s_str)
+        # If it's a single digit, sort after binary strings
+        elif s_str.isdigit() and len(s_str) == 1:
+            return (1, int(s_str))
+        # Otherwise sort as string
+        else:
+            return (2, s_str)
+    
+    per_shard = per_shard.sort_values('shard', key=lambda x: x.map(shard_sort_key))
+    shards = per_shard['shard'].tolist()
+    
+    # Limit to top 20 shards by node count if there are too many
+    if len(shards) > 20:
+        node_counts = final_per_node.groupby('current_shard').size()
+        top_shards = node_counts.nlargest(20).index.tolist()
+        per_shard = per_shard[per_shard['shard'].isin(top_shards)]
+        shards = per_shard['shard'].tolist()
+        print(f"  Limiting display to top 20 shards by node count")
+    
+    x_pos = range(len(shards))
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+
+    # Top: nodes and files per shard
+    # Reconstruct node count per shard from final_per_node
+    node_counts_by_shard = final_per_node.groupby('current_shard').size()
+    nodes_per_shard = [node_counts_by_shard.get(shard, 0) for shard in shards]
+    known_files = per_shard['known_files'].tolist()
+
+    width = 0.35
+
+    axes[0].bar([x - width/2 for x in x_pos], nodes_per_shard,
+                width, label='Nodes in Shard', color='#2E86AB', alpha=0.85)
+    axes[0].set_ylabel('Node Count', fontsize=11)
+    axes[0].set_title('Per-Shard Nodes and Files (Final State)', fontsize=12, fontweight='bold')
+    axes[0].grid(True, alpha=0.3, linestyle='--', axis='y')
+
+    ax2 = axes[0].twinx()
+    ax2.bar([x + width/2 for x in x_pos], known_files,
+            width, label='Total Known Files', color='#A23B72', alpha=0.75)
+    ax2.set_ylabel('Total Known Files', fontsize=11, color='#A23B72')
+    ax2.tick_params(axis='y', labelcolor='#A23B72')
+
+    # Build combined legend
+    handles1, labels1 = axes[0].get_legend_handles_labels()
+    handles2, labels2 = ax2.get_legend_handles_labels()
+    axes[0].legend(handles1 + handles2, labels1 + labels2,
+                   loc='upper left', frameon=True, fancybox=True, shadow=True)
+
+    # Bottom: average replication per shard
+    avg_rep = per_shard['avg_replication_level'].tolist()
+    axes[1].bar(x_pos, avg_rep, color='#06A77D', alpha=0.85)
+    axes[1].axhline(y=5, color='#F18F01', linestyle='--', linewidth=1, label='Min Target (5)')
+    axes[1].axhline(y=10, color='#C73E1D', linestyle='--', linewidth=1, label='Max Target (10)')
+    axes[1].set_xlabel('Shard', fontsize=11)
+    axes[1].set_ylabel('Average Replication Level', fontsize=11)
+    axes[1].set_title('Average Replication Level per Shard (Final State)', fontsize=12, fontweight='bold')
+    axes[1].set_xticks(list(x_pos))
+    axes[1].set_xticklabels(shards, rotation=45, ha='right')
+    axes[1].legend(loc='best', frameon=True, fancybox=True, shadow=True)
+    axes[1].grid(True, alpha=0.3, linestyle='--', axis='y')
+
+    # Add value labels
+    for i, val in enumerate(avg_rep):
+        axes[1].text(i, val + 0.2, f'{val:.2f}', ha='center', va='bottom', fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'overview_shard_metrics.png'), format='png', dpi=300)
+    plt.close()
+    print(f"✓ Generated overview_shard_metrics.png")
 
 def plot_overview_convergence_metrics(df, output_dir):
     """Plot replication convergence metrics across all nodes."""
@@ -545,9 +677,9 @@ def plot_overview_convergence_metrics(df, output_dir):
     axes[2].legend(loc='best', frameon=True, fancybox=True, shadow=True)
     axes[2].grid(True, alpha=0.3, linestyle='--')
     
-    # Format x-axis
+    # Format x-axis with regular 1-minute ticks for readability
     axes[2].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
-    axes[2].xaxis.set_major_locator(mdates.MinuteLocator(interval=max(1, len(aggregated) // 10)))
+    axes[2].xaxis.set_major_locator(mdates.MinuteLocator(interval=1))
     plt.setp(axes[2].xaxis.get_majorticklabels(), rotation=45, ha='right')
     
     plt.tight_layout()
@@ -558,7 +690,8 @@ def plot_overview_convergence_metrics(df, output_dir):
 def plot_overview_replication_distribution(df, output_dir):
     """Plot replication level distribution across all nodes."""
     # Check if distribution columns exist
-    repl_cols = [f'repl_level_{i}' for i in range(11)]
+    # Metrics schema uses repl_level_0..repl_level_9 plus repl_level_10plus (not repl_level_10)
+    repl_cols = [f'repl_level_{i}' for i in range(10)] + ['repl_level_10plus']
     if not all(col in df.columns for col in repl_cols):
         print(f"⚠ Skipping replication distribution (missing columns)")
         return
@@ -573,10 +706,10 @@ def plot_overview_replication_distribution(df, output_dir):
     # Stacked area chart showing distribution over time
     colors = ['#D00000', '#F18F01', '#FFC300', '#FFD60A', '#FFE66D',  # 0-4: Red to Yellow
               '#06A77D', '#06A77D', '#06A77D', '#06A77D', '#06A77D', '#06A77D']  # 5-10+: Green
-    labels = [f'Level {i}' if i < 10 else 'Level 10+' for i in range(11)]
+    labels = [f'Level {i}' for i in range(10)] + ['Level 10+']
     
     axes[0].stackplot(aggregated['timestamp'],
-                      [aggregated[f'repl_level_{i}'] for i in range(11)],
+                      [aggregated[f'repl_level_{i}'] for i in range(10)] + [aggregated['repl_level_10plus']],
                       labels=labels, colors=colors, alpha=0.7)
     axes[0].set_ylabel('File Count', fontsize=11)
     axes[0].set_title('Network-Wide Replication Level Distribution (Stacked)', fontsize=12, fontweight='bold')
@@ -596,9 +729,9 @@ def plot_overview_replication_distribution(df, output_dir):
     axes[1].legend(loc='best', frameon=True, fancybox=True, shadow=True)
     axes[1].grid(True, alpha=0.3, linestyle='--')
     
-    # Format x-axis
+    # Format x-axis with regular 1-minute ticks for readability
     axes[1].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
-    axes[1].xaxis.set_major_locator(mdates.MinuteLocator(interval=max(1, len(aggregated) // 10)))
+    axes[1].xaxis.set_major_locator(mdates.MinuteLocator(interval=1))
     plt.setp(axes[1].xaxis.get_majorticklabels(), rotation=45, ha='right')
     
     plt.tight_layout()
@@ -608,9 +741,15 @@ def plot_overview_replication_distribution(df, output_dir):
 
 def plot_overview_performance_metrics(df, output_dir):
     """Plot aggregated performance metrics across all nodes."""
+    # Verify required columns exist
+    required_cols = ['worker_pool_active', 'files_in_backoff']
+    if not all(col in df.columns for col in required_cols):
+        print(f"⚠ Skipping performance metrics (missing columns)")
+        return
+    
     fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
     
-    # Aggregate by timestamp
+    # Aggregate by timestamp (sum across all nodes - total workers/backoff files network-wide)
     aggregated = df.groupby('timestamp').agg({
         'worker_pool_active': 'sum',
         'files_in_backoff': 'sum'
@@ -633,9 +772,9 @@ def plot_overview_performance_metrics(df, output_dir):
     axes[1].legend(loc='best', frameon=True, fancybox=True, shadow=True)
     axes[1].grid(True, alpha=0.3, linestyle='--')
     
-    # Format x-axis
+    # Format x-axis with regular 1-minute ticks for readability
     axes[1].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
-    axes[1].xaxis.set_major_locator(mdates.MinuteLocator(interval=max(1, len(aggregated) // 10)))
+    axes[1].xaxis.set_major_locator(mdates.MinuteLocator(interval=1))
     plt.setp(axes[1].xaxis.get_majorticklabels(), rotation=45, ha='right')
     
     plt.tight_layout()
@@ -645,9 +784,16 @@ def plot_overview_performance_metrics(df, output_dir):
 
 def plot_overview_cumulative_metrics(df, output_dir):
     """Plot aggregated cumulative metrics across all nodes."""
+    # Verify required columns exist
+    required_cols = ['cumulative_messages_received', 'cumulative_messages_dropped',
+                     'cumulative_dht_queries', 'cumulative_dht_query_timeouts']
+    if not all(col in df.columns for col in required_cols):
+        print(f"⚠ Skipping cumulative metrics (missing columns)")
+        return
+    
     fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
     
-    # Aggregate by timestamp
+    # Aggregate by timestamp (sum cumulative values across all nodes)
     aggregated = df.groupby('timestamp').agg({
         'cumulative_messages_received': 'sum',
         'cumulative_messages_dropped': 'sum',
@@ -676,9 +822,9 @@ def plot_overview_cumulative_metrics(df, output_dir):
     axes[1].legend(loc='best', frameon=True, fancybox=True, shadow=True)
     axes[1].grid(True, alpha=0.3, linestyle='--')
     
-    # Format x-axis
+    # Format x-axis with regular 1-minute ticks for readability
     axes[1].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
-    axes[1].xaxis.set_major_locator(mdates.MinuteLocator(interval=max(1, len(aggregated) // 10)))
+    axes[1].xaxis.set_major_locator(mdates.MinuteLocator(interval=1))
     plt.setp(axes[1].xaxis.get_majorticklabels(), rotation=45, ha='right')
     
     plt.tight_layout()
@@ -856,6 +1002,10 @@ Examples:
         plt.close('all')
         
         plot_overview_replication_metrics(combined_df, output_base_dir)
+        plt.close('all')
+
+        # Per-shard metrics (uses current_shard + per-node final state)
+        plot_overview_shard_metrics(combined_df, output_base_dir)
         plt.close('all')
         
         plot_overview_convergence_metrics(combined_df, output_base_dir)

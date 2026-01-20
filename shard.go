@@ -1,15 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
-	"strings"
 	"sync"
 	"time"
 
+	"github.com/ipld/go-ipld-prime/codec/dagcbor"
+	"github.com/ipld/go-ipld-prime/node/basicnode"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
+
+	"dlockss/pkg/schema"
 )
 
 type ShardManager struct {
@@ -31,7 +35,8 @@ type ShardManager struct {
 	controlTopic *pubsub.Topic
 	controlSub   *pubsub.Subscription
 
-	msgCounter int
+	msgCounter    int
+	lastPeerCheck time.Time
 
 	shardDone chan struct{}
 }
@@ -75,10 +80,10 @@ func (sm *ShardManager) joinChannels() {
 	oldShardName := sm.oldShardName
 	oldShardTopicName := ""
 	if oldShardSub != nil && oldShardName != "" {
-		oldShardTopicName = fmt.Sprintf("dlockss-creative-commons-shard-%s", oldShardName)
+		oldShardTopicName = fmt.Sprintf("dlockss-v2-creative-commons-shard-%s", oldShardName)
 	}
 
-	topicName := fmt.Sprintf("dlockss-creative-commons-shard-%s", sm.currentShard)
+	topicName := fmt.Sprintf("dlockss-v2-creative-commons-shard-%s", sm.currentShard)
 	t, err := sm.ps.Join(topicName)
 	if err != nil {
 		log.Printf("[Error] Failed to subscribe to shard topic %s: %v", topicName, err)
@@ -126,6 +131,23 @@ func (sm *ShardManager) Run() {
 	go sm.readControl()
 	go sm.readShard()
 	go sm.manageOverlap()
+	go sm.runPeerCountChecker()
+}
+
+// runPeerCountChecker periodically checks the number of peers in the shard
+// and triggers splits when the threshold is exceeded.
+func (sm *ShardManager) runPeerCountChecker() {
+	ticker := time.NewTicker(ShardPeerCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-sm.ctx.Done():
+			return
+		case <-ticker.C:
+			sm.checkAndSplitIfNeeded()
+		}
+	}
 }
 
 func (sm *ShardManager) readControl() {
@@ -150,8 +172,9 @@ func (sm *ShardManager) readControl() {
 			continue
 		}
 
-		data := string(msg.Data)
-		if !strings.HasPrefix(data, "DELEGATE:") {
+		// Control channel uses CBOR DelegateMessage in V2.
+		msgType, err := decodeCBORMessageType(msg.Data)
+		if err != nil || msgType != schema.MessageTypeDelegate {
 			continue
 		}
 
@@ -166,17 +189,12 @@ func (sm *ShardManager) readControl() {
 			continue
 		}
 
-		parts := strings.Split(data, ":")
-		if len(parts) != 3 {
-			log.Printf("[Warning] Invalid DELEGATE message format: %s", data)
+		var dm schema.DelegateMessage
+		if err := dm.UnmarshalCBOR(msg.Data); err != nil {
+			log.Printf("[Warning] Invalid DelegateMessage CBOR: %v", err)
 			continue
 		}
-
-		targetHash := parts[1]
-		targetPrefix := parts[2]
-
-		if !validateHash(targetHash) {
-			log.Printf("[Warning] Invalid hash in DELEGATE message: %s", targetHash)
+		if verifyAndAuthorizeMessage(sm.h, msg.GetFrom(), dm.SenderID, dm.Timestamp, dm.Nonce, dm.Sig, dm.MarshalCBORForSigning, "DelegateMessage") {
 			continue
 		}
 
@@ -184,21 +202,60 @@ func (sm *ShardManager) readControl() {
 		myShard := sm.currentShard
 		sm.mu.RUnlock()
 
-		if targetPrefix == myShard {
+		if dm.TargetShard == myShard {
 			incrementMetric(&metrics.messagesReceived)
-			log.Printf("[Delegate] Accepted delegation for %s (I am %s)", targetHash, myShard)
-			addKnownFile(targetHash)
-			select {
-			case replicationWorkers <- struct{}{}:
-				go func(h string) {
-					defer func() { <-replicationWorkers }()
-					checkReplication(sm.ctx, h)
-				}(targetHash)
-			case <-sm.ctx.Done():
+			manifestKey := dm.ManifestCID.String()
+			log.Printf("[Delegate] Accepted delegation for %s (I am %s)", manifestKey[:min(16, len(manifestKey))]+"...", myShard)
+			addKnownFile(manifestKey)
+			if !withReplicationWorker(sm.ctx, func() {
+				checkReplication(sm.ctx, manifestKey)
+			}) {
 				return
 			}
 		}
 	}
+}
+
+// handleIngestMessage processes an IngestMessage after CBOR unmarshaling.
+// It performs authorization, signature verification, and enqueues replication checking.
+// The logPrefix parameter allows customizing log messages (e.g., "IngestMessage" vs "IngestMessage (old shard overlap)").
+func (sm *ShardManager) handleIngestMessage(msg *pubsub.Message, im *schema.IngestMessage, logPrefix string) bool {
+	if verifyAndAuthorizeMessage(sm.h, msg.GetFrom(), im.SenderID, im.Timestamp, im.Nonce, im.Sig, im.MarshalCBORForSigning, logPrefix) {
+		return false
+	}
+	key := im.ManifestCID.String()
+	incrementMetric(&metrics.messagesReceived)
+	if logPrefix != "IngestMessage" {
+		log.Printf("[Sharding] Received Ingest message from old shard during overlap: %s", key[:min(16, len(key))]+"...")
+	}
+	addKnownFile(key)
+	if !withReplicationWorker(sm.ctx, func() {
+		checkReplication(sm.ctx, key)
+	}) {
+		return false
+	}
+	return true
+}
+
+// handleReplicationRequest processes a ReplicationRequest after CBOR unmarshaling.
+// It performs authorization, signature verification, and enqueues replication checking.
+// The logPrefix parameter allows customizing log messages (e.g., "ReplicationRequest" vs "ReplicationRequest (old shard overlap)").
+func (sm *ShardManager) handleReplicationRequest(msg *pubsub.Message, rr *schema.ReplicationRequest, logPrefix string) bool {
+	if verifyAndAuthorizeMessage(sm.h, msg.GetFrom(), rr.SenderID, rr.Timestamp, rr.Nonce, rr.Sig, rr.MarshalCBORForSigning, logPrefix) {
+		return false
+	}
+	key := rr.ManifestCID.String()
+	incrementMetric(&metrics.messagesReceived)
+	if logPrefix != "ReplicationRequest" {
+		log.Printf("[Sharding] Received ReplicationRequest from old shard during overlap: %s", key[:min(16, len(key))]+"...")
+	}
+	addKnownFile(key)
+	if !withReplicationWorker(sm.ctx, func() {
+		checkReplication(sm.ctx, key)
+	}) {
+		return false
+	}
+	return true
 }
 
 func (sm *ShardManager) readShard() {
@@ -237,53 +294,89 @@ func (sm *ShardManager) readShard() {
 
 		sm.mu.Lock()
 		sm.msgCounter++
-		shouldSplit := sm.msgCounter > MaxShardLoad
-		if shouldSplit {
-			sm.msgCounter = 0
-		}
 		sm.mu.Unlock()
 
-		if shouldSplit {
-			sm.splitShard()
+		msgType, err := decodeCBORMessageType(msg.Data)
+		if err != nil {
+			continue
 		}
 
-		data := string(msg.Data)
-		if strings.HasPrefix(data, "NEED:") {
-			hash := strings.TrimPrefix(data, "NEED:")
-			if validateHash(hash) {
-				incrementMetric(&metrics.messagesReceived)
-				addKnownFile(hash)
-				select {
-				case replicationWorkers <- struct{}{}:
-					go func(h string) {
-						defer func() { <-replicationWorkers }()
-						checkReplication(sm.ctx, h)
-					}(hash)
-				case <-sm.ctx.Done():
-					return
-				}
+		switch msgType {
+		case schema.MessageTypeIngest:
+			var im schema.IngestMessage
+			if err := im.UnmarshalCBOR(msg.Data); err != nil {
+				continue
 			}
-		} else if strings.HasPrefix(data, "NEW:") {
-			hash := strings.TrimPrefix(data, "NEW:")
-			if validateHash(hash) {
-				incrementMetric(&metrics.messagesReceived)
-				addKnownFile(hash)
-				select {
-				case replicationWorkers <- struct{}{}:
-					go func(h string) {
-						defer func() { <-replicationWorkers }()
-						checkReplication(sm.ctx, h)
-					}(hash)
-				case <-sm.ctx.Done():
-					return
-				}
+			if !sm.handleIngestMessage(msg, &im, "IngestMessage") {
+				return
+			}
+
+		case schema.MessageTypeReplicationRequest:
+			var rr schema.ReplicationRequest
+			if err := rr.UnmarshalCBOR(msg.Data); err != nil {
+				continue
+			}
+			if !sm.handleReplicationRequest(msg, &rr, "ReplicationRequest") {
+				return
 			}
 		}
 	}
 }
 
+// getShardPeerCount returns the estimated number of peers in the current shard topic.
+// This is an estimate because GossipSub only reports peers it knows about.
+func (sm *ShardManager) getShardPeerCount() int {
+	sm.mu.RLock()
+	topic := sm.shardTopic
+	sm.mu.RUnlock()
+
+	if topic == nil {
+		return 0
+	}
+
+	// ListPeers returns peers subscribed to this topic (excluding self)
+	peers := topic.ListPeers()
+	count := len(peers)
+	// Add 1 for self (we're subscribed but not in the list)
+	return count + 1
+}
+
+func (sm *ShardManager) checkAndSplitIfNeeded() {
+	// Rate-limit how often we check to avoid hammering GossipSub APIs.
+	sm.mu.Lock()
+	now := time.Now()
+	if now.Sub(sm.lastPeerCheck) < ShardPeerCheckInterval {
+		sm.mu.Unlock()
+		return
+	}
+	sm.lastPeerCheck = now
+	currentShard := sm.currentShard
+	sm.mu.Unlock()
+
+	peerCount := sm.getShardPeerCount()
+
+	// Estimate peers per shard after split (roughly half)
+	estimatedPeersAfterSplit := peerCount / 2
+
+	// Check if we should split:
+	// 1. Current shard exceeds max peers
+	// 2. After split, each new shard would have at least MinPeersPerShard
+	shouldSplit := peerCount > MaxPeersPerShard && estimatedPeersAfterSplit >= MinPeersPerShard
+
+	if shouldSplit {
+		log.Printf("[Sharding] Shard %s has %d peers (threshold: %d). Splitting...", currentShard, peerCount, MaxPeersPerShard)
+		sm.splitShard()
+	} else if peerCount > MaxPeersPerShard {
+		log.Printf("[Sharding] Shard %s has %d peers but cannot split (would create shards with < %d peers each)", currentShard, peerCount, MinPeersPerShard)
+	} else if peerCount > 0 {
+		// Debug logging: show peer count occasionally
+		log.Printf("[Sharding] Shard %s peer count: %d/%d (checking every %v)", currentShard, peerCount, MaxPeersPerShard, ShardPeerCheckInterval)
+	}
+}
+
 func (sm *ShardManager) splitShard() {
 	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
 	currentDepth := len(sm.currentShard)
 	nextDepth := currentDepth + 1
@@ -292,12 +385,16 @@ func (sm *ShardManager) splitShard() {
 	peerIDHash := getBinaryPrefix(sm.h.ID().String(), nextDepth)
 	sm.currentShard = peerIDHash
 	sm.oldShardName = oldShard
+	sm.msgCounter = 0
 
 	incrementMetric(&metrics.shardSplits)
 	log.Printf("[Sharding] Split shard to depth %d: %s -> %s (entering overlap state)", nextDepth, oldShard, sm.currentShard)
 
+	// Release the lock before rejoining topics to avoid deadlocks; joinChannels
+	// will acquire its own locks as needed.
 	sm.mu.Unlock()
 	sm.joinChannels()
+	sm.mu.Lock()
 }
 
 func (sm *ShardManager) readOldShard() {
@@ -350,38 +447,26 @@ func (sm *ShardManager) readOldShard() {
 			continue
 		}
 
-		data := string(msg.Data)
-		if strings.HasPrefix(data, "NEED:") {
-			hash := strings.TrimPrefix(data, "NEED:")
-			if validateHash(hash) {
-				incrementMetric(&metrics.messagesReceived)
-				log.Printf("[Sharding] Received NEED message from old shard during overlap: %s", hash[:16]+"...")
-				addKnownFile(hash)
-				select {
-				case replicationWorkers <- struct{}{}:
-					go func(h string) {
-						defer func() { <-replicationWorkers }()
-						checkReplication(sm.ctx, h)
-					}(hash)
-				case <-sm.ctx.Done():
-					return
-				}
+		msgType, err := decodeCBORMessageType(msg.Data)
+		if err != nil {
+			continue
+		}
+		switch msgType {
+		case schema.MessageTypeIngest:
+			var im schema.IngestMessage
+			if err := im.UnmarshalCBOR(msg.Data); err != nil {
+				continue
 			}
-		} else if strings.HasPrefix(data, "NEW:") {
-			hash := strings.TrimPrefix(data, "NEW:")
-			if validateHash(hash) {
-				incrementMetric(&metrics.messagesReceived)
-				log.Printf("[Sharding] Received NEW message from old shard during overlap: %s", hash[:16]+"...")
-				addKnownFile(hash)
-				select {
-				case replicationWorkers <- struct{}{}:
-					go func(h string) {
-						defer func() { <-replicationWorkers }()
-						checkReplication(sm.ctx, h)
-					}(hash)
-				case <-sm.ctx.Done():
-					return
-				}
+			if !sm.handleIngestMessage(msg, &im, "IngestMessage (old shard overlap)") {
+				return
+			}
+		case schema.MessageTypeReplicationRequest:
+			var rr schema.ReplicationRequest
+			if err := rr.UnmarshalCBOR(msg.Data); err != nil {
+				continue
+			}
+			if !sm.handleReplicationRequest(msg, &rr, "ReplicationRequest (old shard overlap)") {
+				return
 			}
 		}
 	}
@@ -434,6 +519,21 @@ func (sm *ShardManager) PublishToShard(msg string) {
 	}
 }
 
+func (sm *ShardManager) PublishToShardCBOR(data []byte) {
+	sm.mu.RLock()
+	topic := sm.shardTopic
+	inOverlap := sm.inOverlap
+	oldTopic := sm.oldShardTopic
+	sm.mu.RUnlock()
+
+	if topic != nil {
+		_ = topic.Publish(sm.ctx, data)
+	}
+	if inOverlap && oldTopic != nil {
+		_ = oldTopic.Publish(sm.ctx, data)
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -451,11 +551,38 @@ func (sm *ShardManager) PublishToControl(msg string) {
 	}
 }
 
-func (sm *ShardManager) AmIResponsibleFor(hash string) bool {
+func (sm *ShardManager) PublishToControlCBOR(data []byte) {
+	sm.mu.RLock()
+	topic := sm.controlTopic
+	sm.mu.RUnlock()
+	if topic != nil {
+		_ = topic.Publish(sm.ctx, data)
+	}
+}
+
+func (sm *ShardManager) AmIResponsibleFor(key string) bool {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-	prefix := getHexBinaryPrefix(hash, len(sm.currentShard))
+	// V2 keys are ManifestCID strings (not 64-hex). Use stable hashing for sharding.
+	prefix := getHexBinaryPrefix(keyToStableHex(key), len(sm.currentShard))
 	return prefix == sm.currentShard
+}
+
+func decodeCBORMessageType(data []byte) (schema.MessageType, error) {
+	nb := basicnode.Prototype.Any.NewBuilder()
+	if err := dagcbor.Decode(nb, bytes.NewReader(data)); err != nil {
+		return 0, err
+	}
+	node := nb.Build()
+	tn, err := node.LookupByString("type")
+	if err != nil {
+		return 0, err
+	}
+	ti, err := tn.AsInt()
+	if err != nil {
+		return 0, err
+	}
+	return schema.MessageType(ti), nil
 }
 
 func (sm *ShardManager) Close() {

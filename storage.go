@@ -6,6 +6,8 @@ import (
 	"time"
 )
 
+// pinFile is the legacy V1 function that takes a SHA-256 hash and converts it to CID.
+// For V2, use pinFileV2 which takes a ManifestCID string directly.
 func pinFile(hash string) bool {
 	fileCid, err := hashToCid(hash)
 	if err != nil {
@@ -19,77 +21,83 @@ func pinFile(hash string) bool {
 		return false
 	}
 
-	pinnedFiles.Lock()
-	defer pinnedFiles.Unlock()
-	if !pinnedFiles.hashes[hash] {
-		pinnedFiles.hashes[hash] = true
+	if pinnedFiles.Add(hash) {
 		updateMetrics(func() {
-			metrics.pinnedFilesCount = len(pinnedFiles.hashes)
+			metrics.pinnedFilesCount = pinnedFiles.Size()
 		})
-		log.Printf("[Storage] Pinned file: %s (total pinned: %d)", hash[:16]+"...", len(pinnedFiles.hashes))
+		log.Printf("[Storage] Pinned file: %s (total pinned: %d)", hash[:16]+"...", pinnedFiles.Size())
 		return true
 	}
 	return true
 }
 
-func unpinFile(hash string) {
-	pinnedFiles.Lock()
-	defer pinnedFiles.Unlock()
-	if pinnedFiles.hashes[hash] {
-		delete(pinnedFiles.hashes, hash)
+// unpinFile removes a file/manifest from the pinned set.
+// The key parameter can be either a legacy SHA-256 hash (V1) or a ManifestCID string (V2).
+func unpinFile(key string) {
+	if pinnedFiles.Has(key) {
+		pinnedFiles.Remove(key)
 		updateMetrics(func() {
-			metrics.pinnedFilesCount = len(pinnedFiles.hashes)
+			metrics.pinnedFilesCount = pinnedFiles.Size()
 		})
-		log.Printf("[Storage] Unpinned file: %s (remaining pinned: %d)", hash[:16]+"...", len(pinnedFiles.hashes))
+		log.Printf("[Storage] Unpinned file: %s (remaining pinned: %d)", key[:16]+"...", pinnedFiles.Size())
 	}
 }
 
-func isPinned(hash string) bool {
-	pinnedFiles.RLock()
-	defer pinnedFiles.RUnlock()
-	return pinnedFiles.hashes[hash]
+// isPinned checks if a file/manifest is pinned.
+// The key parameter can be either a legacy SHA-256 hash (V1) or a ManifestCID string (V2).
+func isPinned(key string) bool {
+	return pinnedFiles.Has(key)
 }
 
-func addKnownFile(hash string) {
-	recentlyRemoved.RLock()
-	removedTime, wasRemoved := recentlyRemoved.hashes[hash]
-	recentlyRemoved.RUnlock()
+// addKnownFile adds a file/manifest to the known files set.
+// The key parameter can be either a legacy SHA-256 hash (V1) or a ManifestCID string (V2).
+func addKnownFile(key string) {
+	removedTime, wasRemoved := recentlyRemoved.WasRemoved(key)
 	if wasRemoved && time.Since(removedTime) < RemovedFileCooldown {
 		return
 	}
 
-	knownFiles.Lock()
-	defer knownFiles.Unlock()
-	knownFiles.hashes[hash] = true
+	knownFiles.Add(key)
 	updateMetrics(func() {
-		metrics.knownFilesCount = len(knownFiles.hashes)
+		metrics.knownFilesCount = knownFiles.Size()
 	})
 }
 
-func removeKnownFile(hash string) {
-	knownFiles.Lock()
-	defer knownFiles.Unlock()
-	delete(knownFiles.hashes, hash)
+// removeKnownFile removes a file/manifest from the known files set.
+// The key parameter can be either a legacy SHA-256 hash (V1) or a ManifestCID string (V2).
+func removeKnownFile(key string) {
+	knownFiles.Remove(key)
 	updateMetrics(func() {
-		metrics.knownFilesCount = len(knownFiles.hashes)
+		metrics.knownFilesCount = knownFiles.Size()
 	})
 
-	fileReplicationLevels.Lock()
-	delete(fileReplicationLevels.levels, hash)
-	fileReplicationLevels.Unlock()
+	fileReplicationLevels.Remove(key)
 
-	recentlyRemoved.Lock()
-	recentlyRemoved.hashes[hash] = time.Now()
-	recentlyRemoved.Unlock()
+	recentlyRemoved.Record(key)
 }
 
-func provideFile(ctx context.Context, hash string) {
-	c, err := hashToCid(hash)
+// provideFile announces a file/manifest to the DHT.
+// The key parameter can be either a legacy SHA-256 hash (V1) or a ManifestCID string (V2).
+func provideFile(ctx context.Context, key string) {
+	c, err := keyToCID(key)
 	if err != nil {
-		log.Printf("[Error] Failed to convert hash to CID: %v", err)
+		log.Printf("[Error] Failed to convert key to CID: %v", err)
 		return
 	}
 	if globalDHT != nil {
 		_ = globalDHT.Provide(ctx, c, true)
 	}
+}
+
+// pinFileV2 is the V2 version that works with ManifestCID strings
+// It tracks the ManifestCID in our internal state (for now, still using hash map)
+func pinFileV2(manifestCIDStr string) bool {
+	if pinnedFiles.Add(manifestCIDStr) {
+		updateMetrics(func() {
+			metrics.pinnedFilesCount = pinnedFiles.Size()
+		})
+		log.Printf("[Storage] Pinned ManifestCID: %s (total pinned: %d)", manifestCIDStr[:16]+"...", pinnedFiles.Size())
+		return true
+	}
+	return true
 }

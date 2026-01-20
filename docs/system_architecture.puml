@@ -13,6 +13,8 @@ package "D-LOCKSS Node" {
     [Rate Limiter] as rateLimit
     [Backoff Manager] as backoff
     [Discovery Service] as discovery
+    [IPFS Client] as ipfsClient
+    [Signing & Trust] as signingTrust
 }
 
 package "libp2p Stack" {
@@ -40,21 +42,28 @@ main --> metrics : collects
 main --> rateLimit : uses
 main --> backoff : uses
 main --> discovery : initializes
+main --> signingTrust : initializes
 
 shardMgr --> pubsub : subscribes/publishes
 shardMgr --> host : uses
+shardMgr --> signingTrust : verifies messages
 
 fileOps --> storage : pins/unpins
 fileOps --> shardMgr : checks responsibility
 fileOps --> dht : provides files
 fileOps --> watcher : triggered by
+fileOps --> ipfsClient : imports/pins\nResearchObjects
+fileOps --> signingTrust : signs manifests/messages
 
 replChecker --> dht : queries providers
 replChecker --> shardMgr : publishes NEED
 replChecker --> storage : manages pins
 replChecker --> backoff : checks backoff
+replChecker --> ipfsClient : verifies DAG\nand sizes
+replChecker --> signingTrust : verifies manifests
 
 storage --> dht : provides files
+storage --> ipfsClient : pin/unpin DAGs
 
 metrics --> storage : reads state
 metrics --> replChecker : tracks stats

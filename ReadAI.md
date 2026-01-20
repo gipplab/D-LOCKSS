@@ -16,7 +16,7 @@ The code must adhere to the following strict specifications, logical structures,
 All configuration must be environment-variable driven with sensible defaults. Implement helper functions `getEnvString`, `getEnvInt`, `getEnvDuration`, and `getEnvFloat` that read environment variables and return defaults if not set. Log all active configuration on startup using `logConfiguration()`.
 
 **Configuration Variables:**
-* Control Topic: "dlockss-creative-commons-control" (env: `DLOCKSS_CONTROL_TOPIC`)
+* Control Topic: "dlockss-v2-creative-commons-control" (env: `DLOCKSS_CONTROL_TOPIC`)
 * Discovery Tag: "dlockss-v2-prod" (env: `DLOCKSS_DISCOVERY_TAG`)
 * Watch Folder: "./data" (env: `DLOCKSS_DATA_DIR`)
 * **Replication Rules:** Minimum = 5, Maximum = 10 (env: `DLOCKSS_MIN_REPLICATION`, `DLOCKSS_MAX_REPLICATION`)
@@ -82,23 +82,24 @@ Create a struct named `ShardManager` to handle dynamic topic switching. It must 
 
 **ShardManager Methods:**
 * **New:** Factory function to initialize and join channels
-* **joinChannels:** Subscribe to static Control topic. Subscribe to dynamic Shard topic (`dlockss-creative-commons-shard-{prefix}`). Reset `msgCounter`. Must properly clean up old subscriptions before creating new ones using synchronization (shardDone channel) to prevent resource leaks
-* **readControl:** Loop listening for "DELEGATE:{hash}:{prefix}" messages. Validate message format. Apply rate limiting. If target prefix matches node's current shard prefix, add hash to `knownFiles` and launch replication check
-* **readShard:** Loop listening for messages. Validate message format. Apply rate limiting. Increment `msgCounter`. If it exceeds `MaxShardLoad`, immediately reset counter to zero and trigger `splitShard` synchronously (not in goroutine). Handle "NEED:{hash}" and "NEW:{hash}" messages by adding to `knownFiles` and launching replication check
+* **joinChannels:** Subscribe to static Control topic. Subscribe to dynamic Shard topic (`dlockss-v2-creative-commons-shard-{prefix}`). Reset `msgCounter`. Must properly clean up old subscriptions before creating new ones using synchronization (shardDone channel) to prevent resource leaks
+* **readControl:** Loop decoding CBOR `DelegateMessage`. Apply rate limiting and disk-pressure checks for custodial requests. If target shard matches node's current shard prefix, add ManifestCID to `knownFiles` and launch replication check.
+* **readShard:** Loop decoding CBOR messages. Apply rate limiting. Increment `msgCounter` and trigger `splitShard` when overloaded. Handle `IngestMessage` and `ReplicationRequest` by adding ManifestCID to `knownFiles` and launching replication check.
 * **splitShard:** Calculate next binary bit based on node's Peer ID hash at next depth. Update current shard prefix and call `joinChannels` synchronously
-* **AmIResponsibleFor:** Boolean check comparing file hash's binary prefix against node's current shard prefix
-* **Publish helpers:** Methods to publish strings to current shard or control topic
+* **AmIResponsibleFor:** Boolean check comparing a stable hash of the ManifestCID string against node's current shard prefix
+* **Publish helpers:** Methods to publish CBOR bytes to shard/control topics
 * **Close:** Gracefully close all subscriptions and clean up resources
 
 ### 9. File Handling & Custodial Logic
 Implement `processNewFile(path)` with "Custodial" logic:
 1. Validate file path (prevent path traversal attacks using `filepath.Abs` and prefix checks)
-2. Calculate SHA256 hash with error handling
-3. **Immediate Pin:** Always pin file locally and provide it to DHT immediately with timeout context
+2. Import file into IPFS UnixFS DAG → PayloadCID
+3. Build `ResearchObject` (CBOR), store as dag-cbor block → ManifestCID
+4. **Recursive Pin:** Pin ManifestCID recursively (pins payload DAG)
 4. Add to `knownFiles` (check `recentlyRemoved` cooldown first)
 5. **Routing:**
-   * If responsible: Announce "NEW:{hash}" to Shard
-   * If *not* responsible: Announce "DELEGATE:{hash}:{target_prefix}" to Control, but keep file pinned (Custodial Mode)
+   * If responsible: Announce CBOR `IngestMessage` to Shard
+   * If *not* responsible: Announce CBOR `DelegateMessage` to Control, but keep file pinned (Custodial Mode)
 
 ### 10. The Replication Checker (Core Logic)
 Implement `checkReplication(ctx, hash)` with comprehensive logic:
@@ -108,15 +109,16 @@ Implement `checkReplication(ctx, hash)` with comprehensive logic:
 4. **Backoff Check:** Skip if operation is in backoff period
 5. Determine if node is `responsible` and if file is `pinned`
 6. **Tracking Cleanup:** If node is neither responsible nor pinning file, remove from `knownFiles` and return
-7. **DHT Query:** Find providers with 2-minute timeout context, limit iteration to MaxReplication+5
+7. **DHT Query:** Find providers for ManifestCID with 2-minute timeout context, limit iteration to MaxReplication+5
 8. **Store Replication Level:** Update `fileReplicationLevels` map with actual count
 9. **Convergence Tracking:** If count >= MinReplication && count <= MaxReplication, check if first time reaching target and record in `fileConvergenceTime`, increment convergence metrics
 10. **Case 1 (Low Redundancy):** If count < MinReplication:
-    * If responsible (or custodial), re-pin file locally and provide to DHT
-    * Broadcast "NEED:{hash}" to shard
+    * If responsible (or custodial), re-pin ManifestCID locally (recursive) and provide to DHT
+    * Broadcast CBOR `ReplicationRequest` to shard
 11. **Case 2 (Garbage Collection):**
-    * If responsible AND count > MaxReplication AND pinned: Unpin file (log as "Monitoring only"). If count > MaxReplication+3, remove from tracking
-    * If *not* responsible (Custodial) AND count >= MinReplication AND pinned: Unpin file (log as "Handoff Complete")
+    * If responsible AND count > MaxReplication AND pinned: Unpin ManifestCID (recursive). If count > MaxReplication+3, remove from tracking
+    * If *not* responsible (Custodial) AND count >= MinReplication AND pinned: Unpin ManifestCID (handoff complete)
+12. **DAG Verification + Liar Detection:** When pinned locally, verify manifest decodes, payload is pinned, and payload size matches `TotalSize`. If mismatch, unpin recursively and drop.
 12. **Update Metrics:** Increment replication checks, success/failures, update distribution counters
 13. **Record Check Time:** Update `lastCheckTime` for cooldown tracking
 

@@ -24,22 +24,23 @@ Instead of a central controller, the network uses a Distributed Hash Table (DHT)
 
 | RAID Concept | D-LOCKSS Equivalent | Implementation Details |
 | :--- | :--- | :--- |
-| **Striping** | **Sharding** | The `ShardManager` assigns binary prefixes (e.g., `01*`, `11*`) to nodes. A node only permanently stores files whose SHA-256 hash matches its assigned prefix. |
+| **Striping** | **Sharding** | The `ShardManager` assigns binary prefixes (e.g., `01*`, `11*`) to nodes. Responsibility is determined from a **stable hash of the `ManifestCID` string** (so V2 CIDs shard deterministically). |
 | **Redundancy** | **Replication** | The system enforces a `MinReplication` of 5 and `MaxReplication` of 10. |
-| **Scrubbing** | **Replication Checker** | A background process (`runReplicationChecker`) scans known CIDs every 1 minute. Uses hysteresis (dual-query verification) to prevent false alarms. If redundancy < 5, it triggers a `NEED` broadcast; if > 10, it drops the file to save space. |
-| **Write Cache** | **Custodial Mode** | If a node receives a file it *should not* own, it holds it temporarily ("Custodial Mode") and broadcasts a `DELEGATE` message to find the correct owner, ensuring no data loss during transit. |
+| **Scrubbing** | **Replication Checker** | A background process (`runReplicationChecker`) scans known **ManifestCIDs** every 1 minute. Uses hysteresis (dual-query verification) to prevent false alarms. If redundancy < 5, it broadcasts a **CBOR `ReplicationRequest`**; if > 10, it unpins locally to save space. |
+| **Write Cache** | **Custodial Mode** | If a node ingests an object it *should not* own, it holds it temporarily ("Custodial Mode") and broadcasts a **CBOR `DelegateMessage`** to find the responsible shard. |
 
 ### B. Core Components
 
 1.  **Shard Manager:**
-      * Monitors network load (`MaxShardLoad`).
-      * Dynamically splits responsibilities (e.g., if handling `0*` becomes too heavy, it splits into `00*` and `01*`).
+      * Monitors peer count in shard topics (default: checks every 30 seconds).
+      * Dynamically splits responsibilities when peer count exceeds threshold (e.g., if shard `0*` has >150 peers, it splits into `00*` and `01*`).
+      * Prevents over-splitting by ensuring each new shard has at least `MinPeersPerShard` peers (default: 50).
       * Implements **Shard Overlap State**: During shard splits, maintains dual subscription to both old and new shard topics for a configurable duration to prevent message loss.
-      * Manages PubSub topics: `dlockss-creative-commons-control` (delegation) and `dlockss-creative-commons-shard-{prefix}` (data announcements).
+      * Manages PubSub topics: `dlockss-v2-creative-commons-control` (delegation) and `dlockss-v2-creative-commons-shard-{prefix}` (data announcements).
 2.  **File Watcher:**
       * Monitors the `./data` directory recursively using `fsnotify`.
       * Automatically watches all subdirectories and adds new ones as they are created.
-      * Automatically hashes, pins, and announces new files dropped anywhere in the directory tree.
+      * Automatically imports new files into IPFS (UnixFS), builds a `ResearchObject` manifest, pins recursively, and announces the **ManifestCID**.
       * Checks **BadBits** list before pinning to enforce DMCA takedowns.
 3.  **Discovery:**
       * Uses MDNS for local peer discovery (`dlockss-v2-prod`).
@@ -64,6 +65,7 @@ Instead of a central controller, the network uses a Distributed Hash Table (DHT)
 ### Prerequisites
 
   * **Go 1.20** or later installed.
+  * A running **IPFS daemon** (default API address: `/ip4/127.0.0.1/tcp/5001`).
   * A working internet connection.
   * An environment allowing P2P connections (ports 4001/tcp/udp and multicast enabled for MDNS).
 
@@ -135,12 +137,30 @@ export DLOCKSS_DISK_USAGE_HIGH_WATER_MARK=90.0
 # Shard overlap duration (prevents message loss during splits)
 export DLOCKSS_SHARD_OVERLAP_DURATION=2m
 
+# Shard peer count thresholds (peer-count-based splitting)
+export DLOCKSS_MAX_PEERS_PER_SHARD=150    # Split when shard exceeds this many peers
+export DLOCKSS_MIN_PEERS_PER_SHARD=50     # Don't split if result would be below this
+export DLOCKSS_SHARD_PEER_CHECK_INTERVAL=30s  # How often to check peer count
+
 # Replication verification delay (hysteresis)
 export DLOCKSS_REPLICATION_VERIFICATION_DELAY=30s
+
+# DHT sampling and replication cache
+export DLOCKSS_DHT_MAX_SAMPLE_SIZE=50
+export DLOCKSS_REPLICATION_CACHE_TTL=5m
+
+# IPFS API address
+export DLOCKSS_IPFS_NODE=/ip4/127.0.0.1/tcp/5001
 
 # Rate limiting
 export DLOCKSS_RATE_LIMIT_WINDOW=1m
 export DLOCKSS_MAX_MESSAGES_PER_WINDOW=100
+
+# Trust store / signatures
+export DLOCKSS_TRUST_MODE=open            # open | allowlist
+export DLOCKSS_TRUST_STORE=trusted_peers.json
+export DLOCKSS_SIGNATURE_MODE=warn        # off | warn | strict
+export DLOCKSS_SIGNATURE_MAX_AGE=10m
 
 # See config.go for all available options
 ```
@@ -150,8 +170,8 @@ You will see logs indicating the node is online, the shard it is managing, and t
 ```text
 --- Node ID: 12D3KooW... ---
 --- Addresses: [/ip4/192.168.1.5/tcp/34567 ...] ---
-[System] Joined Control Channel: dlockss-creative-commons-control
-[Sharding] Active Data Shard: 0 (Topic: dlockss-creative-commons-shard-0)
+[System] Joined Control Channel: dlockss-v2-creative-commons-control
+[Sharding] Active Data Shard: 0 (Topic: dlockss-v2-creative-commons-shard-0)
 [BadBits] Loaded 3 blocked CID entries from badBits.csv
 [StorageMonitor] Disk usage: 45.2% (Total: 500GB, Free: 275GB). Pressure: false
 Scanning for existing files...
@@ -163,22 +183,53 @@ Scanning for existing files...
 1.  **Add a File:**
     Copy any PDF document into the `./data` directory.
 2.  **Ingestion:**
-    Within seconds, the application will detect the file, hash it, check BadBits, and determine responsibility.
-      * **BadBits Check:** If the CID is blocked for the node's country, pinning is refused and logged.
-      * **If Responsible:** It pins the file and announces "NEW:{hash}" to its shard.
-      * **If Not Responsible:** It enters **Custodial Mode**, announcing "DELEGATE:{hash}" to the control topic.
+    Within seconds, the application will detect the file and ingest a **ResearchObject**:
+      * Import file into IPFS (UnixFS) → **PayloadCID**
+      * Build `ResearchObject` → store as **dag-cbor** block in IPFS → **ManifestCID**
+      * Pin recursively (ManifestCID → PayloadCID DAG)
+      * **BadBits Check:** If the **ManifestCID** is blocked for the node's country, the ingest is refused.
+      * **If Responsible:** It announces a CBOR **`IngestMessage`** with the ManifestCID to its shard.
+      * **If Not Responsible:** It enters **Custodial Mode**, announcing a CBOR **`DelegateMessage`** to the control topic.
       * **Storage Protection:** If disk usage is high (>90%), custodial requests are rejected, but responsible files are still accepted.
 3.  **Replication:**
     The replication checker runs every 1 minute:
       * **Hysteresis:** Under-replication triggers a verification delay (default: 30s) before broadcasting NEED messages to prevent false alarms from transient DHT issues.
       * **Dual Query:** Two DHT queries confirm under-replication before triggering replication requests.
+      * **DHT Sampling:** Each DHT lookup samples up to a bounded number of providers (`DLOCKSS_DHT_MAX_SAMPLE_SIZE`) instead of scanning the entire network.
+      * **Replication Cache:** Successful replication counts are cached per ManifestCID for a short TTL (`DLOCKSS_REPLICATION_CACHE_TTL`) to avoid redundant DHT queries for stable objects.
       * **Backoff:** Failed operations use exponential backoff to prevent network storms.
+      * **DAG Verification:** A file is only considered replicated if both the **ManifestCID** and its **PayloadCID** are pinned locally.
+      * **Liar Detection:** If payload size differs from manifest `TotalSize`, the node unpins the manifest recursively and drops it.
 4.  **Shard Splits:**
-    When a shard becomes overloaded (>2000 messages):
+    When a shard becomes overloaded (exceeds `MaxPeersPerShard` peers, default: 150):
+      * **Peer Count Monitoring:** Periodically checks peer count in shard topic (default: every 30 seconds).
+      * **Split Conditions:** Splits when peer count > `MaxPeersPerShard` AND estimated peers after split >= `MinPeersPerShard` (default: 50).
       * **Overlap State:** Node maintains subscription to both old and new shard topics for 2 minutes to prevent message loss during transition.
       * **Dual Publishing:** Messages are published to both topics during overlap period.
 5.  **Run a Second Peer:**
     Run `go run .` in a separate terminal (ensure a separate directory if testing on the same machine to avoid lock conflicts, or use containerization). The new peer will auto-discover the first peer, negotiate shards, and begin replication if the redundancy count is below 5.
+
+### Citation & Reference Graphing (Console)
+
+While the node is running, you can use stdin commands:
+
+- `resolve <ManifestCID>`: prints a JSON citation (title, authors, payload CID, refs, size, ingester, timestamp)
+- `bibtex <ManifestCID>`: prints a minimal BibTeX entry pointing at the payload CID
+- `refs <ManifestCID> [depth]`: prints a reference tree and an edge list (cycle-safe, depth-limited)
+
+### Security: Signed Messages & Manifests
+
+- All protocol messages (`IngestMessage`, `ReplicationRequest`, `DelegateMessage`) are:
+  - encoded as CBOR,
+  - include a `Timestamp` and random `Nonce`,
+  - and carry a cryptographic signature (`Sig`) from the sender's libp2p key.
+- Each `ResearchObject` manifest is also signed by the ingester:
+  - verification checks both **who** issued it and **whether** it has been tampered with.
+- Behavior is controlled via:
+  - `DLOCKSS_TRUST_MODE` (`open` or `allowlist`),
+  - `DLOCKSS_TRUST_STORE` (JSON file of allowed peer IDs),
+  - `DLOCKSS_SIGNATURE_MODE` (`off`, `warn`, `strict`),
+  - `DLOCKSS_SIGNATURE_MAX_AGE` (maximum accepted message age, e.g. `10m`).
 
 -----
 

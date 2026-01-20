@@ -50,7 +50,10 @@ func logConfiguration() {
 	log.Printf("[Config] Data Directory: %s", FileWatchFolder)
 	log.Printf("[Config] Replication: %d-%d", MinReplication, MaxReplication)
 	log.Printf("[Config] Check Interval: %v", CheckInterval)
-	log.Printf("[Config] Max Shard Load: %d", MaxShardLoad)
+	log.Printf("[Config] Max Shard Load: %d (deprecated, using peer count)", MaxShardLoad)
+	log.Printf("[Config] Max Peers Per Shard: %d (split threshold)", MaxPeersPerShard)
+	log.Printf("[Config] Min Peers Per Shard: %d (prevent over-splitting)", MinPeersPerShard)
+	log.Printf("[Config] Shard Peer Check Interval: %v", ShardPeerCheckInterval)
 	log.Printf("[Config] Max Concurrent Checks: %d", MaxConcurrentReplicationChecks)
 	log.Printf("[Config] Rate Limit: %d messages per %v", MaxMessagesPerWindow, RateLimitWindow)
 	log.Printf("[Config] Backoff: %v - %v (multiplier: %.1f)", InitialBackoffDelay, MaxBackoffDelay, BackoffMultiplier)
@@ -65,16 +68,26 @@ func logConfiguration() {
 	log.Printf("[Config] Shard Overlap Duration: %v", ShardOverlapDuration)
 	log.Printf("[Config] Replication Verification Delay: %v", ReplicationVerificationDelay)
 	log.Printf("[Config] Disk Usage High Water Mark: %.1f%%", DiskUsageHighWaterMark)
+	log.Printf("[Config] IPFS Node Address: %s", IPFSNodeAddress)
+	log.Printf("[Config] Trust Mode: %s", TrustMode)
+	log.Printf("[Config] Trust Store Path: %s", TrustStorePath)
+	log.Printf("[Config] Signature Mode: %s", SignatureMode)
+	log.Printf("[Config] Signature Max Age: %v", SignatureMaxAge)
+	log.Printf("[Config] DHT Max Sample Size: %d", DHTMaxSampleSize)
+	log.Printf("[Config] Replication Cache TTL: %v", ReplicationCacheTTL)
 }
 
 var (
-	ControlTopicName               = getEnvString("DLOCKSS_CONTROL_TOPIC", "dlockss-creative-commons-control")
+	ControlTopicName               = getEnvString("DLOCKSS_CONTROL_TOPIC", "dlockss-v2-creative-commons-control")
 	DiscoveryServiceTag            = getEnvString("DLOCKSS_DISCOVERY_TAG", "dlockss-v2-prod")
 	FileWatchFolder                = getEnvString("DLOCKSS_DATA_DIR", "./data")
 	MinReplication                 = getEnvInt("DLOCKSS_MIN_REPLICATION", 5)
 	MaxReplication                 = getEnvInt("DLOCKSS_MAX_REPLICATION", 10)
 	CheckInterval                  = getEnvDuration("DLOCKSS_CHECK_INTERVAL", 1*time.Minute)
-	MaxShardLoad                   = getEnvInt("DLOCKSS_MAX_SHARD_LOAD", 2000)
+	MaxShardLoad                   = getEnvInt("DLOCKSS_MAX_SHARD_LOAD", 2000)                           // Deprecated: kept for backward compatibility
+	MaxPeersPerShard               = getEnvInt("DLOCKSS_MAX_PEERS_PER_SHARD", 150)                       // Production default: split when shard exceeds this many peers
+	MinPeersPerShard               = getEnvInt("DLOCKSS_MIN_PEERS_PER_SHARD", 50)                        // Don't split if shard would drop below this
+	ShardPeerCheckInterval         = getEnvDuration("DLOCKSS_SHARD_PEER_CHECK_INTERVAL", 30*time.Second) // How often to check peer count
 	MaxConcurrentReplicationChecks = getEnvInt("DLOCKSS_MAX_CONCURRENT_CHECKS", 10)
 	RateLimitWindow                = getEnvDuration("DLOCKSS_RATE_LIMIT_WINDOW", 1*time.Minute)
 	MaxMessagesPerWindow           = getEnvInt("DLOCKSS_MAX_MESSAGES_PER_WINDOW", 100)
@@ -90,4 +103,11 @@ var (
 	ShardOverlapDuration           = getEnvDuration("DLOCKSS_SHARD_OVERLAP_DURATION", 2*time.Minute)
 	ReplicationVerificationDelay   = getEnvDuration("DLOCKSS_REPLICATION_VERIFICATION_DELAY", 30*time.Second)
 	DiskUsageHighWaterMark         = getEnvFloat("DLOCKSS_DISK_USAGE_HIGH_WATER_MARK", 90.0)
+	IPFSNodeAddress                = getEnvString("DLOCKSS_IPFS_NODE", "/ip4/127.0.0.1/tcp/5001")
+	TrustMode                      = getEnvString("DLOCKSS_TRUST_MODE", "open") // open | allowlist
+	TrustStorePath                 = getEnvString("DLOCKSS_TRUST_STORE", "trusted_peers.json")
+	SignatureMode                  = getEnvString("DLOCKSS_SIGNATURE_MODE", "warn") // off | warn | strict
+	SignatureMaxAge                = getEnvDuration("DLOCKSS_SIGNATURE_MAX_AGE", 10*time.Minute)
+	DHTMaxSampleSize               = getEnvInt("DLOCKSS_DHT_MAX_SAMPLE_SIZE", 50)                   // Max providers to query per DHT lookup
+	ReplicationCacheTTL            = getEnvDuration("DLOCKSS_REPLICATION_CACHE_TTL", 5*time.Minute) // How long to cache replication counts
 )

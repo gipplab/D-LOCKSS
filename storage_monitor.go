@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"log"
-	"os"
 	"sync"
 	"syscall"
 	"time"
@@ -49,20 +48,8 @@ func checkDiskUsage() float64 {
 		return usagePercent
 	}
 
-	absPath, err := os.Stat(FileWatchFolder)
-	if err != nil {
-		log.Printf("[Warning] Failed to stat data directory: %v", err)
-		return usagePercent
-	}
-
-	var path string
-	if absPath.IsDir() {
-		path = FileWatchFolder
-	} else {
-		path = FileWatchFolder
-	}
-
-	usage, err := getDiskUsagePercent(path)
+	// Use the data directory path directly; Statfs operates on the mount point.
+	usage, err := getDiskUsagePercent(FileWatchFolder)
 	if err != nil {
 		log.Printf("[Warning] Failed to check disk usage: %v", err)
 		return usagePercent

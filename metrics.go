@@ -69,13 +69,8 @@ func reportMetrics() {
 	dropRate := float64(metrics.messagesDropped) / minutes
 	checkRate := float64(metrics.replicationChecks) / minutes
 
-	rateLimiter.RLock()
-	activePeers := len(rateLimiter.peers)
-	rateLimiter.RUnlock()
-
-	failedOperations.RLock()
-	backoffCount := len(failedOperations.hashes)
-	failedOperations.RUnlock()
+	activePeers := rateLimiter.Size()
+	backoffCount := failedOperations.Size()
 
 	activeWorkers := MaxConcurrentReplicationChecks - len(replicationWorkers)
 	if activeWorkers < 0 {
@@ -91,11 +86,11 @@ func reportMetrics() {
 
 	metrics.RUnlock()
 
-	fileReplicationLevels.RLock()
+	levelsMap := fileReplicationLevels.All()
 	distribution := [11]int{}
 	totalFiles := 0
 	totalReplication := 0
-	for _, count := range fileReplicationLevels.levels {
+	for _, count := range levelsMap {
 		if count >= 10 {
 			distribution[10]++
 		} else {
@@ -104,7 +99,6 @@ func reportMetrics() {
 		totalFiles++
 		totalReplication += count
 	}
-	fileReplicationLevels.RUnlock()
 
 	avgReplication := 0.0
 	if totalFiles > 0 {
@@ -112,13 +106,11 @@ func reportMetrics() {
 	}
 
 	filesAtTarget := 0
-	fileReplicationLevels.RLock()
-	for _, count := range fileReplicationLevels.levels {
+	for _, count := range levelsMap {
 		if count >= MinReplication && count <= MaxReplication {
 			filesAtTarget++
 		}
 	}
-	fileReplicationLevels.RUnlock()
 
 	metrics.Lock()
 	metrics.replicationDistribution = distribution
@@ -264,13 +256,8 @@ func exportMetricsToFile(timestamp time.Time) {
 		shardMgr.mu.RUnlock()
 	}
 
-	rateLimiter.RLock()
-	rateLimitedPeers := len(rateLimiter.peers)
-	rateLimiter.RUnlock()
-
-	failedOperations.RLock()
-	backoffCount := len(failedOperations.hashes)
-	failedOperations.RUnlock()
+	rateLimitedPeers := rateLimiter.Size()
+	backoffCount := failedOperations.Size()
 
 	activeWorkers := MaxConcurrentReplicationChecks - len(replicationWorkers)
 	if activeWorkers < 0 {
