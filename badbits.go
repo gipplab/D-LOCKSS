@@ -4,6 +4,7 @@ import (
 	"encoding/csv"
 	"log"
 	"os"
+	"strings"
 	"sync"
 )
 
@@ -52,8 +53,11 @@ func loadBadBits(path string) error {
 		if len(record) < 2 {
 			continue
 		}
-		cid := record[0]
-		country := record[1]
+		cid := strings.TrimSpace(record[0])
+		country := strings.ToUpper(strings.TrimSpace(record[1]))
+		if cid == "" || country == "" {
+			continue
+		}
 
 		if badBits.cids[cid] == nil {
 			badBits.cids[cid] = make(map[string]bool)
@@ -74,6 +78,8 @@ func isCIDBlocked(cid string, country string) bool {
 		return false
 	}
 
+	cid = strings.TrimSpace(cid)
+	country = strings.ToUpper(strings.TrimSpace(country))
 	countries, exists := badBits.cids[cid]
 	if !exists {
 		return false

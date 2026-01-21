@@ -239,22 +239,48 @@ func (sm *ShardManager) handleIngestMessage(msg *pubsub.Message, im *schema.Inge
 
 // handleReplicationRequest processes a ReplicationRequest after CBOR unmarshaling.
 // It performs authorization, signature verification, and enqueues replication checking.
+// If AutoReplicationEnabled is true and the file is not pinned, it attempts to fetch and pin the file.
 // The logPrefix parameter allows customizing log messages (e.g., "ReplicationRequest" vs "ReplicationRequest (old shard overlap)").
 func (sm *ShardManager) handleReplicationRequest(msg *pubsub.Message, rr *schema.ReplicationRequest, logPrefix string) bool {
 	if verifyAndAuthorizeMessage(sm.h, msg.GetFrom(), rr.SenderID, rr.Timestamp, rr.Nonce, rr.Sig, rr.MarshalCBORForSigning, logPrefix) {
 		return false
 	}
 	key := rr.ManifestCID.String()
+	manifestCID := rr.ManifestCID
 	incrementMetric(&metrics.messagesReceived)
 	if logPrefix != "ReplicationRequest" {
 		log.Printf("[Sharding] Received ReplicationRequest from old shard during overlap: %s", key[:min(16, len(key))]+"...")
 	}
-	addKnownFile(key)
-	if !withReplicationWorker(sm.ctx, func() {
-		checkReplication(sm.ctx, key)
-	}) {
-		return false
+
+	// Attempt automatic replication if enabled and file is not pinned
+	if AutoReplicationEnabled && !isPinned(key) {
+		log.Printf("[Replication] Received replication request for %s, attempting to replicate...", key[:min(16, len(key))]+"...")
+
+		// Use replication worker pool to limit concurrent fetches
+		if !withReplicationWorker(sm.ctx, func() {
+			success, err := replicateFileFromRequest(sm.ctx, manifestCID)
+			if err != nil {
+				log.Printf("[Replication] Failed to replicate %s: %v", key[:min(16, len(key))]+"...", err)
+				recordFailedOperation(key)
+			} else if success {
+				log.Printf("[Replication] Successfully replicated %s", key[:min(16, len(key))]+"...")
+				clearBackoff(key)
+				// Trigger replication check to update metrics
+				checkReplication(sm.ctx, key)
+			}
+		}) {
+			return false
+		}
+	} else {
+		// File already pinned or auto-replication disabled, just check replication status
+		addKnownFile(key)
+		if !withReplicationWorker(sm.ctx, func() {
+			checkReplication(sm.ctx, key)
+		}) {
+			return false
+		}
 	}
+
 	return true
 }
 
@@ -510,12 +536,19 @@ func (sm *ShardManager) PublishToShard(msg string) {
 	sm.mu.RUnlock()
 
 	if topic != nil {
-		_ = topic.Publish(sm.ctx, []byte(msg))
+		if err := topic.Publish(sm.ctx, []byte(msg)); err != nil {
+			incrementMetric(&metrics.messagesDropped)
+			log.Printf("[PubSub] Failed to publish to shard topic: %v", err)
+		}
 	}
 
 	if inOverlap && oldTopic != nil {
-		_ = oldTopic.Publish(sm.ctx, []byte(msg))
-		log.Printf("[Sharding] Published to both shards during overlap: %s", msg[:min(20, len(msg))])
+		if err := oldTopic.Publish(sm.ctx, []byte(msg)); err != nil {
+			incrementMetric(&metrics.messagesDropped)
+			log.Printf("[PubSub] Failed to publish to old shard topic during overlap: %v", err)
+		} else {
+			log.Printf("[Sharding] Published to both shards during overlap: %s", msg[:min(20, len(msg))])
+		}
 	}
 }
 
@@ -527,10 +560,16 @@ func (sm *ShardManager) PublishToShardCBOR(data []byte) {
 	sm.mu.RUnlock()
 
 	if topic != nil {
-		_ = topic.Publish(sm.ctx, data)
+		if err := topic.Publish(sm.ctx, data); err != nil {
+			incrementMetric(&metrics.messagesDropped)
+			log.Printf("[PubSub] Failed to publish CBOR to shard topic: %v", err)
+		}
 	}
 	if inOverlap && oldTopic != nil {
-		_ = oldTopic.Publish(sm.ctx, data)
+		if err := oldTopic.Publish(sm.ctx, data); err != nil {
+			incrementMetric(&metrics.messagesDropped)
+			log.Printf("[PubSub] Failed to publish CBOR to old shard topic during overlap: %v", err)
+		}
 	}
 }
 
@@ -547,7 +586,10 @@ func (sm *ShardManager) PublishToControl(msg string) {
 	sm.mu.RUnlock()
 
 	if topic != nil {
-		_ = topic.Publish(sm.ctx, []byte(msg))
+		if err := topic.Publish(sm.ctx, []byte(msg)); err != nil {
+			incrementMetric(&metrics.messagesDropped)
+			log.Printf("[PubSub] Failed to publish to control topic: %v", err)
+		}
 	}
 }
 
@@ -556,7 +598,10 @@ func (sm *ShardManager) PublishToControlCBOR(data []byte) {
 	topic := sm.controlTopic
 	sm.mu.RUnlock()
 	if topic != nil {
-		_ = topic.Publish(sm.ctx, data)
+		if err := topic.Publish(sm.ctx, data); err != nil {
+			incrementMetric(&metrics.messagesDropped)
+			log.Printf("[PubSub] Failed to publish CBOR to control topic: %v", err)
+		}
 	}
 }
 

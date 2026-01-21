@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -47,6 +48,72 @@ func scanExistingFiles() {
 	log.Printf("[System] Found %d existing files (recursive scan).", fileCount)
 }
 
+// fileEventInfo tracks file metadata to detect actual content changes.
+type fileEventInfo struct {
+	size    int64
+	modTime time.Time
+	lastSeen time.Time
+}
+
+// shouldProcessFileEvent dedupes noisy fsnotify sequences (Create/Write/Rename bursts)
+// while allowing legitimate file modifications. Returns true if the file should be processed.
+// It checks file size + modification time to distinguish duplicate events from real changes.
+var fileEventDeduper = struct {
+	mu   sync.Mutex
+	info map[string]fileEventInfo
+}{
+	info: make(map[string]fileEventInfo),
+}
+
+func shouldProcessFileEvent(path string) bool {
+	const window = 2 * time.Second
+	now := time.Now()
+	
+	// Get current file metadata
+	info, err := os.Stat(path)
+	if err != nil {
+		// File doesn't exist or can't be stat'd - process anyway (might be deletion/rename)
+		return true
+	}
+	if info.IsDir() {
+		return false // Directories are handled separately
+	}
+	
+	currentSize := info.Size()
+	currentModTime := info.ModTime()
+	
+	fileEventDeduper.mu.Lock()
+	defer fileEventDeduper.mu.Unlock()
+	
+	// Check if we've seen this exact file content recently
+	if last, ok := fileEventDeduper.info[path]; ok {
+		// Same size + mtime within window = duplicate event, skip
+		if last.size == currentSize && 
+		   last.modTime.Equal(currentModTime) && 
+		   now.Sub(last.lastSeen) < window {
+			return false
+		}
+		// Different size or mtime = legitimate modification, process
+	}
+	
+	// Record this file state
+	fileEventDeduper.info[path] = fileEventInfo{
+		size:     currentSize,
+		modTime:   currentModTime,
+		lastSeen:  now,
+	}
+	
+	// Opportunistic cleanup to avoid unbounded growth
+	cutoff := now.Add(-10 * window)
+	for k, v := range fileEventDeduper.info {
+		if v.lastSeen.Before(cutoff) {
+			delete(fileEventDeduper.info, k)
+		}
+	}
+	
+	return true
+}
+
 // processNewFile imports a newly detected file into IPFS, builds a ResearchObject
 // manifest, pins it, and announces it to the D-LOCKSS network (V2 ingestion path).
 func processNewFile(path string) {
@@ -62,7 +129,11 @@ func processNewFile(path string) {
 		return
 	}
 
-	if !strings.HasPrefix(absPath, absWatch) {
+	// Prevent path traversal / prefix confusion:
+	// - filepath.Abs cleans .. segments
+	// - filepath.Rel ensures absPath is within absWatch (not just string-prefix)
+	rel, err := filepath.Rel(absWatch, absPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 		log.Printf("[Security] Rejected path outside watch folder: %s", path)
 		return
 	}
@@ -81,6 +152,10 @@ func processNewFile(path string) {
 	if err != nil {
 		log.Printf("[Error] Failed to import file to IPFS: %s: %v", path, err)
 		return
+	}
+	// If ingestion fails later, ensure we don't leak a pinned payload.
+	cleanupPayload := func() {
+		_ = ipfsClient.UnpinRecursive(ctx, payloadCID)
 	}
 
 	// Step 2: Get file size
@@ -128,12 +203,14 @@ func processNewFile(path string) {
 	manifestBytes, err := ro.MarshalCBOR()
 	if err != nil {
 		log.Printf("[Error] Failed to marshal ResearchObject: %v", err)
+		cleanupPayload()
 		return
 	}
 
 	manifestCID, err := ipfsClient.PutDagCBOR(ctx, manifestBytes)
 	if err != nil {
 		log.Printf("[Error] Failed to store manifest block in IPFS: %v", err)
+		cleanupPayload()
 		return
 	}
 
@@ -143,13 +220,15 @@ func processNewFile(path string) {
 	if isCIDBlocked(manifestCIDStr, NodeCountry) {
 		log.Printf("[FileOps] Refused to process file %s (blocked ManifestCID: %s)", path, manifestCIDStr[:16]+"...")
 		// Unpin the payload since we're rejecting it
-		_ = ipfsClient.UnpinRecursive(ctx, payloadCID)
+		cleanupPayload()
 		return
 	}
 
 	// Step 8: Pin recursively (ManifestCID will pin PayloadCID)
 	if err := ipfsClient.PinRecursive(ctx, manifestCID); err != nil {
 		log.Printf("[Error] Failed to pin ManifestCID recursively: %v", err)
+		// Best-effort cleanup: payload may be pinned from import.
+		cleanupPayload()
 		return
 	}
 
@@ -283,7 +362,9 @@ func watchFolder(ctx context.Context) {
 					}
 				} else if !info.IsDir() {
 					// New or updated file inside watched tree.
-					processNewFile(event.Name)
+					if shouldProcessFileEvent(event.Name) {
+						processNewFile(event.Name)
+					}
 				}
 			}
 		case err, ok := <-watcher.Errors:

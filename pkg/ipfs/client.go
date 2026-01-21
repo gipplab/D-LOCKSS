@@ -118,11 +118,19 @@ func (c *Client) UnpinRecursive(ctx context.Context, cid cid.Cid) error {
 
 // IsPinned checks if a CID is pinned.
 func (c *Client) IsPinned(ctx context.Context, cid cid.Cid) (bool, error) {
+	// Prefer a targeted pin/ls <cid> query to avoid enumerating all pins (which can be huge).
+	// go-ipfs-api v0.7.0 doesn't expose PinLs directly, but Shell.Request supports it.
+	var raw struct{ Keys map[string]ipfsapi.PinInfo }
+	if err := c.api.Request("pin/ls", cid.String()).Exec(ctx, &raw); err == nil {
+		_, ok := raw.Keys[cid.String()]
+		return ok, nil
+	}
+
+	// Fallback to enumerating all pins (may be expensive).
 	pins, err := c.api.Pins()
 	if err != nil {
 		return false, err
 	}
-
 	_, isPinned := pins[cid.String()]
 	return isPinned, nil
 }

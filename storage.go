@@ -85,7 +85,11 @@ func provideFile(ctx context.Context, key string) {
 		return
 	}
 	if globalDHT != nil {
-		_ = globalDHT.Provide(ctx, c, true)
+		if err := globalDHT.Provide(ctx, c, true); err != nil {
+			log.Printf("[DHT] Provide failed for %s: %v", key[:min(16, len(key))]+"...", err)
+			recordFailedOperation(key)
+			return
+		}
 	}
 }
 

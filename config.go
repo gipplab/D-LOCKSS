@@ -44,6 +44,26 @@ func getEnvFloat(key string, defaultValue float64) float64 {
 	return defaultValue
 }
 
+func getEnvBool(key string, defaultValue bool) bool {
+	if value := os.Getenv(key); value != "" {
+		if boolValue, err := strconv.ParseBool(value); err == nil {
+			return boolValue
+		}
+		log.Printf("[Config] Invalid boolean value for %s, using default: %v", key, defaultValue)
+	}
+	return defaultValue
+}
+
+func getEnvUint64(key string, defaultValue uint64) uint64 {
+	if value := os.Getenv(key); value != "" {
+		if uintValue, err := strconv.ParseUint(value, 10, 64); err == nil {
+			return uintValue
+		}
+		log.Printf("[Config] Invalid uint64 value for %s, using default: %d", key, defaultValue)
+	}
+	return defaultValue
+}
+
 func logConfiguration() {
 	log.Printf("[Config] Control Topic: %s", ControlTopicName)
 	log.Printf("[Config] Discovery Tag: %s", DiscoveryServiceTag)
@@ -75,6 +95,13 @@ func logConfiguration() {
 	log.Printf("[Config] Signature Max Age: %v", SignatureMaxAge)
 	log.Printf("[Config] DHT Max Sample Size: %d", DHTMaxSampleSize)
 	log.Printf("[Config] Replication Cache TTL: %v", ReplicationCacheTTL)
+	log.Printf("[Config] Auto Replication Enabled: %v", AutoReplicationEnabled)
+	if AutoReplicationMaxSize > 0 {
+		log.Printf("[Config] Auto Replication Max Size: %d bytes", AutoReplicationMaxSize)
+	} else {
+		log.Printf("[Config] Auto Replication Max Size: unlimited")
+	}
+	log.Printf("[Config] Auto Replication Timeout: %v", AutoReplicationTimeout)
 }
 
 var (
@@ -108,6 +135,9 @@ var (
 	TrustStorePath                 = getEnvString("DLOCKSS_TRUST_STORE", "trusted_peers.json")
 	SignatureMode                  = getEnvString("DLOCKSS_SIGNATURE_MODE", "warn") // off | warn | strict
 	SignatureMaxAge                = getEnvDuration("DLOCKSS_SIGNATURE_MAX_AGE", 10*time.Minute)
-	DHTMaxSampleSize               = getEnvInt("DLOCKSS_DHT_MAX_SAMPLE_SIZE", 50)                   // Max providers to query per DHT lookup
-	ReplicationCacheTTL            = getEnvDuration("DLOCKSS_REPLICATION_CACHE_TTL", 5*time.Minute) // How long to cache replication counts
+	DHTMaxSampleSize               = getEnvInt("DLOCKSS_DHT_MAX_SAMPLE_SIZE", 50)                      // Max providers to query per DHT lookup
+	ReplicationCacheTTL            = getEnvDuration("DLOCKSS_REPLICATION_CACHE_TTL", 5*time.Minute)    // How long to cache replication counts
+	AutoReplicationEnabled         = getEnvBool("DLOCKSS_AUTO_REPLICATION_ENABLED", true)              // Enable automatic replication on ReplicationRequest
+	AutoReplicationMaxSize         = getEnvUint64("DLOCKSS_AUTO_REPLICATION_MAX_SIZE", 0)              // Max file size for auto-replication (0 = unlimited)
+	AutoReplicationTimeout         = getEnvDuration("DLOCKSS_AUTO_REPLICATION_TIMEOUT", 5*time.Minute) // Timeout for fetching files during replication
 )

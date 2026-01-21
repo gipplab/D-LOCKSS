@@ -243,7 +243,11 @@ func checkReplication(ctx context.Context, key string) {
 
 func pinKeyV2(ctx context.Context, key string, manifestCID cid.Cid) error {
 	if ipfsClient != nil {
-		_ = ipfsClient.PinRecursive(ctx, manifestCID)
+		if err := ipfsClient.PinRecursive(ctx, manifestCID); err != nil {
+			log.Printf("[IPFS] PinRecursive failed for %s: %v", key[:min(16, len(key))]+"...", err)
+			recordFailedOperation(key)
+			return err
+		}
 	}
 	_ = pinFileV2(key)
 	return nil
@@ -251,9 +255,141 @@ func pinKeyV2(ctx context.Context, key string, manifestCID cid.Cid) error {
 
 func unpinKeyV2(ctx context.Context, key string, manifestCID cid.Cid) {
 	if ipfsClient != nil {
-		_ = ipfsClient.UnpinRecursive(ctx, manifestCID)
+		if err := ipfsClient.UnpinRecursive(ctx, manifestCID); err != nil {
+			log.Printf("[IPFS] UnpinRecursive failed for %s: %v", key[:min(16, len(key))]+"...", err)
+		}
 	}
 	unpinFile(key)
+}
+
+// replicateFileFromRequest attempts to fetch and pin a ResearchObject
+// when receiving a ReplicationRequest. Returns true if replication succeeded.
+func replicateFileFromRequest(ctx context.Context, manifestCID cid.Cid) (bool, error) {
+	if ipfsClient == nil {
+		return false, fmt.Errorf("IPFS client not initialized")
+	}
+
+	manifestCIDStr := manifestCID.String()
+
+	// Step 1: Check if already pinned
+	if isPinned(manifestCIDStr) {
+		log.Printf("[Replication] File %s already pinned, skipping fetch", manifestCIDStr[:min(16, len(manifestCIDStr))]+"...")
+		return true, nil
+	}
+
+	// Step 2: Check disk usage (respect storage limits)
+	if !canAcceptCustodialFile() {
+		usage := checkDiskUsage()
+		log.Printf("[Replication] Cannot replicate %s: disk usage high (%.1f%%)",
+			manifestCIDStr[:min(16, len(manifestCIDStr))]+"...", usage)
+		return false, fmt.Errorf("disk usage too high: %.1f%%", usage)
+	}
+
+	// Step 3: Create timeout context for replication
+	replCtx, replCancel := context.WithTimeout(ctx, AutoReplicationTimeout)
+	defer replCancel()
+
+	// Step 4: Fetch manifest block
+	manifestBytes, err := ipfsClient.GetBlock(replCtx, manifestCID)
+	if err != nil {
+		log.Printf("[Replication] Failed to fetch manifest %s: %v",
+			manifestCIDStr[:min(16, len(manifestCIDStr))]+"...", err)
+		return false, fmt.Errorf("fetch manifest: %w", err)
+	}
+
+	// Step 5: Decode and verify ResearchObject
+	var ro schema.ResearchObject
+	if err := ro.UnmarshalCBOR(manifestBytes); err != nil {
+		log.Printf("[Replication] Invalid manifest %s: %v",
+			manifestCIDStr[:min(16, len(manifestCIDStr))]+"...", err)
+		return false, fmt.Errorf("decode manifest: %w", err)
+	}
+
+	// Step 6: Check file size limit
+	if AutoReplicationMaxSize > 0 && ro.TotalSize > AutoReplicationMaxSize {
+		log.Printf("[Replication] File %s too large (%d bytes, max: %d), skipping replication",
+			manifestCIDStr[:min(16, len(manifestCIDStr))]+"...", ro.TotalSize, AutoReplicationMaxSize)
+		return false, fmt.Errorf("file too large: %d bytes (max: %d)", ro.TotalSize, AutoReplicationMaxSize)
+	}
+
+	// Step 7: Verify signature and authorization
+	if !signaturesDisabled() {
+		if err := authorizePeer(ro.IngestedBy); err != nil {
+			if handleSignatureError("ResearchObject trust", err) {
+				return false, fmt.Errorf("unauthorized peer: %w", err)
+			}
+		} else if shardMgr != nil && shardMgr.h != nil {
+			unsigned, err := ro.MarshalCBORForSigning()
+			if err != nil {
+				if handleSignatureError("ResearchObject marshal", err) {
+					return false, fmt.Errorf("marshal error: %w", err)
+				}
+			} else if handleSignatureError("ResearchObject signature",
+				verifySignedObject(shardMgr.h, ro.IngestedBy, ro.Timestamp, ro.Signature, unsigned)) {
+				return false, fmt.Errorf("signature verification failed")
+			}
+		}
+	}
+
+	// Step 8: Check BadBits
+	if isCIDBlocked(manifestCIDStr, NodeCountry) {
+		log.Printf("[Replication] Refused to replicate blocked CID: %s", manifestCIDStr[:min(16, len(manifestCIDStr))]+"...")
+		return false, fmt.Errorf("CID blocked in country %s", NodeCountry)
+	}
+
+	// Step 9: Fetch payload (IPFS will fetch recursively via Bitswap)
+	// Note: PinRecursive will trigger IPFS to fetch missing blocks
+	log.Printf("[Replication] Fetching and pinning payload %s for manifest %s",
+		ro.Payload.String()[:min(16, len(ro.Payload.String()))]+"...", manifestCIDStr[:min(16, len(manifestCIDStr))]+"...")
+	if err := ipfsClient.PinRecursive(replCtx, ro.Payload); err != nil {
+		log.Printf("[Replication] Failed to pin payload %s: %v",
+			ro.Payload.String()[:min(16, len(ro.Payload.String()))]+"...", err)
+		return false, fmt.Errorf("pin payload: %w", err)
+	}
+
+	// Step 10: Pin manifest recursively (ensures entire DAG is pinned)
+	if err := ipfsClient.PinRecursive(replCtx, manifestCID); err != nil {
+		log.Printf("[Replication] Failed to pin manifest %s: %v",
+			manifestCIDStr[:min(16, len(manifestCIDStr))]+"...", err)
+		// Unpin payload on failure
+		_ = ipfsClient.UnpinRecursive(ctx, ro.Payload)
+		return false, fmt.Errorf("pin manifest: %w", err)
+	}
+
+	// Step 11: Verify payload size (liar detection)
+	actualSize, err := ipfsClient.GetFileSize(replCtx, ro.Payload)
+	if err != nil {
+		log.Printf("[Replication] Warning: failed to verify payload size for %s: %v",
+			manifestCIDStr[:min(16, len(manifestCIDStr))]+"...", err)
+		// Continue despite error - size verification is best-effort
+	} else if ro.TotalSize != 0 && actualSize != ro.TotalSize {
+		log.Printf("[Security] Liar detection: payload size mismatch for %s (manifest=%d, actual=%d). Unpinning.",
+			manifestCIDStr[:min(16, len(manifestCIDStr))]+"...", ro.TotalSize, actualSize)
+		_ = ipfsClient.UnpinRecursive(ctx, manifestCID)
+		_ = ipfsClient.UnpinRecursive(ctx, ro.Payload)
+		return false, fmt.Errorf("payload size mismatch: manifest=%d, actual=%d", ro.TotalSize, actualSize)
+	}
+
+	// Step 12: Track in local state
+	if !pinFileV2(manifestCIDStr) {
+		log.Printf("[Replication] Failed to track ManifestCID: %s", manifestCIDStr[:min(16, len(manifestCIDStr))]+"...")
+		// File is pinned in IPFS but not tracked - this is recoverable
+	}
+
+	// Step 13: Provide to DHT
+	provideCtx, provideCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	go func() {
+		defer provideCancel()
+		provideFile(provideCtx, manifestCIDStr)
+	}()
+
+	// Step 14: Add to known files
+	addKnownFile(manifestCIDStr)
+
+	log.Printf("[Replication] Successfully replicated file %s (payload: %s, size: %d bytes)",
+		manifestCIDStr[:min(16, len(manifestCIDStr))]+"...", ro.Payload.String()[:min(16, len(ro.Payload.String()))]+"...", ro.TotalSize)
+
+	return true, nil
 }
 
 // verifyResearchObjectLocal verifies:
