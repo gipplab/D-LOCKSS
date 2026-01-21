@@ -17,6 +17,7 @@ const (
 	MessageTypeIngest MessageType = iota + 1
 	MessageTypeReplicationRequest
 	MessageTypeDelegate
+	MessageTypeUnreplicateRequest
 )
 
 // IngestMessage replaces the old "NEW:<hash>" string format.
@@ -55,6 +56,20 @@ type DelegateMessage struct {
 	Timestamp  int64       `cbor:"ts"`            // Unix timestamp
 	Nonce      []byte      `cbor:"nonce"`         // Random nonce for replay protection
 	Sig        []byte      `cbor:"sig"`           // Signature over canonical CBOR (excluding sig)
+}
+
+// UnreplicateRequest requests peers to drop over-replicated files.
+// Peers use deterministic selection (hash of ManifestCID + PeerID) to decide
+// if they should drop the file, ensuring distributed consensus without coordination.
+type UnreplicateRequest struct {
+	Type        MessageType `cbor:"type"`         // Always MessageTypeUnreplicateRequest
+	ManifestCID cid.Cid     `cbor:"manifest_cid"` // The CID of the ResearchObject to drop
+	ExcessCount int         `cbor:"excess_count"` // How many replicas need to be dropped (count - MaxReplication)
+	CurrentCount int        `cbor:"current_count"` // Current replication count (for verification)
+	SenderID    peer.ID     `cbor:"sender_id"`    // PeerID of the sender
+	Timestamp   int64       `cbor:"ts"`          // Unix timestamp
+	Nonce       []byte      `cbor:"nonce"`        // Random nonce for replay protection
+	Sig         []byte      `cbor:"sig"`          // Signature over canonical CBOR (excluding sig)
 }
 
 // MarshalCBOR serializes an IngestMessage to CBOR format.

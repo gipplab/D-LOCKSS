@@ -69,19 +69,22 @@ func reportMetrics() {
 	dropRate := float64(metrics.messagesDropped) / minutes
 	checkRate := float64(metrics.replicationChecks) / minutes
 
-	activePeers := rateLimiter.Size()
+	// Active peers are the peers currently subscribed to our shard topic
+	// (including self). This reflects actual replication neighborhood size,
+	// not just rate-limited peers.
+	currentShard, activePeers := getShardInfo()
+
+	// Rate-limited peers is a narrower metric: peers currently tracked by the
+	// rate limiter due to recent message activity.
+	rateLimitedPeers := rateLimiter.Size()
 	backoffCount := failedOperations.Size()
 
-	activeWorkers := ReplicationWorkers // Pipeline has fixed number of workers
+	// Track actual concurrent operations (files currently being checked)
+	// This is more accurate than reporting the configured worker count
+	activeWorkers := checkingFiles.Size()
+	maxWorkers := ReplicationWorkers // Maximum number of worker goroutines
 	if activeWorkers < 0 {
 		activeWorkers = 0
-	}
-
-	var currentShard string
-	if shardMgr != nil {
-		shardMgr.mu.RLock()
-		currentShard = shardMgr.currentShard
-		shardMgr.mu.RUnlock()
 	}
 
 	metrics.RUnlock()
@@ -134,9 +137,9 @@ func reportMetrics() {
 		msgRate, dropRate, activePeers)
 	log.Printf("[Metrics] DHT: queries=%d, timeouts=%d", metrics.dhtQueries, metrics.dhtQueryTimeouts)
 	log.Printf("[Metrics] Performance: worker_pool_active=%d/%d, checks_rate=%.1f/min",
-		activeWorkers, MaxConcurrentReplicationChecks, checkRate)
+		activeWorkers, maxWorkers, checkRate)
 	log.Printf("[Metrics] System: shard_splits=%d, current_shard=%s, rate_limited_peers=%d, files_in_backoff=%d",
-		metrics.shardSplits, currentShard, activePeers, backoffCount)
+		metrics.shardSplits, currentShard, rateLimitedPeers, backoffCount)
 
 	uptime := now.Sub(metrics.startTime)
 	log.Printf("[Metrics] Cumulative (since startup): uptime=%v, msgs=%d (dropped=%d), checks=%d (success=%d, failures=%d), dht_queries=%d (timeouts=%d), shard_splits=%d",
@@ -246,25 +249,19 @@ func exportMetricsToFile(timestamp time.Time) {
 		}
 	}
 
-	metrics.RLock()
-	uptime := timestamp.Sub(metrics.startTime).Seconds()
-
-	var currentShard string
-	if shardMgr != nil {
-		shardMgr.mu.RLock()
-		currentShard = shardMgr.currentShard
-		shardMgr.mu.RUnlock()
-	}
-
+	// Compute shard/peer metrics outside of metrics lock to avoid lock ordering issues.
+	currentShard, activePeers := getShardInfo()
 	rateLimitedPeers := rateLimiter.Size()
 	backoffCount := failedOperations.Size()
 
-	activeWorkers := ReplicationWorkers // Pipeline has fixed number of workers
+	// Track actual concurrent operations (files currently being checked)
+	activeWorkers := checkingFiles.Size()
 	if activeWorkers < 0 {
 		activeWorkers = 0
 	}
 
-	activePeers := rateLimitedPeers
+	metrics.RLock()
+	uptime := timestamp.Sub(metrics.startTime).Seconds()
 
 	record := []string{
 		timestamp.Format(time.RFC3339),

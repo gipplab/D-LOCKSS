@@ -23,7 +23,7 @@ class ShardManager {
     --
     + NewShardManager(...): *ShardManager
     + Run()
-    + AmIResponsibleFor(key): bool
+    + AmIResponsibleFor(key): bool  ' key is a content-based routing key (PayloadCID string)
     + PublishToShardCBOR(bytes)
     + PublishToControlCBOR(bytes)
     + splitShard()

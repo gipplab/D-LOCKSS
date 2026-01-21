@@ -3,7 +3,7 @@
 # Configuration
 # Reduced to 15 nodes for bandwidth-limited environments
 # Each node runs its own isolated IPFS daemon
-NODE_COUNT=50
+NODE_COUNT=30
 BASE_DIR="testnet_data"
 BINARY_NAME="dlockss-node"
 PID_FILE="active_nodes.pids"

@@ -73,7 +73,7 @@ This document lists all functional and non-functional requirements that form the
 ### SH-1: Shard Assignment
 - Must assign each node a binary prefix shard based on node's Peer ID
 - Must calculate initial shard using SHA-256 hash of Peer ID at depth 1
-- Must determine responsibility using a **stable hash of the ManifestCID string** (since ManifestCID is not 64-hex)
+- Must determine responsibility using a **stable hash of the PayloadCID string** (content-based, stable across ingests)
 - Must support dynamic shard prefix matching (prefix-based routing)
 
 ### SH-2: Shard Management
@@ -86,8 +86,9 @@ This document lists all functional and non-functional requirements that form the
 ### SH-3: Shard Splitting
 - Must monitor peer count in current shard topic periodically (default: every 30 seconds)
 - Must use GossipSub `ListPeers()` API to estimate peer count in shard
-- Must trigger shard split when peer count exceeds `MaxPeersPerShard` threshold (default: 150 peers)
-- Must prevent over-splitting: only split if estimated peers after split >= `MinPeersPerShard` (default: 50 peers)
+- Must trigger shard split when peer count exceeds replication-safe threshold (20 peers, 2× safety margin)
+- Must prevent over-splitting: only split if estimated peers after split >= 10 peers (2× MinReplication)
+- Must ensure shard splits never create shards that cannot achieve MinReplication targets
 - Must calculate next shard by increasing binary prefix depth
 - Must reset message counter after split
 - Must prevent infinite split loops (check if new shard equals old shard)
@@ -97,7 +98,7 @@ This document lists all functional and non-functional requirements that form the
 - Must clean up old subscription after overlap period expires
 
 ### SH-4: Responsibility Determination
-- Must determine responsibility for a **ManifestCID** based on stable hashing and prefix matching
+- Must determine responsibility for a file based on its **PayloadCID** using stable hashing and prefix matching
 - Must support prefix matching at variable depths
 
 ---

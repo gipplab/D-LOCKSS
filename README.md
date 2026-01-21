@@ -33,8 +33,9 @@ Instead of a central controller, the network uses a Distributed Hash Table (DHT)
 
 1.  **Shard Manager:**
       * Monitors peer count in shard topics (default: checks every 30 seconds).
-      * Dynamically splits responsibilities when peer count exceeds threshold (e.g., if shard `0*` has >150 peers, it splits into `00*` and `01*`).
-      * Prevents over-splitting by ensuring each new shard has at least `MinPeersPerShard` peers (default: 50).
+      * Dynamically splits responsibilities when peer count exceeds threshold (tied to replication requirements).
+      * Prevents over-splitting by ensuring each new shard has at least `MinPeersPerShard` nodes (default: 10).
+      * **Replication-Safe Splitting:** Only splits when each resulting shard can achieve `MinReplication` (5 copies).
       * Implements **Shard Overlap State**: During shard splits, maintains dual subscription to both old and new shard topics for a configurable duration to prevent message loss.
       * Manages PubSub topics: `dlockss-v2-creative-commons-control` (delegation) and `dlockss-v2-creative-commons-shard-{prefix}` (data announcements).
 2.  **File Watcher:**
@@ -137,9 +138,9 @@ export DLOCKSS_DISK_USAGE_HIGH_WATER_MARK=90.0
 # Shard overlap duration (prevents message loss during splits)
 export DLOCKSS_SHARD_OVERLAP_DURATION=2m
 
-# Shard peer count thresholds (peer-count-based splitting)
-export DLOCKSS_MAX_PEERS_PER_SHARD=150    # Split when shard exceeds this many peers
-export DLOCKSS_MIN_PEERS_PER_SHARD=50     # Don't split if result would be below this
+# Shard peer count thresholds (replication-safe splitting)
+export DLOCKSS_MAX_PEERS_PER_SHARD=20         # Split when shard exceeds this many peers (2x replication safety margin)
+export DLOCKSS_MIN_PEERS_PER_SHARD=10         # Don't split if result would be below this (2x MinReplication)
 export DLOCKSS_SHARD_PEER_CHECK_INTERVAL=30s  # How often to check peer count
 
 # Replication verification delay (hysteresis)
@@ -201,9 +202,11 @@ Scanning for existing files...
       * **DAG Verification:** A file is only considered replicated if both the **ManifestCID** and its **PayloadCID** are pinned locally.
       * **Liar Detection:** If payload size differs from manifest `TotalSize`, the node unpins the manifest recursively and drops it.
 4.  **Shard Splits:**
-    When a shard becomes overloaded (exceeds `MaxPeersPerShard` peers, default: 150):
+    When a shard becomes overloaded (exceeds replication-safe threshold):
+      * **Replication-Safe Thresholds:** `MaxPeersPerShard=20` (2× safety margin), `MinPeersPerShard=10` (2× MinReplication).
+      * **Safety Logic:** Ensures each shard always has enough nodes to achieve `MinReplication=5` copies, even after splits.
       * **Peer Count Monitoring:** Periodically checks peer count in shard topic (default: every 30 seconds).
-      * **Split Conditions:** Splits when peer count > `MaxPeersPerShard` AND estimated peers after split >= `MinPeersPerShard` (default: 50).
+      * **Split Conditions:** Splits when peer count > 20 AND estimated peers after split >= 10.
       * **Overlap State:** Node maintains subscription to both old and new shard topics for 2 minutes to prevent message loss during transition.
       * **Dual Publishing:** Messages are published to both topics during overlap period.
 5.  **Run a Second Peer:**

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log"
 	"sync"
@@ -256,7 +257,7 @@ func (sm *ShardManager) handleReplicationRequest(msg *pubsub.Message, rr *schema
 
 		// Directly replicate (bypass pipeline for immediate action on replication requests)
 		go func() {
-			success, err := replicateFileFromRequest(sm.ctx, manifestCID)
+			success, err := replicateFileFromRequest(sm.ctx, manifestCID, msg.GetFrom())
 			if err != nil {
 				log.Printf("[Replication] Failed to replicate %s: %v", key[:min(16, len(key))]+"...", err)
 				recordFailedOperation(key)
@@ -271,6 +272,51 @@ func (sm *ShardManager) handleReplicationRequest(msg *pubsub.Message, rr *schema
 		// File already pinned or auto-replication disabled, just ensure it's tracked
 		addKnownFile(key)
 		// Pipeline will pick up the new file on next scan
+	}
+
+	return true
+}
+
+// handleUnreplicateRequest processes an UnreplicateRequest message.
+// Peers use deterministic selection (hash of ManifestCID + PeerID) to decide
+// if they should drop the file, ensuring distributed consensus without coordination.
+func (sm *ShardManager) handleUnreplicateRequest(msg *pubsub.Message, ur *schema.UnreplicateRequest, logPrefix string) bool {
+	if verifyAndAuthorizeMessage(sm.h, msg.GetFrom(), ur.SenderID, ur.Timestamp, ur.Nonce, ur.Sig, ur.MarshalCBORForSigning, logPrefix) {
+		return false
+	}
+	key := ur.ManifestCID.String()
+	manifestCID := ur.ManifestCID
+	incrementMetric(&metrics.messagesReceived)
+
+	log.Printf("[Replication] Received UnreplicateRequest for %s (excess: %d, current: %d)", key[:min(16, len(key))]+"...", ur.ExcessCount, ur.CurrentCount)
+
+	// Only act if we're pinning this file
+	if !isPinned(key) {
+		log.Printf("[Replication] Not pinning %s, ignoring UnreplicateRequest", key[:min(16, len(key))]+"...")
+		return true
+	}
+
+	// Deterministic selection: hash(ManifestCID + PeerID) to decide if this peer should drop
+	// This ensures distributed consensus - all peers independently make the same decision
+	selectionKey := key + sm.h.ID().String()
+	hash := sha256.Sum256([]byte(selectionKey))
+	
+	// Use first 8 bytes of hash as a 64-bit integer for selection
+	// Select peers where (hash % currentCount) < excessCount
+	// This gives us approximately excessCount / currentCount probability per peer
+	var hashInt uint64
+	for i := 0; i < 8 && i < len(hash); i++ {
+		hashInt = (hashInt << 8) | uint64(hash[i])
+	}
+	
+	selected := (hashInt % uint64(ur.CurrentCount)) < uint64(ur.ExcessCount)
+	
+	if selected {
+		log.Printf("[Replication] Selected to drop over-replicated file %s (hash selection)", key[:min(16, len(key))]+"...")
+		unpinKeyV2(sm.ctx, key, manifestCID)
+		// Keep in knownFiles for monitoring, but unpinned
+	} else {
+		log.Printf("[Replication] Not selected to drop %s (hash selection)", key[:min(16, len(key))]+"...")
 	}
 
 	return true
@@ -337,6 +383,15 @@ func (sm *ShardManager) readShard() {
 			if !sm.handleReplicationRequest(msg, &rr, "ReplicationRequest") {
 				return
 			}
+
+		case schema.MessageTypeUnreplicateRequest:
+			var ur schema.UnreplicateRequest
+			if err := ur.UnmarshalCBOR(msg.Data); err != nil {
+				continue
+			}
+			if !sm.handleUnreplicateRequest(msg, &ur, "UnreplicateRequest") {
+				return
+			}
 		}
 	}
 }
@@ -357,6 +412,27 @@ func (sm *ShardManager) getShardPeerCount() int {
 	count := len(peers)
 	// Add 1 for self (we're subscribed but not in the list)
 	return count + 1
+}
+
+// getShardInfo returns the current shard ID and the estimated number of peers
+// subscribed to the shard topic (including self). It is safe to call from
+// other packages without manually locking shardMgr.
+func getShardInfo() (string, int) {
+	if shardMgr == nil {
+		return "", 0
+	}
+
+	shardMgr.mu.RLock()
+	topic := shardMgr.shardTopic
+	currentShard := shardMgr.currentShard
+	shardMgr.mu.RUnlock()
+
+	if topic == nil {
+		return currentShard, 0
+	}
+
+	peers := topic.ListPeers()
+	return currentShard, len(peers) + 1
 }
 
 func (sm *ShardManager) checkAndSplitIfNeeded() {
@@ -469,7 +545,10 @@ func (sm *ShardManager) RunReshardPass() {
 			continue
 		}
 
-		stableHex := keyToStableHex(key)
+		// Use PayloadCID for shard assignment (stable, content-based)
+		// ManifestCID includes timestamp/metadata and changes on every ingestion
+		payloadCIDStr := getPayloadCIDForShardAssignment(sm.ctx, key)
+		stableHex := keyToStableHex(payloadCIDStr)
 		targetOld := getHexBinaryPrefix(stableHex, oldDepth)
 		targetNew := getHexBinaryPrefix(stableHex, newDepth)
 
@@ -612,6 +691,15 @@ func (sm *ShardManager) readOldShard() {
 				continue
 			}
 			if !sm.handleReplicationRequest(msg, &rr, "ReplicationRequest (old shard overlap)") {
+				return
+			}
+
+		case schema.MessageTypeUnreplicateRequest:
+			var ur schema.UnreplicateRequest
+			if err := ur.UnmarshalCBOR(msg.Data); err != nil {
+				continue
+			}
+			if !sm.handleUnreplicateRequest(msg, &ur, "UnreplicateRequest (old shard overlap)") {
 				return
 			}
 		}

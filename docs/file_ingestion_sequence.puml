@@ -30,14 +30,14 @@ end
 FileOps -> DHT: provideFile(ManifestCID)
 FileOps -> Storage: addKnownFile(ManifestCID)
 
-FileOps -> ShardMgr: AmIResponsibleFor(ManifestCID)
+FileOps -> ShardMgr: AmIResponsibleFor(PayloadCID)
 
 alt Node is responsible
     FileOps -> PubSub: PublishToShard(IngestMessage CBOR)\n{manifest_cid, hint_size}
     PubSub -> Nodes: Broadcast IngestMessage
     Nodes -> Nodes: Add ManifestCID to knownFiles, check replication
 else Node is NOT responsible (Custodial Mode)
-    FileOps -> ShardMgr: target_shard = prefix(hash(ManifestCID))
+    FileOps -> ShardMgr: target_shard = prefix(hash(PayloadCID))
     FileOps -> PubSub: PublishToControl(DelegateMessage CBOR)\n{manifest_cid, target_shard}
     PubSub -> Nodes: Broadcast DelegateMessage
     Nodes -> Nodes: Responsible node accepts delegation

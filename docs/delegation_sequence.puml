@@ -8,7 +8,7 @@ participant "Replication Checker" as ReplChecker
 participant "IPFS" as IPFS
 participant "DHT" as DHT
 
-Custodial -> Custodial: processNewFile()\nManifestCID not in my shard
+Custodial -> Custodial: processNewFile()\nPayloadCID not in my shard (by shard routing)
 Custodial -> IPFS: PinRecursive(ManifestCID)\n[temporary custodial hold]
 Custodial -> DHT: provideFile(ManifestCID)
 Custodial -> Control: PublishToControl(DelegateMessage CBOR)\n{manifest_cid, target_shard}

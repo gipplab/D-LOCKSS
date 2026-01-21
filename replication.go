@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ipfs/go-cid"
+	"github.com/libp2p/go-libp2p/core/peer"
 
 	"dlockss/pkg/schema"
 )
@@ -83,12 +84,22 @@ func runScheduler(ctx context.Context, jobQueue chan<- CheckJob) {
 func scheduleJobs(ctx context.Context, jobQueue chan<- CheckJob) {
 	files := knownFiles.All()
 	for key := range files {
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
 		// Filter: Skip if recently checked or removed
 		if !shouldCheckFile(key) {
 			continue
 		}
 
-		responsible := shardMgr.AmIResponsibleFor(key)
+		// Use PayloadCID for shard assignment (stable, content-based)
+		// ManifestCID includes timestamp/metadata and changes on every ingestion
+		payloadCIDStr := getPayloadCIDForShardAssignment(ctx, key)
+		responsible := shardMgr.AmIResponsibleFor(payloadCIDStr)
 		pinned := isPinned(key)
 
 		// Filter: Cleanup if not responsible and not pinned
@@ -240,11 +251,22 @@ func reconcile(ctx context.Context, result CheckResult) {
 
 	incrementMetric(&metrics.replicationChecks)
 
-	if result.Err == context.DeadlineExceeded || (count == 0 && job.Responsible && !result.FromCache) {
+	// Only apply backoff for actual DHT query failures (timeouts), not for legitimate zero-count results
+	// Zero count with no cache might mean the file is new/unreplicated, which should trigger replication
+	// requests rather than backoff. Backoff should be reserved for network/DHT failures.
+	if result.Err == context.DeadlineExceeded {
 		incrementMetric(&metrics.replicationFailures)
 		recordFailedOperation(key)
-		log.Printf("[Backoff] DHT query failed for %s, applying backoff", key[:min(16, len(key))]+"...")
+		log.Printf("[Backoff] DHT query timeout for %s, applying backoff", key[:min(16, len(key))]+"...")
 		return
+	}
+
+	// If count is 0 and we're responsible, this might be under-replication, not a DHT failure
+	// Let the under-replication handler deal with it (it will trigger replication requests)
+	if count == 0 && job.Responsible && !result.FromCache {
+		// Don't apply backoff - this is likely legitimate under-replication
+		// The under-replication handler will deal with it below
+		log.Printf("[Replication] Zero providers found for responsible file %s (may be new/unreplicated)", key[:min(16, len(key))]+"...")
 	}
 
 	if !result.FromCache {
@@ -353,8 +375,28 @@ func handleOverReplication(ctx context.Context, job CheckJob, count int) {
 	log.Printf("[Replication] High Redundancy (%d/%d). Unpinning %s (Monitoring only)", count, MaxReplication, job.Key)
 	unpinKeyV2(ctx, job.Key, job.ManifestCID)
 	if count > MaxReplication+3 {
-		log.Printf("[Replication] Replication stable (%d), removing from tracking", count)
-		removeKnownFile(job.Key)
+		excessCount := count - MaxReplication
+		log.Printf("[Replication] Excessive replication (%d/%d, excess: %d). Broadcasting UnreplicateRequest for %s", count, MaxReplication, excessCount, job.Key[:min(16, len(job.Key))]+"...")
+
+		// Broadcast UnreplicateRequest to coordinate peers dropping excess replicas
+		ur := schema.UnreplicateRequest{
+			Type:         schema.MessageTypeUnreplicateRequest,
+			ManifestCID:  job.ManifestCID,
+			ExcessCount:  excessCount,
+			CurrentCount: count,
+		}
+		if err := signProtocolMessage(&ur); err != nil {
+			log.Printf("[Sig] Failed to sign UnreplicateRequest: %v", err)
+		}
+		b, err := ur.MarshalCBOR()
+		if err != nil {
+			log.Printf("[Error] Failed to marshal UnreplicateRequest: %v", err)
+			return
+		}
+		shardMgr.PublishToShardCBOR(b)
+
+		// Keep file in tracking to monitor if replication comes down
+		log.Printf("[Replication] Replication excessive (%d), keeping in tracking to monitor reduction", count)
 	}
 }
 
@@ -394,7 +436,11 @@ func unpinKeyV2(ctx context.Context, key string, manifestCID cid.Cid) {
 	unpinFile(key)
 }
 
-func replicateFileFromRequest(ctx context.Context, manifestCID cid.Cid) (bool, error) {
+// replicateFileFromRequest attempts to fetch and pin a ResearchObject when
+// receiving a ReplicationRequest. If a non-empty sender peer ID is provided,
+// it can be used as a provider hint by higher-level components or future
+// IPFS client enhancements to prioritize fetching from that peer.
+func replicateFileFromRequest(ctx context.Context, manifestCID cid.Cid, sender peer.ID) (bool, error) {
 	if ipfsClient == nil {
 		return false, fmt.Errorf("IPFS client not initialized")
 	}
@@ -418,6 +464,13 @@ func replicateFileFromRequest(ctx context.Context, manifestCID cid.Cid) (bool, e
 	// Step 3: Create timeout context for replication
 	replCtx, replCancel := context.WithTimeout(ctx, AutoReplicationTimeout)
 	defer replCancel()
+
+	// Note: At this layer we only log the sender as a potential provider hint.
+	// Future work can extend the IPFS client to take a peer.ID and use IPFS's
+	// provider system or direct connections to prefer fetching from that peer.
+	if sender != "" {
+		log.Printf("[Replication] Using sender %s as provider hint for %s", sender.String(), manifestCIDStr[:min(16, len(manifestCIDStr))]+"...")
+	}
 
 	// Step 4: Fetch manifest block
 	manifestBytes, err := ipfsClient.GetBlock(replCtx, manifestCID)

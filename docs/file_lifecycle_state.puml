@@ -2,11 +2,11 @@
 
 [*] --> Discovered: File detected in ./data
 
-Discovered --> Pinned: pinFile(hash)
+Discovered --> Pinned: pinFile(ManifestCID)
 Discovered --> Custodial: Not responsible\nbut holds temporarily
 
-Pinned --> Responsible: AmIResponsibleFor() == true
-Pinned --> Custodial: AmIResponsibleFor() == false
+Pinned --> Responsible: AmIResponsibleFor(PayloadCID) == true
+Pinned --> Custodial: AmIResponsibleFor(PayloadCID) == false
 
 Custodial --> Delegated: DELEGATE message sent
 Delegated --> HandoffComplete: Replication >= MinReplication

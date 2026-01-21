@@ -239,18 +239,15 @@ func processNewFile(path string) {
 		return
 	}
 
-	// Step 10: Provide to DHT
-	provideCtx, provideCancel := context.WithTimeout(context.Background(), DHTProvideTimeout)
-	go func() {
-		defer provideCancel()
-		provideFile(provideCtx, manifestKey)
-	}()
-
 	addKnownFile(manifestKey)
 
-	// Step 11: Determine responsibility and announce
-	if shardMgr.AmIResponsibleFor(manifestKey) {
-		log.Printf("[Core] I am responsible for ManifestCID %s. Announcing to Shard.", manifestCIDStr[:16]+"...")
+	// Step 10: Determine responsibility and announce
+	// CRITICAL: Use PayloadCID for shard assignment, not ManifestCID.
+	// PayloadCID is stable (content-based), while ManifestCID includes timestamp/metadata
+	// and changes on every ingestion, causing unstable shard assignment.
+	payloadCIDStr := payloadCID.String()
+	if shardMgr.AmIResponsibleFor(payloadCIDStr) {
+		log.Printf("[Core] I am responsible for PayloadCID %s (ManifestCID %s). Announcing to Shard.", payloadCIDStr[:16]+"...", manifestCIDStr[:16]+"...")
 		im := schema.IngestMessage{
 			Type:        schema.MessageTypeIngest,
 			ManifestCID: manifestCID,
@@ -266,9 +263,18 @@ func processNewFile(path string) {
 			return
 		}
 		shardMgr.PublishToShardCBOR(b)
+
+		// Responsible ingester: announce as provider to DHT.
+		// Non-responsible custodial nodes do NOT announce, so they don't
+		// show up as long-term replicas in replication accounting.
+		provideCtx, provideCancel := context.WithTimeout(context.Background(), DHTProvideTimeout)
+		go func() {
+			defer provideCancel()
+			provideFile(provideCtx, manifestKey)
+		}()
 	} else {
-		targetPrefix := getHexBinaryPrefix(keyToStableHex(manifestKey), len(shardMgr.currentShard))
-		log.Printf("[Core] Custodial Mode: %s belongs to shard %s. Delegating but holding...", manifestCIDStr[:16]+"...", targetPrefix)
+		targetPrefix := getHexBinaryPrefix(keyToStableHex(payloadCIDStr), len(shardMgr.currentShard))
+		log.Printf("[Core] Custodial Mode: PayloadCID %s (ManifestCID %s) belongs to shard %s. Delegating but holding...", payloadCIDStr[:16]+"...", manifestCIDStr[:16]+"...", targetPrefix)
 		dm := schema.DelegateMessage{
 			Type:        schema.MessageTypeDelegate,
 			ManifestCID: manifestCID,

@@ -15,8 +15,8 @@ loop For each known file
     alt In backoff period
         ReplChecker -> ReplChecker: Skip this file
     else Not in backoff
-        ReplChecker -> Storage: isPinned(hash)
-        ReplChecker -> ShardMgr: AmIResponsibleFor(hash)
+    ReplChecker -> Storage: isPinned(hash)  ' hash is ManifestCID string in tracking
+        ReplChecker -> ShardMgr: AmIResponsibleFor(PayloadCID)\n(extracted from manifest for stable routing)
         ReplChecker -> IPFS: Verify manifest+payload pinned\n(and decode manifest)
         alt Payload size mismatch (liar detection)
             ReplChecker -> IPFS: UnpinRecursive(ManifestCID)

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"math/big"
 	"sync"
 	"time"
 
@@ -275,11 +277,33 @@ func (bt *BackoffTable) RecordFailure(key string) {
 	backoff.mu.Lock()
 	defer backoff.mu.Unlock()
 
-	backoff.nextRetry = time.Now().Add(backoff.delay)
+	// Add exponential backoff with jitter to prevent thundering herd
 	backoff.delay = time.Duration(float64(backoff.delay) * BackoffMultiplier)
-
 	if backoff.delay > MaxBackoffDelay {
 		backoff.delay = MaxBackoffDelay
+	}
+	
+	// Add jitter: random variation between -25% and +25% of delay
+	// This spreads out retries when many operations fail simultaneously,
+	// preventing thundering herd problems where all retries happen at once
+	jitterRange := float64(backoff.delay) * 0.25
+	jitterRangeInt := int64(jitterRange * 2)
+	if jitterRangeInt > 0 {
+		// Generate random jitter between -jitterRange and +jitterRange
+		jitterVal, err := rand.Int(rand.Reader, big.NewInt(jitterRangeInt))
+		if err == nil {
+			jitter := time.Duration(jitterVal.Int64()) - time.Duration(jitterRange)
+			jitteredDelay := backoff.delay + jitter
+			if jitteredDelay < InitialBackoffDelay {
+				jitteredDelay = InitialBackoffDelay
+			}
+			backoff.nextRetry = time.Now().Add(jitteredDelay)
+		} else {
+			// Fallback if random generation fails
+			backoff.nextRetry = time.Now().Add(backoff.delay)
+		}
+	} else {
+		backoff.nextRetry = time.Now().Add(backoff.delay)
 	}
 }
 
@@ -339,6 +363,12 @@ func (cf *CheckingFiles) Unlock(key string) {
 	cf.mu.Lock()
 	defer cf.mu.Unlock()
 	delete(cf.m, key)
+}
+
+func (cf *CheckingFiles) Size() int {
+	cf.mu.RLock()
+	defer cf.mu.RUnlock()
+	return len(cf.m)
 }
 
 // LastCheckTime tracks when files were last checked for replication
