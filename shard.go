@@ -377,15 +377,16 @@ func (sm *ShardManager) checkAndSplitIfNeeded() {
 	estimatedPeersAfterSplit := peerCount / 2
 
 	// Check if we should split:
-	// 1. Current shard exceeds max peers
-	// 2. After split, each new shard would have at least MinPeersPerShard
+	// 1. Current shard exceeds max peers (tied to replication requirements)
+	// 2. After split, each new shard would have at least MinPeersPerShard nodes
+	// This ensures replication targets remain achievable after splits
 	shouldSplit := peerCount > MaxPeersPerShard && estimatedPeersAfterSplit >= MinPeersPerShard
 
 	if shouldSplit {
-		log.Printf("[Sharding] Shard %s has %d peers (threshold: %d). Splitting...", currentShard, peerCount, MaxPeersPerShard)
+		log.Printf("[Sharding] Shard %s has %d peers (threshold: %d). Splitting to ensure replication targets remain achievable...", currentShard, peerCount, MaxPeersPerShard)
 		sm.splitShard()
 	} else if peerCount > MaxPeersPerShard {
-		log.Printf("[Sharding] Shard %s has %d peers but cannot split (would create shards with < %d peers each)", currentShard, peerCount, MinPeersPerShard)
+		log.Printf("[Sharding] Shard %s has %d peers but cannot split (would create shards with < %d peers each, risking replication failures)", currentShard, peerCount, MinPeersPerShard)
 	} else if peerCount > 0 {
 		// Debug logging: show peer count occasionally
 		log.Printf("[Sharding] Shard %s peer count: %d/%d (checking every %v)", currentShard, peerCount, MaxPeersPerShard, ShardPeerCheckInterval)

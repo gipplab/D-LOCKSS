@@ -71,8 +71,8 @@ func logConfiguration() {
 	log.Printf("[Config] Replication: %d-%d", MinReplication, MaxReplication)
 	log.Printf("[Config] Check Interval: %v", CheckInterval)
 	log.Printf("[Config] Max Shard Load: %d (deprecated, using peer count)", MaxShardLoad)
-	log.Printf("[Config] Max Peers Per Shard: %d (split threshold)", MaxPeersPerShard)
-	log.Printf("[Config] Min Peers Per Shard: %d (prevent over-splitting)", MinPeersPerShard)
+	log.Printf("[Config] Max Peers Per Shard: %d (split threshold, ensures 2x replication safety)", MaxPeersPerShard)
+	log.Printf("[Config] Min Peers Per Shard: %d (minimum, ensures replication achievable)", MinPeersPerShard)
 	log.Printf("[Config] Shard Peer Check Interval: %v", ShardPeerCheckInterval)
 	log.Printf("[Config] Max Concurrent Checks: %d", MaxConcurrentReplicationChecks)
 	log.Printf("[Config] Rate Limit: %d messages per %v", MaxMessagesPerWindow, RateLimitWindow)
@@ -129,15 +129,18 @@ func logConfiguration() {
 }
 
 var (
-	ControlTopicName               = getEnvString("DLOCKSS_CONTROL_TOPIC", "dlockss-v2-creative-commons-control")
-	DiscoveryServiceTag            = getEnvString("DLOCKSS_DISCOVERY_TAG", "dlockss-v2-prod")
-	FileWatchFolder                = getEnvString("DLOCKSS_DATA_DIR", "./data")
-	MinReplication                 = getEnvInt("DLOCKSS_MIN_REPLICATION", 5)
-	MaxReplication                 = getEnvInt("DLOCKSS_MAX_REPLICATION", 10)
-	CheckInterval                  = getEnvDuration("DLOCKSS_CHECK_INTERVAL", 1*time.Minute)
-	MaxShardLoad                   = getEnvInt("DLOCKSS_MAX_SHARD_LOAD", 2000)                           // Deprecated: kept for backward compatibility
-	MaxPeersPerShard               = getEnvInt("DLOCKSS_MAX_PEERS_PER_SHARD", 150)                       // Production default: split when shard exceeds this many peers
-	MinPeersPerShard               = getEnvInt("DLOCKSS_MIN_PEERS_PER_SHARD", 50)                        // Don't split if shard would drop below this
+	ControlTopicName    = getEnvString("DLOCKSS_CONTROL_TOPIC", "dlockss-v2-creative-commons-control")
+	DiscoveryServiceTag = getEnvString("DLOCKSS_DISCOVERY_TAG", "dlockss-v2-prod")
+	FileWatchFolder     = getEnvString("DLOCKSS_DATA_DIR", "./data")
+	MinReplication      = getEnvInt("DLOCKSS_MIN_REPLICATION", 5)
+	MaxReplication      = getEnvInt("DLOCKSS_MAX_REPLICATION", 10)
+	CheckInterval       = getEnvDuration("DLOCKSS_CHECK_INTERVAL", 1*time.Minute)
+	MaxShardLoad        = getEnvInt("DLOCKSS_MAX_SHARD_LOAD", 2000) // Deprecated: kept for backward compatibility
+	// Shard splitting tied to replication requirements
+	// Must have 2 * MinReplication nodes per shard to ensure splits are safe
+	// Using hardcoded defaults: MinReplication=5, so split at 20, min 10 per shard
+	MaxPeersPerShard               = getEnvInt("DLOCKSS_MAX_PEERS_PER_SHARD", 20)                        // Split when shard exceeds 2*MinReplication*2 nodes (default: 20)
+	MinPeersPerShard               = getEnvInt("DLOCKSS_MIN_PEERS_PER_SHARD", 10)                        // Don't split if result would be below MinReplication*2 nodes (default: 10)
 	ShardPeerCheckInterval         = getEnvDuration("DLOCKSS_SHARD_PEER_CHECK_INTERVAL", 30*time.Second) // How often to check peer count
 	MaxConcurrentReplicationChecks = getEnvInt("DLOCKSS_MAX_CONCURRENT_CHECKS", 10)
 	RateLimitWindow                = getEnvDuration("DLOCKSS_RATE_LIMIT_WINDOW", 1*time.Minute)
