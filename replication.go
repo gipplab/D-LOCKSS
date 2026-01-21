@@ -103,7 +103,7 @@ func checkReplication(ctx context.Context, key string) {
 
 	// Query DHT if cache miss or expired
 	if !fromCache {
-		dhtCtx, dhtCancel := context.WithTimeout(ctx, 2*time.Minute)
+		dhtCtx, dhtCancel := context.WithTimeout(ctx, DHTQueryTimeout)
 		defer dhtCancel()
 
 		incrementMetric(&metrics.dhtQueries)

@@ -102,6 +102,23 @@ func logConfiguration() {
 		log.Printf("[Config] Auto Replication Max Size: unlimited")
 	}
 	log.Printf("[Config] Auto Replication Timeout: %v", AutoReplicationTimeout)
+
+	// File operation configuration
+	log.Printf("[Config] File Import Timeout: %v", FileImportTimeout)
+	log.Printf("[Config] DHT Provide Timeout: %v", DHTProvideTimeout)
+	log.Printf("[Config] File Processing Delay: %v", FileProcessingDelay)
+	log.Printf("[Config] File Retry Delay: %v", FileRetryDelay)
+
+	// Replication timeouts
+	log.Printf("[Config] DHT Query Timeout: %v", DHTQueryTimeout)
+
+	// Shard operation timeouts
+	log.Printf("[Config] Shard Subscription Timeout: %v", ShardSubscriptionTimeout)
+
+	// Cryptographic parameters
+	log.Printf("[Config] Nonce Size: %d bytes", NonceSize)
+	log.Printf("[Config] Min Nonce Size: %d bytes", MinNonceSize)
+	log.Printf("[Config] Future Skew Tolerance: %v", FutureSkewTolerance)
 }
 
 var (
@@ -140,4 +157,21 @@ var (
 	AutoReplicationEnabled         = getEnvBool("DLOCKSS_AUTO_REPLICATION_ENABLED", true)              // Enable automatic replication on ReplicationRequest
 	AutoReplicationMaxSize         = getEnvUint64("DLOCKSS_AUTO_REPLICATION_MAX_SIZE", 0)              // Max file size for auto-replication (0 = unlimited)
 	AutoReplicationTimeout         = getEnvDuration("DLOCKSS_AUTO_REPLICATION_TIMEOUT", 5*time.Minute) // Timeout for fetching files during replication
+
+	// File operation timeouts and delays
+	FileImportTimeout   = getEnvDuration("DLOCKSS_FILE_IMPORT_TIMEOUT", 2*time.Minute)          // Timeout for importing files to IPFS
+	DHTProvideTimeout   = getEnvDuration("DLOCKSS_DHT_PROVIDE_TIMEOUT", 30*time.Second)         // Timeout for providing files to DHT
+	FileProcessingDelay = getEnvDuration("DLOCKSS_FILE_PROCESSING_DELAY", 100*time.Millisecond) // Delay before processing new files
+	FileRetryDelay      = getEnvDuration("DLOCKSS_FILE_RETRY_DELAY", 200*time.Millisecond)      // Delay between file processing retries
+
+	// Replication timeouts
+	DHTQueryTimeout = getEnvDuration("DLOCKSS_DHT_QUERY_TIMEOUT", 2*time.Minute) // Timeout for DHT queries during replication checks
+
+	// Shard operation timeouts
+	ShardSubscriptionTimeout = getEnvDuration("DLOCKSS_SHARD_SUBSCRIPTION_TIMEOUT", 2*time.Second) // Timeout for shard subscription cleanup
+
+	// Cryptographic parameters
+	NonceSize           = getEnvInt("DLOCKSS_NONCE_SIZE", 16)                             // Size of cryptographic nonces in bytes
+	MinNonceSize        = getEnvInt("DLOCKSS_MIN_NONCE_SIZE", 8)                          // Minimum allowed nonce size
+	FutureSkewTolerance = getEnvDuration("DLOCKSS_FUTURE_SKEW_TOLERANCE", 30*time.Second) // Tolerance for future timestamps in signature verification
 )

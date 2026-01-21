@@ -115,7 +115,7 @@ func (sm *ShardManager) joinChannels() {
 			sm.mu.Unlock()
 			select {
 			case <-sm.shardDone:
-			case <-time.After(2 * time.Second):
+			case <-time.After(ShardSubscriptionTimeout):
 				log.Printf("[Warning] Timeout waiting for old shard subscription to close")
 			}
 		} else {

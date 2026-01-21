@@ -43,34 +43,34 @@ func loadTrustedPeers(path string) error {
 	return nil
 }
 
-func isPeerTrusted(id peer.ID) bool {
-	return trustedPeers.Has(id)
+func isPeerTrusted(peerID peer.ID) bool {
+	return trustedPeers.Has(peerID)
 }
 
 // authorizeIncomingSender enforces:
 // - SenderID must match libp2p's ReceivedFrom (prevents in-message spoofing)
 // - If TrustMode == "allowlist", sender must be present in trust store
-func authorizeIncomingSender(receivedFrom peer.ID, senderID peer.ID) error {
-	if senderID == "" {
+func authorizeIncomingSender(receivedFrom peer.ID, peerID peer.ID) error {
+	if peerID == "" {
 		return fmt.Errorf("missing sender_id")
 	}
-	if receivedFrom != "" && senderID != receivedFrom {
-		return fmt.Errorf("sender_id mismatch: sender_id=%s received_from=%s", senderID.String(), receivedFrom.String())
+	if receivedFrom != "" && peerID != receivedFrom {
+		return fmt.Errorf("sender_id mismatch: sender_id=%s received_from=%s", peerID.String(), receivedFrom.String())
 	}
-	if TrustMode == "allowlist" && !isPeerTrusted(senderID) {
-		return fmt.Errorf("sender not trusted: %s", senderID.String())
+	if TrustMode == "allowlist" && !isPeerTrusted(peerID) {
+		return fmt.Errorf("sender not trusted: %s", peerID.String())
 	}
 	return nil
 }
 
 // authorizePeer enforces allowlist-only mode for contexts where there is no ReceivedFrom
 // (e.g., verifying a stored ResearchObject manifest).
-func authorizePeer(senderID peer.ID) error {
-	if senderID == "" {
+func authorizePeer(peerID peer.ID) error {
+	if peerID == "" {
 		return fmt.Errorf("missing sender_id")
 	}
-	if TrustMode == "allowlist" && !isPeerTrusted(senderID) {
-		return fmt.Errorf("sender not trusted: %s", senderID.String())
+	if TrustMode == "allowlist" && !isPeerTrusted(peerID) {
+		return fmt.Errorf("sender not trusted: %s", peerID.String())
 	}
 	return nil
 }

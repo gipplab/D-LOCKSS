@@ -145,7 +145,7 @@ func processNewFile(path string) {
 	}
 
 	// Step 1: Import file to IPFS (get PayloadCID)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), FileImportTimeout)
 	defer cancel()
 
 	payloadCID, err := ipfsClient.ImportFile(ctx, path)
@@ -240,7 +240,7 @@ func processNewFile(path string) {
 	}
 
 	// Step 10: Provide to DHT
-	provideCtx, provideCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	provideCtx, provideCancel := context.WithTimeout(context.Background(), DHTProvideTimeout)
 	go func() {
 		defer provideCancel()
 		provideFile(provideCtx, manifestKey)
@@ -336,7 +336,7 @@ func watchFolder(ctx context.Context) {
 			}
 			// Treat Create, Write, and Rename as signals that new content is present.
 			if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Rename) != 0 {
-				time.Sleep(100 * time.Millisecond)
+				time.Sleep(FileProcessingDelay)
 				info, err := os.Stat(event.Name)
 				if err != nil {
 					continue
@@ -348,7 +348,7 @@ func watchFolder(ctx context.Context) {
 					} else {
 						log.Printf("[FileWatcher] Added watch for new directory: %s", event.Name)
 						go func(dirPath string) {
-							time.Sleep(200 * time.Millisecond)
+							time.Sleep(FileRetryDelay)
 							filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
 								if err != nil {
 									return nil

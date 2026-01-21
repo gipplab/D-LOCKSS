@@ -56,7 +56,7 @@ func signMessageEnvelope(marshalForSigning func() ([]byte, error), setSig func([
 }
 
 func signProtocolMessage(msg interface{}) error {
-	nonce, err := newNonce(16)
+	nonce, err := newNonce(NonceSize)
 	if err != nil {
 		return err
 	}
@@ -110,13 +110,13 @@ func verifySignedMessage(h host.Host, receivedFrom peer.ID, sender peer.ID, ts i
 	}
 	now := time.Now()
 	msgTime := time.Unix(ts, 0)
-	if msgTime.After(now.Add(30 * time.Second)) { // small future skew tolerance
+	if msgTime.After(now.Add(FutureSkewTolerance)) { // small future skew tolerance
 		return fmt.Errorf("timestamp too far in future: %v", msgTime)
 	}
 	if now.Sub(msgTime) > SignatureMaxAge {
 		return fmt.Errorf("message too old: age=%v", now.Sub(msgTime))
 	}
-	if len(nonce) < 8 {
+	if len(nonce) < MinNonceSize {
 		return fmt.Errorf("nonce too short")
 	}
 	if len(sig) == 0 {
@@ -157,7 +157,7 @@ func verifySignedObject(h host.Host, sender peer.ID, ts int64, sig []byte, unsig
 	}
 	now := time.Now()
 	msgTime := time.Unix(ts, 0)
-	if msgTime.After(now.Add(30 * time.Second)) {
+	if msgTime.After(now.Add(FutureSkewTolerance)) {
 		return fmt.Errorf("timestamp too far in future: %v", msgTime)
 	}
 	if len(sig) == 0 {
