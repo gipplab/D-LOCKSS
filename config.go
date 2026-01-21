@@ -126,6 +126,10 @@ func logConfiguration() {
 	log.Printf("[Config] Nonce Size: %d bytes", NonceSize)
 	log.Printf("[Config] Min Nonce Size: %d bytes", MinNonceSize)
 	log.Printf("[Config] Future Skew Tolerance: %v", FutureSkewTolerance)
+
+	// Reshard configuration
+	log.Printf("[Config] Reshard Batch Size: %d", ReshardBatchSize)
+	log.Printf("[Config] Reshard Delay After Split: %v", ReshardDelay)
 }
 
 var (
@@ -136,11 +140,11 @@ var (
 	MaxReplication      = getEnvInt("DLOCKSS_MAX_REPLICATION", 10)
 	CheckInterval       = getEnvDuration("DLOCKSS_CHECK_INTERVAL", 1*time.Minute)
 	MaxShardLoad        = getEnvInt("DLOCKSS_MAX_SHARD_LOAD", 2000) // Deprecated: kept for backward compatibility
-	// Shard splitting tied to replication requirements
-	// Must have 2 * MinReplication nodes per shard to ensure splits are safe
-	// Using hardcoded defaults: MinReplication=5, so split at 20, min 10 per shard
-	MaxPeersPerShard               = getEnvInt("DLOCKSS_MAX_PEERS_PER_SHARD", 20)                        // Split when shard exceeds 2*MinReplication*2 nodes (default: 20)
-	MinPeersPerShard               = getEnvInt("DLOCKSS_MIN_PEERS_PER_SHARD", 10)                        // Don't split if result would be below MinReplication*2 nodes (default: 10)
+	// Shard splitting tied to replication requirements.
+	// With MinReplication=5, we require at least 10 nodes per shard so that the
+	// replication target remains achievable even after a split.
+	MaxPeersPerShard               = getEnvInt("DLOCKSS_MAX_PEERS_PER_SHARD", 20)                        // Split when shard exceeds this many peers (default: 20)
+	MinPeersPerShard               = getEnvInt("DLOCKSS_MIN_PEERS_PER_SHARD", 10)                        // Don't split if result would be below this many peers (default: 10)
 	ShardPeerCheckInterval         = getEnvDuration("DLOCKSS_SHARD_PEER_CHECK_INTERVAL", 30*time.Second) // How often to check peer count
 	MaxConcurrentReplicationChecks = getEnvInt("DLOCKSS_MAX_CONCURRENT_CHECKS", 10)
 	RateLimitWindow                = getEnvDuration("DLOCKSS_RATE_LIMIT_WINDOW", 1*time.Minute)
@@ -188,6 +192,10 @@ var (
 	PipelineProberWorkers   = getEnvInt("DLOCKSS_PIPELINE_PROBER_WORKERS", 50)      // Number of concurrent DHT probers
 	PipelineJobQueueSize    = getEnvInt("DLOCKSS_PIPELINE_JOB_QUEUE_SIZE", 1000)    // Size of job channel buffer
 	PipelineResultQueueSize = getEnvInt("DLOCKSS_PIPELINE_RESULT_QUEUE_SIZE", 1000) // Size of result channel buffer
+
+	// Reshard configuration
+	ReshardBatchSize = getEnvInt("DLOCKSS_RESHARD_BATCH_SIZE", 200)           // Files per batch during reshard pass
+	ReshardDelay     = getEnvDuration("DLOCKSS_RESHARD_DELAY", 5*time.Second) // Delay after split before starting reshard pass
 
 	// Cryptographic parameters
 	NonceSize           = getEnvInt("DLOCKSS_NONCE_SIZE", 16)                             // Size of cryptographic nonces in bytes

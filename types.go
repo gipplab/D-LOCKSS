@@ -544,6 +544,11 @@ var (
 	pinnedFiles = NewPinnedSet()
 	knownFiles  = NewKnownFiles()
 
+	// reshardedFiles tracks which files have already been processed during
+	// a reshard pass after a shard split. This prevents duplicate work and
+	// duplicate announcements for the same ManifestCID.
+	reshardedFiles = NewKnownFiles()
+
 	globalDHT   *dht.IpfsDHT
 	shardMgr    *ShardManager
 	ipfsClient  *ipfs.Client

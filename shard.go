@@ -414,6 +414,133 @@ func (sm *ShardManager) splitShard() {
 	sm.mu.Unlock()
 	sm.joinChannels()
 	sm.mu.Lock()
+
+	// Schedule a reshard pass to re-evaluate responsibility for existing files
+	// at the new shard depth. Delay slightly to allow overlap state to settle.
+	go func() {
+		time.Sleep(ReshardDelay)
+		sm.RunReshardPass()
+	}()
+}
+
+// RunReshardPass walks knownFiles and re-evaluates responsibility for each
+// ManifestCID at the new shard depth after a split. It emits DelegateMessages
+// or IngestMessages as needed so that content is gradually redistributed to
+// the correct shards.
+func (sm *ShardManager) RunReshardPass() {
+	sm.mu.RLock()
+	currentShard := sm.currentShard
+	oldShard := sm.oldShardName
+	ctx := sm.ctx
+	sm.mu.RUnlock()
+
+	if ctx == nil {
+		return
+	}
+	if oldShard == "" {
+		// No previous shard recorded; nothing to do.
+		return
+	}
+
+	newDepth := len(currentShard)
+	oldDepth := len(oldShard)
+	if newDepth <= oldDepth {
+		// Depth did not actually increase; nothing to do.
+		return
+	}
+
+	files := knownFiles.All()
+	if len(files) == 0 {
+		return
+	}
+
+	log.Printf("[Reshard] Starting reshard pass for shard %s (old shard %s), files=%d", currentShard, oldShard, len(files))
+
+	batchCount := 0
+
+	for key := range files {
+		if ctx.Err() != nil {
+			log.Printf("[Reshard] Context canceled, stopping reshard pass")
+			return
+		}
+
+		// Skip files we've already processed in a previous reshard pass.
+		if reshardedFiles.Has(key) {
+			continue
+		}
+
+		stableHex := keyToStableHex(key)
+		targetOld := getHexBinaryPrefix(stableHex, oldDepth)
+		targetNew := getHexBinaryPrefix(stableHex, newDepth)
+
+		wasResponsible := (targetOld == oldShard)
+		isResponsible := (targetNew == currentShard)
+
+		// If responsibility didn't change with the new depth, just mark as processed.
+		if wasResponsible == isResponsible {
+			reshardedFiles.Add(key)
+			continue
+		}
+
+		manifestCID, err := keyToCID(key)
+		if err != nil {
+			log.Printf("[Reshard] Invalid key format during reshard: %s, error: %v", key, err)
+			reshardedFiles.Add(key)
+			continue
+		}
+
+		shortKey := key
+		if len(shortKey) > 16 {
+			shortKey = shortKey[:16] + "..."
+		}
+
+		switch {
+		// Case B: Node was responsible, now not responsible -> become custodial and delegate.
+		case wasResponsible && !isResponsible:
+			log.Printf("[Reshard] %s moved off my shard (%s -> %s). Delegating to shard %s", shortKey, oldShard, currentShard, targetNew)
+			dm := schema.DelegateMessage{
+				Type:        schema.MessageTypeDelegate,
+				ManifestCID: manifestCID,
+				TargetShard: targetNew,
+			}
+			if err := signProtocolMessage(&dm); err != nil {
+				log.Printf("[Reshard] Failed to sign DelegateMessage for %s: %v", shortKey, err)
+			} else if b, err := dm.MarshalCBOR(); err != nil {
+				log.Printf("[Reshard] Failed to marshal DelegateMessage for %s: %v", shortKey, err)
+			} else {
+				sm.PublishToControlCBOR(b)
+			}
+
+		// Case C: Node was custodial (or uninvolved), now responsible -> announce ingest.
+		case !wasResponsible && isResponsible:
+			log.Printf("[Reshard] %s moved onto my shard (%s -> %s). Announcing ingest.", shortKey, oldShard, currentShard)
+			im := schema.IngestMessage{
+				Type:        schema.MessageTypeIngest,
+				ManifestCID: manifestCID,
+				ShardID:     currentShard,
+				// We don't know the original size hint here; use 0 as a neutral value.
+				HintSize: 0,
+			}
+			if err := signProtocolMessage(&im); err != nil {
+				log.Printf("[Reshard] Failed to sign IngestMessage for %s: %v", shortKey, err)
+			} else if b, err := im.MarshalCBOR(); err != nil {
+				log.Printf("[Reshard] Failed to marshal IngestMessage for %s: %v", shortKey, err)
+			} else {
+				sm.PublishToShardCBOR(b)
+			}
+		}
+
+		reshardedFiles.Add(key)
+		batchCount++
+
+		if batchCount >= ReshardBatchSize {
+			// Yield to avoid overwhelming the network and CPU.
+			time.Sleep(50 * time.Millisecond)
+			batchCount = 0
+		}
+	}
+
+	log.Printf("[Reshard] Completed reshard pass for shard %s", currentShard)
 }
 
 func (sm *ShardManager) readOldShard() {
