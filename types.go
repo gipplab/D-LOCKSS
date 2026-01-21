@@ -554,7 +554,7 @@ var (
 
 	seenNonces = NewNonceStore()
 
-	replicationWorkers chan struct{}
+	// replicationWorkers chan struct{} // Deprecated by Async Pipeline
 
 	rateLimiter = NewRateLimiter()
 

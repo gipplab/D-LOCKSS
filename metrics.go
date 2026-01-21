@@ -72,7 +72,7 @@ func reportMetrics() {
 	activePeers := rateLimiter.Size()
 	backoffCount := failedOperations.Size()
 
-	activeWorkers := MaxConcurrentReplicationChecks - len(replicationWorkers)
+	activeWorkers := ReplicationWorkers // Pipeline has fixed number of workers
 	if activeWorkers < 0 {
 		activeWorkers = 0
 	}
@@ -259,7 +259,7 @@ func exportMetricsToFile(timestamp time.Time) {
 	rateLimitedPeers := rateLimiter.Size()
 	backoffCount := failedOperations.Size()
 
-	activeWorkers := MaxConcurrentReplicationChecks - len(replicationWorkers)
+	activeWorkers := ReplicationWorkers // Pipeline has fixed number of workers
 	if activeWorkers < 0 {
 		activeWorkers = 0
 	}

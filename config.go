@@ -110,10 +110,17 @@ func logConfiguration() {
 	log.Printf("[Config] File Retry Delay: %v", FileRetryDelay)
 
 	// Replication timeouts
+	log.Printf("[Config] Replication Workers: %d", ReplicationWorkers)
+	log.Printf("[Config] Replication Queue Size: %d", ReplicationQueueSize)
 	log.Printf("[Config] DHT Query Timeout: %v", DHTQueryTimeout)
 
 	// Shard operation timeouts
 	log.Printf("[Config] Shard Subscription Timeout: %v", ShardSubscriptionTimeout)
+
+	// Pipeline configuration
+	log.Printf("[Config] Pipeline Prober Workers: %d", PipelineProberWorkers)
+	log.Printf("[Config] Pipeline Job Queue Size: %d", PipelineJobQueueSize)
+	log.Printf("[Config] Pipeline Result Queue Size: %d", PipelineResultQueueSize)
 
 	// Cryptographic parameters
 	log.Printf("[Config] Nonce Size: %d bytes", NonceSize)
@@ -164,11 +171,20 @@ var (
 	FileProcessingDelay = getEnvDuration("DLOCKSS_FILE_PROCESSING_DELAY", 100*time.Millisecond) // Delay before processing new files
 	FileRetryDelay      = getEnvDuration("DLOCKSS_FILE_RETRY_DELAY", 200*time.Millisecond)      // Delay between file processing retries
 
+	// Replication configuration
+	ReplicationWorkers   = getEnvInt("DLOCKSS_REPLICATION_WORKERS", 50)      // Number of concurrent network probers
+	ReplicationQueueSize = getEnvInt("DLOCKSS_REPLICATION_QUEUE_SIZE", 1000) // Size of replication job/result channels
+
 	// Replication timeouts
 	DHTQueryTimeout = getEnvDuration("DLOCKSS_DHT_QUERY_TIMEOUT", 2*time.Minute) // Timeout for DHT queries during replication checks
 
 	// Shard operation timeouts
 	ShardSubscriptionTimeout = getEnvDuration("DLOCKSS_SHARD_SUBSCRIPTION_TIMEOUT", 2*time.Second) // Timeout for shard subscription cleanup
+
+	// Pipeline configuration
+	PipelineProberWorkers   = getEnvInt("DLOCKSS_PIPELINE_PROBER_WORKERS", 50)      // Number of concurrent DHT probers
+	PipelineJobQueueSize    = getEnvInt("DLOCKSS_PIPELINE_JOB_QUEUE_SIZE", 1000)    // Size of job channel buffer
+	PipelineResultQueueSize = getEnvInt("DLOCKSS_PIPELINE_RESULT_QUEUE_SIZE", 1000) // Size of result channel buffer
 
 	// Cryptographic parameters
 	NonceSize           = getEnvInt("DLOCKSS_NONCE_SIZE", 16)                             // Size of cryptographic nonces in bytes

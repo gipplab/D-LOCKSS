@@ -207,11 +207,13 @@ func (sm *ShardManager) readControl() {
 			manifestKey := dm.ManifestCID.String()
 			log.Printf("[Delegate] Accepted delegation for %s (I am %s)", manifestKey[:min(16, len(manifestKey))]+"...", myShard)
 			addKnownFile(manifestKey)
-			if !withReplicationWorker(sm.ctx, func() {
-				checkReplication(sm.ctx, manifestKey)
-			}) {
-				return
-			}
+			// Trigger immediate check (high priority for custodial)
+			// Note: In async pipeline, we don't have direct access to jobQueue here.
+			// We rely on the fact that addKnownFile adds it to the set, and the scheduler will pick it up.
+			// To make it faster, we could expose a way to trigger the scheduler or inject a job.
+			// For now, we rely on the scheduler loop (every 1m or faster).
+			// Ideally, we should inject into the job queue.
+			// TODO: Inject into job queue directly for lower latency.
 		}
 	}
 }
@@ -229,11 +231,7 @@ func (sm *ShardManager) handleIngestMessage(msg *pubsub.Message, im *schema.Inge
 		log.Printf("[Sharding] Received Ingest message from old shard during overlap: %s", key[:min(16, len(key))]+"...")
 	}
 	addKnownFile(key)
-	if !withReplicationWorker(sm.ctx, func() {
-		checkReplication(sm.ctx, key)
-	}) {
-		return false
-	}
+	// Scheduler will pick this up.
 	return true
 }
 
@@ -256,8 +254,8 @@ func (sm *ShardManager) handleReplicationRequest(msg *pubsub.Message, rr *schema
 	if AutoReplicationEnabled && !isPinned(key) {
 		log.Printf("[Replication] Received replication request for %s, attempting to replicate...", key[:min(16, len(key))]+"...")
 
-		// Use replication worker pool to limit concurrent fetches
-		if !withReplicationWorker(sm.ctx, func() {
+		// Directly replicate (bypass pipeline for immediate action on replication requests)
+		go func() {
 			success, err := replicateFileFromRequest(sm.ctx, manifestCID)
 			if err != nil {
 				log.Printf("[Replication] Failed to replicate %s: %v", key[:min(16, len(key))]+"...", err)
@@ -265,20 +263,14 @@ func (sm *ShardManager) handleReplicationRequest(msg *pubsub.Message, rr *schema
 			} else if success {
 				log.Printf("[Replication] Successfully replicated %s", key[:min(16, len(key))]+"...")
 				clearBackoff(key)
-				// Trigger replication check to update metrics
-				checkReplication(sm.ctx, key)
+				// File is now replicated, add to known files and let pipeline handle ongoing monitoring
+				addKnownFile(key)
 			}
-		}) {
-			return false
-		}
+		}()
 	} else {
-		// File already pinned or auto-replication disabled, just check replication status
+		// File already pinned or auto-replication disabled, just ensure it's tracked
 		addKnownFile(key)
-		if !withReplicationWorker(sm.ctx, func() {
-			checkReplication(sm.ctx, key)
-		}) {
-			return false
-		}
+		// Pipeline will pick up the new file on next scan
 	}
 
 	return true

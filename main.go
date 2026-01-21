@@ -15,7 +15,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
-	
+
 	"dlockss/pkg/ipfs"
 )
 
@@ -58,7 +58,8 @@ func main() {
 		log.Printf("[Warning] Missing private key for self peer ID; message signing will be unavailable")
 	}
 
-	replicationWorkers = make(chan struct{}, MaxConcurrentReplicationChecks)
+	// Initialize replication worker pool (Deprecated by Async Pipeline, but kept for compilation if referenced elsewhere)
+	// replicationWorkers = make(chan struct{}, MaxConcurrentReplicationChecks)
 
 	logConfiguration()
 
@@ -103,7 +104,7 @@ func main() {
 
 	go watchFolder(ctx)
 
-	go runReplicationChecker(ctx)
+	go startReplicationPipeline(ctx)
 	go runReplicationCacheCleanup(ctx)
 	go runRateLimiterCleanup(ctx)
 	go runMetricsReporter(ctx)
