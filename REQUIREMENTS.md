@@ -63,7 +63,7 @@ This document lists all functional and non-functional requirements that form the
 ### FM-4: File Processing
 - Must process each new file found in the watch folder
 - Must pin every ingested **ManifestCID** locally (recursive pin)
-- Must provide **ManifestCID** to DHT network immediately after pinning
+- Must provide **ManifestCID** to DHT network immediately after pinning (only if responsible; custodial nodes do NOT announce to DHT)
 - Must track all processed manifests in knownFiles list
 
 ---
@@ -125,7 +125,8 @@ This document lists all functional and non-functional requirements that form the
 - If replication count < 5:
   - If node is responsible and manifest is not pinned: must re-pin the **ManifestCID** (recursive)
   - Must provide the ManifestCID to DHT network
-  - Must broadcast a **CBOR `ReplicationRequest`** message to shard topic
+  - Must broadcast a **CBOR `ReplicationRequest`** message to shard topic (only nodes in the same shard receive it)
+  - Only responsible nodes should respond to `ReplicationRequest` and announce to DHT (shard-local replication)
   - If node is in custodial mode: must keep holding the file
 
 ### RP-4: High Replication Handling

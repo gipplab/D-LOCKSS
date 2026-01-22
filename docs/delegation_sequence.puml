@@ -10,8 +10,8 @@ participant "DHT" as DHT
 
 Custodial -> Custodial: processNewFile()\nPayloadCID not in my shard (by shard routing)
 Custodial -> IPFS: PinRecursive(ManifestCID)\n[temporary custodial hold]
-Custodial -> DHT: provideFile(ManifestCID)
-Custodial -> Control: PublishToControl(DelegateMessage CBOR)\n{manifest_cid, target_shard}
+Note over Custodial: Do NOT announce to DHT\n(keep cross-shard communication minimal)
+Custodial -> Control: PublishToControl(DelegateMessage CBOR)\n{manifest_cid, target_shard} (control topic)
 
 Control -> Responsible: Broadcast DELEGATE message
 Responsible -> Responsible: checkRateLimitForMessage(peerID, "DELEGATE")
@@ -28,7 +28,7 @@ alt Rate limit OK AND disk usage OK
     
     alt count < MinReplication
         ReplChecker -> IPFS: PinRecursive(ManifestCID)
-        ReplChecker -> DHT: provideFile(ManifestCID)
+        ReplChecker -> DHT: provideFile(ManifestCID)\n(only responsible nodes announce)
     end
     
     Note over Responsible: File now properly replicated

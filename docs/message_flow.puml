@@ -15,11 +15,28 @@ C -> C: Add to knownFiles
 
 == Replication Request ==
 A -> GS: ReplicationRequest(CBOR)\n{manifest_cid, priority, deadline, ts, nonce, sig} (shard topic)
-GS -> B: Forward message
-GS -> C: Forward message
-B -> DHT: Check if I have file
-C -> DHT: Check if I have file
-B -> DHT: provideFile(manifest_cid) [if available]
+GS -> B: Forward message (same shard only)
+GS -> C: Forward message (same shard only)
+B -> B: Check if responsible\n(AmIResponsibleFor(PayloadCID))
+C -> C: Check if responsible\n(AmIResponsibleFor(PayloadCID))
+alt B is responsible
+    B -> DHT: Check if I have file
+    alt File not pinned
+        B -> IPFS: Fetch and pin file
+        B -> DHT: provideFile(manifest_cid)\n(only responsible nodes announce)
+    end
+else B not responsible
+    B -> B: Ignore (not in responsible shard)
+end
+alt C is responsible
+    C -> DHT: Check if I have file
+    alt File not pinned
+        C -> IPFS: Fetch and pin file
+        C -> DHT: provideFile(manifest_cid)\n(only responsible nodes announce)
+    end
+else C not responsible
+    C -> C: Ignore (not in responsible shard)
+end
 
 == Delegation ==
 A -> GS: DelegateMessage(CBOR)\n{manifest_cid, target_shard, ts, nonce, sig} (control topic)

@@ -251,13 +251,28 @@ func (sm *ShardManager) handleReplicationRequest(msg *pubsub.Message, rr *schema
 		log.Printf("[Sharding] Received ReplicationRequest from old shard during overlap: %s", key[:min(16, len(key))]+"...")
 	}
 
+	// Check if we're responsible for this file before replicating
+	// In normal operation, ReplicationRequest is only sent to the shard topic, so only
+	// nodes in the same shard should receive it. However, during shard overlap periods
+	// (after a split), nodes may receive messages from their old shard via readOldShard().
+	// This check ensures only responsible nodes participate in D-LOCKSS replication.
+	payloadCIDStr := getPayloadCIDForShardAssignment(sm.ctx, key)
+	responsible := sm.AmIResponsibleFor(payloadCIDStr)
+	
+	if !responsible {
+		log.Printf("[Replication] Received ReplicationRequest for %s, but not responsible (shard mismatch). Ignoring.", key[:min(16, len(key))]+"...")
+		// Non-responsible nodes can pin files in IPFS for their own use, but shouldn't
+		// participate in D-LOCKSS replication to keep cross-shard communication minimal
+		return true
+	}
+
 	// Attempt automatic replication if enabled and file is not pinned
 	if AutoReplicationEnabled && !isPinned(key) {
-		log.Printf("[Replication] Received replication request for %s, attempting to replicate...", key[:min(16, len(key))]+"...")
+		log.Printf("[Replication] Received replication request for %s (responsible), attempting to replicate...", key[:min(16, len(key))]+"...")
 
 		// Directly replicate (bypass pipeline for immediate action on replication requests)
 		go func() {
-			success, err := replicateFileFromRequest(sm.ctx, manifestCID, msg.GetFrom())
+			success, err := replicateFileFromRequest(sm.ctx, manifestCID, msg.GetFrom(), true) // responsible=true
 			if err != nil {
 				log.Printf("[Replication] Failed to replicate %s: %v", key[:min(16, len(key))]+"...", err)
 				recordFailedOperation(key)

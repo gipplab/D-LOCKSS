@@ -440,7 +440,9 @@ func unpinKeyV2(ctx context.Context, key string, manifestCID cid.Cid) {
 // receiving a ReplicationRequest. If a non-empty sender peer ID is provided,
 // it can be used as a provider hint by higher-level components or future
 // IPFS client enhancements to prioritize fetching from that peer.
-func replicateFileFromRequest(ctx context.Context, manifestCID cid.Cid, sender peer.ID) (bool, error) {
+// The responsible parameter indicates if this node is responsible for the file's shard.
+// Only responsible nodes should announce to DHT to keep cross-shard communication minimal.
+func replicateFileFromRequest(ctx context.Context, manifestCID cid.Cid, sender peer.ID, responsible bool) (bool, error) {
 	if ipfsClient == nil {
 		return false, fmt.Errorf("IPFS client not initialized")
 	}
@@ -557,12 +559,18 @@ func replicateFileFromRequest(ctx context.Context, manifestCID cid.Cid, sender p
 		log.Printf("[Replication] Failed to track ManifestCID: %s", manifestCIDStr[:min(16, len(manifestCIDStr))]+"...")
 	}
 
-	// Step 13: Provide to DHT
-	provideCtx, provideCancel := context.WithTimeout(context.Background(), DHTProvideTimeout)
-	go func() {
-		defer provideCancel()
-		provideFile(provideCtx, manifestCIDStr)
-	}()
+	// Step 13: Provide to DHT (only if responsible)
+	// Only responsible nodes should advertise to D-LOCKSS to keep cross-shard communication minimal.
+	// Non-responsible nodes can pin files in IPFS for their own use, but shouldn't announce.
+	if responsible {
+		provideCtx, provideCancel := context.WithTimeout(context.Background(), DHTProvideTimeout)
+		go func() {
+			defer provideCancel()
+			provideFile(provideCtx, manifestCIDStr)
+		}()
+	} else {
+		log.Printf("[Replication] Not responsible for %s, skipping DHT announcement (pinned for local use only)", manifestCIDStr[:min(16, len(manifestCIDStr))]+"...")
+	}
 
 	// Step 14: Add to known files
 	addKnownFile(manifestCIDStr)

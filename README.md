@@ -189,13 +189,14 @@ Scanning for existing files...
       * Build `ResearchObject` → store as **dag-cbor** block in IPFS → **ManifestCID**
       * Pin recursively (ManifestCID → PayloadCID DAG)
       * **BadBits Check:** If the **ManifestCID** is blocked for the node's country, the ingest is refused.
-      * **If Responsible:** It announces a CBOR **`IngestMessage`** with the ManifestCID to its shard.
-      * **If Not Responsible:** It enters **Custodial Mode**, announcing a CBOR **`DelegateMessage`** to the control topic.
+      * **If Responsible:** It announces a CBOR **`IngestMessage`** with the ManifestCID to its shard topic and announces to DHT via `provideFile()`.
+      * **If Not Responsible:** It enters **Custodial Mode**, announcing a CBOR **`DelegateMessage`** to the control topic. Custodial nodes do NOT announce to DHT to keep cross-shard communication minimal.
       * **Storage Protection:** If disk usage is high (>90%), custodial requests are rejected, but responsible files are still accepted.
 3.  **Replication:**
     The replication checker runs every 1 minute:
       * **Hysteresis:** Under-replication triggers a verification delay (default: 30s) before broadcasting NEED messages to prevent false alarms from transient DHT issues.
       * **Dual Query:** Two DHT queries confirm under-replication before triggering replication requests.
+      * **Shard-Local Replication:** Only nodes in the responsible shard respond to `ReplicationRequest` and announce to DHT. This keeps cross-shard communication minimal and ensures accurate replication metrics.
       * **DHT Sampling:** Each DHT lookup samples up to a bounded number of providers (`DLOCKSS_DHT_MAX_SAMPLE_SIZE`) instead of scanning the entire network.
       * **Replication Cache:** Successful replication counts are cached per ManifestCID for a short TTL (`DLOCKSS_REPLICATION_CACHE_TTL`) to avoid redundant DHT queries for stable objects.
       * **Backoff:** Failed operations use exponential backoff to prevent network storms.

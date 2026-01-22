@@ -27,18 +27,19 @@ else BadBits check passes
     Storage -> Storage: Track pinnedFiles[ManifestCID]
 end
 
-FileOps -> DHT: provideFile(ManifestCID)
 FileOps -> Storage: addKnownFile(ManifestCID)
 
 FileOps -> ShardMgr: AmIResponsibleFor(PayloadCID)
 
 alt Node is responsible
-    FileOps -> PubSub: PublishToShard(IngestMessage CBOR)\n{manifest_cid, hint_size}
-    PubSub -> Nodes: Broadcast IngestMessage
+    FileOps -> DHT: provideFile(ManifestCID)\n(only responsible nodes announce)
+    FileOps -> PubSub: PublishToShard(IngestMessage CBOR)\n{manifest_cid, hint_size} (shard topic)
+    PubSub -> Nodes: Broadcast IngestMessage\n(only to same shard)
     Nodes -> Nodes: Add ManifestCID to knownFiles, check replication
 else Node is NOT responsible (Custodial Mode)
+    Note over FileOps: Do NOT announce to DHT\n(keep cross-shard communication minimal)
     FileOps -> ShardMgr: target_shard = prefix(hash(PayloadCID))
-    FileOps -> PubSub: PublishToControl(DelegateMessage CBOR)\n{manifest_cid, target_shard}
+    FileOps -> PubSub: PublishToControl(DelegateMessage CBOR)\n{manifest_cid, target_shard} (control topic)
     PubSub -> Nodes: Broadcast DelegateMessage
     Nodes -> Nodes: Responsible node accepts delegation
     Nodes -> Nodes: checkReplication(ManifestCID)

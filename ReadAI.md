@@ -84,7 +84,7 @@ Create a struct named `ShardManager` to handle dynamic topic switching. It must 
 * **New:** Factory function to initialize and join channels
 * **joinChannels:** Subscribe to static Control topic. Subscribe to dynamic Shard topic (`dlockss-v2-creative-commons-shard-{prefix}`). Reset `msgCounter`. Must properly clean up old subscriptions before creating new ones using synchronization (shardDone channel) to prevent resource leaks
 * **readControl:** Loop decoding CBOR `DelegateMessage`. Apply rate limiting and disk-pressure checks for custodial requests. If target shard matches node's current shard prefix, add ManifestCID to `knownFiles` and launch replication check.
-* **readShard:** Loop decoding CBOR messages. Apply rate limiting. Increment `msgCounter` and trigger `splitShard` when overloaded. Handle `IngestMessage` and `ReplicationRequest` by adding ManifestCID to `knownFiles` and launching replication check.
+* **readShard:** Loop decoding CBOR messages. Apply rate limiting. Increment `msgCounter` and trigger `splitShard` when overloaded. Handle `IngestMessage` and `ReplicationRequest`. For `ReplicationRequest`, only responsible nodes respond and announce to DHT (shard-local replication).
 * **splitShard:** Calculate next binary bit based on node's Peer ID hash at next depth. Update current shard prefix and call `joinChannels` synchronously
 * **AmIResponsibleFor:** Boolean check comparing a stable hash of the **PayloadCID string** (extracted from the ResearchObject manifest) against node's current shard prefix
 * **Publish helpers:** Methods to publish CBOR bytes to shard/control topics

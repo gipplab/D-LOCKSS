@@ -54,10 +54,16 @@ loop For each known file
                             ReplChecker -> IPFS: PinRecursive(ManifestCID)
                             ReplChecker -> DHT: provideFile(ManifestCID)
                         end
-                        ReplChecker -> PubSub: PublishToShard(ReplicationRequest CBOR)
-                        PubSub -> Nodes: Broadcast ReplicationRequest
-                        Nodes -> Nodes: Check if they can replicate
-                        Note over ReplChecker: Both queries confirmed\nunder-replication
+                        ReplChecker -> PubSub: PublishToShard(ReplicationRequest CBOR)\n(shard topic only)
+                        PubSub -> Nodes: Broadcast ReplicationRequest\n(only to same shard)
+                        Nodes -> Nodes: Check if responsible\n(AmIResponsibleFor(PayloadCID))
+                        alt Node is responsible
+                            Nodes -> IPFS: Fetch and pin if not pinned
+                            Nodes -> DHT: provideFile(manifest_cid)\n(only responsible nodes announce)
+                        else Node not responsible
+                            Nodes -> Nodes: Ignore (not in responsible shard)
+                        end
+                        Note over ReplChecker: Both queries confirmed\nunder-replication\nOnly responsible nodes respond
                     else Verification shows adequate replication
                         Note over ReplChecker: First query was false alarm\nCanceling NEED
                         ReplChecker -> ReplChecker: Remove pending verification
