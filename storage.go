@@ -11,13 +11,13 @@ import (
 func pinFile(hash string) bool {
 	fileCid, err := hashToCid(hash)
 	if err != nil {
-		log.Printf("[Storage] Failed to convert hash to CID: %v", err)
+		logError("Storage", "convert hash to CID", hash, err)
 		return false
 	}
 
 	cidStr := fileCid.String()
 	if isCIDBlocked(cidStr, NodeCountry) {
-		log.Printf("[Storage] Refused to pin blocked CID: %s (blocked in %s)", cidStr[:16]+"...", NodeCountry)
+		log.Printf("[Storage] Refused to pin blocked CID: %s (blocked in %s)", truncateCID(cidStr, 16), NodeCountry)
 		return false
 	}
 
@@ -25,7 +25,7 @@ func pinFile(hash string) bool {
 		updateMetrics(func() {
 			metrics.pinnedFilesCount = pinnedFiles.Size()
 		})
-		log.Printf("[Storage] Pinned file: %s (total pinned: %d)", hash[:16]+"...", pinnedFiles.Size())
+		log.Printf("[Storage] Pinned file: %s (total pinned: %d)", truncateCID(hash, 16), pinnedFiles.Size())
 		return true
 	}
 	return true
@@ -39,7 +39,7 @@ func unpinFile(key string) {
 		updateMetrics(func() {
 			metrics.pinnedFilesCount = pinnedFiles.Size()
 		})
-		log.Printf("[Storage] Unpinned file: %s (remaining pinned: %d)", key[:16]+"...", pinnedFiles.Size())
+		log.Printf("[Storage] Unpinned file: %s (remaining pinned: %d)", truncateCID(key, 16), pinnedFiles.Size())
 	}
 }
 
@@ -81,12 +81,12 @@ func removeKnownFile(key string) {
 func provideFile(ctx context.Context, key string) {
 	c, err := keyToCID(key)
 	if err != nil {
-		log.Printf("[Error] Failed to convert key to CID: %v", err)
+		logError("Storage", "convert key to CID", key, err)
 		return
 	}
 	if globalDHT != nil {
 		if err := globalDHT.Provide(ctx, c, true); err != nil {
-			log.Printf("[DHT] Provide failed for %s: %v", key[:min(16, len(key))]+"...", err)
+			logError("DHT", "provide file", key, err)
 			recordFailedOperation(key)
 			return
 		}
@@ -100,7 +100,7 @@ func pinFileV2(manifestCIDStr string) bool {
 		updateMetrics(func() {
 			metrics.pinnedFilesCount = pinnedFiles.Size()
 		})
-		log.Printf("[Storage] Pinned ManifestCID: %s (total pinned: %d)", manifestCIDStr[:16]+"...", pinnedFiles.Size())
+		log.Printf("[Storage] Pinned ManifestCID: %s (total pinned: %d)", truncateCID(manifestCIDStr, 16), pinnedFiles.Size())
 		return true
 	}
 	return true

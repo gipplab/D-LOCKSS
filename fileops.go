@@ -117,179 +117,249 @@ func shouldProcessFileEvent(path string) bool {
 // processNewFile imports a newly detected file into IPFS, builds a ResearchObject
 // manifest, pins it, and announces it to the D-LOCKSS network (V2 ingestion path).
 func processNewFile(path string) {
+	// Validate path and check prerequisites
+	if !validateFilePath(path) {
+		return
+	}
+
+	if ipfsClient == nil {
+		logError("FileOps", "process file", path, fmt.Errorf("IPFS client not initialized"))
+		return
+	}
+
+	// Import file and create manifest
+	ctx, cancel := context.WithTimeout(context.Background(), FileImportTimeout)
+	defer cancel()
+
+	payloadCID, cleanupPayload, err := importFileToIPFS(ctx, path)
+	if err != nil {
+		return
+	}
+	defer cleanupPayload()
+
+	// Build and store ResearchObject
+	manifestCID, manifestCIDStr, err := buildAndStoreManifest(ctx, path, payloadCID, cleanupPayload)
+	if err != nil {
+		return
+	}
+
+	// Check BadBits and pin
+	if !checkBadBitsAndPin(ctx, manifestCID, manifestCIDStr, path, cleanupPayload) {
+		return
+	}
+
+	// Track and announce
+	trackAndAnnounceFile(ctx, manifestCID, manifestCIDStr, payloadCID)
+}
+
+// validateFilePath validates that the file path is within the watch folder and returns true if valid.
+func validateFilePath(path string) bool {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		log.Printf("[Error] Invalid path: %v", err)
-		return
+		logError("FileOps", "resolve absolute path", path, err)
+		return false
 	}
 
 	absWatch, err := filepath.Abs(FileWatchFolder)
 	if err != nil {
-		log.Printf("[Error] Invalid watch folder: %v", err)
-		return
+		logError("FileOps", "resolve watch folder path", FileWatchFolder, err)
+		return false
 	}
 
-	// Prevent path traversal / prefix confusion:
-	// - filepath.Abs cleans .. segments
-	// - filepath.Rel ensures absPath is within absWatch (not just string-prefix)
+	// Prevent path traversal / prefix confusion
 	rel, err := filepath.Rel(absWatch, absPath)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 		log.Printf("[Security] Rejected path outside watch folder: %s", path)
-		return
+		return false
 	}
 
-	// Check if IPFS client is available
-	if ipfsClient == nil {
-		log.Printf("[Error] IPFS client not initialized. Cannot process file: %s", path)
-		return
-	}
+	return true
+}
 
-	// Step 1: Import file to IPFS (get PayloadCID)
-	ctx, cancel := context.WithTimeout(context.Background(), FileImportTimeout)
-	defer cancel()
-
+// importFileToIPFS imports a file to IPFS and returns the PayloadCID and a cleanup function.
+func importFileToIPFS(ctx context.Context, path string) (cid.Cid, func(), error) {
 	payloadCID, err := ipfsClient.ImportFile(ctx, path)
 	if err != nil {
-		log.Printf("[Error] Failed to import file to IPFS: %s: %v", path, err)
-		return
-	}
-	// If ingestion fails later, ensure we don't leak a pinned payload.
-	cleanupPayload := func() {
-		_ = ipfsClient.UnpinRecursive(ctx, payloadCID)
+		logError("FileOps", "import file to IPFS", path, err)
+		return cid.Cid{}, nil, err
 	}
 
-	// Step 2: Get file size
+	cleanupPayload := func() {
+		if err := ipfsClient.UnpinRecursive(ctx, payloadCID); err != nil {
+			logWarningWithContext("FileOps", "Failed to cleanup payload CID during error recovery", payloadCID.String(), "cleanup")
+		}
+	}
+
+	return payloadCID, cleanupPayload, nil
+}
+
+// buildAndStoreManifest creates a ResearchObject, signs it, and stores it in IPFS.
+func buildAndStoreManifest(ctx context.Context, path string, payloadCID cid.Cid, cleanupPayload func()) (cid.Cid, string, error) {
+	// Get file size
 	fileInfo, err := os.Stat(path)
 	if err != nil {
-		log.Printf("[Error] Failed to stat file: %s: %v", path, err)
-		return
+		logError("FileOps", "stat file", path, err)
+		cleanupPayload()
+		return cid.Cid{}, "", err
 	}
 	totalSize := uint64(fileInfo.Size())
 
-	// Step 3: Extract metadata (simple: filename as title, empty authors for now)
+	// Extract metadata
 	title := filepath.Base(path)
 	authors := []string{}     // TODO: Extract from file metadata or user input
 	references := []cid.Cid{} // TODO: Allow user to specify citations
 
-	// Step 4: Get ingester ID (current node's peer ID)
+	// Get ingester ID
 	var ingesterID peer.ID
 	if shardMgr != nil && shardMgr.h != nil {
 		ingesterID = shardMgr.h.ID()
 	} else {
-		log.Printf("[Error] Cannot get ingester ID: shard manager not initialized")
-		return
+		logError("FileOps", "get ingester ID", path, fmt.Errorf("shard manager not initialized"))
+		cleanupPayload()
+		return cid.Cid{}, "", fmt.Errorf("shard manager not initialized")
 	}
 
-	// Step 5: Create ResearchObject
+	// Create and sign ResearchObject
 	ro := schema.NewResearchObject(title, authors, ingesterID, payloadCID, references, totalSize)
-
-	// Step 6: Sign manifest (ResearchObject) and store in IPFS (dag-cbor) to obtain ManifestCID
-	unsigned, err := ro.MarshalCBORForSigning()
-	if err != nil {
-		log.Printf("[Error] Failed to marshal ResearchObject for signing: %v", err)
-		return
-	}
-	if selfPrivKey == nil {
-		log.Printf("[Sig] Warning: missing private key; ResearchObject manifest will not be signed")
-	} else {
-		sig, err := selfPrivKey.Sign(unsigned)
-		if err != nil {
-			log.Printf("[Sig] Failed to sign ResearchObject: %v", err)
-		} else {
-			ro.Signature = sig
-		}
+	if err := signResearchObject(ro); err != nil {
+		logError("FileOps", "sign ResearchObject", path, err)
+		cleanupPayload()
+		return cid.Cid{}, "", err
 	}
 
+	// Marshal and store in IPFS
 	manifestBytes, err := ro.MarshalCBOR()
 	if err != nil {
-		log.Printf("[Error] Failed to marshal ResearchObject: %v", err)
+		logError("FileOps", "marshal ResearchObject", path, err)
 		cleanupPayload()
-		return
+		return cid.Cid{}, "", err
 	}
 
 	manifestCID, err := ipfsClient.PutDagCBOR(ctx, manifestBytes)
 	if err != nil {
-		log.Printf("[Error] Failed to store manifest block in IPFS: %v", err)
+		logError("FileOps", "store manifest block in IPFS", path, err)
 		cleanupPayload()
-		return
+		return cid.Cid{}, "", err
 	}
 
-	manifestCIDStr := manifestCID.String()
+	return manifestCID, manifestCID.String(), nil
+}
 
-	// Step 7: Check BadBits (on ManifestCID)
+// signResearchObject signs a ResearchObject if a private key is available.
+func signResearchObject(ro *schema.ResearchObject) error {
+	unsigned, err := ro.MarshalCBORForSigning()
+	if err != nil {
+		return err
+	}
+
+	if selfPrivKey == nil {
+		log.Printf("[Sig] Warning: missing private key; ResearchObject manifest will not be signed")
+		return nil
+	}
+
+	sig, err := selfPrivKey.Sign(unsigned)
+	if err != nil {
+		return err
+	}
+
+	ro.Signature = sig
+	return nil
+}
+
+// checkBadBitsAndPin checks BadBits and pins the manifest if allowed.
+func checkBadBitsAndPin(ctx context.Context, manifestCID cid.Cid, manifestCIDStr, path string, cleanupPayload func()) bool {
+	// Check BadBits
 	if isCIDBlocked(manifestCIDStr, NodeCountry) {
-		log.Printf("[FileOps] Refused to process file %s (blocked ManifestCID: %s)", path, manifestCIDStr[:16]+"...")
-		// Unpin the payload since we're rejecting it
+		log.Printf("[FileOps] Refused to process file %s (blocked ManifestCID: %s)", path, truncateCID(manifestCIDStr, 16))
 		cleanupPayload()
-		return
+		return false
 	}
 
-	// Step 8: Pin recursively (ManifestCID will pin PayloadCID)
+	// Pin recursively
 	if err := ipfsClient.PinRecursive(ctx, manifestCID); err != nil {
-		log.Printf("[Error] Failed to pin ManifestCID recursively: %v", err)
-		// Best-effort cleanup: payload may be pinned from import.
+		logError("FileOps", "pin ManifestCID recursively", manifestCIDStr, err)
 		cleanupPayload()
+		return false
+	}
+
+	return true
+}
+
+// trackAndAnnounceFile tracks the file and announces it to the appropriate shard.
+func trackAndAnnounceFile(ctx context.Context, manifestCID cid.Cid, manifestCIDStr string, payloadCID cid.Cid) {
+	// Track in local state
+	if !pinFileV2(manifestCIDStr) {
+		logWarning("FileOps", "Failed to track ManifestCID", manifestCIDStr)
 		return
 	}
 
-	// Step 9: Store in our tracking (using ManifestCID string as key)
-	manifestKey := manifestCIDStr // Use ManifestCID string as the key for tracking
-	if !pinFileV2(manifestKey) {
-		log.Printf("[FileOps] Failed to track ManifestCID: %s", manifestCIDStr[:16]+"...")
-		return
-	}
+	addKnownFile(manifestCIDStr)
 
-	addKnownFile(manifestKey)
-
-	// Step 10: Determine responsibility and announce
-	// CRITICAL: Use PayloadCID for shard assignment, not ManifestCID.
-	// PayloadCID is stable (content-based), while ManifestCID includes timestamp/metadata
-	// and changes on every ingestion, causing unstable shard assignment.
+	// Determine responsibility and announce
 	payloadCIDStr := payloadCID.String()
 	if shardMgr.AmIResponsibleFor(payloadCIDStr) {
-		log.Printf("[Core] I am responsible for PayloadCID %s (ManifestCID %s). Announcing to Shard.", payloadCIDStr[:16]+"...", manifestCIDStr[:16]+"...")
-		im := schema.IngestMessage{
-			Type:        schema.MessageTypeIngest,
-			ManifestCID: manifestCID,
-			ShardID:     shardMgr.currentShard,
-			HintSize:    totalSize,
-		}
-		if err := signProtocolMessage(&im); err != nil {
-			log.Printf("[Sig] Failed to sign IngestMessage: %v", err)
-		}
-		b, err := im.MarshalCBOR()
-		if err != nil {
-			log.Printf("[Error] Failed to marshal IngestMessage: %v", err)
-			return
-		}
-		shardMgr.PublishToShardCBOR(b)
-
-		// Responsible ingester: announce as provider to DHT.
-		// Non-responsible custodial nodes do NOT announce, so they don't
-		// show up as long-term replicas in replication accounting.
-		provideCtx, provideCancel := context.WithTimeout(context.Background(), DHTProvideTimeout)
-		go func() {
-			defer provideCancel()
-			provideFile(provideCtx, manifestKey)
-		}()
+		announceResponsibleFile(ctx, manifestCID, manifestCIDStr, payloadCIDStr)
 	} else {
-		targetPrefix := getHexBinaryPrefix(keyToStableHex(payloadCIDStr), len(shardMgr.currentShard))
-		log.Printf("[Core] Custodial Mode: PayloadCID %s (ManifestCID %s) belongs to shard %s. Delegating but holding...", payloadCIDStr[:16]+"...", manifestCIDStr[:16]+"...", targetPrefix)
-		dm := schema.DelegateMessage{
-			Type:        schema.MessageTypeDelegate,
-			ManifestCID: manifestCID,
-			TargetShard: targetPrefix,
-		}
-		if err := signProtocolMessage(&dm); err != nil {
-			log.Printf("[Sig] Failed to sign DelegateMessage: %v", err)
-		}
-		b, err := dm.MarshalCBOR()
-		if err != nil {
-			log.Printf("[Error] Failed to marshal DelegateMessage: %v", err)
-			return
-		}
-		shardMgr.PublishToControlCBOR(b)
+		announceCustodialFile(manifestCID, manifestCIDStr, payloadCIDStr)
 	}
+}
+
+// announceResponsibleFile announces a file when this node is responsible for it.
+func announceResponsibleFile(ctx context.Context, manifestCID cid.Cid, manifestCIDStr, payloadCIDStr string) {
+	log.Printf("[Core] I am responsible for PayloadCID %s (ManifestCID %s). Announcing to Shard.",
+		truncateCID(payloadCIDStr, 16), truncateCID(manifestCIDStr, 16))
+
+	// Get file size for hint (we'd need to pass this, but for now use 0)
+	im := schema.IngestMessage{
+		Type:        schema.MessageTypeIngest,
+		ManifestCID: manifestCID,
+		ShardID:     shardMgr.currentShard,
+		HintSize:    0, // TODO: Pass actual size
+	}
+
+	if err := signProtocolMessage(&im); err != nil {
+		logError("FileOps", "sign IngestMessage", manifestCIDStr, err)
+	}
+
+	b, err := im.MarshalCBOR()
+	if err != nil {
+		logError("FileOps", "marshal IngestMessage", manifestCIDStr, err)
+		return
+	}
+
+	shardMgr.PublishToShardCBOR(b)
+
+	// Announce to DHT
+	provideCtx, provideCancel := context.WithTimeout(context.Background(), DHTProvideTimeout)
+	go func() {
+		defer provideCancel()
+		provideFile(provideCtx, manifestCIDStr)
+	}()
+}
+
+// announceCustodialFile announces a file when this node is in custodial mode.
+func announceCustodialFile(manifestCID cid.Cid, manifestCIDStr, payloadCIDStr string) {
+	targetPrefix := getHexBinaryPrefix(keyToStableHex(payloadCIDStr), len(shardMgr.currentShard))
+	log.Printf("[Core] Custodial Mode: PayloadCID %s (ManifestCID %s) belongs to shard %s. Delegating but holding...",
+		truncateCID(payloadCIDStr, 16), truncateCID(manifestCIDStr, 16), targetPrefix)
+
+	dm := schema.DelegateMessage{
+		Type:        schema.MessageTypeDelegate,
+		ManifestCID: manifestCID,
+		TargetShard: targetPrefix,
+	}
+
+	if err := signProtocolMessage(&dm); err != nil {
+		logError("FileOps", "sign DelegateMessage", manifestCIDStr, err)
+	}
+
+	b, err := dm.MarshalCBOR()
+	if err != nil {
+		logError("FileOps", "marshal DelegateMessage", manifestCIDStr, err)
+		return
+	}
+
+	shardMgr.PublishToControlCBOR(b)
 }
 
 // watchFolder monitors the data directory recursively for new or updated files

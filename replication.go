@@ -115,7 +115,7 @@ func scheduleJobs(ctx context.Context, jobQueue chan<- CheckJob) {
 
 		manifestCID, err := keyToCID(key)
 		if err != nil {
-			log.Printf("[Error] Invalid key format in scheduler: %s, error: %v", key, err)
+			logError("Replication", "convert key to CID in scheduler", key, err)
 			checkingFiles.Unlock(key)
 			continue
 		}
@@ -251,36 +251,44 @@ func reconcile(ctx context.Context, result CheckResult) {
 
 	incrementMetric(&metrics.replicationChecks)
 
-	// Only apply backoff for actual DHT query failures (timeouts), not for legitimate zero-count results
-	// Zero count with no cache might mean the file is new/unreplicated, which should trigger replication
-	// requests rather than backoff. Backoff should be reserved for network/DHT failures.
+	// Handle DHT query failures
 	if result.Err == context.DeadlineExceeded {
-		incrementMetric(&metrics.replicationFailures)
-		recordFailedOperation(key)
-		log.Printf("[Backoff] DHT query timeout for %s, applying backoff", key[:min(16, len(key))]+"...")
+		handleDHTQueryFailure(key)
 		return
 	}
 
-	// If count is 0 and we're responsible, this might be under-replication, not a DHT failure
-	// Let the under-replication handler deal with it (it will trigger replication requests)
-	if count == 0 && job.Responsible && !result.FromCache {
-		// Don't apply backoff - this is likely legitimate under-replication
-		// The under-replication handler will deal with it below
-		log.Printf("[Replication] Zero providers found for responsible file %s (may be new/unreplicated)", key[:min(16, len(key))]+"...")
+	// Process successful replication check
+	processReplicationResult(ctx, job, count, result.FromCache)
+}
+
+// handleDHTQueryFailure handles DHT query timeout errors by applying backoff.
+func handleDHTQueryFailure(key string) {
+	incrementMetric(&metrics.replicationFailures)
+	recordFailedOperation(key)
+	log.Printf("[Backoff] DHT query timeout for %s, applying backoff", truncateCID(key, 16))
+}
+
+// processReplicationResult processes a successful replication check result and handles
+// under-replication, over-replication, and custodial handoff scenarios.
+func processReplicationResult(ctx context.Context, job CheckJob, count int, fromCache bool) {
+	key := job.Key
+
+	// Log zero providers for responsible files (may be new/unreplicated)
+	if count == 0 && job.Responsible && !fromCache {
+		log.Printf("[Replication] Zero providers found for responsible file %s (may be new/unreplicated)", truncateCID(key, 16))
 	}
 
-	if !result.FromCache {
+	// Update cache and metrics
+	if !fromCache {
 		replicationCache.Set(key, count)
 	}
 
 	incrementMetric(&metrics.replicationSuccess)
 	clearBackoff(key)
 	fileReplicationLevels.Set(key, count)
-
-	// Metrics updates
 	updateReplicationMetrics(count)
 
-	// Logic: Under-replication
+	// Handle replication scenarios
 	if count < MinReplication {
 		handleUnderReplication(ctx, job, count)
 	} else {
@@ -288,12 +296,10 @@ func reconcile(ctx context.Context, result CheckResult) {
 		pendingVerifications.Remove(key)
 	}
 
-	// Logic: Over-replication
 	if job.Responsible && count > MaxReplication && job.Pinned {
 		handleOverReplication(ctx, job, count)
 	}
 
-	// Logic: Custodial Handoff
 	if !job.Responsible && count >= MinReplication && job.Pinned {
 		handleCustodialHandoff(ctx, job, count)
 	}
@@ -328,8 +334,13 @@ func handleUnderReplication(ctx context.Context, job CheckJob, count int) {
 
 			// If responsible and missing, re-pin and provide
 			if pending.responsible && !pending.pinned {
-				_ = pinKeyV2(ctx, key, job.ManifestCID)
-				provideFile(ctx, key)
+				if err := pinKeyV2(ctx, key, job.ManifestCID); err != nil {
+					logError("Replication", "pin file during under-replication handling", key, err)
+					recordFailedOperation(key)
+					// Continue to broadcast NEED even if pinning fails
+				} else {
+					provideFile(ctx, key)
+				}
 			}
 
 			// Broadcast NEED
@@ -344,7 +355,7 @@ func handleUnderReplication(ctx context.Context, job CheckJob, count int) {
 			}
 			b, err := rr.MarshalCBOR()
 			if err != nil {
-				log.Printf("[Error] Failed to marshal ReplicationRequest: %v", err)
+				logError("Replication", "marshal ReplicationRequest", key, err)
 				return
 			}
 			shardMgr.PublishToShardCBOR(b)
@@ -390,7 +401,7 @@ func handleOverReplication(ctx context.Context, job CheckJob, count int) {
 		}
 		b, err := ur.MarshalCBOR()
 		if err != nil {
-			log.Printf("[Error] Failed to marshal UnreplicateRequest: %v", err)
+			logError("Replication", "marshal UnreplicateRequest", job.Key, err)
 			return
 		}
 		shardMgr.PublishToShardCBOR(b)
@@ -423,7 +434,10 @@ func pinKeyV2(ctx context.Context, key string, manifestCID cid.Cid) error {
 			return err
 		}
 	}
-	_ = pinFileV2(key)
+	if !pinFileV2(key) {
+		logWarning("Replication", "Failed to track pinned file in local state", key)
+		// Continue despite tracking failure - file is pinned in IPFS
+	}
 	return nil
 }
 
@@ -536,7 +550,9 @@ func replicateFileFromRequest(ctx context.Context, manifestCID cid.Cid, sender p
 		log.Printf("[Replication] Failed to pin manifest %s: %v",
 			manifestCIDStr[:min(16, len(manifestCIDStr))]+"...", err)
 		// Unpin payload on failure
-		_ = ipfsClient.UnpinRecursive(ctx, ro.Payload)
+		if unpinErr := ipfsClient.UnpinRecursive(ctx, ro.Payload); unpinErr != nil {
+			logWarningWithContext("Replication", "Failed to cleanup payload after manifest pin failure", ro.Payload.String(), "cleanup")
+		}
 		return false, fmt.Errorf("pin manifest: %w", err)
 	}
 
@@ -549,8 +565,12 @@ func replicateFileFromRequest(ctx context.Context, manifestCID cid.Cid, sender p
 	} else if ro.TotalSize != 0 && actualSize != ro.TotalSize {
 		log.Printf("[Security] Liar detection: payload size mismatch for %s (manifest=%d, actual=%d). Unpinning.",
 			manifestCIDStr[:min(16, len(manifestCIDStr))]+"...", ro.TotalSize, actualSize)
-		_ = ipfsClient.UnpinRecursive(ctx, manifestCID)
-		_ = ipfsClient.UnpinRecursive(ctx, ro.Payload)
+		if err := ipfsClient.UnpinRecursive(ctx, manifestCID); err != nil {
+			logWarningWithContext("Security", "Failed to unpin manifest after liar detection", manifestCIDStr, "cleanup")
+		}
+		if err := ipfsClient.UnpinRecursive(ctx, ro.Payload); err != nil {
+			logWarningWithContext("Security", "Failed to unpin payload after liar detection", ro.Payload.String(), "cleanup")
+		}
 		return false, fmt.Errorf("payload size mismatch: manifest=%d, actual=%d", ro.TotalSize, actualSize)
 	}
 

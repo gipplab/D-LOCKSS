@@ -34,7 +34,7 @@ func getBinaryPrefix(s string, depth int) string {
 func getHexBinaryPrefix(hexStr string, depth int) string {
 	b, err := hex.DecodeString(hexStr)
 	if err != nil {
-		log.Printf("[Error] Failed to decode hex string: %v", err)
+		logError("Utils", "decode hex string", hexStr, err)
 		return ""
 	}
 	return bytesToBinaryString(b, depth)
@@ -109,4 +109,37 @@ func getPayloadCIDForShardAssignment(ctx context.Context, manifestCIDStr string)
 
 	// Return PayloadCID string for stable shard assignment
 	return ro.Payload.String()
+}
+
+// truncateCID truncates a CID string to a maximum length, appending "..." if truncated.
+// This is used for consistent logging format throughout the codebase.
+func truncateCID(cidStr string, maxLen int) string {
+	if len(cidStr) <= maxLen {
+		return cidStr
+	}
+	return cidStr[:maxLen] + "..."
+}
+
+// logError logs an error with consistent formatting including component, operation, and identifier.
+// This standardizes error logging across the codebase.
+func logError(component, operation, identifier string, err error) {
+	log.Printf("[Error] %s: Failed to %s %s: %v",
+		component, operation, truncateCID(identifier, 16), err)
+}
+
+// logErrorWithContext logs an error with additional context information.
+// Use this when you need to include extra details beyond the standard format.
+func logErrorWithContext(component, operation, identifier string, context string, err error) {
+	log.Printf("[Error] %s: Failed to %s %s (%s): %v",
+		component, operation, truncateCID(identifier, 16), context, err)
+}
+
+// logWarning logs a warning with consistent formatting.
+func logWarning(component, message, identifier string) {
+	log.Printf("[Warning] %s: %s %s", component, message, truncateCID(identifier, 16))
+}
+
+// logWarningWithContext logs a warning with additional context.
+func logWarningWithContext(component, message, identifier, context string) {
+	log.Printf("[Warning] %s: %s %s (%s)", component, message, truncateCID(identifier, 16), context)
 }
