@@ -330,11 +330,13 @@ func (rm *ReplicationManager) processReplicationResult(ctx context.Context, job 
 		rm.pendingVerifications.Remove(key)
 	}
 
-	if job.Responsible && count > MaxReplication && job.Pinned {
+	// Handle over-replication: responsible nodes keep files pinned, custodial nodes unpin
+	if count > MaxReplication && job.Pinned {
 		rm.handleOverReplication(ctx, job, count)
 	}
 
-	if !job.Responsible && count >= MinReplication && job.Pinned {
+	// Handle custodial handoff: unpin when replication is sufficient (but not if already handled by over-replication)
+	if !job.Responsible && count >= MinReplication && count <= MaxReplication && job.Pinned {
 		rm.handleCustodialHandoff(ctx, job, count)
 	}
 }
@@ -417,11 +419,19 @@ func (rm *ReplicationManager) handleUnderReplication(ctx context.Context, job Ch
 }
 
 func (rm *ReplicationManager) handleOverReplication(ctx context.Context, job CheckJob, count int) {
-	log.Printf("[Replication] High Redundancy (%d/%d). Unpinning %s (Monitoring only)", count, MaxReplication, job.Key)
-	rm.UnpinFile(ctx, job.Key, job.ManifestCID)
+	// Responsible nodes should NEVER unpin their files, even if over-replicated.
+	// They are responsible for maintaining the file. Only custodial nodes should unpin.
+	if !job.Responsible {
+		// Custodial node: unpin if over-replicated
+		log.Printf("[Replication] High Redundancy (%d/%d). Unpinning custodial file %s", count, MaxReplication, truncateCID(job.Key, 16))
+		rm.UnpinFile(ctx, job.Key, job.ManifestCID)
+		return
+	}
+
+	// Responsible node: keep file pinned, but ask others to reduce replication
 	if count > MaxReplication+3 {
 		excessCount := count - MaxReplication
-		log.Printf("[Replication] Excessive replication (%d/%d, excess: %d). Broadcasting UnreplicateRequest for %s", count, MaxReplication, excessCount, job.Key[:min(16, len(job.Key))]+"...")
+		log.Printf("[Replication] Excessive replication (%d/%d, excess: %d). Broadcasting UnreplicateRequest for %s (keeping responsible copy pinned)", count, MaxReplication, excessCount, truncateCID(job.Key, 16))
 
 		// Broadcast UnreplicateRequest to coordinate peers dropping excess replicas
 		ur := schema.UnreplicateRequest{
@@ -441,7 +451,9 @@ func (rm *ReplicationManager) handleOverReplication(ctx context.Context, job Che
 		rm.shardMgr.PublishToShardCBOR(b, rm.shardMgr.currentShard) // Responsible node broadcasts to its shard
 
 		// Keep file in tracking to monitor if replication comes down
-		log.Printf("[Replication] Replication excessive (%d), keeping in tracking to monitor reduction", count)
+		log.Printf("[Replication] Replication excessive (%d), keeping responsible copy pinned and monitoring reduction", count)
+	} else {
+		log.Printf("[Replication] High Redundancy (%d/%d) for responsible file %s. Keeping pinned (responsible node must maintain copy)", count, MaxReplication, truncateCID(job.Key, 16))
 	}
 }
 

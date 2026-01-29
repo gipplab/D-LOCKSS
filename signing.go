@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"dlockss/pkg/schema"
 
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -125,7 +127,36 @@ func verifySignedMessage(h host.Host, receivedFrom peer.ID, sender peer.ID, ts i
 
 	pk := h.Peerstore().PubKey(sender)
 	if pk == nil {
-		return fmt.Errorf("missing public key for sender %s", sender.String())
+		// Try to fetch public key by attempting a connection
+		// This will populate the peerstore with the peer's public key
+		if h.Network().Connectedness(sender) != network.Connected {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			// Get addresses from peerstore or try to find peer
+			addrs := h.Peerstore().Addrs(sender)
+			if len(addrs) == 0 {
+				// Try to find peer via DHT if available
+				if globalDHT != nil {
+					addrInfo, err := globalDHT.FindPeer(ctx, sender)
+					if err == nil {
+						h.Peerstore().AddAddrs(addrInfo.ID, addrInfo.Addrs, 10*time.Minute)
+						addrs = addrInfo.Addrs
+					}
+				}
+			}
+			if len(addrs) > 0 {
+				if err := h.Connect(ctx, peer.AddrInfo{ID: sender, Addrs: addrs}); err != nil {
+					// Connection failed, but continue - connection attempt may have populated peerstore
+					log.Printf("[Sig] Failed to connect to %s to fetch public key: %v", sender.String()[:12], err)
+				}
+			}
+		}
+		
+		// Try again after potential connection
+		pk = h.Peerstore().PubKey(sender)
+		if pk == nil {
+			return fmt.Errorf("missing public key for sender %s (attempted to fetch)", sender.String()[:12])
+		}
 	}
 
 	ok, err := pk.Verify(unsigned, sig)

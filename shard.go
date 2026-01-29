@@ -6,13 +6,17 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"log"
+	"math/big"
 	"sync"
 	"time"
 
+	"github.com/ipfs/go-cid"
 	"github.com/ipld/go-ipld-prime/codec/dagcbor"
 	"github.com/ipld/go-ipld-prime/node/basicnode"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multihash"
 
 	"dlockss/pkg/ipfs"
 	"dlockss/pkg/schema"
@@ -193,6 +197,7 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 	// Rate limit check
 	if !checkRateLimit(msg.GetFrom()) {
 		incrementMetric(&metrics.messagesDropped)
+		log.Printf("[Shard] Dropped message from %s due to rate limiting (shard %s)", msg.GetFrom().String()[:12], shardID)
 		return
 	}
 
@@ -202,6 +207,7 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 
 	msgType, err := decodeCBORMessageType(msg.Data)
 	if err != nil {
+		log.Printf("[Shard] Failed to decode message type from %s in shard %s: %v", msg.GetFrom().String()[:12], shardID, err)
 		return
 	}
 
@@ -209,6 +215,7 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 	case schema.MessageTypeIngest:
 		var im schema.IngestMessage
 		if err := im.UnmarshalCBOR(msg.Data); err != nil {
+			log.Printf("[Shard] Failed to unmarshal IngestMessage from %s in shard %s: %v", msg.GetFrom().String()[:12], shardID, err)
 			return
 		}
 		sm.handleIngestMessage(msg, &im, shardID)
@@ -233,6 +240,7 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 func (sm *ShardManager) handleIngestMessage(msg *pubsub.Message, im *schema.IngestMessage, shardID string) {
 	logPrefix := fmt.Sprintf("IngestMessage (Shard %s)", shardID)
 	if verifyAndAuthorizeMessage(sm.h, msg.GetFrom(), im.SenderID, im.Timestamp, im.Nonce, im.Sig, im.MarshalCBORForSigning, logPrefix) {
+		log.Printf("[Shard] Dropped IngestMessage from %s in shard %s due to verification failure", msg.GetFrom().String()[:12], shardID)
 		return
 	}
 	key := im.ManifestCID.String()
@@ -241,6 +249,7 @@ func (sm *ShardManager) handleIngestMessage(msg *pubsub.Message, im *schema.Inge
 	// Add to known files. If we are just a tourist, we still "know" about it,
 	// but the replication manager will eventually decide if we stick around.
 	sm.storageMgr.addKnownFile(key)
+	log.Printf("[Shard] Added file to known files: %s (from %s, shard %s)", truncateCID(key, 16), msg.GetFrom().String()[:12], shardID)
 }
 
 // handleReplicationRequest processes a ReplicationRequest.
@@ -267,7 +276,39 @@ func (sm *ShardManager) handleReplicationRequest(msg *pubsub.Message, rr *schema
 
 	// Attempt automatic replication if enabled and file is not pinned
 	if AutoReplicationEnabled && !sm.storageMgr.isPinned(key) {
-		log.Printf("[Replication] Received replication request for %s (responsible), attempting to replicate...", key[:min(16, len(key))]+"...")
+		// XOR distance-based selection (IPFS/Kademlia style)
+		// Select the MinReplication nodes with smallest XOR distance to the content
+		xorDistance, err := calculateXORDistance(sm.h.ID(), manifestCID)
+		if err != nil {
+			log.Printf("[Replication] Failed to calculate XOR distance for %s: %v", key[:min(16, len(key))]+"...", err)
+			sm.storageMgr.addKnownFile(key)
+			return
+		}
+		
+		peersInShard := sm.getShardPeerCount()
+		if peersInShard == 0 {
+			peersInShard = MinReplication // Fallback
+		}
+		
+		// Simple approach: Use XOR distance modulo to select nodes
+		// Nodes with smaller distance mod values are "closer" and should replicate
+		// We select nodes where (distance % peersInShard) < MinReplication
+		// This ensures roughly MinReplication nodes participate per file
+		distanceMod := new(big.Int).Mod(xorDistance, big.NewInt(int64(peersInShard)))
+		modValue := int(distanceMod.Int64())
+		
+		selected := modValue < MinReplication
+		
+		if !selected {
+			log.Printf("[Replication] Not selected to replicate %s (XOR distance mod %d/%d, need < %d, distance: %s)", 
+				key[:min(16, len(key))]+"...", modValue, peersInShard, MinReplication, truncateBigInt(xorDistance, 16))
+			sm.storageMgr.addKnownFile(key)
+			return
+		}
+		
+		log.Printf("[Replication] Selected to replicate %s (XOR distance mod %d/%d, distance: %s)", 
+			key[:min(16, len(key))]+"...", modValue, peersInShard, truncateBigInt(xorDistance, 16))
+		
 
 		go func() {
 			if sm.replicationMgr == nil {
@@ -342,6 +383,77 @@ func getShardInfo() (string, int) {
 	}
 	// Note: Avoiding global lock for peek
 	return shardMgr.currentShard, shardMgr.getShardPeerCount()
+}
+
+// calculateXORDistance computes the XOR distance between a peer ID and a CID.
+// This follows IPFS/Kademlia DHT conventions for determining content locality.
+// Returns the XOR distance as a big.Int for comparison.
+func calculateXORDistance(peerID peer.ID, contentCID cid.Cid) (*big.Int, error) {
+	// Extract raw hash bytes from peer ID
+	// Peer IDs in libp2p are multihash-encoded, so we need to decode
+	peerIDBytes := []byte(peerID)
+	peerMh, err := multihash.Decode(peerIDBytes)
+	if err != nil {
+		// If decoding fails, try using the bytes directly (might be identity hash)
+		peerHash := peerIDBytes
+		// Try to extract hash from CID
+		cidMh := contentCID.Hash()
+		cidMhDecoded, err := multihash.Decode(cidMh)
+		if err != nil {
+			return nil, fmt.Errorf("decode CID multihash: %w", err)
+		}
+		contentHash := cidMhDecoded.Digest
+		
+		// XOR with minimum length
+		minLen := len(peerHash)
+		if len(contentHash) < minLen {
+			minLen = len(contentHash)
+		}
+		xorResult := make([]byte, minLen)
+		for i := 0; i < minLen; i++ {
+			xorResult[i] = peerHash[i] ^ contentHash[i]
+		}
+		return new(big.Int).SetBytes(xorResult), nil
+	}
+	peerHash := peerMh.Digest
+	
+	// Extract raw hash bytes from CID (multihash)
+	cidMh := contentCID.Hash()
+	cidMhDecoded, err := multihash.Decode(cidMh)
+	if err != nil {
+		return nil, fmt.Errorf("decode CID multihash: %w", err)
+	}
+	contentHash := cidMhDecoded.Digest
+	
+	// Ensure both hashes are the same length (pad with zeros if needed)
+	maxLen := len(peerHash)
+	if len(contentHash) > maxLen {
+		maxLen = len(contentHash)
+	}
+	
+	peerPadded := make([]byte, maxLen)
+	copy(peerPadded[maxLen-len(peerHash):], peerHash)
+	
+	contentPadded := make([]byte, maxLen)
+	copy(contentPadded[maxLen-len(contentHash):], contentHash)
+	
+	// Calculate XOR distance byte by byte
+	xorResult := make([]byte, maxLen)
+	for i := 0; i < maxLen; i++ {
+		xorResult[i] = peerPadded[i] ^ contentPadded[i]
+	}
+	
+	// Convert to big.Int for comparison
+	return new(big.Int).SetBytes(xorResult), nil
+}
+
+// truncateBigInt truncates a big.Int's string representation for logging.
+func truncateBigInt(n *big.Int, maxLen int) string {
+	str := n.String()
+	if len(str) <= maxLen {
+		return str
+	}
+	return str[:maxLen] + "..."
 }
 
 func (sm *ShardManager) checkAndSplitIfNeeded() {

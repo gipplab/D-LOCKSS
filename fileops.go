@@ -406,22 +406,51 @@ func (fp *FileProcessor) announceCustodialFile(manifestCID cid.Cid, manifestCIDS
 }
 
 // watchFolder watches the data directory for new files.
+// It will restart automatically if the watcher fails.
 func (fp *FileProcessor) watchFolder(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("[FileWatcher] Context cancelled, stopping file watcher")
+			return
+		default:
+			if err := fp.runWatcher(ctx); err != nil {
+				log.Printf("[FileWatcher] Watcher exited with error: %v. Restarting in 5 seconds...", err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(5 * time.Second):
+					log.Printf("[FileWatcher] Restarting file watcher...")
+					// Continue loop to restart
+				}
+			} else {
+				log.Printf("[FileWatcher] Watcher exited normally. Restarting in 5 seconds...")
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(5 * time.Second):
+					log.Printf("[FileWatcher] Restarting file watcher...")
+					// Continue loop to restart
+				}
+			}
+		}
+	}
+}
+
+// runWatcher runs a single instance of the file watcher.
+func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.Printf("[Error] Failed to create file watcher: %v", err)
-		return
+		return fmt.Errorf("failed to create file watcher: %w", err)
 	}
 	defer watcher.Close()
 
 	if err := os.MkdirAll(FileWatchFolder, 0755); err != nil {
-		log.Printf("[Error] Failed to create data directory: %v", err)
-		return
+		return fmt.Errorf("failed to create data directory: %w", err)
 	}
 
 	if err := watcher.Add(FileWatchFolder); err != nil {
-		log.Printf("[Error] Failed to watch data directory: %v", err)
-		return
+		return fmt.Errorf("failed to watch data directory: %w", err)
 	}
 
 	// Recursive watch: Add all existing subdirectories
@@ -448,10 +477,11 @@ func (fp *FileProcessor) watchFolder(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			log.Printf("[FileWatcher] Context cancelled, stopping file watcher")
+			return nil
 		case event, ok := <-watcher.Events:
 			if !ok {
-				return
+				return fmt.Errorf("events channel closed unexpectedly")
 			}
 
 			// Handle Create events for directories (to add new watches)
@@ -498,9 +528,10 @@ func (fp *FileProcessor) watchFolder(ctx context.Context) {
 			}
 		case err, ok := <-watcher.Errors:
 			if !ok {
-				return
+				return fmt.Errorf("errors channel closed unexpectedly")
 			}
-			log.Printf("[Error] Watcher error: %v", err)
+			log.Printf("[FileWatcher] ERROR: Watcher error: %v", err)
+			// Don't exit on error - continue watching, but log it
 		}
 	}
 }
