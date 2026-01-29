@@ -424,7 +424,23 @@ func (fp *FileProcessor) watchFolder(ctx context.Context) {
 		return
 	}
 
-	log.Printf("[FileWatcher] Watching %s for new files...", FileWatchFolder)
+	// Recursive watch: Add all existing subdirectories
+	err = filepath.Walk(FileWatchFolder, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			if err := watcher.Add(path); err != nil {
+				log.Printf("[Error] Failed to watch subdirectory %s: %v", path, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("[Error] Failed to walk directory for watching: %v", err)
+	}
+
+	log.Printf("[FileWatcher] Watching %s (and subdirectories) for new files...", FileWatchFolder)
 
 	// Debounce timer (not strictly used with goroutine approach, but good practice concept)
 	// const debounceDuration = 100 * time.Millisecond
@@ -438,12 +454,35 @@ func (fp *FileProcessor) watchFolder(ctx context.Context) {
 				return
 			}
 
-			// Handle Create and Write events
+			// Handle Create events for directories (to add new watches)
+			if event.Op&fsnotify.Create == fsnotify.Create {
+				info, err := os.Stat(event.Name)
+				if err == nil && info.IsDir() {
+					// It's a directory, watch it!
+					if err := watcher.Add(event.Name); err != nil {
+						log.Printf("[Error] Failed to watch new directory %s: %v", event.Name, err)
+					} else {
+						log.Printf("[FileWatcher] Added watch for new directory: %s", event.Name)
+					}
+					// Also process any files that might have been copied in quickly with the folder?
+					// Usually files trigger their own create events, but if a folder move happens, 
+					// we might need to scan it. For now, rely on file events.
+					continue 
+				}
+			}
+
+			// Handle Create and Write events for files
 			if event.Op&fsnotify.Create == fsnotify.Create || event.Op&fsnotify.Write == fsnotify.Write {
 				path := event.Name
 				
 				// Validate path before processing (security)
 				if !validateFilePath(path) {
+					continue
+				}
+
+				// Verify it is a file (not a dir - handled above)
+				info, err := os.Stat(path)
+				if err != nil || info.IsDir() {
 					continue
 				}
 

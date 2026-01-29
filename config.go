@@ -200,4 +200,7 @@ var (
 	NonceSize           = getEnvInt("DLOCKSS_NONCE_SIZE", 16)                             // Size of cryptographic nonces in bytes
 	MinNonceSize        = getEnvInt("DLOCKSS_MIN_NONCE_SIZE", 8)                          // Minimum allowed nonce size
 	FutureSkewTolerance = getEnvDuration("DLOCKSS_FUTURE_SKEW_TOLERANCE", 30*time.Second) // Tolerance for future timestamps in signature verification
+
+	// Telemetry
+	MonitorPeerID = getEnvString("DLOCKSS_MONITOR_PEER_ID", "") // Centralized monitor PeerID (optional)
 )

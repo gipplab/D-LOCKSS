@@ -58,9 +58,6 @@ func main() {
 		log.Printf("[Warning] Missing private key for self peer ID; message signing will be unavailable")
 	}
 
-	// Initialize replication worker pool (Deprecated by Async Pipeline, but kept for compilation if referenced elsewhere)
-	// replicationWorkers = make(chan struct{}, MaxConcurrentReplicationChecks)
-
 	logConfiguration()
 
 	// Initialize optional trust store (default trust mode is "open").
@@ -94,7 +91,20 @@ func main() {
 	shardMgr.SetReplicationManager(replicationMgr)
 
 	go shardMgr.Run()
-	go inputLoop(shardMgr)
+	// Input loop removed in favor of API server
+	
+	// Start API Server
+	apiPort := getEnvInt("DLOCKSS_API_PORT", 5050)
+	apiServer := NewAPIServer(apiPort)
+	apiServer.Start()
+
+	// Start Telemetry Client
+	if MonitorPeerID != "" {
+		telemetryClient := NewTelemetryClient(h, globalDHT, MonitorPeerID)
+		if telemetryClient != nil {
+			telemetryClient.Start(ctx)
+		}
+	}
 
 	fileProcessor := NewFileProcessor(ipfsClient, shardMgr, storageMgr, selfPrivKey)
 
@@ -128,6 +138,10 @@ func main() {
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
+	
+	if err := apiServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[Error] API server shutdown error: %v", err)
+	}
 
 	if shardMgr != nil {
 		shardMgr.Close()
@@ -142,7 +156,9 @@ func main() {
 	}
 
 	<-shutdownCtx.Done()
-	log.Println("[Warning] Shutdown timeout exceeded, forcing exit")
+	if shutdownCtx.Err() == context.DeadlineExceeded {
+		log.Println("[Warning] Shutdown timeout exceeded, forcing exit")
+	}
 
 	log.Println("[System] Shutdown complete")
 }

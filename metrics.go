@@ -9,29 +9,118 @@ import (
 	"path/filepath"
 	"strconv"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
+
+var (
+	// Prometheus Metrics
+	promMessagesReceived = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "dlockss_messages_received_total",
+		Help: "Total number of P2P messages received",
+	})
+	promMessagesDropped = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "dlockss_messages_dropped_total",
+		Help: "Total number of P2P messages dropped due to rate limits or errors",
+	})
+	promReplicationChecks = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "dlockss_replication_checks_total",
+		Help: "Total number of replication checks performed",
+	})
+	promReplicationSuccess = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "dlockss_replication_success_total",
+		Help: "Total number of successful replication checks",
+	})
+	promReplicationFailures = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "dlockss_replication_failures_total",
+		Help: "Total number of failed replication checks",
+	})
+	promDHTQueries = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "dlockss_dht_queries_total",
+		Help: "Total number of DHT queries performed",
+	})
+	promDHTTimeouts = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "dlockss_dht_timeouts_total",
+		Help: "Total number of DHT queries that timed out",
+	})
+	promShardSplits = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "dlockss_shard_splits_total",
+		Help: "Total number of shard split events",
+	})
+	
+	// Gauges
+	promPinnedFiles = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dlockss_pinned_files",
+		Help: "Current number of files pinned locally",
+	})
+	promKnownFiles = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dlockss_known_files",
+		Help: "Current number of files tracked in known files",
+	})
+	promActivePeers = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dlockss_active_peers",
+		Help: "Number of peers in the current shard",
+	})
+	promWorkerPoolActive = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dlockss_worker_pool_active",
+		Help: "Number of active replication workers",
+	})
+	promQueueDepth = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dlockss_replication_queue_depth",
+		Help: "Current depth of the replication job queue",
+	})
+)
+
+func init() {
+	// Register metrics
+	prometheus.MustRegister(
+		promMessagesReceived,
+		promMessagesDropped,
+		promReplicationChecks,
+		promReplicationSuccess,
+		promReplicationFailures,
+		promDHTQueries,
+		promDHTTimeouts,
+		promShardSplits,
+		promPinnedFiles,
+		promKnownFiles,
+		promActivePeers,
+		promWorkerPoolActive,
+		promQueueDepth,
+	)
+}
 
 func incrementMetric(metric *int64) {
 	metrics.Lock()
 	defer metrics.Unlock()
 	*metric++
+	
+	// Update Prometheus and legacy struct
 	switch metric {
 	case &metrics.messagesReceived:
 		metrics.cumulativeMessagesReceived++
+		promMessagesReceived.Inc()
 	case &metrics.messagesDropped:
 		metrics.cumulativeMessagesDropped++
+		promMessagesDropped.Inc()
 	case &metrics.replicationChecks:
 		metrics.cumulativeReplicationChecks++
+		promReplicationChecks.Inc()
 	case &metrics.replicationSuccess:
 		metrics.cumulativeReplicationSuccess++
+		promReplicationSuccess.Inc()
 	case &metrics.replicationFailures:
 		metrics.cumulativeReplicationFailures++
+		promReplicationFailures.Inc()
 	case &metrics.dhtQueries:
 		metrics.cumulativeDhtQueries++
+		promDHTQueries.Inc()
 	case &metrics.dhtQueryTimeouts:
 		metrics.cumulativeDhtQueryTimeouts++
+		promDHTTimeouts.Inc()
 	case &metrics.shardSplits:
 		metrics.cumulativeShardSplits++
+		promShardSplits.Inc()
 	}
 }
 
@@ -50,8 +139,28 @@ func runMetricsReporter(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			updateGauges()
 			reportMetrics()
 		}
+	}
+}
+
+func updateGauges() {
+	metrics.RLock()
+	defer metrics.RUnlock()
+	
+	promPinnedFiles.Set(float64(metrics.pinnedFilesCount))
+	promKnownFiles.Set(float64(metrics.knownFilesCount))
+	
+	if shardMgr != nil {
+		_, activePeers := getShardInfo()
+		promActivePeers.Set(float64(activePeers))
+	}
+	
+	if replicationMgr != nil {
+		promWorkerPoolActive.Set(float64(replicationMgr.checkingFiles.Size()))
+		// Note: Queue depth isn't directly exposed by ReplicationManager yet, 
+		// but we can add that later.
 	}
 }
 
