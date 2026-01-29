@@ -77,11 +77,17 @@ func reportMetrics() {
 	// Rate-limited peers is a narrower metric: peers currently tracked by the
 	// rate limiter due to recent message activity.
 	rateLimitedPeers := rateLimiter.Size()
-	backoffCount := failedOperations.Size()
+	backoffCount := 0
+	if storageMgr != nil {
+		backoffCount = storageMgr.failedOperations.Size()
+	}
 
 	// Track actual concurrent operations (files currently being checked)
 	// This is more accurate than reporting the configured worker count
-	activeWorkers := checkingFiles.Size()
+	activeWorkers := 0
+	if replicationMgr != nil {
+		activeWorkers = replicationMgr.checkingFiles.Size()
+	}
 	maxWorkers := ReplicationWorkers // Maximum number of worker goroutines
 	if activeWorkers < 0 {
 		activeWorkers = 0
@@ -89,7 +95,10 @@ func reportMetrics() {
 
 	metrics.RUnlock()
 
-	levelsMap := fileReplicationLevels.All()
+	levelsMap := make(map[string]int)
+	if storageMgr != nil {
+		levelsMap = storageMgr.fileReplicationLevels.All()
+	}
 	distribution := [11]int{}
 	totalFiles := 0
 	totalReplication := 0
@@ -252,10 +261,16 @@ func exportMetricsToFile(timestamp time.Time) {
 	// Compute shard/peer metrics outside of metrics lock to avoid lock ordering issues.
 	currentShard, activePeers := getShardInfo()
 	rateLimitedPeers := rateLimiter.Size()
-	backoffCount := failedOperations.Size()
+	backoffCount := 0
+	if storageMgr != nil {
+		backoffCount = storageMgr.failedOperations.Size()
+	}
 
 	// Track actual concurrent operations (files currently being checked)
-	activeWorkers := checkingFiles.Size()
+	activeWorkers := 0
+	if replicationMgr != nil {
+		activeWorkers = replicationMgr.checkingFiles.Size()
+	}
 	if activeWorkers < 0 {
 		activeWorkers = 0
 	}

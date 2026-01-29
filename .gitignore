@@ -15,3 +15,13 @@ charts
 
 /testnet/active_ipfs.pids
 /testnet/active_nodes.pids
+
+docs/architecture
+docs/development
+docs/project
+
+testnet/TESTNET_OPTIMIZATIONS.md
+docs/README.md
+
+replication_test.go
+shard_test.go

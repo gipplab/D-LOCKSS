@@ -6,102 +6,114 @@ import (
 	"time"
 )
 
-// pinFile is the legacy V1 function that takes a SHA-256 hash and converts it to CID.
-// For V2, use pinFileV2 which takes a ManifestCID string directly.
-func pinFile(hash string) bool {
-	fileCid, err := hashToCid(hash)
-	if err != nil {
-		logError("Storage", "convert hash to CID", hash, err)
+// StorageManager handles local file state and DHT announcements.
+type StorageManager struct {
+	dht                   DHTProvider
+	pinnedFiles           *PinnedSet
+	knownFiles            *KnownFiles
+	recentlyRemoved       *RecentlyRemoved
+	fileReplicationLevels *FileReplicationLevels
+	failedOperations      *BackoffTable
+}
+
+// NewStorageManager creates a new StorageManager.
+func NewStorageManager(dht DHTProvider) *StorageManager {
+	return &StorageManager{
+		dht:                   dht,
+		pinnedFiles:           NewPinnedSet(),
+		knownFiles:            NewKnownFiles(),
+		recentlyRemoved:       NewRecentlyRemoved(),
+		fileReplicationLevels: NewFileReplicationLevels(),
+		failedOperations:      NewBackoffTable(),
+	}
+}
+
+// pinFile pins a file using its ManifestCID string.
+// It tracks the ManifestCID in our internal state and announces to DHT.
+func (sm *StorageManager) pinFile(manifestCIDStr string) bool {
+	// Only pin if allowed
+	if isCIDBlocked(manifestCIDStr, NodeCountry) {
+		log.Printf("[Storage] Refused to pin blocked CID: %s (blocked in %s)", truncateCID(manifestCIDStr, 16), NodeCountry)
 		return false
 	}
 
-	cidStr := fileCid.String()
-	if isCIDBlocked(cidStr, NodeCountry) {
-		log.Printf("[Storage] Refused to pin blocked CID: %s (blocked in %s)", truncateCID(cidStr, 16), NodeCountry)
-		return false
-	}
-
-	if pinnedFiles.Add(hash) {
+	if sm.pinnedFiles.Add(manifestCIDStr) {
 		updateMetrics(func() {
-			metrics.pinnedFilesCount = pinnedFiles.Size()
+			metrics.pinnedFilesCount = sm.pinnedFiles.Size()
 		})
-		log.Printf("[Storage] Pinned file: %s (total pinned: %d)", truncateCID(hash, 16), pinnedFiles.Size())
+		log.Printf("[Storage] Pinned ManifestCID: %s (total pinned: %d)", truncateCID(manifestCIDStr, 16), sm.pinnedFiles.Size())
+		
+		// Also announce to DHT (provide)
+		// We do this here to ensure anything we pin is also provided
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), DHTProvideTimeout)
+			defer cancel()
+			sm.provideFile(ctx, manifestCIDStr)
+		}()
+		
 		return true
 	}
 	return true
 }
 
 // unpinFile removes a file/manifest from the pinned set.
-// The key parameter can be either a legacy SHA-256 hash (V1) or a ManifestCID string (V2).
-func unpinFile(key string) {
-	if pinnedFiles.Has(key) {
-		pinnedFiles.Remove(key)
+func (sm *StorageManager) unpinFile(key string) {
+	if sm.pinnedFiles.Has(key) {
+		sm.pinnedFiles.Remove(key)
 		updateMetrics(func() {
-			metrics.pinnedFilesCount = pinnedFiles.Size()
+			metrics.pinnedFilesCount = sm.pinnedFiles.Size()
 		})
-		log.Printf("[Storage] Unpinned file: %s (remaining pinned: %d)", truncateCID(key, 16), pinnedFiles.Size())
+		log.Printf("[Storage] Unpinned file: %s (remaining pinned: %d)", truncateCID(key, 16), sm.pinnedFiles.Size())
 	}
 }
 
 // isPinned checks if a file/manifest is pinned.
-// The key parameter can be either a legacy SHA-256 hash (V1) or a ManifestCID string (V2).
-func isPinned(key string) bool {
-	return pinnedFiles.Has(key)
+func (sm *StorageManager) isPinned(key string) bool {
+	return sm.pinnedFiles.Has(key)
 }
 
 // addKnownFile adds a file/manifest to the known files set.
-// The key parameter can be either a legacy SHA-256 hash (V1) or a ManifestCID string (V2).
-func addKnownFile(key string) {
-	removedTime, wasRemoved := recentlyRemoved.WasRemoved(key)
+func (sm *StorageManager) addKnownFile(key string) {
+	removedTime, wasRemoved := sm.recentlyRemoved.WasRemoved(key)
 	if wasRemoved && time.Since(removedTime) < RemovedFileCooldown {
 		return
 	}
 
-	knownFiles.Add(key)
+	sm.knownFiles.Add(key)
 	updateMetrics(func() {
-		metrics.knownFilesCount = knownFiles.Size()
+		metrics.knownFilesCount = sm.knownFiles.Size()
 	})
 }
 
 // removeKnownFile removes a file/manifest from the known files set.
-// The key parameter can be either a legacy SHA-256 hash (V1) or a ManifestCID string (V2).
-func removeKnownFile(key string) {
-	knownFiles.Remove(key)
+func (sm *StorageManager) removeKnownFile(key string) {
+	sm.knownFiles.Remove(key)
 	updateMetrics(func() {
-		metrics.knownFilesCount = knownFiles.Size()
+		metrics.knownFilesCount = sm.knownFiles.Size()
 	})
 
-	fileReplicationLevels.Remove(key)
+	sm.fileReplicationLevels.Remove(key)
 
-	recentlyRemoved.Record(key)
+	sm.recentlyRemoved.Record(key)
 }
 
 // provideFile announces a file/manifest to the DHT.
-// The key parameter can be either a legacy SHA-256 hash (V1) or a ManifestCID string (V2).
-func provideFile(ctx context.Context, key string) {
+func (sm *StorageManager) provideFile(ctx context.Context, key string) {
 	c, err := keyToCID(key)
 	if err != nil {
 		logError("Storage", "convert key to CID", key, err)
 		return
 	}
-	if globalDHT != nil {
-		if err := globalDHT.Provide(ctx, c, true); err != nil {
+	if sm.dht != nil {
+		if err := sm.dht.Provide(ctx, c, true); err != nil {
 			logError("DHT", "provide file", key, err)
-			recordFailedOperation(key)
+			sm.recordFailedOperation(key)
 			return
 		}
 	}
 }
 
-// pinFileV2 is the V2 version that works with ManifestCID strings
-// It tracks the ManifestCID in our internal state (for now, still using hash map)
-func pinFileV2(manifestCIDStr string) bool {
-	if pinnedFiles.Add(manifestCIDStr) {
-		updateMetrics(func() {
-			metrics.pinnedFilesCount = pinnedFiles.Size()
-		})
-		log.Printf("[Storage] Pinned ManifestCID: %s (total pinned: %d)", truncateCID(manifestCIDStr, 16), pinnedFiles.Size())
-		return true
-	}
-	return true
+// recordFailedOperation records a failure for exponential backoff
+func (sm *StorageManager) recordFailedOperation(key string) {
+	sm.failedOperations.RecordFailure(key)
 }

@@ -84,11 +84,19 @@ func main() {
 		log.Printf("[System] IPFS client initialized successfully")
 	}
 
+	// Create managers
+	storageMgr = NewStorageManager(globalDHT)
+
 	initialShard := getBinaryPrefix(h.ID().String(), 1)
-	shardMgr = NewShardManager(ctx, h, ps, initialShard)
+	shardMgr = NewShardManager(ctx, h, ps, ipfsClient, storageMgr, initialShard)
+
+	replicationMgr = NewReplicationManager(ipfsClient, shardMgr, storageMgr, globalDHT)
+	shardMgr.SetReplicationManager(replicationMgr)
 
 	go shardMgr.Run()
 	go inputLoop(shardMgr)
+
+	fileProcessor := NewFileProcessor(ipfsClient, shardMgr, storageMgr, selfPrivKey)
 
 	if err := os.Mkdir(FileWatchFolder, 0755); err != nil && !os.IsExist(err) {
 		log.Printf("Error creating folder: %v", err)
@@ -100,12 +108,12 @@ func main() {
 	}
 
 	log.Println("Scanning for existing files...")
-	scanExistingFiles()
+	fileProcessor.scanExistingFiles()
 
-	go watchFolder(ctx)
+	go fileProcessor.watchFolder(ctx)
 
-	go startReplicationPipeline(ctx)
-	go runReplicationCacheCleanup(ctx)
+	go replicationMgr.startReplicationPipeline(ctx)
+	go replicationMgr.runReplicationCacheCleanup(ctx)
 	go runRateLimiterCleanup(ctx)
 	go runMetricsReporter(ctx)
 	go runDiskUsageMonitor(ctx)

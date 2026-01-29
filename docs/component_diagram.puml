@@ -1,27 +1,24 @@
 @startuml D-LOCKSS Component Diagram
 
 package "Core Components" {
-    component ShardManager
-    component "Storage Manager" as StorageManager
-    component "Replication Checker" as ReplicationChecker
-    component "File Operations" as FileOperations
+    component "ShardManager" as ShardManager
+    component "StorageManager" as StorageManager
+    component "ReplicationManager" as ReplicationManager
+    component "FileProcessor" as FileProcessor
     component Metrics
     component "Rate Limiter" as RateLimiter
-    component "Backoff Manager" as BackoffManager
     component "Storage Monitor" as StorageMonitor
 }
 
-ShardManager --> StorageManager : checks responsibility
-ReplicationChecker --> StorageManager : manages pins
-ReplicationChecker --> ShardManager : publishes NEED
-FileOperations --> StorageManager : pins files
-FileOperations --> ShardManager : checks responsibility
-ReplicationChecker --> BackoffManager : checks backoff
+ShardManager --> StorageManager : updates state (reshard)
+ReplicationManager --> StorageManager : pins/unpins, check state
+ReplicationManager --> ShardManager : uses for responsibility check
+FileProcessor --> StorageManager : pins files, adds known
+FileProcessor --> ShardManager : checks responsibility
 ShardManager --> RateLimiter : filters messages
 RateLimiter --> StorageMonitor : checks disk usage
-StorageMonitor --> StorageManager : monitors disk
-Metrics --> StorageManager : reads state
-Metrics --> ReplicationChecker : tracks stats
+Metrics --> StorageManager : reads stats
+Metrics --> ReplicationManager : reads stats
 
 note right of ShardManager
     Manages shard assignment
@@ -29,39 +26,22 @@ note right of ShardManager
 end note
 
 note right of StorageManager
-    Manages pinned files
-    and known files tracking
+    Owns local state:
+    - PinnedFiles
+    - KnownFiles
+    - BackoffTable
 end note
 
-note right of ReplicationChecker
-    Periodic replication
-    level verification
+note right of ReplicationManager
+    Owns pipeline:
+    - Scheduler
+    - Prober
+    - Reconciler
 end note
 
-note right of FileOperations
+note right of FileProcessor
     File ingestion
-    and hash calculation
-end note
-
-note right of Metrics
-    Metrics collection
-    and CSV export
-end note
-
-note right of RateLimiter
-    Per-peer message
-    rate limiting
-end note
-
-note right of BackoffManager
-    Exponential backoff
-    for failed operations
-end note
-
-note right of StorageMonitor
-    Monitors disk usage
-    and rejects custodial files
-    when disk is full
+    and Manifest creation
 end note
 
 @enduml

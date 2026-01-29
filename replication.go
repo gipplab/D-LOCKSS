@@ -12,8 +12,42 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p/core/peer"
 
+	"dlockss/pkg/ipfs"
 	"dlockss/pkg/schema"
 )
+
+// ReplicationManager handles the replication lifecycle and pipeline.
+type ReplicationManager struct {
+	ipfsClient           ipfs.IPFSClient
+	shardMgr             *ShardManager
+	storageMgr           *StorageManager
+	dht                  DHTProvider
+	
+	// State
+	checkingFiles        *CheckingFiles
+	lastCheckTime        *LastCheckTime
+	pendingVerifications *PendingVerifications
+	replicationCache     *ReplicationCache
+}
+
+// NewReplicationManager creates a new ReplicationManager.
+func NewReplicationManager(
+	client ipfs.IPFSClient, 
+	sm *ShardManager, 
+	stm *StorageManager, 
+	dht DHTProvider,
+) *ReplicationManager {
+	return &ReplicationManager{
+		ipfsClient:           client,
+		shardMgr:             sm,
+		storageMgr:           stm,
+		dht:                  dht,
+		checkingFiles:        NewCheckingFiles(),
+		lastCheckTime:        NewLastCheckTime(),
+		pendingVerifications: NewPendingVerifications(),
+		replicationCache:     NewReplicationCache(),
+	}
+}
 
 // CheckJob represents a unit of work for the replication pipeline
 type CheckJob struct {
@@ -35,12 +69,12 @@ type CheckResult struct {
 }
 
 // startReplicationPipeline initializes and starts the async replication pipeline
-func startReplicationPipeline(ctx context.Context) {
+func (rm *ReplicationManager) startReplicationPipeline(ctx context.Context) {
 	jobQueue := make(chan CheckJob, ReplicationQueueSize)
 	resultQueue := make(chan CheckResult, ReplicationQueueSize)
 
 	// Start Scheduler (Stage 1)
-	go runScheduler(ctx, jobQueue)
+	go rm.runScheduler(ctx, jobQueue)
 
 	// Start Network Probers (Stage 2)
 	var wg sync.WaitGroup
@@ -48,12 +82,12 @@ func startReplicationPipeline(ctx context.Context) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runNetworkProber(ctx, jobQueue, resultQueue)
+			rm.runNetworkProber(ctx, jobQueue, resultQueue)
 		}()
 	}
 
 	// Start Reconciler (Stage 3)
-	go runReconciler(ctx, resultQueue)
+	go rm.runReconciler(ctx, resultQueue)
 
 	// Wait for context cancellation to clean up
 	go func() {
@@ -67,7 +101,7 @@ func startReplicationPipeline(ctx context.Context) {
 }
 
 // Stage 1: Scheduler
-func runScheduler(ctx context.Context, jobQueue chan<- CheckJob) {
+func (rm *ReplicationManager) runScheduler(ctx context.Context, jobQueue chan<- CheckJob) {
 	ticker := time.NewTicker(CheckInterval)
 	defer ticker.Stop()
 
@@ -76,13 +110,13 @@ func runScheduler(ctx context.Context, jobQueue chan<- CheckJob) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			scheduleJobs(ctx, jobQueue)
+			rm.scheduleJobs(ctx, jobQueue)
 		}
 	}
 }
 
-func scheduleJobs(ctx context.Context, jobQueue chan<- CheckJob) {
-	files := knownFiles.All()
+func (rm *ReplicationManager) scheduleJobs(ctx context.Context, jobQueue chan<- CheckJob) {
+	files := rm.storageMgr.knownFiles.All()
 	for key := range files {
 		// Check for context cancellation
 		select {
@@ -92,31 +126,31 @@ func scheduleJobs(ctx context.Context, jobQueue chan<- CheckJob) {
 		}
 
 		// Filter: Skip if recently checked or removed
-		if !shouldCheckFile(key) {
+		if !rm.shouldCheckFile(key) {
 			continue
 		}
 
 		// Use PayloadCID for shard assignment (stable, content-based)
 		// ManifestCID includes timestamp/metadata and changes on every ingestion
-		payloadCIDStr := getPayloadCIDForShardAssignment(ctx, key)
-		responsible := shardMgr.AmIResponsibleFor(payloadCIDStr)
-		pinned := isPinned(key)
+		payloadCIDStr := getPayloadCIDForShardAssignment(ctx, rm.ipfsClient, key)
+		responsible := rm.shardMgr.AmIResponsibleFor(payloadCIDStr)
+		pinned := rm.storageMgr.isPinned(key)
 
 		// Filter: Cleanup if not responsible and not pinned
 		if !responsible && !pinned {
-			removeKnownFile(key)
+			rm.storageMgr.removeKnownFile(key)
 			continue
 		}
 
 		// Filter: TryLock to prevent duplicate scheduling
-		if !checkingFiles.TryLock(key) {
+		if !rm.checkingFiles.TryLock(key) {
 			continue
 		}
 
 		manifestCID, err := keyToCID(key)
 		if err != nil {
 			logError("Replication", "convert key to CID in scheduler", key, err)
-			checkingFiles.Unlock(key)
+			rm.checkingFiles.Unlock(key)
 			continue
 		}
 
@@ -146,18 +180,18 @@ func scheduleJobs(ctx context.Context, jobQueue chan<- CheckJob) {
 				// Try harder for high priority? For now, just log and skip to avoid blocking scheduler
 				log.Printf("[Scheduler] Job queue full, skipping HIGH priority check for %s", key[:min(16, len(key))]+"...")
 			}
-			checkingFiles.Unlock(key)
+			rm.checkingFiles.Unlock(key)
 		}
 	}
 }
 
-func shouldCheckFile(key string) bool {
-	lastCheck, exists := lastCheckTime.Get(key)
+func (rm *ReplicationManager) shouldCheckFile(key string) bool {
+	lastCheck, exists := rm.lastCheckTime.Get(key)
 	if exists && time.Since(lastCheck) < ReplicationCheckCooldown {
 		return false
 	}
 
-	removedTime, wasRemoved := recentlyRemoved.WasRemoved(key)
+	removedTime, wasRemoved := rm.storageMgr.recentlyRemoved.WasRemoved(key)
 	if wasRemoved && time.Since(removedTime) < RemovedFileCooldown {
 		return false
 	}
@@ -165,35 +199,35 @@ func shouldCheckFile(key string) bool {
 }
 
 // Stage 2: Network Prober
-func runNetworkProber(ctx context.Context, jobQueue <-chan CheckJob, resultQueue chan<- CheckResult) {
+func (rm *ReplicationManager) runNetworkProber(ctx context.Context, jobQueue <-chan CheckJob, resultQueue chan<- CheckResult) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case job := <-jobQueue:
-			processJob(ctx, job, resultQueue)
+			rm.processJob(ctx, job, resultQueue)
 		}
 	}
 }
 
-func processJob(ctx context.Context, job CheckJob, resultQueue chan<- CheckResult) {
+func (rm *ReplicationManager) processJob(ctx context.Context, job CheckJob, resultQueue chan<- CheckResult) {
 	start := time.Now()
 
 	// Local Verification (Liar Detection)
 	if job.Pinned {
-		ok, err := verifyResearchObjectLocal(ctx, job.ManifestCID)
+		ok, err := rm.verifyResearchObjectLocal(ctx, job.ManifestCID)
 		if err != nil {
 			log.Printf("[Replication] Local verification error for %s: %v", job.Key[:min(16, len(job.Key))]+"...", err)
 		}
 		if !ok {
 			log.Printf("[Replication] Local DAG incomplete or invalid for %s; unpinning local state", job.Key[:min(16, len(job.Key))]+"...")
-			unpinKeyV2(ctx, job.Key, job.ManifestCID)
+			rm.UnpinFile(ctx, job.Key, job.ManifestCID)
 			job.Pinned = false // Update job state
 		}
 	}
 
 	// Check Cache
-	cachedCount, cachedAt, hasCache := replicationCache.GetWithAge(job.Key)
+	cachedCount, cachedAt, hasCache := rm.replicationCache.GetWithAge(job.Key)
 	if hasCache && time.Since(cachedAt) < ReplicationCacheTTL {
 		resultQueue <- CheckResult{
 			Job:       job,
@@ -209,7 +243,7 @@ func processJob(ctx context.Context, job CheckJob, resultQueue chan<- CheckResul
 	defer dhtCancel()
 
 	incrementMetric(&metrics.dhtQueries)
-	provs := globalDHT.FindProvidersAsync(dhtCtx, job.ManifestCID, 0)
+	provs := rm.dht.FindProvidersAsync(dhtCtx, job.ManifestCID, 0)
 	count := 0
 	maxCount := DHTMaxSampleSize
 
@@ -234,43 +268,43 @@ func processJob(ctx context.Context, job CheckJob, resultQueue chan<- CheckResul
 }
 
 // Stage 3: Reconciler
-func runReconciler(ctx context.Context, resultQueue <-chan CheckResult) {
+func (rm *ReplicationManager) runReconciler(ctx context.Context, resultQueue <-chan CheckResult) {
 	for result := range resultQueue {
-		reconcile(ctx, result)
+		rm.reconcile(ctx, result)
 	}
 }
 
-func reconcile(ctx context.Context, result CheckResult) {
+func (rm *ReplicationManager) reconcile(ctx context.Context, result CheckResult) {
 	job := result.Job
 	key := job.Key
 	count := result.Count
 
 	// Always unlock at the end of reconciliation
-	defer checkingFiles.Unlock(key)
-	lastCheckTime.Set(key, time.Now())
+	defer rm.checkingFiles.Unlock(key)
+	rm.lastCheckTime.Set(key, time.Now())
 
 	incrementMetric(&metrics.replicationChecks)
 
 	// Handle DHT query failures
 	if result.Err == context.DeadlineExceeded {
-		handleDHTQueryFailure(key)
+		rm.handleDHTQueryFailure(key)
 		return
 	}
 
 	// Process successful replication check
-	processReplicationResult(ctx, job, count, result.FromCache)
+	rm.processReplicationResult(ctx, job, count, result.FromCache)
 }
 
 // handleDHTQueryFailure handles DHT query timeout errors by applying backoff.
-func handleDHTQueryFailure(key string) {
+func (rm *ReplicationManager) handleDHTQueryFailure(key string) {
 	incrementMetric(&metrics.replicationFailures)
-	recordFailedOperation(key)
+	rm.storageMgr.recordFailedOperation(key)
 	log.Printf("[Backoff] DHT query timeout for %s, applying backoff", truncateCID(key, 16))
 }
 
 // processReplicationResult processes a successful replication check result and handles
 // under-replication, over-replication, and custodial handoff scenarios.
-func processReplicationResult(ctx context.Context, job CheckJob, count int, fromCache bool) {
+func (rm *ReplicationManager) processReplicationResult(ctx context.Context, job CheckJob, count int, fromCache bool) {
 	key := job.Key
 
 	// Log zero providers for responsible files (may be new/unreplicated)
@@ -280,32 +314,32 @@ func processReplicationResult(ctx context.Context, job CheckJob, count int, from
 
 	// Update cache and metrics
 	if !fromCache {
-		replicationCache.Set(key, count)
+		rm.replicationCache.Set(key, count)
 	}
 
 	incrementMetric(&metrics.replicationSuccess)
-	clearBackoff(key)
-	fileReplicationLevels.Set(key, count)
-	updateReplicationMetrics(count)
+	rm.storageMgr.failedOperations.Clear(key)
+	rm.storageMgr.fileReplicationLevels.Set(key, count)
+	rm.updateReplicationMetrics(count)
 
 	// Handle replication scenarios
 	if count < MinReplication {
-		handleUnderReplication(ctx, job, count)
+		rm.handleUnderReplication(ctx, job, count)
 	} else {
 		// Clear pending verifications if healthy
-		pendingVerifications.Remove(key)
+		rm.pendingVerifications.Remove(key)
 	}
 
 	if job.Responsible && count > MaxReplication && job.Pinned {
-		handleOverReplication(ctx, job, count)
+		rm.handleOverReplication(ctx, job, count)
 	}
 
 	if !job.Responsible && count >= MinReplication && job.Pinned {
-		handleCustodialHandoff(ctx, job, count)
+		rm.handleCustodialHandoff(ctx, job, count)
 	}
 }
 
-func updateReplicationMetrics(count int) {
+func (rm *ReplicationManager) updateReplicationMetrics(count int) {
 	if count >= MinReplication && count <= MaxReplication {
 		updateMetrics(func() {
 			metrics.filesAtTargetReplication++
@@ -324,9 +358,9 @@ func updateReplicationMetrics(count int) {
 	}
 }
 
-func handleUnderReplication(ctx context.Context, job CheckJob, count int) {
+func (rm *ReplicationManager) handleUnderReplication(ctx context.Context, job CheckJob, count int) {
 	key := job.Key
-	pending, hasPending := pendingVerifications.Get(key)
+	pending, hasPending := rm.pendingVerifications.Get(key)
 
 	if hasPending {
 		if time.Now().After(pending.verifyTime) {
@@ -334,12 +368,12 @@ func handleUnderReplication(ctx context.Context, job CheckJob, count int) {
 
 			// If responsible and missing, re-pin and provide
 			if pending.responsible && !pending.pinned {
-				if err := pinKeyV2(ctx, key, job.ManifestCID); err != nil {
+				if err := rm.pinKeyV2(ctx, key, job.ManifestCID); err != nil {
 					logError("Replication", "pin file during under-replication handling", key, err)
-					recordFailedOperation(key)
+					rm.storageMgr.recordFailedOperation(key)
 					// Continue to broadcast NEED even if pinning fails
 				} else {
-					provideFile(ctx, key)
+					rm.storageMgr.provideFile(ctx, key)
 				}
 			}
 
@@ -358,8 +392,8 @@ func handleUnderReplication(ctx context.Context, job CheckJob, count int) {
 				logError("Replication", "marshal ReplicationRequest", key, err)
 				return
 			}
-			shardMgr.PublishToShardCBOR(b)
-			pendingVerifications.Remove(key)
+			rm.shardMgr.PublishToShardCBOR(b, rm.shardMgr.currentShard) // Uses current shard for responsible nodes
+			rm.pendingVerifications.Remove(key)
 		} else {
 			log.Printf("[Replication] Under-replication detected (%d/%d) but verification pending for %s", count, MinReplication, key[:min(16, len(key))]+"...")
 		}
@@ -369,7 +403,7 @@ func handleUnderReplication(ctx context.Context, job CheckJob, count int) {
 		verifyTime := time.Now().Add(delay)
 		log.Printf("[Replication] Under-replication detected (%d/%d). Scheduling verification for %s in %v", count, MinReplication, key[:min(16, len(key))]+"...", delay)
 
-		pendingVerifications.Add(key, &verificationPending{
+		rm.pendingVerifications.Add(key, &verificationPending{
 			firstCount:     count,
 			firstCheckTime: time.Now(),
 			verifyTime:     verifyTime,
@@ -382,9 +416,9 @@ func handleUnderReplication(ctx context.Context, job CheckJob, count int) {
 	}
 }
 
-func handleOverReplication(ctx context.Context, job CheckJob, count int) {
+func (rm *ReplicationManager) handleOverReplication(ctx context.Context, job CheckJob, count int) {
 	log.Printf("[Replication] High Redundancy (%d/%d). Unpinning %s (Monitoring only)", count, MaxReplication, job.Key)
-	unpinKeyV2(ctx, job.Key, job.ManifestCID)
+	rm.UnpinFile(ctx, job.Key, job.ManifestCID)
 	if count > MaxReplication+3 {
 		excessCount := count - MaxReplication
 		log.Printf("[Replication] Excessive replication (%d/%d, excess: %d). Broadcasting UnreplicateRequest for %s", count, MaxReplication, excessCount, job.Key[:min(16, len(job.Key))]+"...")
@@ -404,16 +438,35 @@ func handleOverReplication(ctx context.Context, job CheckJob, count int) {
 			logError("Replication", "marshal UnreplicateRequest", job.Key, err)
 			return
 		}
-		shardMgr.PublishToShardCBOR(b)
+		rm.shardMgr.PublishToShardCBOR(b, rm.shardMgr.currentShard) // Responsible node broadcasts to its shard
 
 		// Keep file in tracking to monitor if replication comes down
 		log.Printf("[Replication] Replication excessive (%d), keeping in tracking to monitor reduction", count)
 	}
 }
 
-func handleCustodialHandoff(ctx context.Context, job CheckJob, count int) {
+func (rm *ReplicationManager) handleCustodialHandoff(ctx context.Context, job CheckJob, count int) {
 	log.Printf("[Replication] Handoff Complete (%d/%d copies found). Unpinning custodial file %s", count, MinReplication, job.Key)
-	unpinKeyV2(ctx, job.Key, job.ManifestCID)
+	rm.UnpinFile(ctx, job.Key, job.ManifestCID)
+	
+	// Tourist Mode Exit: Leave the target shard
+	// Calculate target shard based on file
+	payloadCIDStr := getPayloadCIDForShardAssignment(ctx, rm.ipfsClient, job.Key)
+	stableHex := keyToStableHex(payloadCIDStr)
+	
+	// Determine depth: we assume the depth matches our current shard depth
+	// This is an approximation, but typically nodes operate at similar depths.
+	rm.shardMgr.mu.RLock()
+	currentDepth := len(rm.shardMgr.currentShard)
+	rm.shardMgr.mu.RUnlock()
+	
+	if currentDepth == 0 {
+		currentDepth = 1
+	}
+	targetShard := getHexBinaryPrefix(stableHex, currentDepth)
+	
+	log.Printf("[Replication] Tourist Mode: Leaving target shard %s for file %s", targetShard, truncateCID(job.Key, 16))
+	rm.shardMgr.LeaveShard(targetShard)
 }
 
 // Helpers
@@ -426,45 +479,41 @@ func getRandomVerificationDelay() time.Duration {
 	return time.Duration(base + jitter)
 }
 
-func pinKeyV2(ctx context.Context, key string, manifestCID cid.Cid) error {
-	if ipfsClient != nil {
-		if err := ipfsClient.PinRecursive(ctx, manifestCID); err != nil {
+func (rm *ReplicationManager) pinKeyV2(ctx context.Context, key string, manifestCID cid.Cid) error {
+	if rm.ipfsClient != nil {
+		if err := rm.ipfsClient.PinRecursive(ctx, manifestCID); err != nil {
 			log.Printf("[IPFS] PinRecursive failed for %s: %v", key[:min(16, len(key))]+"...", err)
-			recordFailedOperation(key)
+			rm.storageMgr.recordFailedOperation(key)
 			return err
 		}
 	}
-	if !pinFileV2(key) {
+	if !rm.storageMgr.pinFile(key) {
 		logWarning("Replication", "Failed to track pinned file in local state", key)
 		// Continue despite tracking failure - file is pinned in IPFS
 	}
 	return nil
 }
 
-func unpinKeyV2(ctx context.Context, key string, manifestCID cid.Cid) {
-	if ipfsClient != nil {
-		if err := ipfsClient.UnpinRecursive(ctx, manifestCID); err != nil {
+func (rm *ReplicationManager) UnpinFile(ctx context.Context, key string, manifestCID cid.Cid) {
+	if rm.ipfsClient != nil {
+		if err := rm.ipfsClient.UnpinRecursive(ctx, manifestCID); err != nil {
 			log.Printf("[IPFS] UnpinRecursive failed for %s: %v", key[:min(16, len(key))]+"...", err)
 		}
 	}
-	unpinFile(key)
+	rm.storageMgr.unpinFile(key)
 }
 
 // replicateFileFromRequest attempts to fetch and pin a ResearchObject when
-// receiving a ReplicationRequest. If a non-empty sender peer ID is provided,
-// it can be used as a provider hint by higher-level components or future
-// IPFS client enhancements to prioritize fetching from that peer.
-// The responsible parameter indicates if this node is responsible for the file's shard.
-// Only responsible nodes should announce to DHT to keep cross-shard communication minimal.
-func replicateFileFromRequest(ctx context.Context, manifestCID cid.Cid, sender peer.ID, responsible bool) (bool, error) {
-	if ipfsClient == nil {
+// receiving a ReplicationRequest.
+func (rm *ReplicationManager) replicateFileFromRequest(ctx context.Context, manifestCID cid.Cid, sender peer.ID, responsible bool) (bool, error) {
+	if rm.ipfsClient == nil {
 		return false, fmt.Errorf("IPFS client not initialized")
 	}
 
 	manifestCIDStr := manifestCID.String()
 
 	// Step 1: Check if already pinned
-	if isPinned(manifestCIDStr) {
+	if rm.storageMgr.isPinned(manifestCIDStr) {
 		log.Printf("[Replication] File %s already pinned, skipping fetch", manifestCIDStr[:min(16, len(manifestCIDStr))]+"...")
 		return true, nil
 	}
@@ -481,15 +530,12 @@ func replicateFileFromRequest(ctx context.Context, manifestCID cid.Cid, sender p
 	replCtx, replCancel := context.WithTimeout(ctx, AutoReplicationTimeout)
 	defer replCancel()
 
-	// Note: At this layer we only log the sender as a potential provider hint.
-	// Future work can extend the IPFS client to take a peer.ID and use IPFS's
-	// provider system or direct connections to prefer fetching from that peer.
 	if sender != "" {
 		log.Printf("[Replication] Using sender %s as provider hint for %s", sender.String(), manifestCIDStr[:min(16, len(manifestCIDStr))]+"...")
 	}
 
 	// Step 4: Fetch manifest block
-	manifestBytes, err := ipfsClient.GetBlock(replCtx, manifestCID)
+	manifestBytes, err := rm.ipfsClient.GetBlock(replCtx, manifestCID)
 	if err != nil {
 		log.Printf("[Replication] Failed to fetch manifest %s: %v",
 			manifestCIDStr[:min(16, len(manifestCIDStr))]+"...", err)
@@ -517,14 +563,14 @@ func replicateFileFromRequest(ctx context.Context, manifestCID cid.Cid, sender p
 			if handleSignatureError("ResearchObject trust", err) {
 				return false, fmt.Errorf("unauthorized peer: %w", err)
 			}
-		} else if shardMgr != nil && shardMgr.h != nil {
+		} else if rm.shardMgr != nil && rm.shardMgr.h != nil {
 			unsigned, err := ro.MarshalCBORForSigning()
 			if err != nil {
 				if handleSignatureError("ResearchObject marshal", err) {
 					return false, fmt.Errorf("marshal error: %w", err)
 				}
 			} else if handleSignatureError("ResearchObject signature",
-				verifySignedObject(shardMgr.h, ro.IngestedBy, ro.Timestamp, ro.Signature, unsigned)) {
+				verifySignedObject(rm.shardMgr.h, ro.IngestedBy, ro.Timestamp, ro.Signature, unsigned)) {
 				return false, fmt.Errorf("signature verification failed")
 			}
 		}
@@ -539,25 +585,25 @@ func replicateFileFromRequest(ctx context.Context, manifestCID cid.Cid, sender p
 	// Step 9: Fetch payload (IPFS will fetch recursively via Bitswap)
 	log.Printf("[Replication] Fetching and pinning payload %s for manifest %s",
 		ro.Payload.String()[:min(16, len(ro.Payload.String()))]+"...", manifestCIDStr[:min(16, len(manifestCIDStr))]+"...")
-	if err := ipfsClient.PinRecursive(replCtx, ro.Payload); err != nil {
+	if err := rm.ipfsClient.PinRecursive(replCtx, ro.Payload); err != nil {
 		log.Printf("[Replication] Failed to pin payload %s: %v",
 			ro.Payload.String()[:min(16, len(ro.Payload.String()))]+"...", err)
 		return false, fmt.Errorf("pin payload: %w", err)
 	}
 
 	// Step 10: Pin manifest recursively (ensures entire DAG is pinned)
-	if err := ipfsClient.PinRecursive(replCtx, manifestCID); err != nil {
+	if err := rm.ipfsClient.PinRecursive(replCtx, manifestCID); err != nil {
 		log.Printf("[Replication] Failed to pin manifest %s: %v",
 			manifestCIDStr[:min(16, len(manifestCIDStr))]+"...", err)
 		// Unpin payload on failure
-		if unpinErr := ipfsClient.UnpinRecursive(ctx, ro.Payload); unpinErr != nil {
+		if unpinErr := rm.ipfsClient.UnpinRecursive(ctx, ro.Payload); unpinErr != nil {
 			logWarningWithContext("Replication", "Failed to cleanup payload after manifest pin failure", ro.Payload.String(), "cleanup")
 		}
 		return false, fmt.Errorf("pin manifest: %w", err)
 	}
 
 	// Step 11: Verify payload size (liar detection)
-	actualSize, err := ipfsClient.GetFileSize(replCtx, ro.Payload)
+	actualSize, err := rm.ipfsClient.GetFileSize(replCtx, ro.Payload)
 	if err != nil {
 		log.Printf("[Replication] Warning: failed to verify payload size for %s: %v",
 			manifestCIDStr[:min(16, len(manifestCIDStr))]+"...", err)
@@ -565,35 +611,33 @@ func replicateFileFromRequest(ctx context.Context, manifestCID cid.Cid, sender p
 	} else if ro.TotalSize != 0 && actualSize != ro.TotalSize {
 		log.Printf("[Security] Liar detection: payload size mismatch for %s (manifest=%d, actual=%d). Unpinning.",
 			manifestCIDStr[:min(16, len(manifestCIDStr))]+"...", ro.TotalSize, actualSize)
-		if err := ipfsClient.UnpinRecursive(ctx, manifestCID); err != nil {
+		if err := rm.ipfsClient.UnpinRecursive(ctx, manifestCID); err != nil {
 			logWarningWithContext("Security", "Failed to unpin manifest after liar detection", manifestCIDStr, "cleanup")
 		}
-		if err := ipfsClient.UnpinRecursive(ctx, ro.Payload); err != nil {
+		if err := rm.ipfsClient.UnpinRecursive(ctx, ro.Payload); err != nil {
 			logWarningWithContext("Security", "Failed to unpin payload after liar detection", ro.Payload.String(), "cleanup")
 		}
 		return false, fmt.Errorf("payload size mismatch: manifest=%d, actual=%d", ro.TotalSize, actualSize)
 	}
 
 	// Step 12: Track in local state
-	if !pinFileV2(manifestCIDStr) {
+	if !rm.storageMgr.pinFile(manifestCIDStr) {
 		log.Printf("[Replication] Failed to track ManifestCID: %s", manifestCIDStr[:min(16, len(manifestCIDStr))]+"...")
 	}
 
 	// Step 13: Provide to DHT (only if responsible)
-	// Only responsible nodes should advertise to D-LOCKSS to keep cross-shard communication minimal.
-	// Non-responsible nodes can pin files in IPFS for their own use, but shouldn't announce.
 	if responsible {
 		provideCtx, provideCancel := context.WithTimeout(context.Background(), DHTProvideTimeout)
 		go func() {
 			defer provideCancel()
-			provideFile(provideCtx, manifestCIDStr)
+			rm.storageMgr.provideFile(provideCtx, manifestCIDStr)
 		}()
 	} else {
 		log.Printf("[Replication] Not responsible for %s, skipping DHT announcement (pinned for local use only)", manifestCIDStr[:min(16, len(manifestCIDStr))]+"...")
 	}
 
 	// Step 14: Add to known files
-	addKnownFile(manifestCIDStr)
+	rm.storageMgr.addKnownFile(manifestCIDStr)
 
 	log.Printf("[Replication] Successfully replicated file %s (payload: %s, size: %d bytes)",
 		manifestCIDStr[:min(16, len(manifestCIDStr))]+"...", ro.Payload.String()[:min(16, len(ro.Payload.String()))]+"...", ro.TotalSize)
@@ -602,7 +646,7 @@ func replicateFileFromRequest(ctx context.Context, manifestCID cid.Cid, sender p
 }
 
 // runReplicationCacheCleanup periodically cleans up expired cache entries
-func runReplicationCacheCleanup(ctx context.Context) {
+func (rm *ReplicationManager) runReplicationCacheCleanup(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
@@ -612,7 +656,7 @@ func runReplicationCacheCleanup(ctx context.Context) {
 			return
 		case <-ticker.C:
 			cutoff := time.Now().Add(-ReplicationCacheTTL)
-			removed := replicationCache.Cleanup(cutoff)
+			removed := rm.replicationCache.Cleanup(cutoff)
 			if removed > 0 {
 				log.Printf("[Cache] Cleaned up %d expired replication cache entries", removed)
 			}
@@ -620,13 +664,13 @@ func runReplicationCacheCleanup(ctx context.Context) {
 	}
 }
 
-func verifyResearchObjectLocal(ctx context.Context, manifestCID cid.Cid) (bool, error) {
-	if ipfsClient == nil {
+func (rm *ReplicationManager) verifyResearchObjectLocal(ctx context.Context, manifestCID cid.Cid) (bool, error) {
+	if rm.ipfsClient == nil {
 		return false, fmt.Errorf("IPFS client not initialized")
 	}
 
 	// 1. Verify manifest block exists and is a valid ResearchObject
-	manifestBytes, err := ipfsClient.GetBlock(ctx, manifestCID)
+	manifestBytes, err := rm.ipfsClient.GetBlock(ctx, manifestCID)
 	if err != nil {
 		return false, fmt.Errorf("manifest block missing: %w", err)
 	}
@@ -637,7 +681,7 @@ func verifyResearchObjectLocal(ctx context.Context, manifestCID cid.Cid) (bool, 
 	}
 
 	// 2. Verify payload is pinned
-	isPinned, err := ipfsClient.IsPinned(ctx, ro.Payload)
+	isPinned, err := rm.ipfsClient.IsPinned(ctx, ro.Payload)
 	if err != nil {
 		return false, fmt.Errorf("check payload pin: %w", err)
 	}
@@ -648,7 +692,7 @@ func verifyResearchObjectLocal(ctx context.Context, manifestCID cid.Cid) (bool, 
 	// 3. Verify payload size (Liar Detection)
 	// Only check if we have a size hint
 	if ro.TotalSize > 0 {
-		size, err := ipfsClient.GetFileSize(ctx, ro.Payload)
+		size, err := rm.ipfsClient.GetFileSize(ctx, ro.Payload)
 		if err != nil {
 			// If we can't get size, assume it's okay but warn?
 			// Or fail safe? Let's fail safe for integrity.

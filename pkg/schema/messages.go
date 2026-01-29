@@ -16,7 +16,6 @@ type MessageType uint8
 const (
 	MessageTypeIngest MessageType = iota + 1
 	MessageTypeReplicationRequest
-	MessageTypeDelegate
 	MessageTypeUnreplicateRequest
 )
 
@@ -44,18 +43,6 @@ type ReplicationRequest struct {
 	Timestamp  int64       `cbor:"ts"`           // Unix timestamp
 	Nonce      []byte      `cbor:"nonce"`        // Random nonce for replay protection
 	Sig        []byte      `cbor:"sig"`          // Signature over canonical CBOR (excluding sig)
-}
-
-// DelegateMessage replaces the old "DELEGATE:<hash>:<prefix>" string format.
-// It delegates responsibility for a ResearchObject to a specific shard.
-type DelegateMessage struct {
-	Type       MessageType `cbor:"type"`        // Always MessageTypeDelegate
-	ManifestCID cid.Cid    `cbor:"manifest_cid"` // The CID of the ResearchObject
-	TargetShard string     `cbor:"target_shard"`  // Target shard prefix
-	SenderID   peer.ID     `cbor:"sender_id"`     // PeerID of the sender
-	Timestamp  int64       `cbor:"ts"`            // Unix timestamp
-	Nonce      []byte      `cbor:"nonce"`         // Random nonce for replay protection
-	Sig        []byte      `cbor:"sig"`           // Signature over canonical CBOR (excluding sig)
 }
 
 // UnreplicateRequest requests peers to drop over-replicated files.
@@ -391,172 +378,6 @@ func (m *ReplicationRequest) UnmarshalCBOR(data []byte) error {
 		return err
 	}
 	m.Deadline, err = deadlineNode.AsInt()
-	if err != nil {
-		return err
-	}
-
-	senderNode, err := node.LookupByString("sender_id")
-	if err != nil {
-		return err
-	}
-	senderStr, err := senderNode.AsString()
-	if err != nil {
-		return err
-	}
-	m.SenderID, err = peer.Decode(senderStr)
-	if err != nil {
-		return err
-	}
-
-	tsNode, err := node.LookupByString("ts")
-	if err != nil {
-		return err
-	}
-	m.Timestamp, err = tsNode.AsInt()
-	if err != nil {
-		return err
-	}
-
-	nonceNode, err := node.LookupByString("nonce")
-	if err != nil {
-		return err
-	}
-	m.Nonce, err = nonceNode.AsBytes()
-	if err != nil {
-		return err
-	}
-
-	sigNode, err := node.LookupByString("sig")
-	if err != nil {
-		return err
-	}
-	m.Sig, err = sigNode.AsBytes()
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// MarshalCBOR serializes a DelegateMessage to CBOR format.
-func (m *DelegateMessage) MarshalCBOR() ([]byte, error) {
-	return m.marshalCBOR(true)
-}
-
-// MarshalCBORForSigning serializes the message without the signature field.
-func (m *DelegateMessage) MarshalCBORForSigning() ([]byte, error) {
-	return m.marshalCBOR(false)
-}
-
-func (m *DelegateMessage) marshalCBOR(includeSig bool) ([]byte, error) {
-	nb := basicnode.Prototype.Map.NewBuilder()
-	fieldCount := int64(6)
-	if includeSig {
-		fieldCount = 7
-	}
-	ma, err := nb.BeginMap(fieldCount)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := ma.AssembleKey().AssignString("type"); err != nil {
-		return nil, err
-	}
-	if err := ma.AssembleValue().AssignInt(int64(m.Type)); err != nil {
-		return nil, err
-	}
-
-	if err := ma.AssembleKey().AssignString("manifest_cid"); err != nil {
-		return nil, err
-	}
-	if err := ma.AssembleValue().AssignString(m.ManifestCID.String()); err != nil {
-		return nil, err
-	}
-
-	if err := ma.AssembleKey().AssignString("target_shard"); err != nil {
-		return nil, err
-	}
-	if err := ma.AssembleValue().AssignString(m.TargetShard); err != nil {
-		return nil, err
-	}
-
-	if err := ma.AssembleKey().AssignString("sender_id"); err != nil {
-		return nil, err
-	}
-	if err := ma.AssembleValue().AssignString(m.SenderID.String()); err != nil {
-		return nil, err
-	}
-
-	if err := ma.AssembleKey().AssignString("ts"); err != nil {
-		return nil, err
-	}
-	if err := ma.AssembleValue().AssignInt(m.Timestamp); err != nil {
-		return nil, err
-	}
-
-	if err := ma.AssembleKey().AssignString("nonce"); err != nil {
-		return nil, err
-	}
-	if err := ma.AssembleValue().AssignBytes(m.Nonce); err != nil {
-		return nil, err
-	}
-
-	if includeSig {
-		if err := ma.AssembleKey().AssignString("sig"); err != nil {
-			return nil, err
-		}
-		if err := ma.AssembleValue().AssignBytes(m.Sig); err != nil {
-			return nil, err
-		}
-	}
-
-	if err := ma.Finish(); err != nil {
-		return nil, err
-	}
-
-	var buf bytes.Buffer
-	if err := dagcbor.Encode(nb.Build(), &buf); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-// UnmarshalCBOR deserializes a DelegateMessage from CBOR format.
-func (m *DelegateMessage) UnmarshalCBOR(data []byte) error {
-	nb := basicnode.Prototype.Map.NewBuilder()
-	if err := dagcbor.Decode(nb, bytes.NewReader(data)); err != nil {
-		return err
-	}
-	node := nb.Build()
-
-	typeNode, err := node.LookupByString("type")
-	if err != nil {
-		return err
-	}
-	typeInt, err := typeNode.AsInt()
-	if err != nil {
-		return err
-	}
-	m.Type = MessageType(typeInt)
-
-	manifestNode, err := node.LookupByString("manifest_cid")
-	if err != nil {
-		return err
-	}
-	manifestStr, err := manifestNode.AsString()
-	if err != nil {
-		return err
-	}
-	m.ManifestCID, err = cid.Decode(manifestStr)
-	if err != nil {
-		return err
-	}
-
-	shardNode, err := node.LookupByString("target_shard")
-	if err != nil {
-		return err
-	}
-	m.TargetShard, err = shardNode.AsString()
 	if err != nil {
 		return err
 	}

@@ -65,7 +65,6 @@ func getEnvUint64(key string, defaultValue uint64) uint64 {
 }
 
 func logConfiguration() {
-	log.Printf("[Config] Control Topic: %s", ControlTopicName)
 	log.Printf("[Config] Discovery Tag: %s", DiscoveryServiceTag)
 	log.Printf("[Config] Data Directory: %s", FileWatchFolder)
 	log.Printf("[Config] Replication: %d-%d", MinReplication, MaxReplication)
@@ -133,8 +132,8 @@ func logConfiguration() {
 }
 
 var (
-	ControlTopicName    = getEnvString("DLOCKSS_CONTROL_TOPIC", "dlockss-v2-creative-commons-control")
-	DiscoveryServiceTag = getEnvString("DLOCKSS_DISCOVERY_TAG", "dlockss-v2-prod")
+	// ControlTopicName removed in favor of Tourist Pattern (ephemeral shard joining)
+	DiscoveryServiceTag = getEnvString("DLOCKSS_DISCOVERY_TAG", "dlockss-prod")
 	FileWatchFolder     = getEnvString("DLOCKSS_DATA_DIR", "./data")
 	MinReplication      = getEnvInt("DLOCKSS_MIN_REPLICATION", 5)
 	MaxReplication      = getEnvInt("DLOCKSS_MAX_REPLICATION", 10)

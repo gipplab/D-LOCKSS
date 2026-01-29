@@ -12,15 +12,14 @@ Custodial --> Delegated: DELEGATE message sent
 Delegated --> HandoffComplete: Replication >= MinReplication
 HandoffComplete --> [*]: unpinFile()
 
-Responsible --> Monitoring: Replication in range\n[MinReplication, MaxReplication]
+Responsible --> Monitoring: Replication in range
 Monitoring --> UnderReplicated: count < MinReplication
 Monitoring --> OverReplicated: count > MaxReplication
-Monitoring --> Removed: count > MaxReplication + 3
 
 UnderReplicated --> Monitoring: Replication restored
-OverReplicated --> Monitoring: Replication reduced
+OverReplicated --> Monitoring: Unpinned (but still tracked)
 
-Responsible --> Removed: File no longer tracked
+Responsible --> Removed: Shard split -> Not Responsible
 Removed --> [*]
 
 note right of Custodial

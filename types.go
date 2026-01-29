@@ -1,17 +1,25 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"math/big"
 	"sync"
 	"time"
 
+	"github.com/ipfs/go-cid"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"dlockss/pkg/ipfs"
 )
+
+// DHTProvider abstracts the DHT operations for testing
+type DHTProvider interface {
+	FindProvidersAsync(ctx context.Context, key cid.Cid, count int) <-chan peer.AddrInfo
+	Provide(ctx context.Context, key cid.Cid, broadcast bool) error
+}
 
 // PinnedSet tracks which files/manifests are currently pinned
 type PinnedSet struct {
@@ -571,16 +579,12 @@ func (rc *ReplicationCache) Cleanup(cutoff time.Time) int {
 }
 
 var (
-	pinnedFiles = NewPinnedSet()
-	knownFiles  = NewKnownFiles()
-
-	// reshardedFiles tracks which files have already been processed during
-	// a reshard pass after a shard split. This prevents duplicate work and
-	// duplicate announcements for the same ManifestCID.
-	reshardedFiles = NewKnownFiles()
-
+	// Globals that are still used directly or via legacy paths
+	// TODO: Continue refactoring to remove these
 	globalDHT   *dht.IpfsDHT
 	shardMgr    *ShardManager
+	storageMgr  *StorageManager
+	replicationMgr *ReplicationManager
 	ipfsClient  *ipfs.Client
 	selfPeerID  peer.ID
 	selfPrivKey crypto.PrivKey
@@ -589,25 +593,7 @@ var (
 
 	seenNonces = NewNonceStore()
 
-	// replicationWorkers chan struct{} // Deprecated by Async Pipeline
-
 	rateLimiter = NewRateLimiter()
-
-	failedOperations = NewBackoffTable()
-
-	checkingFiles = NewCheckingFiles()
-
-	lastCheckTime = NewLastCheckTime()
-
-	recentlyRemoved = NewRecentlyRemoved()
-
-	fileReplicationLevels = NewFileReplicationLevels()
-
-	fileConvergenceTime = NewFileConvergenceTime()
-
-	pendingVerifications = NewPendingVerifications()
-
-	replicationCache = NewReplicationCache()
 
 	metrics = struct {
 		sync.RWMutex
@@ -646,6 +632,14 @@ var (
 		startTime:      time.Now(),
 	}
 )
+
+// NodeDependencies holds the core dependencies for the D-LOCKSS node.
+// It is used for dependency injection to facilitate testing.
+type NodeDependencies struct {
+	DHT        *dht.IpfsDHT
+	ShardMgr   *ShardManager
+	IPFSClient ipfs.IPFSClient
+}
 
 type operationBackoff struct {
 	nextRetry time.Time

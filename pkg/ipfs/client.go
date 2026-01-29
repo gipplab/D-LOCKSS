@@ -10,10 +10,27 @@ import (
 	ipfsapi "github.com/ipfs/go-ipfs-api"
 )
 
+// IPFSClient defines the interface for interacting with an IPFS node.
+// This interface facilitates testing by allowing mock implementations.
+type IPFSClient interface {
+	ImportFile(ctx context.Context, filePath string) (cid.Cid, error)
+	ImportReader(ctx context.Context, reader io.Reader) (cid.Cid, error)
+	PutDagCBOR(ctx context.Context, block []byte) (cid.Cid, error)
+	GetBlock(ctx context.Context, blockCID cid.Cid) ([]byte, error)
+	PinRecursive(ctx context.Context, cid cid.Cid) error
+	UnpinRecursive(ctx context.Context, cid cid.Cid) error
+	IsPinned(ctx context.Context, cid cid.Cid) (bool, error)
+	GetFileSize(ctx context.Context, cid cid.Cid) (uint64, error)
+	VerifyDAGCompleteness(ctx context.Context, rootCID cid.Cid) (bool, error)
+}
+
 // Client wraps IPFS API operations for importing files and managing pins.
 type Client struct {
 	api *ipfsapi.Shell
 }
+
+// Ensure Client implements IPFSClient
+var _ IPFSClient = (*Client)(nil)
 
 // NewClient creates a new IPFS client.
 // If ipfsNodeAddr is empty, it defaults to local IPFS node at /ip4/127.0.0.1/tcp/5001

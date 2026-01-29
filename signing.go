@@ -81,7 +81,7 @@ func signProtocolMessage(msg interface{}) error {
 			func() ([]byte, error) { return m.MarshalCBORForSigning() },
 			func(sig []byte) { m.Sig = sig },
 		)
-	case *schema.DelegateMessage:
+	case *schema.UnreplicateRequest:
 		m.SenderID = selfPeerID
 		m.Timestamp = ts
 		m.Nonce = nonce

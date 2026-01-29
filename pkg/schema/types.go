@@ -15,23 +15,18 @@ import (
 )
 
 // ResearchObject is the fundamental unit of storage in the D-LOCKSS network.
-// It wraps content in a structured format with metadata, citations, and validation hints.
+// It wraps content in a structured format with metadata references and validation hints.
 // Pinning a ResearchObject (ManifestCID) recursively pins the underlying PayloadCID.
 type ResearchObject struct {
 	// --- Metadata (Context) ---
-	Title      string   `cbor:"title"`       // Document title
-	Authors    []string `cbor:"authors"`     // List of author names
-	IngestedBy peer.ID  `cbor:"ingester_id"` // PeerID of the node that ingested this
-	Signature  []byte   `cbor:"sig"`         // Cryptographic signature (future: verify ownership)
-	Timestamp  int64    `cbor:"ts"`          // Unix timestamp of ingestion
+	MetadataRef string  `cbor:"meta_ref"`    // DOI or URL to external metadata
+	IngestedBy  peer.ID `cbor:"ingester_id"` // PeerID of the node that ingested this
+	Signature   []byte  `cbor:"sig"`         // Cryptographic signature
+	Timestamp   int64   `cbor:"ts"`          // Unix timestamp of ingestion
 
 	// --- The Content (Redundancy Target) ---
 	// Pinning 'ResearchObject' recursively pins this CID.
 	Payload cid.Cid `cbor:"payload"` // Link to the raw UnixFS DAG containing the actual file data
-
-	// --- The Graph (Citations) ---
-	// Immutable links to other ResearchObjects within the network
-	References []cid.Cid `cbor:"refs"` // CIDs of referenced ResearchObjects (citation graph)
 
 	// --- Validation Hints ---
 	TotalSize uint64 `cbor:"size"` // Total size in bytes (used for rate limiting and liar detection)
@@ -69,44 +64,22 @@ func (ro *ResearchObject) MarshalCBORForSigning() ([]byte, error) {
 
 func (ro *ResearchObject) marshalCBOR(includeSig bool) ([]byte, error) {
 	nb := basicnode.Prototype.Map.NewBuilder()
-	fieldCount := int64(6)
+	fieldCount := int64(5)
 	if includeSig {
-		fieldCount = 7
+		fieldCount = 6
 	}
 	ma, err := nb.BeginMap(fieldCount)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin map: %w", err)
 	}
 
-	// Title
-	titleNode := basicnode.NewString(ro.Title)
-	if err := ma.AssembleKey().AssignString("title"); err != nil {
-		return nil, fmt.Errorf("failed to assign title key: %w", err)
+	// MetadataRef
+	metaNode := basicnode.NewString(ro.MetadataRef)
+	if err := ma.AssembleKey().AssignString("meta_ref"); err != nil {
+		return nil, fmt.Errorf("failed to assign meta_ref key: %w", err)
 	}
-	if err := ma.AssembleValue().AssignNode(titleNode); err != nil {
-		return nil, fmt.Errorf("failed to assign title value: %w", err)
-	}
-
-	// Authors (array)
-	authorsBuilder := basicnode.Prototype.List.NewBuilder()
-	la, err := authorsBuilder.BeginList(int64(len(ro.Authors)))
-	if err != nil {
-		return nil, fmt.Errorf("failed to begin authors list: %w", err)
-	}
-	for _, author := range ro.Authors {
-		if err := la.AssembleValue().AssignString(author); err != nil {
-			return nil, fmt.Errorf("failed to assign author: %w", err)
-		}
-	}
-	if err := la.Finish(); err != nil {
-		return nil, fmt.Errorf("failed to finish authors list: %w", err)
-	}
-	authorsNode := authorsBuilder.Build()
-	if err := ma.AssembleKey().AssignString("authors"); err != nil {
-		return nil, fmt.Errorf("failed to assign authors key: %w", err)
-	}
-	if err := ma.AssembleValue().AssignNode(authorsNode); err != nil {
-		return nil, fmt.Errorf("failed to assign authors value: %w", err)
+	if err := ma.AssembleValue().AssignNode(metaNode); err != nil {
+		return nil, fmt.Errorf("failed to assign meta_ref value: %w", err)
 	}
 
 	// IngestedBy (PeerID as string)
@@ -149,28 +122,6 @@ func (ro *ResearchObject) marshalCBOR(includeSig bool) ([]byte, error) {
 		return nil, fmt.Errorf("failed to assign payload value: %w", err)
 	}
 
-	// References (array of CIDs)
-	refsBuilder := basicnode.Prototype.List.NewBuilder()
-	refsList, err := refsBuilder.BeginList(int64(len(ro.References)))
-	if err != nil {
-		return nil, fmt.Errorf("failed to begin references list: %w", err)
-	}
-	for _, ref := range ro.References {
-		if err := refsList.AssembleValue().AssignString(ref.String()); err != nil {
-			return nil, fmt.Errorf("failed to assign reference: %w", err)
-		}
-	}
-	if err := refsList.Finish(); err != nil {
-		return nil, fmt.Errorf("failed to finish references list: %w", err)
-	}
-	refsNode := refsBuilder.Build()
-	if err := ma.AssembleKey().AssignString("refs"); err != nil {
-		return nil, fmt.Errorf("failed to assign refs key: %w", err)
-	}
-	if err := ma.AssembleValue().AssignNode(refsNode); err != nil {
-		return nil, fmt.Errorf("failed to assign refs value: %w", err)
-	}
-
 	// TotalSize
 	sizeNode := basicnode.NewInt(int64(ro.TotalSize))
 	if err := ma.AssembleKey().AssignString("size"); err != nil {
@@ -209,37 +160,14 @@ func (ro *ResearchObject) UnmarshalCBOR(data []byte) error {
 		return fmt.Errorf("expected map node, got %v", node.Kind())
 	}
 
-	// Title
-	titleNode, err := node.LookupByString("title")
+	// MetadataRef
+	metaNode, err := node.LookupByString("meta_ref")
 	if err != nil {
-		return fmt.Errorf("failed to get title: %w", err)
+		return fmt.Errorf("failed to get meta_ref: %w", err)
 	}
-	ro.Title, err = titleNode.AsString()
+	ro.MetadataRef, err = metaNode.AsString()
 	if err != nil {
-		return fmt.Errorf("failed to get title string: %w", err)
-	}
-
-	// Authors
-	authorsNode, err := node.LookupByString("authors")
-	if err != nil {
-		return fmt.Errorf("failed to get authors: %w", err)
-	}
-	if authorsNode.Kind() != datamodel.Kind_List {
-		return fmt.Errorf("authors is not a list")
-	}
-	// Iterate using Length and LookupByIndex
-	length := authorsNode.Length()
-	ro.Authors = make([]string, 0, length)
-	for i := int64(0); i < length; i++ {
-		authorNode, err := authorsNode.LookupByIndex(i)
-		if err != nil {
-			return fmt.Errorf("failed to lookup author at index %d: %w", i, err)
-		}
-		author, err := authorNode.AsString()
-		if err != nil {
-			return fmt.Errorf("failed to get author string: %w", err)
-		}
-		ro.Authors = append(ro.Authors, author)
+		return fmt.Errorf("failed to get meta_ref string: %w", err)
 	}
 
 	// IngestedBy
@@ -291,33 +219,6 @@ func (ro *ResearchObject) UnmarshalCBOR(data []byte) error {
 		return fmt.Errorf("failed to decode payload CID: %w", err)
 	}
 
-	// References
-	refsNode, err := node.LookupByString("refs")
-	if err != nil {
-		return fmt.Errorf("failed to get refs: %w", err)
-	}
-	if refsNode.Kind() != datamodel.Kind_List {
-		return fmt.Errorf("refs is not a list")
-	}
-	// Iterate using Length and LookupByIndex
-	refsLength := refsNode.Length()
-	ro.References = make([]cid.Cid, 0, refsLength)
-	for i := int64(0); i < refsLength; i++ {
-		refNode, err := refsNode.LookupByIndex(i)
-		if err != nil {
-			return fmt.Errorf("failed to lookup ref at index %d: %w", i, err)
-		}
-		refStr, err := refNode.AsString()
-		if err != nil {
-			return fmt.Errorf("failed to get ref string: %w", err)
-		}
-		refCID, err := cid.Decode(refStr)
-		if err != nil {
-			return fmt.Errorf("failed to decode ref CID: %w", err)
-		}
-		ro.References = append(ro.References, refCID)
-	}
-
 	// TotalSize
 	sizeNode, err := node.LookupByString("size")
 	if err != nil {
@@ -333,14 +234,12 @@ func (ro *ResearchObject) UnmarshalCBOR(data []byte) error {
 }
 
 // NewResearchObject creates a new ResearchObject with the given parameters.
-func NewResearchObject(title string, authors []string, ingesterID peer.ID, payloadCID cid.Cid, references []cid.Cid, totalSize uint64) *ResearchObject {
+func NewResearchObject(metadataRef string, ingesterID peer.ID, payloadCID cid.Cid, totalSize uint64) *ResearchObject {
 	return &ResearchObject{
-		Title:      title,
-		Authors:    authors,
-		IngestedBy: ingesterID,
-		Timestamp:  time.Now().Unix(),
-		Payload:    payloadCID,
-		References: references,
-		TotalSize:  totalSize,
+		MetadataRef: metadataRef,
+		IngestedBy:  ingesterID,
+		Timestamp:   time.Now().Unix(),
+		Payload:     payloadCID,
+		TotalSize:   totalSize,
 	}
 }

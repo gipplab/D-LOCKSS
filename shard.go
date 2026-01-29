@@ -14,128 +14,160 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
 
+	"dlockss/pkg/ipfs"
 	"dlockss/pkg/schema"
 )
 
+type shardSubscription struct {
+	topic    *pubsub.Topic
+	sub      *pubsub.Subscription
+	refCount int
+	cancel   context.CancelFunc
+	shardID  string
+}
+
 type ShardManager struct {
-	ctx context.Context
-	h   host.Host
-	ps  *pubsub.PubSub
+	ctx            context.Context
+	h              host.Host
+	ps             *pubsub.PubSub
+	ipfsClient     ipfs.IPFSClient
+	storageMgr     *StorageManager
+	replicationMgr *ReplicationManager
+	reshardedFiles *KnownFiles
 
 	mu           sync.RWMutex
 	currentShard string
-	shardTopic   *pubsub.Topic
-	shardSub     *pubsub.Subscription
+	
+	// Map of shardID -> subscription
+	shardSubs map[string]*shardSubscription
 
-	oldShardName    string
-	oldShardTopic   *pubsub.Topic
-	oldShardSub     *pubsub.Subscription
-	oldShardEndTime time.Time
-	inOverlap       bool
-
-	controlTopic *pubsub.Topic
-	controlSub   *pubsub.Subscription
+	// Old shard overlap management (still useful for split transitions)
+	// We handle this by simply 'holding' a reference to the old shard for a duration.
+	// No special fields needed, just logic in splitShard.
 
 	msgCounter    int
 	lastPeerCheck time.Time
-
-	shardDone chan struct{}
 }
 
-func NewShardManager(ctx context.Context, h host.Host, ps *pubsub.PubSub, startShard string) *ShardManager {
+func NewShardManager(
+	ctx context.Context, 
+	h host.Host, 
+	ps *pubsub.PubSub, 
+	ipfsClient ipfs.IPFSClient,
+	stm *StorageManager,
+	startShard string,
+) *ShardManager {
 	sm := &ShardManager{
-		ctx:          ctx,
-		h:            h,
-		ps:           ps,
-		currentShard: startShard,
-		shardDone:    make(chan struct{}, 1),
+		ctx:            ctx,
+		h:              h,
+		ps:             ps,
+		ipfsClient:     ipfsClient,
+		storageMgr:     stm,
+		reshardedFiles: NewKnownFiles(),
+		currentShard:   startShard,
+		shardSubs:      make(map[string]*shardSubscription),
 	}
-	sm.joinChannels()
+	
+	// Join initial shard
+	sm.JoinShard(startShard)
+	
 	return sm
 }
 
-func (sm *ShardManager) joinChannels() {
-	sm.mu.Lock()
-
-	if sm.controlTopic == nil {
-		t, err := sm.ps.Join(ControlTopicName)
-		if err != nil {
-			log.Printf("[Error] Failed to join control topic %s: %v", ControlTopicName, err)
-			sm.mu.Unlock()
-			return
-		}
-		sm.controlTopic = t
-
-		sub, err := t.Subscribe()
-		if err != nil {
-			log.Printf("[Error] Failed to subscribe to control topic: %v", err)
-			sm.mu.Unlock()
-			return
-		}
-		sm.controlSub = sub
-		log.Printf("[System] Joined Control Channel: %s", ControlTopicName)
-	}
-
-	oldShardSub := sm.shardSub
-	oldShardTopic := sm.shardTopic
-	oldShardName := sm.oldShardName
-	oldShardTopicName := ""
-	if oldShardSub != nil && oldShardName != "" {
-		oldShardTopicName = fmt.Sprintf("dlockss-v2-creative-commons-shard-%s", oldShardName)
-	}
-
-	topicName := fmt.Sprintf("dlockss-v2-creative-commons-shard-%s", sm.currentShard)
-	t, err := sm.ps.Join(topicName)
-	if err != nil {
-		log.Printf("[Error] Failed to subscribe to shard topic %s: %v", topicName, err)
-		sm.mu.Unlock()
-		return
-	}
-	sm.shardTopic = t
-
-	sub, err := t.Subscribe()
-	if err != nil {
-		log.Printf("[Error] Failed to subscribe to shard topic: %v", err)
-		sm.mu.Unlock()
-		return
-	}
-	sm.shardSub = sub
-	sm.msgCounter = 0
-
-	if oldShardSub != nil && oldShardTopicName != topicName && oldShardTopicName != "" {
-		sm.oldShardSub = oldShardSub
-		sm.oldShardTopic = oldShardTopic
-		sm.oldShardEndTime = time.Now().Add(ShardOverlapDuration)
-		sm.inOverlap = true
-		sm.mu.Unlock()
-		log.Printf("[Sharding] Entering overlap state: keeping old shard %s active until %v", oldShardTopicName, sm.oldShardEndTime)
-		go sm.readOldShard()
-	} else {
-		if oldShardSub != nil {
-			oldShardSub.Cancel()
-			sm.mu.Unlock()
-			select {
-			case <-sm.shardDone:
-			case <-time.After(ShardSubscriptionTimeout):
-				log.Printf("[Warning] Timeout waiting for old shard subscription to close")
-			}
-		} else {
-			sm.mu.Unlock()
-		}
-		sm.oldShardName = ""
-	}
-
-	log.Printf("[Sharding] Active Data Shard: %s (Topic: %s)", sm.currentShard, topicName)
+func (sm *ShardManager) SetReplicationManager(rm *ReplicationManager) {
+	sm.replicationMgr = rm
 }
 
 func (sm *ShardManager) Run() {
-	go sm.readControl()
-	go sm.readShard()
-	go sm.manageOverlap()
 	go sm.runPeerCountChecker()
 }
 
-// runPeerCountChecker periodically checks the number of peers in the shard
+// JoinShard increments the reference count for a shard topic.
+// If the topic is not currently subscribed, it joins and starts a read loop.
+func (sm *ShardManager) JoinShard(shardID string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sub, exists := sm.shardSubs[shardID]
+	if exists {
+		sub.refCount++
+		log.Printf("[Sharding] Retained shard %s (refCount: %d)", shardID, sub.refCount)
+		return
+	}
+
+	// New subscription
+	topicName := fmt.Sprintf("dlockss-creative-commons-shard-%s", shardID)
+	t, err := sm.ps.Join(topicName)
+	if err != nil {
+		log.Printf("[Error] Failed to join shard topic %s: %v", topicName, err)
+		return
+	}
+
+	psSub, err := t.Subscribe()
+	if err != nil {
+		log.Printf("[Error] Failed to subscribe to shard topic %s: %v", topicName, err)
+		return
+	}
+
+	ctx, cancel := context.WithCancel(sm.ctx)
+	newSub := &shardSubscription{
+		topic:    t,
+		sub:      psSub,
+		refCount: 1,
+		cancel:   cancel,
+		shardID:  shardID,
+	}
+	sm.shardSubs[shardID] = newSub
+
+	log.Printf("[Sharding] Joined shard %s (Topic: %s)", shardID, topicName)
+
+	// Start read loop
+	go sm.readLoop(ctx, newSub)
+}
+
+// LeaveShard decrements the reference count for a shard topic.
+// If the count reaches zero, it unsubscribes and closes the topic.
+func (sm *ShardManager) LeaveShard(shardID string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sub, exists := sm.shardSubs[shardID]
+	if !exists {
+		return
+	}
+
+	sub.refCount--
+	log.Printf("[Sharding] Released shard %s (refCount: %d)", shardID, sub.refCount)
+
+	if sub.refCount <= 0 {
+		sub.cancel() // Stop read loop
+		sub.sub.Cancel()
+		sub.topic.Close()
+		delete(sm.shardSubs, shardID)
+		log.Printf("[Sharding] Left shard %s", shardID)
+	}
+}
+
+func (sm *ShardManager) readLoop(ctx context.Context, sub *shardSubscription) {
+	defer sub.sub.Cancel()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		msg, err := sub.sub.Next(ctx)
+		if err != nil {
+			return
+		}
+
+		sm.processMessage(msg, sub.shardID)
+	}
+}
+
+// runPeerCountChecker periodically checks the number of peers in the CURRENT shard
 // and triggers splits when the threshold is exceeded.
 func (sm *ShardManager) runPeerCountChecker() {
 	ticker := time.NewTicker(ShardPeerCheckInterval)
@@ -151,174 +183,128 @@ func (sm *ShardManager) runPeerCountChecker() {
 	}
 }
 
-func (sm *ShardManager) readControl() {
-	sub := sm.controlSub
-	if sub == nil {
+// processMessage decodes and dispatches a message to the appropriate handler.
+func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
+	// Self-check
+	if msg.GetFrom() == sm.h.ID() {
 		return
 	}
 
-	for {
-		select {
-		case <-sm.ctx.Done():
+	// Rate limit check
+	if !checkRateLimit(msg.GetFrom()) {
+		incrementMetric(&metrics.messagesDropped)
+		return
+	}
+
+	sm.mu.Lock()
+	sm.msgCounter++
+	sm.mu.Unlock()
+
+	msgType, err := decodeCBORMessageType(msg.Data)
+	if err != nil {
+		return
+	}
+
+	switch msgType {
+	case schema.MessageTypeIngest:
+		var im schema.IngestMessage
+		if err := im.UnmarshalCBOR(msg.Data); err != nil {
 			return
-		default:
 		}
+		sm.handleIngestMessage(msg, &im, shardID)
 
-		msg, err := sub.Next(sm.ctx)
-		if err != nil {
+	case schema.MessageTypeReplicationRequest:
+		var rr schema.ReplicationRequest
+		if err := rr.UnmarshalCBOR(msg.Data); err != nil {
 			return
 		}
+		sm.handleReplicationRequest(msg, &rr, shardID)
 
-		if msg.GetFrom() == sm.h.ID() {
-			continue
+	case schema.MessageTypeUnreplicateRequest:
+		var ur schema.UnreplicateRequest
+		if err := ur.UnmarshalCBOR(msg.Data); err != nil {
+			return
 		}
-
-		// Control channel uses CBOR DelegateMessage in V2.
-		msgType, err := decodeCBORMessageType(msg.Data)
-		if err != nil || msgType != schema.MessageTypeDelegate {
-			continue
-		}
-
-		if !checkRateLimitForMessage(msg.GetFrom(), "DELEGATE") {
-			incrementMetric(&metrics.messagesDropped)
-			if !canAcceptCustodialFile() {
-				usage := checkDiskUsage()
-				log.Printf("[Storage] Dropped DELEGATE message from %s (disk usage high: %.1f%%)", msg.GetFrom().String(), usage)
-			} else {
-				log.Printf("[RateLimit] Dropped DELEGATE message from %s (rate limit exceeded)", msg.GetFrom().String())
-			}
-			continue
-		}
-
-		var dm schema.DelegateMessage
-		if err := dm.UnmarshalCBOR(msg.Data); err != nil {
-			log.Printf("[Warning] Invalid DelegateMessage CBOR: %v", err)
-			continue
-		}
-		if verifyAndAuthorizeMessage(sm.h, msg.GetFrom(), dm.SenderID, dm.Timestamp, dm.Nonce, dm.Sig, dm.MarshalCBORForSigning, "DelegateMessage") {
-			continue
-		}
-
-		sm.mu.RLock()
-		myShard := sm.currentShard
-		sm.mu.RUnlock()
-
-		if dm.TargetShard == myShard {
-			incrementMetric(&metrics.messagesReceived)
-			manifestKey := dm.ManifestCID.String()
-			log.Printf("[Delegate] Accepted delegation for %s (I am %s)", manifestKey[:min(16, len(manifestKey))]+"...", myShard)
-			addKnownFile(manifestKey)
-			// Trigger immediate check (high priority for custodial)
-			// Note: In async pipeline, we don't have direct access to jobQueue here.
-			// We rely on the fact that addKnownFile adds it to the set, and the scheduler will pick it up.
-			// To make it faster, we could expose a way to trigger the scheduler or inject a job.
-			// For now, we rely on the scheduler loop (every 1m or faster).
-			// Ideally, we should inject into the job queue.
-			// TODO: Inject into job queue directly for lower latency.
-		}
+		sm.handleUnreplicateRequest(msg, &ur, shardID)
 	}
 }
 
-// handleIngestMessage processes an IngestMessage after CBOR unmarshaling.
-// It performs authorization, signature verification, and enqueues replication checking.
-// The logPrefix parameter allows customizing log messages (e.g., "IngestMessage" vs "IngestMessage (old shard overlap)").
-func (sm *ShardManager) handleIngestMessage(msg *pubsub.Message, im *schema.IngestMessage, logPrefix string) bool {
+// handleIngestMessage processes an IngestMessage.
+func (sm *ShardManager) handleIngestMessage(msg *pubsub.Message, im *schema.IngestMessage, shardID string) {
+	logPrefix := fmt.Sprintf("IngestMessage (Shard %s)", shardID)
 	if verifyAndAuthorizeMessage(sm.h, msg.GetFrom(), im.SenderID, im.Timestamp, im.Nonce, im.Sig, im.MarshalCBORForSigning, logPrefix) {
-		return false
+		return
 	}
 	key := im.ManifestCID.String()
 	incrementMetric(&metrics.messagesReceived)
-	if logPrefix != "IngestMessage" {
-		log.Printf("[Sharding] Received Ingest message from old shard during overlap: %s", key[:min(16, len(key))]+"...")
-	}
-	addKnownFile(key)
-	// Scheduler will pick this up.
-	return true
+	
+	// Add to known files. If we are just a tourist, we still "know" about it,
+	// but the replication manager will eventually decide if we stick around.
+	sm.storageMgr.addKnownFile(key)
 }
 
-// handleReplicationRequest processes a ReplicationRequest after CBOR unmarshaling.
-// It performs authorization, signature verification, and enqueues replication checking.
-// If AutoReplicationEnabled is true and the file is not pinned, it attempts to fetch and pin the file.
-// The logPrefix parameter allows customizing log messages (e.g., "ReplicationRequest" vs "ReplicationRequest (old shard overlap)").
-func (sm *ShardManager) handleReplicationRequest(msg *pubsub.Message, rr *schema.ReplicationRequest, logPrefix string) bool {
+// handleReplicationRequest processes a ReplicationRequest.
+func (sm *ShardManager) handleReplicationRequest(msg *pubsub.Message, rr *schema.ReplicationRequest, shardID string) {
+	logPrefix := fmt.Sprintf("ReplicationRequest (Shard %s)", shardID)
 	if verifyAndAuthorizeMessage(sm.h, msg.GetFrom(), rr.SenderID, rr.Timestamp, rr.Nonce, rr.Sig, rr.MarshalCBORForSigning, logPrefix) {
-		return false
+		return
 	}
 	key := rr.ManifestCID.String()
 	manifestCID := rr.ManifestCID
 	incrementMetric(&metrics.messagesReceived)
-	if logPrefix != "ReplicationRequest" {
-		log.Printf("[Sharding] Received ReplicationRequest from old shard during overlap: %s", key[:min(16, len(key))]+"...")
-	}
 
-	// Check if we're responsible for this file before replicating
-	// In normal operation, ReplicationRequest is only sent to the shard topic, so only
-	// nodes in the same shard should receive it. However, during shard overlap periods
-	// (after a split), nodes may receive messages from their old shard via readOldShard().
-	// This check ensures only responsible nodes participate in D-LOCKSS replication.
-	payloadCIDStr := getPayloadCIDForShardAssignment(sm.ctx, key)
+	// Check responsibility
+	payloadCIDStr := getPayloadCIDForShardAssignment(sm.ctx, sm.ipfsClient, key)
 	responsible := sm.AmIResponsibleFor(payloadCIDStr)
 	
 	if !responsible {
-		log.Printf("[Replication] Received ReplicationRequest for %s, but not responsible (shard mismatch). Ignoring.", key[:min(16, len(key))]+"...")
-		// Non-responsible nodes can pin files in IPFS for their own use, but shouldn't
-		// participate in D-LOCKSS replication to keep cross-shard communication minimal
-		return true
+		// If we are a "Tourist" (Custodial Node watching its upload), we might see this.
+		// But tourists don't replicate other people's files.
+		// However, if WE sent the request (unlikely as we filter self), or if another node is requesting,
+		// we ignore it unless we are responsible.
+		return
 	}
 
 	// Attempt automatic replication if enabled and file is not pinned
-	if AutoReplicationEnabled && !isPinned(key) {
+	if AutoReplicationEnabled && !sm.storageMgr.isPinned(key) {
 		log.Printf("[Replication] Received replication request for %s (responsible), attempting to replicate...", key[:min(16, len(key))]+"...")
 
-		// Directly replicate (bypass pipeline for immediate action on replication requests)
 		go func() {
-			success, err := replicateFileFromRequest(sm.ctx, manifestCID, msg.GetFrom(), true) // responsible=true
+			if sm.replicationMgr == nil {
+				return
+			}
+			success, err := sm.replicationMgr.replicateFileFromRequest(sm.ctx, manifestCID, msg.GetFrom(), true) // responsible=true
 			if err != nil {
 				log.Printf("[Replication] Failed to replicate %s: %v", key[:min(16, len(key))]+"...", err)
-				recordFailedOperation(key)
+				sm.storageMgr.recordFailedOperation(key)
 			} else if success {
 				log.Printf("[Replication] Successfully replicated %s", key[:min(16, len(key))]+"...")
-				clearBackoff(key)
-				// File is now replicated, add to known files and let pipeline handle ongoing monitoring
-				addKnownFile(key)
+				sm.storageMgr.failedOperations.Clear(key)
+				sm.storageMgr.addKnownFile(key)
 			}
 		}()
 	} else {
-		// File already pinned or auto-replication disabled, just ensure it's tracked
-		addKnownFile(key)
-		// Pipeline will pick up the new file on next scan
+		sm.storageMgr.addKnownFile(key)
 	}
-
-	return true
 }
 
-// handleUnreplicateRequest processes an UnreplicateRequest message.
-// Peers use deterministic selection (hash of ManifestCID + PeerID) to decide
-// if they should drop the file, ensuring distributed consensus without coordination.
-func (sm *ShardManager) handleUnreplicateRequest(msg *pubsub.Message, ur *schema.UnreplicateRequest, logPrefix string) bool {
+// handleUnreplicateRequest processes an UnreplicateRequest.
+func (sm *ShardManager) handleUnreplicateRequest(msg *pubsub.Message, ur *schema.UnreplicateRequest, shardID string) {
+	logPrefix := fmt.Sprintf("UnreplicateRequest (Shard %s)", shardID)
 	if verifyAndAuthorizeMessage(sm.h, msg.GetFrom(), ur.SenderID, ur.Timestamp, ur.Nonce, ur.Sig, ur.MarshalCBORForSigning, logPrefix) {
-		return false
+		return
 	}
 	key := ur.ManifestCID.String()
 	manifestCID := ur.ManifestCID
 	incrementMetric(&metrics.messagesReceived)
 
-	log.Printf("[Replication] Received UnreplicateRequest for %s (excess: %d, current: %d)", key[:min(16, len(key))]+"...", ur.ExcessCount, ur.CurrentCount)
-
-	// Only act if we're pinning this file
-	if !isPinned(key) {
-		log.Printf("[Replication] Not pinning %s, ignoring UnreplicateRequest", key[:min(16, len(key))]+"...")
-		return true
+	if !sm.storageMgr.isPinned(key) {
+		return
 	}
 
-	// Deterministic selection: hash(ManifestCID + PeerID) to decide if this peer should drop
-	// This ensures distributed consensus - all peers independently make the same decision
+	// Deterministic selection to drop
 	selectionKey := key + sm.h.ID().String()
 	hash := sha256.Sum256([]byte(selectionKey))
-	
-	// Use first 8 bytes of hash as a 64-bit integer for selection
-	// Select peers where (hash % currentCount) < excessCount
-	// This gives us approximately excessCount / currentCount probability per peer
 	var hashInt uint64
 	for i := 0; i < 8 && i < len(hash); i++ {
 		hashInt = (hashInt << 8) | uint64(hash[i])
@@ -327,131 +313,38 @@ func (sm *ShardManager) handleUnreplicateRequest(msg *pubsub.Message, ur *schema
 	selected := (hashInt % uint64(ur.CurrentCount)) < uint64(ur.ExcessCount)
 	
 	if selected {
-		log.Printf("[Replication] Selected to drop over-replicated file %s (hash selection)", key[:min(16, len(key))]+"...")
-		unpinKeyV2(sm.ctx, key, manifestCID)
-		// Keep in knownFiles for monitoring, but unpinned
-	} else {
-		log.Printf("[Replication] Not selected to drop %s (hash selection)", key[:min(16, len(key))]+"...")
-	}
-
-	return true
-}
-
-func (sm *ShardManager) readShard() {
-	defer func() {
-		select {
-		case sm.shardDone <- struct{}{}:
-		default:
-		}
-	}()
-
-	sub := sm.shardSub
-	if sub == nil {
-		return
-	}
-
-	for {
-		select {
-		case <-sm.ctx.Done():
-			return
-		default:
-		}
-
-		msg, err := sub.Next(sm.ctx)
-		if err != nil {
-			return
-		}
-
-		if msg.GetFrom() == sm.h.ID() {
-			continue
-		}
-
-		if !checkRateLimit(msg.GetFrom()) {
-			incrementMetric(&metrics.messagesDropped)
-			continue
-		}
-
-		sm.mu.Lock()
-		sm.msgCounter++
-		sm.mu.Unlock()
-
-		msgType, err := decodeCBORMessageType(msg.Data)
-		if err != nil {
-			continue
-		}
-
-		switch msgType {
-		case schema.MessageTypeIngest:
-			var im schema.IngestMessage
-			if err := im.UnmarshalCBOR(msg.Data); err != nil {
-				continue
-			}
-			if !sm.handleIngestMessage(msg, &im, "IngestMessage") {
-				return
-			}
-
-		case schema.MessageTypeReplicationRequest:
-			var rr schema.ReplicationRequest
-			if err := rr.UnmarshalCBOR(msg.Data); err != nil {
-				continue
-			}
-			if !sm.handleReplicationRequest(msg, &rr, "ReplicationRequest") {
-				return
-			}
-
-		case schema.MessageTypeUnreplicateRequest:
-			var ur schema.UnreplicateRequest
-			if err := ur.UnmarshalCBOR(msg.Data); err != nil {
-				continue
-			}
-			if !sm.handleUnreplicateRequest(msg, &ur, "UnreplicateRequest") {
-				return
-			}
+		log.Printf("[Replication] Selected to drop over-replicated file %s", key[:min(16, len(key))]+"...")
+		if sm.replicationMgr != nil {
+			sm.replicationMgr.UnpinFile(sm.ctx, key, manifestCID)
 		}
 	}
 }
 
-// getShardPeerCount returns the estimated number of peers in the current shard topic.
-// This is an estimate because GossipSub only reports peers it knows about.
+// getShardPeerCount returns peer count for the CURRENT shard.
 func (sm *ShardManager) getShardPeerCount() int {
 	sm.mu.RLock()
-	topic := sm.shardTopic
+	currentShard := sm.currentShard
+	sub, exists := sm.shardSubs[currentShard]
 	sm.mu.RUnlock()
 
-	if topic == nil {
+	if !exists || sub.topic == nil {
 		return 0
 	}
 
-	// ListPeers returns peers subscribed to this topic (excluding self)
-	peers := topic.ListPeers()
-	count := len(peers)
-	// Add 1 for self (we're subscribed but not in the list)
-	return count + 1
+	peers := sub.topic.ListPeers()
+	return len(peers) + 1
 }
 
-// getShardInfo returns the current shard ID and the estimated number of peers
-// subscribed to the shard topic (including self). It is safe to call from
-// other packages without manually locking shardMgr.
+// getShardInfo returns current shard ID and peer count.
 func getShardInfo() (string, int) {
 	if shardMgr == nil {
 		return "", 0
 	}
-
-	shardMgr.mu.RLock()
-	topic := shardMgr.shardTopic
-	currentShard := shardMgr.currentShard
-	shardMgr.mu.RUnlock()
-
-	if topic == nil {
-		return currentShard, 0
-	}
-
-	peers := topic.ListPeers()
-	return currentShard, len(peers) + 1
+	// Note: Avoiding global lock for peek
+	return shardMgr.currentShard, shardMgr.getShardPeerCount()
 }
 
 func (sm *ShardManager) checkAndSplitIfNeeded() {
-	// Rate-limit how often we check to avoid hammering GossipSub APIs.
 	sm.mu.Lock()
 	now := time.Now()
 	if now.Sub(sm.lastPeerCheck) < ShardPeerCheckInterval {
@@ -463,24 +356,12 @@ func (sm *ShardManager) checkAndSplitIfNeeded() {
 	sm.mu.Unlock()
 
 	peerCount := sm.getShardPeerCount()
-
-	// Estimate peers per shard after split (roughly half)
 	estimatedPeersAfterSplit := peerCount / 2
-
-	// Check if we should split:
-	// 1. Current shard exceeds max peers (tied to replication requirements)
-	// 2. After split, each new shard would have at least MinPeersPerShard nodes
-	// This ensures replication targets remain achievable after splits
 	shouldSplit := peerCount > MaxPeersPerShard && estimatedPeersAfterSplit >= MinPeersPerShard
 
 	if shouldSplit {
-		log.Printf("[Sharding] Shard %s has %d peers (threshold: %d). Splitting to ensure replication targets remain achievable...", currentShard, peerCount, MaxPeersPerShard)
+		log.Printf("[Sharding] Shard %s has %d peers. Splitting...", currentShard, peerCount)
 		sm.splitShard()
-	} else if peerCount > MaxPeersPerShard {
-		log.Printf("[Sharding] Shard %s has %d peers but cannot split (would create shards with < %d peers each, risking replication failures)", currentShard, peerCount, MinPeersPerShard)
-	} else if peerCount > 0 {
-		// Debug logging: show peer count occasionally
-		log.Printf("[Sharding] Shard %s peer count: %d/%d (checking every %v)", currentShard, peerCount, MaxPeersPerShard, ShardPeerCheckInterval)
 	}
 }
 
@@ -494,305 +375,114 @@ func (sm *ShardManager) splitShard() {
 	oldShard := sm.currentShard
 	peerIDHash := getBinaryPrefix(sm.h.ID().String(), nextDepth)
 	sm.currentShard = peerIDHash
-	sm.oldShardName = oldShard
 	sm.msgCounter = 0
 
 	incrementMetric(&metrics.shardSplits)
-	log.Printf("[Sharding] Split shard to depth %d: %s -> %s (entering overlap state)", nextDepth, oldShard, sm.currentShard)
+	log.Printf("[Sharding] Split shard to depth %d: %s -> %s", nextDepth, oldShard, sm.currentShard)
 
-	// Release the lock before rejoining topics to avoid deadlocks; joinChannels
-	// will acquire its own locks as needed.
+	// Release lock to join/leave (avoid deadlock)
 	sm.mu.Unlock()
-	sm.joinChannels()
+	
+	// Join new shard
+	sm.JoinShard(peerIDHash)
+	
+	// Keep old shard for overlap duration, then leave
+	go func() {
+		time.Sleep(ShardOverlapDuration)
+		sm.LeaveShard(oldShard)
+	}()
+	
 	sm.mu.Lock()
 
-	// Schedule a reshard pass to re-evaluate responsibility for existing files
-	// at the new shard depth. Delay slightly to allow overlap state to settle.
 	go func() {
 		time.Sleep(ReshardDelay)
-		sm.RunReshardPass()
+		sm.RunReshardPass(oldShard, peerIDHash)
 	}()
 }
 
-// RunReshardPass walks knownFiles and re-evaluates responsibility for each
-// ManifestCID at the new shard depth after a split. It emits DelegateMessages
-// or IngestMessages as needed so that content is gradually redistributed to
-// the correct shards.
-func (sm *ShardManager) RunReshardPass() {
-	sm.mu.RLock()
-	currentShard := sm.currentShard
-	oldShard := sm.oldShardName
-	ctx := sm.ctx
-	sm.mu.RUnlock()
-
-	if ctx == nil {
-		return
-	}
-	if oldShard == "" {
-		// No previous shard recorded; nothing to do.
-		return
-	}
-
-	newDepth := len(currentShard)
-	oldDepth := len(oldShard)
-	if newDepth <= oldDepth {
-		// Depth did not actually increase; nothing to do.
-		return
-	}
-
-	files := knownFiles.All()
+// RunReshardPass re-evaluates responsibility.
+func (sm *ShardManager) RunReshardPass(oldShard, newShard string) {
+	files := sm.storageMgr.knownFiles.All()
 	if len(files) == 0 {
 		return
 	}
 
-	log.Printf("[Reshard] Starting reshard pass for shard %s (old shard %s), files=%d", currentShard, oldShard, len(files))
-
-	batchCount := 0
+	log.Printf("[Reshard] Starting reshard pass: %s -> %s", oldShard, newShard)
+	oldDepth := len(oldShard)
+	newDepth := len(newShard)
 
 	for key := range files {
-		if ctx.Err() != nil {
-			log.Printf("[Reshard] Context canceled, stopping reshard pass")
-			return
-		}
-
-		// Skip files we've already processed in a previous reshard pass.
-		if reshardedFiles.Has(key) {
+		if sm.reshardedFiles.Has(key) {
 			continue
 		}
 
-		// Use PayloadCID for shard assignment (stable, content-based)
-		// ManifestCID includes timestamp/metadata and changes on every ingestion
-		payloadCIDStr := getPayloadCIDForShardAssignment(sm.ctx, key)
+		payloadCIDStr := getPayloadCIDForShardAssignment(sm.ctx, sm.ipfsClient, key)
 		stableHex := keyToStableHex(payloadCIDStr)
 		targetOld := getHexBinaryPrefix(stableHex, oldDepth)
 		targetNew := getHexBinaryPrefix(stableHex, newDepth)
 
 		wasResponsible := (targetOld == oldShard)
-		isResponsible := (targetNew == currentShard)
+		isResponsible := (targetNew == newShard)
 
-		// If responsibility didn't change with the new depth, just mark as processed.
 		if wasResponsible == isResponsible {
-			reshardedFiles.Add(key)
+			sm.reshardedFiles.Add(key)
 			continue
 		}
 
 		manifestCID, err := keyToCID(key)
 		if err != nil {
-			log.Printf("[Reshard] Invalid key format during reshard: %s, error: %v", key, err)
-			reshardedFiles.Add(key)
 			continue
 		}
 
-		shortKey := key
-		if len(shortKey) > 16 {
-			shortKey = shortKey[:16] + "..."
-		}
-
-		switch {
-		// Case B: Node was responsible, now not responsible -> become custodial and delegate.
-		case wasResponsible && !isResponsible:
-			log.Printf("[Reshard] %s moved off my shard (%s -> %s). Delegating to shard %s", shortKey, oldShard, currentShard, targetNew)
-			dm := schema.DelegateMessage{
-				Type:        schema.MessageTypeDelegate,
-				ManifestCID: manifestCID,
-				TargetShard: targetNew,
-			}
-			if err := signProtocolMessage(&dm); err != nil {
-				log.Printf("[Reshard] Failed to sign DelegateMessage for %s: %v", shortKey, err)
-			} else if b, err := dm.MarshalCBOR(); err != nil {
-				log.Printf("[Reshard] Failed to marshal DelegateMessage for %s: %v", shortKey, err)
-			} else {
-				sm.PublishToControlCBOR(b)
-			}
-
-		// Case C: Node was custodial (or uninvolved), now responsible -> announce ingest.
-		case !wasResponsible && isResponsible:
-			log.Printf("[Reshard] %s moved onto my shard (%s -> %s). Announcing ingest.", shortKey, oldShard, currentShard)
+		// Logic simplified: We just announce to the new shard if we are now responsible.
+		// If we are NO LONGER responsible, we are "Custodial". We should check if we can hand off.
+		// But in the new "Tourist" model, we rely on the network to pick it up.
+		// If we are responsible now, we should announce Ingest to our new shard so others know.
+		
+		if isResponsible {
 			im := schema.IngestMessage{
 				Type:        schema.MessageTypeIngest,
 				ManifestCID: manifestCID,
-				ShardID:     currentShard,
-				// We don't know the original size hint here; use 0 as a neutral value.
-				HintSize: 0,
+				ShardID:     newShard,
+				HintSize:    0,
 			}
-			if err := signProtocolMessage(&im); err != nil {
-				log.Printf("[Reshard] Failed to sign IngestMessage for %s: %v", shortKey, err)
-			} else if b, err := im.MarshalCBOR(); err != nil {
-				log.Printf("[Reshard] Failed to marshal IngestMessage for %s: %v", shortKey, err)
-			} else {
-				sm.PublishToShardCBOR(b)
-			}
-		}
-
-		reshardedFiles.Add(key)
-		batchCount++
-
-		if batchCount >= ReshardBatchSize {
-			// Yield to avoid overwhelming the network and CPU.
-			time.Sleep(50 * time.Millisecond)
-			batchCount = 0
-		}
-	}
-
-	log.Printf("[Reshard] Completed reshard pass for shard %s", currentShard)
-}
-
-func (sm *ShardManager) readOldShard() {
-	sm.mu.RLock()
-	sub := sm.oldShardSub
-	endTime := sm.oldShardEndTime
-	sm.mu.RUnlock()
-
-	if sub == nil {
-		return
-	}
-
-	for {
-		select {
-		case <-sm.ctx.Done():
-			return
-		default:
-		}
-
-		if time.Now().After(endTime) {
-			sm.mu.Lock()
-			if sm.oldShardSub != nil {
-				log.Printf("[Sharding] Overlap period ended, closing old shard subscription")
-				sm.oldShardSub.Cancel()
-				sm.oldShardSub = nil
-				sm.oldShardTopic = nil
-				sm.inOverlap = false
-			}
-			sm.mu.Unlock()
-			return
-		}
-
-		ctx, cancel := context.WithDeadline(sm.ctx, endTime)
-		msg, err := sub.Next(ctx)
-		cancel()
-
-		if err != nil {
-			if err == context.DeadlineExceeded {
-				continue
-			}
-			return
-		}
-
-		if msg.GetFrom() == sm.h.ID() {
-			continue
-		}
-
-		if !checkRateLimit(msg.GetFrom()) {
-			incrementMetric(&metrics.messagesDropped)
-			continue
-		}
-
-		msgType, err := decodeCBORMessageType(msg.Data)
-		if err != nil {
-			continue
-		}
-		switch msgType {
-		case schema.MessageTypeIngest:
-			var im schema.IngestMessage
-			if err := im.UnmarshalCBOR(msg.Data); err != nil {
-				continue
-			}
-			if !sm.handleIngestMessage(msg, &im, "IngestMessage (old shard overlap)") {
-				return
-			}
-		case schema.MessageTypeReplicationRequest:
-			var rr schema.ReplicationRequest
-			if err := rr.UnmarshalCBOR(msg.Data); err != nil {
-				continue
-			}
-			if !sm.handleReplicationRequest(msg, &rr, "ReplicationRequest (old shard overlap)") {
-				return
-			}
-
-		case schema.MessageTypeUnreplicateRequest:
-			var ur schema.UnreplicateRequest
-			if err := ur.UnmarshalCBOR(msg.Data); err != nil {
-				continue
-			}
-			if !sm.handleUnreplicateRequest(msg, &ur, "UnreplicateRequest (old shard overlap)") {
-				return
-			}
-		}
-	}
-}
-
-func (sm *ShardManager) manageOverlap() {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-sm.ctx.Done():
-			return
-		case <-ticker.C:
-			sm.mu.RLock()
-			inOverlap := sm.inOverlap
-			endTime := sm.oldShardEndTime
-			sm.mu.RUnlock()
-
-			if inOverlap && time.Now().After(endTime) {
-				sm.mu.Lock()
-				if sm.oldShardSub != nil {
-					log.Printf("[Sharding] Overlap period expired, closing old shard subscription")
-					sm.oldShardSub.Cancel()
-					sm.oldShardSub = nil
-					sm.oldShardTopic = nil
-					sm.oldShardName = ""
-					sm.inOverlap = false
+			if err := signProtocolMessage(&im); err == nil {
+				if b, err := im.MarshalCBOR(); err == nil {
+					sm.PublishToShardCBOR(b, newShard)
 				}
-				sm.mu.Unlock()
 			}
+		} else if wasResponsible {
+			// We lost responsibility. We effectively become custodial.
+			// We should "Join" the target shard as a tourist to ensure handoff?
+			// Or just let the new responsible nodes find it via DHT?
+			// Providing to DHT is enough if nodes query.
+			// But for proactive handoff, we could Join(targetNew) -> Announce -> Wait -> Leave.
+			// For simplicity in this pass, we skip proactive handoff logic for now.
 		}
+
+		sm.reshardedFiles.Add(key)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-func (sm *ShardManager) PublishToShard(msg string) {
+// PublishToShard publishes a message to a specific shard topic.
+func (sm *ShardManager) PublishToShard(shardID, msg string) {
 	sm.mu.RLock()
-	topic := sm.shardTopic
-	inOverlap := sm.inOverlap
-	oldTopic := sm.oldShardTopic
+	sub, exists := sm.shardSubs[shardID]
 	sm.mu.RUnlock()
 
-	if topic != nil {
-		if err := topic.Publish(sm.ctx, []byte(msg)); err != nil {
-			incrementMetric(&metrics.messagesDropped)
-			log.Printf("[PubSub] Failed to publish to shard topic: %v", err)
-		}
-	}
-
-	if inOverlap && oldTopic != nil {
-		if err := oldTopic.Publish(sm.ctx, []byte(msg)); err != nil {
-			incrementMetric(&metrics.messagesDropped)
-			log.Printf("[PubSub] Failed to publish to old shard topic during overlap: %v", err)
-		} else {
-			log.Printf("[Sharding] Published to both shards during overlap: %s", msg[:min(20, len(msg))])
-		}
+	if exists && sub.topic != nil {
+		sub.topic.Publish(sm.ctx, []byte(msg))
 	}
 }
 
-func (sm *ShardManager) PublishToShardCBOR(data []byte) {
+func (sm *ShardManager) PublishToShardCBOR(data []byte, shardID string) {
 	sm.mu.RLock()
-	topic := sm.shardTopic
-	inOverlap := sm.inOverlap
-	oldTopic := sm.oldShardTopic
+	sub, exists := sm.shardSubs[shardID]
 	sm.mu.RUnlock()
 
-	if topic != nil {
-		if err := topic.Publish(sm.ctx, data); err != nil {
-			incrementMetric(&metrics.messagesDropped)
-			log.Printf("[PubSub] Failed to publish CBOR to shard topic: %v", err)
-		}
-	}
-	if inOverlap && oldTopic != nil {
-		if err := oldTopic.Publish(sm.ctx, data); err != nil {
-			incrementMetric(&metrics.messagesDropped)
-			log.Printf("[PubSub] Failed to publish CBOR to old shard topic during overlap: %v", err)
-		}
+	if exists && sub.topic != nil {
+		sub.topic.Publish(sm.ctx, data)
 	}
 }
 
@@ -803,35 +493,9 @@ func min(a, b int) int {
 	return b
 }
 
-func (sm *ShardManager) PublishToControl(msg string) {
-	sm.mu.RLock()
-	topic := sm.controlTopic
-	sm.mu.RUnlock()
-
-	if topic != nil {
-		if err := topic.Publish(sm.ctx, []byte(msg)); err != nil {
-			incrementMetric(&metrics.messagesDropped)
-			log.Printf("[PubSub] Failed to publish to control topic: %v", err)
-		}
-	}
-}
-
-func (sm *ShardManager) PublishToControlCBOR(data []byte) {
-	sm.mu.RLock()
-	topic := sm.controlTopic
-	sm.mu.RUnlock()
-	if topic != nil {
-		if err := topic.Publish(sm.ctx, data); err != nil {
-			incrementMetric(&metrics.messagesDropped)
-			log.Printf("[PubSub] Failed to publish CBOR to control topic: %v", err)
-		}
-	}
-}
-
 func (sm *ShardManager) AmIResponsibleFor(key string) bool {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-	// V2 keys are ManifestCID strings (not 64-hex). Use stable hashing for sharding.
 	prefix := getHexBinaryPrefix(keyToStableHex(key), len(sm.currentShard))
 	return prefix == sm.currentShard
 }
@@ -857,13 +521,8 @@ func (sm *ShardManager) Close() {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	if sm.shardSub != nil {
-		sm.shardSub.Cancel()
-	}
-	if sm.oldShardSub != nil {
-		sm.oldShardSub.Cancel()
-	}
-	if sm.controlSub != nil {
-		sm.controlSub.Cancel()
+	for _, sub := range sm.shardSubs {
+		sub.cancel()
+		sub.sub.Cancel()
 	}
 }

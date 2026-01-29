@@ -2,7 +2,8 @@
 
 participant "ShardManager" as ShardMgr
 participant "PubSub" as PubSub
-participant "Storage" as Storage
+participant "StorageManager" as Storage
+participant "ReplicationManager" as ReplMgr
 participant "Old Shard Reader" as OldReader
 
 ShardMgr -> ShardMgr: runPeerCountChecker()\n(periodic ticker every ShardPeerCheckInterval)
@@ -13,23 +14,31 @@ alt peerCount > MaxPeersPerShard\nAND estimatedPeersAfterSplit >= MinPeersPerSha
     ShardMgr -> ShardMgr: Calculate new depth\ncurrentDepth + 1
     ShardMgr -> ShardMgr: Get peerIDHash at new depth
     ShardMgr -> ShardMgr: Update currentShard = peerIDHash
-    ShardMgr -> Storage: Increment shardSplits metric
     
     Note over ShardMgr: Entering Overlap State
     
-    ShardMgr -> PubSub: Join new shard topic\n("dlockss-v2-creative-commons-shard-" + newShard)
+    ShardMgr -> PubSub: Join new shard topic
     ShardMgr -> ShardMgr: Keep old shard subscription active
-    ShardMgr -> ShardMgr: Set overlap end time\n(currentTime + ShardOverlapDuration)
+    ShardMgr -> ShardMgr: Set overlap end time
     ShardMgr -> OldReader: Start readOldShard() goroutine
+    
+    Note over ShardMgr: Reshard Pass (Re-evaluate Responsibility)
+    ShardMgr -> Storage: Walk known files
+    loop For each file
+        ShardMgr -> ShardMgr: Calculate new responsibility
+        alt Moved ONTO shard
+             ShardMgr -> PubSub: Publish IngestMessage (New Shard)
+        end
+    end
     
     Note over ShardMgr,OldReader: Overlap Period\n(Both subscriptions active)
     
     loop During Overlap Period
         OldReader -> PubSub: Read messages from old shard
         alt Message received
-            OldReader -> ShardMgr: Process NEED/NEW messages
+            OldReader -> ShardMgr: Process messages
             ShardMgr -> Storage: addKnownFile(hash)
-            ShardMgr -> ShardMgr: checkReplication(hash)
+            Note over ShardMgr: Added to known files, picked up by ReplMgr
         end
     end
     
@@ -39,8 +48,7 @@ alt peerCount > MaxPeersPerShard\nAND estimatedPeersAfterSplit >= MinPeersPerSha
         Note over ShardMgr: Overlap complete\nOnly new shard active
     end
     
-    Note over ShardMgr: Responsibility changed\nOld: "0" -> New: "01"
-    Note over ShardMgr: Zero message loss\nguaranteed during transition
+    Note over ShardMgr: Responsibility changed
 end
 
 @enduml

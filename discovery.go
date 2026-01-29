@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -36,10 +35,9 @@ func inputLoop(sm *ShardManager) {
 			continue
 		}
 
-		// V2 console helpers (not network messages):
+		// Console helpers:
 		// - resolve <ManifestCID>
 		// - bibtex <ManifestCID>
-		// - refs <ManifestCID> [depth]
 		fields := strings.Fields(line)
 		cmd := strings.ToLower(fields[0])
 		if cmd == "resolve" && len(fields) >= 2 {
@@ -69,29 +67,9 @@ func inputLoop(sm *ShardManager) {
 			fmt.Println(FormatBibTeX(c))
 			continue
 		}
-		if cmd == "refs" && len(fields) >= 2 {
-			depth := 1
-			if len(fields) >= 3 {
-				if n, err := strconv.Atoi(fields[2]); err == nil {
-					depth = n
-				}
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			tree, edges, err := ResolveReferenceTree(ctx, fields[1], depth)
-			cancel()
-			if err != nil {
-				log.Printf("[Citation] Refs failed: %v", err)
-				continue
-			}
-			fmt.Print(FormatRefTree(tree))
-			fmt.Println("Edges:")
-			for _, e := range edges {
-				fmt.Printf("  %s -> %s\n", e[0], e[1])
-			}
-			continue
-		}
 
 		// Default behavior: publish raw line (useful for manual testing)
-		sm.PublishToShard(line)
+		shardID, _ := getShardInfo()
+		sm.PublishToShard(shardID, line)
 	}
 }

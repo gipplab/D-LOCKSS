@@ -36,13 +36,11 @@ class ShardManager {
 }
 
 class ResearchObject {
-    + Title: string
-    + Authors: []string
+    + MetadataRef: string
     + IngestedBy: peer.ID
     + Signature: []byte
     + Timestamp: int64
     + Payload: cid.Cid
-    + References: []cid.Cid
     + TotalSize: uint64
 }
 
