@@ -3,7 +3,7 @@
 # Configuration
 # Reduced to 15 nodes for bandwidth-limited environments
 # Each node runs its own isolated IPFS daemon
-NODE_COUNT=30
+NODE_COUNT=15
 # Make BASE_DIR absolute to avoid path resolution issues
 BASE_DIR_REL="testnet_data"
 BASE_DIR=$(cd "$BASE_DIR_REL" 2>/dev/null && pwd || echo "$(pwd)/$BASE_DIR_REL")
@@ -71,11 +71,23 @@ if [ -f "$BINARY_NAME" ]; then
 fi
 
 if [ "$NEED_REBUILD" = true ]; then
-    (cd .. && go build -o testnet/$BINARY_NAME)
+    # Detect script directory to handle running from root or testnet dir
+    SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+    ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+    
+    echo "Building from $ROOT_DIR..."
+    (cd "$ROOT_DIR" && go build -o "$SCRIPT_DIR/$BINARY_NAME" ./cmd/dlockss)
     if [ $? -ne 0 ]; then
         echo "Build failed."
         exit 1
     fi
+    
+    echo "Building Monitor..."
+    (cd "$ROOT_DIR" && go build -o "$SCRIPT_DIR/dlockss-monitor" ./cmd/dlockss-monitor)
+    if [ $? -ne 0 ]; then
+        echo "Monitor build failed (continuing anyway)..."
+    fi
+
     echo "Build completed."
 fi
 
@@ -104,7 +116,9 @@ for i in $(seq 1 $NODE_COUNT); do
     mkdir -p "$NODE_DIR"
     
     # Copy binary to node dir (so they don't lock the same file if OS is strict)
-    cp $BINARY_NAME "$NODE_DIR/"
+    # Detect script directory if not already set (re-evaluating for safety)
+    SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+    cp "$SCRIPT_DIR/$BINARY_NAME" "$NODE_DIR/"
 
     # --- Start a per-node IPFS daemon ---
     # Each node gets an isolated IPFS repo and unique ports.
@@ -128,13 +142,13 @@ if [ ! -f "$IPFS_REPO/config" ]; then
         (export IPFS_PATH="$IPFS_REPO" && ipfs init -e --profile=lowpower >/dev/null 2>&1)
 
         # 2. Connection Limits (Bandwidth Protection)
-        #    Keep these low to save bandwidth, even if CPU is fine.
-        (export IPFS_PATH="$IPFS_REPO" && ipfs config Swarm.ConnMgr.LowWater --json 10)
-        (export IPFS_PATH="$IPFS_REPO" && ipfs config Swarm.ConnMgr.HighWater --json 20)
+        #    Increased to allow full mesh in root shard (25 nodes) and facilitate discovery
+        (export IPFS_PATH="$IPFS_REPO" && ipfs config Swarm.ConnMgr.LowWater --json 30)
+        (export IPFS_PATH="$IPFS_REPO" && ipfs config Swarm.ConnMgr.HighWater --json 60)
         
-        # 3. Disable DHT Server Mode (Bandwidth Protection)
-        #    Stops nodes from maintaining the global network map.
-        (export IPFS_PATH="$IPFS_REPO" && ipfs config Routing.Type "dhtclient")
+        # 3. Enable DHT Server Mode
+        #    CRITICAL: In a closed testnet, nodes must act as DHT servers to find each other/content.
+        (export IPFS_PATH="$IPFS_REPO" && ipfs config Routing.Type "dhtserver")
 
         # 4. ENABLE MDNS (Automatic Discovery)
         #    Since you have CPU power, this allows nodes to find each other 

@@ -25,3 +25,8 @@ docs/README.md
 
 replication_test.go
 shard_test.go
+
+# Binaries
+main
+dlockss-monitor
+testnet/dlockss-monitor

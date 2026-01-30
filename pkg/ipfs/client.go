@@ -23,6 +23,7 @@ type IPFSClient interface {
 	GetFileSize(ctx context.Context, cid cid.Cid) (uint64, error)
 	VerifyDAGCompleteness(ctx context.Context, rootCID cid.Cid) (bool, error)
 	GetPeerID(ctx context.Context) (string, error)
+	SwarmConnect(ctx context.Context, addrs []string) error
 }
 
 // Client wraps IPFS API operations for importing files and managing pins.
@@ -199,4 +200,9 @@ func (c *Client) GetPeerID(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("failed to get IPFS peer ID: %w", err)
 	}
 	return id.ID, nil
+}
+
+// SwarmConnect connects the IPFS node to a set of peers.
+func (c *Client) SwarmConnect(ctx context.Context, addrs []string) error {
+	return c.api.SwarmConnect(ctx, addrs...)
 }

@@ -6,8 +6,10 @@ participant "StorageManager" as Storage
 participant "ReplicationManager" as ReplMgr
 participant "Old Shard Reader" as OldReader
 
+== Path 1: Split when current shard is overcrowded ==
+
 ShardMgr -> ShardMgr: runPeerCountChecker()\n(periodic ticker every ShardPeerCheckInterval)
-ShardMgr -> ShardMgr: getShardPeerCount()\n(topic.ListPeers() + 1)
+ShardMgr -> ShardMgr: getShardPeerCount()\n(topic.ListPeers() + seen peers)
 
 alt peerCount > MaxPeersPerShard\nAND estimatedPeersAfterSplit >= MinPeersPerShard
     ShardMgr -> ShardMgr: splitShard()
@@ -49,6 +51,47 @@ alt peerCount > MaxPeersPerShard\nAND estimatedPeersAfterSplit >= MinPeersPerSha
     end
     
     Note over ShardMgr: Responsibility changed
+end
+
+== Path 2: Discover and migrate into existing deeper shards ==
+
+Note over ShardMgr: Late joiner in ROOT, or nodes in parent shard (e.g. "00")\nwith few peers; should discover deeper shards (e.g. "000", "001") and migrate.
+
+ShardMgr -> ShardMgr: runShardDiscovery()\n(periodic ticker every ShardDiscoveryInterval)
+ShardMgr -> ShardMgr: getShardPeerCount()
+
+alt peerCount <= MaxPeersPerShard\n(any shard: explore deeper)
+    ShardMgr -> ShardMgr: discoverAndMoveToDeeperShard()
+    ShardMgr -> ShardMgr: generateDeeperShards(currentShard, 3)\nfilter by peer ID prefix
+    loop For each matching deeper shard (e.g. "0", "1")
+        ShardMgr -> PubSub: probeShard(shard)\nJoin temporarily, wait probeTimeout
+        PubSub -> ShardMgr: mesh/seen peer count
+        ShardMgr -> PubSub: LeaveShard(shard)
+    end
+    alt Found deeper shard with >= 1 peer
+        ShardMgr -> ShardMgr: Update currentShard = deepestActiveShard
+        ShardMgr -> PubSub: Join new shard topic
+        ShardMgr -> ShardMgr: Keep old (ROOT) for ShardOverlapDuration
+        ShardMgr -> ShardMgr: RunReshardPass(ROOT, newShard)
+        Note over ShardMgr: Late joiner now in same shard as peers
+    end
+    else node is idle (no messages in last minute)
+    Note over ShardMgr: Also runs discovery when idle
+    ShardMgr -> ShardMgr: discoverAndMoveToDeeperShard()
+end
+
+== Path 3: Merge up when alone in deep shard (no siblings) ==
+
+Note over ShardMgr: One node in e.g. "011", parent "01" has 7 nodes,\nsibling "010" empty -> migrate up to "01".
+
+ShardMgr -> ShardMgr: checkAndMergeUpIfAlone()
+alt len(currentShard) >= 2\nAND current peer count <= 1 (alone)\nAND parent peer count < MaxPeersPerShard\nAND sibling shard has 0 peers
+    ShardMgr -> ShardMgr: parentShard = currentShard[:-1]
+    ShardMgr -> PubSub: probeShard(parent)
+    ShardMgr -> PubSub: probeShard(sibling)
+    ShardMgr -> ShardMgr: currentShard = parentShard
+    ShardMgr -> PubSub: Join parent, Leave current after overlap
+    ShardMgr -> ShardMgr: RunReshardPass(current, parent)
 end
 
 @enduml

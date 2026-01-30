@@ -30,10 +30,23 @@ class ShardManager {
     + getShardPeerCount(): int
     + checkAndSplitIfNeeded()
     + runPeerCountChecker()
+    + runShardDiscovery()
+    + checkAndMergeUpIfAlone()
+    + discoverAndMoveToDeeperShard()
+    + probeShard(shardID, timeout): int
+    + generateDeeperShards(currentShard, maxDepth): []string
     + readOldShard()
     + manageOverlap()
     + Close()
 }
+
+note right of ShardManager
+  When current shard has few peers (<= MaxPeersPerShard),
+  runShardDiscovery runs without requiring idle.
+  Merge up: if alone in deep shard (<= 1 peer),
+  no siblings (sibling shard empty), parent has room.
+  Discover deeper: move to deeper shard if >= 1 peer.
+end note
 
 class ResearchObject {
     + MetadataRef: string

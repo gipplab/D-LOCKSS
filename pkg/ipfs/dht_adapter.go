@@ -28,6 +28,7 @@ type IPFSDHTAdapter struct {
 	api            *ipfsapi.Shell
 	retryAttempts  int
 	retryDelay     time.Duration
+	provideTimeout time.Duration // Timeout for provide operations
 	provideQueue   chan *provideRequest
 	workerCtx      context.Context
 	workerCancel   context.CancelFunc
@@ -39,12 +40,13 @@ type IPFSDHTAdapter struct {
 func NewIPFSDHTAdapter(api *ipfsapi.Shell) *IPFSDHTAdapter {
 	ctx, cancel := context.WithCancel(context.Background())
 	adapter := &IPFSDHTAdapter{
-		api:           api,
-		retryAttempts: 3, // Default retry attempts
-		retryDelay:    500 * time.Millisecond, // Default retry delay
-		provideQueue:  make(chan *provideRequest, 100), // Buffer up to 100 queued operations
-		workerCtx:     ctx,
-		workerCancel:  cancel,
+		api:            api,
+		retryAttempts:  3, // Default retry attempts
+		retryDelay:     500 * time.Millisecond, // Default retry delay
+		provideTimeout: 60 * time.Second, // Default timeout
+		provideQueue:   make(chan *provideRequest, 100), // Buffer up to 100 queued operations
+		workerCtx:      ctx,
+		workerCancel:   cancel,
 	}
 	adapter.startWorker()
 	return adapter
@@ -52,14 +54,20 @@ func NewIPFSDHTAdapter(api *ipfsapi.Shell) *IPFSDHTAdapter {
 
 // NewIPFSDHTAdapterWithRetry creates a new DHT adapter with custom retry configuration
 func NewIPFSDHTAdapterWithRetry(api *ipfsapi.Shell, retryAttempts int, retryDelay time.Duration) *IPFSDHTAdapter {
+	return NewIPFSDHTAdapterWithTimeout(api, retryAttempts, retryDelay, 60*time.Second)
+}
+
+// NewIPFSDHTAdapterWithTimeout creates a new DHT adapter with custom retry and timeout configuration
+func NewIPFSDHTAdapterWithTimeout(api *ipfsapi.Shell, retryAttempts int, retryDelay time.Duration, provideTimeout time.Duration) *IPFSDHTAdapter {
 	ctx, cancel := context.WithCancel(context.Background())
 	adapter := &IPFSDHTAdapter{
-		api:           api,
-		retryAttempts: retryAttempts,
-		retryDelay:    retryDelay,
-		provideQueue:  make(chan *provideRequest, 100), // Buffer up to 100 queued operations
-		workerCtx:     ctx,
-		workerCancel:  cancel,
+		api:            api,
+		retryAttempts:  retryAttempts,
+		retryDelay:     retryDelay,
+		provideTimeout: provideTimeout,
+		provideQueue:   make(chan *provideRequest, 100), // Buffer up to 100 queued operations
+		workerCtx:      ctx,
+		workerCancel:   cancel,
 	}
 	adapter.startWorker()
 	return adapter
@@ -88,21 +96,21 @@ func (a *IPFSDHTAdapter) worker() {
 			// Create a fresh context for the actual operation
 			// This ensures each operation gets adequate time to complete,
 			// regardless of how long it waited in the queue.
-			// Since operations are queued and expensive, give them a reasonable timeout.
+			// Use the configured timeout to ensure consistency.
 			opCtx := req.ctx
 			if deadline, ok := req.ctx.Deadline(); ok {
 				remaining := time.Until(deadline)
-				// If less than 20s remaining (likely waited in queue), give fresh timeout
-				// Use 60s as a reasonable timeout for provide operations
-				if remaining < 20*time.Second {
+				// If less than half the configured timeout remaining (likely waited in queue), give fresh timeout
+				// This ensures operations get adequate time even if they waited in the queue
+				if remaining < a.provideTimeout/2 {
 					var cancel context.CancelFunc
-					opCtx, cancel = context.WithTimeout(context.Background(), 60*time.Second)
+					opCtx, cancel = context.WithTimeout(context.Background(), a.provideTimeout)
 					defer cancel()
 				}
 			} else {
 				// No deadline set, create one to prevent operations from hanging forever
 				var cancel context.CancelFunc
-				opCtx, cancel = context.WithTimeout(context.Background(), 60*time.Second)
+				opCtx, cancel = context.WithTimeout(context.Background(), a.provideTimeout)
 				defer cancel()
 			}
 			
@@ -324,6 +332,10 @@ func (a *IPFSDHTAdapter) provideInternal(ctx context.Context, key cid.Cid, broad
 		
 		// If both failed and error is not transient, return error immediately
 		if !a.isTransientError(err) && !a.isTransientError(err2) {
+			// Check if error is context deadline or cancelled
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				return err // Don't retry, just fail
+			}
 			return fmt.Errorf("both routing/provide and dht/provide failed: routing=%v, dht=%v", err, err2)
 		}
 	}

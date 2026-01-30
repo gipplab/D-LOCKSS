@@ -1,7 +1,6 @@
 package main
 
 import (
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,27 +17,33 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	ma "github.com/multiformats/go-multiaddr"
+
+	"dlockss/pkg/schema"
 )
 
 // --- Configuration Constants ---
 const (
-	TelemetryProtocol     = protocol.ID("/dlockss/telemetry/1.0.0")
-	DiscoveryServiceTag   = "dlockss-prod"
-	WebUIPort             = 8080
-	NodeCleanupTimeout    = 5*time.Minute // Increased to prevent premature pruning if telemetry is delayed
-	GeoIPCacheDuration    = 24 * time.Hour
-	MaxGeoQueueSize       = 1000
-	MonitorIdentityFile   = "monitor_identity.key"
-	MonitorDiscoveryTopic = "dlockss-monitor"
+	DiscoveryServiceTag     = "dlockss-prod"
+	WebUIPort               = 8080
+	NodeCleanupTimeout      = 10 * time.Minute
+	ReplicationAnnounceTTL  = 10 * time.Minute // Peer announcement expiry for inferred replication (same as node cleanup)
+	MonitorMinReplication   = 5                 // Min copies for "at target" (align with node config)
+	MonitorMaxReplication   = 10                // Max copies for "at target"
+	ReplicationCleanupEvery = 2 * time.Minute   // How often to prune stale manifestReplication entries
+	GeoIPCacheDuration      = 24 * time.Hour
+	MaxGeoQueueSize         = 1000
+	MonitorIdentityFile     = "monitor_identity.key"
+	GeoFailureThreshold     = 5               // Max failures before cooldown
+	GeoCooldownDuration     = 5 * time.Minute // Cooldown time
 )
 
 // --- Data Models ---
@@ -60,25 +65,30 @@ type StorageStatus struct {
 }
 
 type ReplicationStatus struct {
-	QueueDepth            int     `json:"queue_depth"`
-	ActiveWorkers         int     `json:"active_workers"`
-	AvgReplicationLevel   float64 `json:"avg_replication_level"`
-	FilesAtTarget        int     `json:"files_at_target"`
+	QueueDepth              int     `json:"queue_depth"`
+	ActiveWorkers           int     `json:"active_workers"`
+	AvgReplicationLevel     float64 `json:"avg_replication_level"`
+	FilesAtTarget           int     `json:"files_at_target"`
 	ReplicationDistribution [11]int `json:"replication_distribution"` // 0-9, 10+
 }
 
 type NodeState struct {
-	Data         *StatusResponse     `json:"data"`
+	PeerID       string              `json:"peer_id"`
+	CurrentShard string              `json:"current_shard"`
+	PinnedFiles  int                 `json:"pinned_files"`
+	KnownFiles   int                 `json:"known_files"`
 	LastSeen     time.Time           `json:"last_seen"`
-	ShardHistory []ShardHistoryEntry `json:"-"`
-	IPAddress    string              `json:"-"`
+	ShardHistory []ShardHistoryEntry `json:"shard_history"`
+	IPAddress    string              `json:"ip_address"`
 	Region       string              `json:"region"`
-	LastUptime   float64             `json:"-"` // Track uptime to detect restarts
+
+	// Internal tracking only
+	announcedFiles map[string]time.Time
 }
 
 type ShardHistoryEntry struct {
-	ShardID   string
-	FirstSeen time.Time
+	ShardID   string    `json:"shard_id"`
+	FirstSeen time.Time `json:"first_seen"`
 }
 
 type ShardSplitEvent struct {
@@ -110,6 +120,10 @@ type Monitor struct {
 	geoCache     map[string]*GeoLocation
 	geoCacheTime map[string]time.Time
 
+	// Geo Circuit Breaker
+	geoFailures      int
+	geoCooldownUntil time.Time
+
 	// Tree Caching
 	treeCache     *ShardTreeNode
 	treeCacheTime time.Time
@@ -117,6 +131,18 @@ type Monitor struct {
 
 	// Workers
 	geoQueue chan geoRequest
+
+	// PubSub / Network
+	uniqueCIDs  map[string]time.Time     // CID -> last seen time
+	shardTopics map[string]*pubsub.Topic // shardID -> topic
+	ps          *pubsub.PubSub
+	host        host.Host
+
+	// Track which nodes have which files
+	nodeFiles map[string]map[string]time.Time // nodeID -> manifestCID -> last seen
+
+	// Inferred replication: manifest CID -> peer ID -> last announce time (eavesdrop on IngestMessage)
+	manifestReplication map[string]map[string]time.Time
 }
 
 type geoRequest struct {
@@ -126,86 +152,140 @@ type geoRequest struct {
 
 func NewMonitor() *Monitor {
 	m := &Monitor{
-		nodes:        make(map[string]*NodeState),
-		splitEvents:  make([]ShardSplitEvent, 0, 100),
-		geoCache:     make(map[string]*GeoLocation),
-		geoCacheTime: make(map[string]time.Time),
-		geoQueue:     make(chan geoRequest, MaxGeoQueueSize),
+		nodes:               make(map[string]*NodeState),
+		splitEvents:         make([]ShardSplitEvent, 0, 100),
+		geoCache:            make(map[string]*GeoLocation),
+		geoCacheTime:        make(map[string]time.Time),
+		geoQueue:            make(chan geoRequest, MaxGeoQueueSize),
+		uniqueCIDs:          make(map[string]time.Time),
+		shardTopics:         make(map[string]*pubsub.Topic),
+		nodeFiles:           make(map[string]map[string]time.Time),
+		manifestReplication: make(map[string]map[string]time.Time),
 	}
+
 	go m.geoWorker()
+	go m.runReplicationCleanup()
 	return m
 }
 
 // --- Logic: Node Management ---
 
-func (m *Monitor) ProcessTelemetry(ip string, status StatusResponse) {
+func (m *Monitor) handleIngestMessage(im *schema.IngestMessage, senderID peer.ID, shardID string, ip string) {
 	now := time.Now()
+	peerIDStr := senderID.String()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	nodeState, exists := m.nodes[status.PeerID]
+	nodeState, exists := m.nodes[peerIDStr]
 	if !exists {
-		// New node discovered
-		log.Printf("[Monitor] New node discovered: %s (shard: %s, pinned: %d, known: %d)", 
-			status.PeerID[:12]+"...", status.CurrentShard, status.Storage.PinnedFiles, status.Storage.KnownFiles)
+		log.Printf("[Monitor] New node discovered via IngestMessage: %s (shard: %s)",
+			peerIDStr[:12]+"...", shardID)
 		nodeState = &NodeState{
-			Data:         &status,
-			LastSeen:     now,
-			ShardHistory: []ShardHistoryEntry{{ShardID: status.CurrentShard, FirstSeen: now}},
-			IPAddress:    ip,
-			LastUptime:   status.UptimeSeconds,
+			PeerID:         peerIDStr,
+			CurrentShard:   shardID,
+			PinnedFiles:    0,
+			KnownFiles:     0,
+			LastSeen:       now,
+			ShardHistory:   []ShardHistoryEntry{{ShardID: shardID, FirstSeen: now}},
+			IPAddress:      ip,
+			announcedFiles: make(map[string]time.Time),
 		}
-		m.nodes[status.PeerID] = nodeState
+		m.nodes[peerIDStr] = nodeState
+		m.nodeFiles[peerIDStr] = make(map[string]time.Time)
 		m.treeDirty = true
-		log.Printf("[Monitor] Total nodes tracked: %d (expected: 30)", len(m.nodes))
-		
-		// Log if we're missing nodes
-		if len(m.nodes) < 30 {
-			log.Printf("[Monitor] Warning: Only %d nodes tracked, expected 30. Missing %d nodes.", 
-				len(m.nodes), 30-len(m.nodes))
+	}
+
+	nodeState.LastSeen = now
+	manifestCIDStr := im.ManifestCID.String()
+
+	if nodeState.announcedFiles == nil {
+		nodeState.announcedFiles = make(map[string]time.Time)
+	}
+
+	_, alreadyExists := nodeState.announcedFiles[manifestCIDStr]
+	if !alreadyExists {
+		nodeState.PinnedFiles++
+	}
+	nodeState.announcedFiles[manifestCIDStr] = now
+
+	if m.nodeFiles[peerIDStr] == nil {
+		m.nodeFiles[peerIDStr] = make(map[string]time.Time)
+	}
+	m.nodeFiles[peerIDStr][manifestCIDStr] = now
+
+	nodeState.KnownFiles = len(nodeState.announcedFiles)
+	m.uniqueCIDs[manifestCIDStr] = now
+
+	// Record for inferred replication (eavesdrop: who announced this manifest)
+	if m.manifestReplication[manifestCIDStr] == nil {
+		m.manifestReplication[manifestCIDStr] = make(map[string]time.Time)
+	}
+	m.manifestReplication[manifestCIDStr][peerIDStr] = now
+
+	if m.ps != nil {
+		m.ensureShardSubscriptionUnlocked(context.Background(), shardID)
+	}
+
+	if ip != "" && ip != nodeState.IPAddress {
+		nodeState.IPAddress = ip
+		nodeState.Region = "" // Invalidate region
+		select {
+		case m.geoQueue <- geoRequest{ip: ip, peerID: peerIDStr}:
+		default:
 		}
+	}
+}
+
+func (m *Monitor) handleHeartbeat(senderID peer.ID, shardID string, ip string, pinnedCount int) {
+	now := time.Now()
+	peerIDStr := senderID.String()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	nodeState, exists := m.nodes[peerIDStr]
+	if !exists {
+		log.Printf("[Monitor] New node discovered via heartbeat: %s (shard: %s, pinned: %d)",
+			peerIDStr[:12]+"...", shardID, pinnedCount)
+		nodeState = &NodeState{
+			PeerID:         peerIDStr,
+			CurrentShard:   shardID,
+			PinnedFiles:    pinnedCount,
+			KnownFiles:     0,
+			LastSeen:       now,
+			ShardHistory:   []ShardHistoryEntry{{ShardID: shardID, FirstSeen: now}},
+			IPAddress:      ip,
+			announcedFiles: make(map[string]time.Time),
+		}
+		m.nodes[peerIDStr] = nodeState
+		m.treeDirty = true
 	} else {
-		// Detect restart: uptime decreased or reset significantly
-		// Allow small decreases due to timing, but large decreases indicate restart
-		restarted := status.UptimeSeconds < nodeState.LastUptime-10.0
-		
-		if restarted {
-			log.Printf("[Monitor] Node restarted: %s (uptime: %.1fs -> %.1fs)", 
-				status.PeerID[:12]+"...", nodeState.LastUptime, status.UptimeSeconds)
-			// Node restarted - clear its history and old split events related to this node
-			nodeState.ShardHistory = []ShardHistoryEntry{{ShardID: status.CurrentShard, FirstSeen: now}}
-			m.pruneSplitEventsForNode(status.PeerID)
-			m.treeDirty = true
-		}
-		
-		// Check for shard change
-		oldShard := nodeState.Data.CurrentShard
-		if oldShard != status.CurrentShard {
-			log.Printf("[Monitor] Node %s changed shard: %s -> %s", 
-				status.PeerID[:12]+"...", oldShard, status.CurrentShard)
-		}
-		
-		// Check for pinned files change
-		oldPinned := nodeState.Data.Storage.PinnedFiles
-		if oldPinned != status.Storage.PinnedFiles {
-			log.Printf("[Monitor] Node %s pinned files changed: %d -> %d (known: %d)", 
-				status.PeerID[:12]+"...", oldPinned, status.Storage.PinnedFiles, status.Storage.KnownFiles)
-		}
-		
-		nodeState.Data = &status
 		nodeState.LastSeen = now
-		nodeState.LastUptime = status.UptimeSeconds
+		if pinnedCount > nodeState.PinnedFiles {
+			nodeState.PinnedFiles = pinnedCount
+		}
+
+		if nodeState.CurrentShard == "" {
+			nodeState.CurrentShard = shardID
+			nodeState.ShardHistory = append(nodeState.ShardHistory, ShardHistoryEntry{
+				ShardID:   shardID,
+				FirstSeen: now,
+			})
+			m.treeDirty = true
+		} else {
+			m.updateNodeShardLocked(nodeState, shardID, now)
+		}
+
 		if ip != "" && ip != nodeState.IPAddress {
 			nodeState.IPAddress = ip
-			nodeState.Region = "" // Invalidate region
+			nodeState.Region = ""
 		}
 	}
 
-	m.updateNodeShardLocked(nodeState, status.CurrentShard, now)
-
 	if ip != "" && nodeState.Region == "" {
 		select {
-		case m.geoQueue <- geoRequest{ip: ip, peerID: status.PeerID}:
+		case m.geoQueue <- geoRequest{ip: ip, peerID: peerIDStr}:
 		default:
 		}
 	}
@@ -219,24 +299,87 @@ func (m *Monitor) updateNodeShardLocked(node *NodeState, newShard string, timest
 
 	if lastShard != newShard {
 		m.treeDirty = true
-		// Detect Split: Child is longer and contains parent prefix
+		// Detect Split
 		if len(newShard) > len(lastShard) && strings.HasPrefix(newShard, lastShard) {
-			log.Printf("[Monitor] Detected shard split: %s -> %s (node: %s)", 
-				lastShard, newShard, node.Data.PeerID[:12]+"...")
+			log.Printf("[Monitor] Detected shard split: %s -> %s (node: %s)",
+				lastShard, newShard, node.PeerID[:12]+"...")
 			m.splitEvents = append(m.splitEvents, ShardSplitEvent{
 				ParentShard: lastShard,
 				ChildShard:  newShard,
 				Timestamp:   timestamp,
 			})
+			if m.ps != nil {
+				m.ensureShardSubscriptionUnlocked(context.Background(), newShard)
+			}
+			if lastShard == "" && (newShard == "0" || newShard == "1") {
+				siblingShard := "1"
+				if newShard == "1" {
+					siblingShard = "0"
+				}
+				m.ensureShardSubscriptionUnlocked(context.Background(), siblingShard)
+			}
 		} else {
-			log.Printf("[Monitor] Node shard change (not split): %s -> %s (node: %s)", 
-				lastShard, newShard, node.Data.PeerID[:12]+"...")
+			if m.ps != nil {
+				m.ensureShardSubscriptionUnlocked(context.Background(), newShard)
+			}
 		}
+
+		node.CurrentShard = newShard
 		node.ShardHistory = append(node.ShardHistory, ShardHistoryEntry{
 			ShardID:   newShard,
 			FirstSeen: timestamp,
 		})
 	}
+}
+
+// runReplicationCleanup prunes manifestReplication entries older than ReplicationAnnounceTTL.
+func (m *Monitor) runReplicationCleanup() {
+	ticker := time.NewTicker(ReplicationCleanupEvery)
+	defer ticker.Stop()
+	for range ticker.C {
+		m.mu.Lock()
+		cutoff := time.Now().Add(-ReplicationAnnounceTTL)
+		for manifest, peers := range m.manifestReplication {
+			for peerID, lastSeen := range peers {
+				if lastSeen.Before(cutoff) {
+					delete(peers, peerID)
+				}
+			}
+			if len(peers) == 0 {
+				delete(m.manifestReplication, manifest)
+			}
+		}
+		m.mu.Unlock()
+	}
+}
+
+// getReplicationStats returns network-wide replication distribution, average level, and files at target.
+func (m *Monitor) getReplicationStats() (distribution [11]int, avgLevel float64, filesAtTarget int) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var totalReplication int
+	var manifestCount int
+	for _, peers := range m.manifestReplication {
+		count := len(peers)
+		if count == 0 {
+			continue
+		}
+		manifestCount++
+		totalReplication += count
+		if count >= 10 {
+			distribution[10]++
+		} else {
+			distribution[count]++
+		}
+		if count >= MonitorMinReplication && count <= MonitorMaxReplication {
+			filesAtTarget++
+		}
+	}
+	if manifestCount > 0 {
+		avgLevel = float64(totalReplication) / float64(manifestCount)
+	}
+	return distribution, avgLevel, filesAtTarget
 }
 
 func (m *Monitor) PruneStaleNodes() {
@@ -248,32 +391,27 @@ func (m *Monitor) PruneStaleNodes() {
 	prunedCount := 0
 	for id, node := range m.nodes {
 		if now.Sub(node.LastSeen) > NodeCleanupTimeout {
-			log.Printf("[Monitor] Pruning stale node: %s (last seen: %v ago)", 
-				id[:12]+"...", now.Sub(node.LastSeen))
 			delete(m.nodes, id)
 			changed = true
 			prunedCount++
 		}
 	}
 	if prunedCount > 0 {
-		log.Printf("[Monitor] Pruned %d stale nodes. Remaining: %d", prunedCount, len(m.nodes))
+		log.Printf("[Monitor] Pruned %d stale nodes.", prunedCount)
 		m.treeDirty = true
 	}
-	
-	// Always prune orphaned split events and very old events
+
 	if changed {
 		m.pruneOrphanedSplitEvents()
 	}
 	m.pruneOldSplitEvents(now)
-	
+
 	if changed {
 		m.treeDirty = true
 	}
 }
 
-// pruneOldSplitEvents removes split events older than a threshold
 func (m *Monitor) pruneOldSplitEvents(now time.Time) {
-	// Remove events older than 10 minutes (long enough for normal operations, short enough to avoid stale data)
 	cutoff := now.Add(-10 * time.Minute)
 	filtered := make([]ShardSplitEvent, 0, len(m.splitEvents))
 	for _, event := range m.splitEvents {
@@ -287,37 +425,19 @@ func (m *Monitor) pruneOldSplitEvents(now time.Time) {
 	}
 }
 
-// pruneSplitEventsForNode removes split events that are no longer relevant after a node restart
-func (m *Monitor) pruneSplitEventsForNode(peerID string) {
-	// Remove split events older than a reasonable threshold (5 minutes)
-	// This ensures we don't keep stale events from before the restart
-	cutoff := time.Now().Add(-5 * time.Minute)
-	filtered := make([]ShardSplitEvent, 0, len(m.splitEvents))
-	for _, event := range m.splitEvents {
-		if event.Timestamp.After(cutoff) {
-			filtered = append(filtered, event)
-		}
-	}
-	m.splitEvents = filtered
-}
-
-// pruneOrphanedSplitEvents removes split events that don't relate to any current nodes
 func (m *Monitor) pruneOrphanedSplitEvents() {
-	// Build set of all current shards
 	currentShards := make(map[string]bool)
 	for _, node := range m.nodes {
 		if len(node.ShardHistory) > 0 {
 			sid := node.ShardHistory[len(node.ShardHistory)-1].ShardID
 			currentShards[sid] = true
-			// Also include all prefixes
 			for len(sid) > 0 {
 				currentShards[sid] = true
 				sid = sid[:len(sid)-1]
 			}
 		}
 	}
-	
-	// Keep only split events where both parent and child are in current shards
+
 	filtered := make([]ShardSplitEvent, 0, len(m.splitEvents))
 	for _, event := range m.splitEvents {
 		if currentShards[event.ParentShard] && currentShards[event.ChildShard] {
@@ -327,7 +447,7 @@ func (m *Monitor) pruneOrphanedSplitEvents() {
 	m.splitEvents = filtered
 }
 
-// --- Logic: GeoLocation Worker ---
+// --- Logic: GeoLocation Worker (Circuit Breaker) ---
 
 func (m *Monitor) geoWorker() {
 	client := &http.Client{Timeout: 5 * time.Second}
@@ -336,7 +456,14 @@ func (m *Monitor) geoWorker() {
 
 	for req := range m.geoQueue {
 		<-ticker.C
+
 		m.mu.RLock()
+		// Circuit Breaker Check
+		if !m.geoCooldownUntil.IsZero() && time.Now().Before(m.geoCooldownUntil) {
+			m.mu.RUnlock()
+			continue // Skip processing during cooldown
+		}
+
 		cached, found := m.geoCache[req.ip]
 		valid := found && time.Since(m.geoCacheTime[req.ip]) < GeoIPCacheDuration
 		m.mu.RUnlock()
@@ -346,34 +473,41 @@ func (m *Monitor) geoWorker() {
 			continue
 		}
 
-		geo := m.fetchGeoLocation(client, req.ip)
+		geo, err := m.fetchGeoLocation(client, req.ip)
+
+		m.mu.Lock()
+		if err != nil {
+			// Record Failure
+			m.geoFailures++
+			if m.geoFailures >= GeoFailureThreshold {
+				log.Printf("[Monitor] GeoIP Circuit Breaker TRIPPED. Cooldown for %v.", GeoCooldownDuration)
+				m.geoCooldownUntil = time.Now().Add(GeoCooldownDuration)
+			}
+		} else {
+			// Success - Reset breaker
+			m.geoFailures = 0
+			if geo != nil {
+				m.geoCache[req.ip] = geo
+				m.geoCacheTime[req.ip] = time.Now()
+			}
+		}
+		m.mu.Unlock()
+
 		if geo != nil {
-			m.mu.Lock()
-			m.geoCache[req.ip] = geo
-			m.geoCacheTime[req.ip] = time.Now()
-			m.mu.Unlock()
 			m.updateNodeRegion(req.peerID, geo)
 		}
 	}
 }
 
-// Helper to check for private IPs
 func isPrivateIP(ipStr string) bool {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		return false
 	}
-	// Check for loopback, link-local, private networks
 	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 		return true
 	}
-
-	// Check private blocks (10.x, 172.16.x, 192.168.x)
-	privateIPBlocks := []string{
-		"10.0.0.0/8",
-		"172.16.0.0/12",
-		"192.168.0.0/16",
-	}
+	privateIPBlocks := []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
 	for _, cidr := range privateIPBlocks {
 		_, block, _ := net.ParseCIDR(cidr)
 		if block.Contains(ip) {
@@ -383,40 +517,36 @@ func isPrivateIP(ipStr string) bool {
 	return false
 }
 
-func (m *Monitor) fetchGeoLocation(client *http.Client, ip string) *GeoLocation {
+func (m *Monitor) fetchGeoLocation(client *http.Client, ip string) (*GeoLocation, error) {
 	if ip == "" {
-		return nil
+		return nil, nil
 	}
 
-	// FIX: Handle Local/Private IPs immediately
 	if isPrivateIP(ip) {
-		return &GeoLocation{
-			Country:     "Local Network",
-			RegionName:  "LAN",
-			City:        "Localhost",
-			CountryCode: "LOC",
-		}
+		return &GeoLocation{Country: "Local Network", RegionName: "LAN", City: "Localhost", CountryCode: "LOC"}, nil
 	}
 
-	// Existing API logic
 	url := fmt.Sprintf("http://ip-api.com/json/%s?fields=status,country,countryCode,regionName,city", ip)
 	resp, err := client.Get(url)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == 429 {
+		return nil, errors.New("rate limit hit")
+	}
+
 	var geo GeoLocation
 	if err := json.NewDecoder(resp.Body).Decode(&geo); err != nil {
-		return nil
+		return nil, err
 	}
 
-	// Check if API actually returned a valid location (API can return success but no data for reserved IPs)
 	if geo.Country == "" {
-		return nil
+		return nil, nil
 	}
 
-	return &geo
+	return &geo, nil
 }
 
 func (m *Monitor) updateNodeRegion(peerID string, geo *GeoLocation) {
@@ -439,18 +569,16 @@ func (m *Monitor) updateNodeRegion(peerID string, geo *GeoLocation) {
 	}
 }
 
-// --- Logic: Tree Building (Fixed) ---
+// --- Logic: Tree Building ---
 
 func (m *Monitor) GetShardTree() *ShardTreeNode {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Return cached if clean and fresh
 	if !m.treeDirty && m.treeCache != nil && time.Since(m.treeCacheTime) < 5*time.Second {
 		return m.treeCache
 	}
 
-	// 1. Identify all explicit Shard IDs
 	rawShardIDs := make(map[string]bool)
 	rawShardIDs[""] = true
 
@@ -460,50 +588,28 @@ func (m *Monitor) GetShardTree() *ShardTreeNode {
 	}
 
 	shardCounts := make(map[string]int)
-	nodesWithoutShard := 0
 	for _, n := range m.nodes {
 		if len(n.ShardHistory) > 0 {
 			sid := n.ShardHistory[len(n.ShardHistory)-1].ShardID
 			shardCounts[sid]++
 			rawShardIDs[sid] = true
-		} else if n.Data != nil {
-			// Fallback: use current shard from data if history is empty
-			sid := n.Data.CurrentShard
+		} else if n.CurrentShard != "" {
+			sid := n.CurrentShard
 			shardCounts[sid]++
 			rawShardIDs[sid] = true
-		} else {
-			// Node has no shard info at all - this shouldn't happen but handle gracefully
-			nodesWithoutShard++
-			// Can't log peer ID if Data is nil, just count it
 		}
 	}
-	
-	// Log shard distribution for debugging
-	totalCounted := 0
-	for _, count := range shardCounts {
-		totalCounted += count
-	}
-	if len(shardCounts) > 0 {
-		log.Printf("[Monitor] Shard distribution: %v (total counted: %d, nodes tracked: %d, missing: %d)", 
-			shardCounts, totalCounted, len(m.nodes), 30-len(m.nodes))
-	}
-	if nodesWithoutShard > 0 {
-		log.Printf("[Monitor] Warning: %d nodes have no shard information", nodesWithoutShard)
-	}
 
-	// FIX: Expand IDs to include all intermediate prefixes
 	allShardIDs := make(map[string]bool)
 	for id := range rawShardIDs {
 		current := id
 		allShardIDs[current] = true
 		for len(current) > 0 {
-			// Remove last character to get parent prefix
 			current = current[:len(current)-1]
 			allShardIDs[current] = true
 		}
 	}
 
-	// 2. Initialize Node Objects (Intermediate nodes get 0 count)
 	nodeMap := make(map[string]*ShardTreeNode)
 	for id := range allShardIDs {
 		nodeMap[id] = &ShardTreeNode{
@@ -513,17 +619,10 @@ func (m *Monitor) GetShardTree() *ShardTreeNode {
 		}
 	}
 
-	// 3. Link Nodes
-	// Rule: Each shard should appear only once in the tree.
-	// Shards are linked based on prefix relationships (e.g., "11" is child of "1").
-	// If a shard has nodes, it can still have children (transitional state during splits).
 	hasParent := make(map[string]bool)
-
-	// A. Apply explicit split events
 	for _, e := range m.splitEvents {
 		if parent, ok := nodeMap[e.ParentShard]; ok {
 			if child, ok := nodeMap[e.ChildShard]; ok {
-				// Check duplicates before adding
 				exists := false
 				for _, c := range parent.Children {
 					if c.ShardID == child.ShardID {
@@ -541,15 +640,12 @@ func (m *Monitor) GetShardTree() *ShardTreeNode {
 		}
 	}
 
-	// B. Infer parents for shards without explicit parent relationships
-	// Sort by length (shorter first) to ensure parents are processed before children
 	var sortedIDs []string
 	for id := range nodeMap {
 		if id != "" && !hasParent[id] {
 			sortedIDs = append(sortedIDs, id)
 		}
 	}
-	// Sort by length first, then lexicographically
 	sort.Slice(sortedIDs, func(i, j int) bool {
 		if len(sortedIDs[i]) != len(sortedIDs[j]) {
 			return len(sortedIDs[i]) < len(sortedIDs[j])
@@ -559,17 +655,11 @@ func (m *Monitor) GetShardTree() *ShardTreeNode {
 
 	for _, id := range sortedIDs {
 		child := nodeMap[id]
-		
-		// Skip if this shard is the root
 		if id == "" {
 			continue
 		}
-
-		// Find the immediate parent by removing the last character
-		// This ensures "11" is always a child of "1", not of ""
 		parentID := id[:len(id)-1]
 		if parent, ok := nodeMap[parentID]; ok {
-			// Check duplicates
 			exists := false
 			for _, c := range parent.Children {
 				if c.ShardID == child.ShardID {
@@ -584,16 +674,12 @@ func (m *Monitor) GetShardTree() *ShardTreeNode {
 		}
 	}
 
-	// 4. Clean up: Remove intermediate nodes that have no children and no nodes
-	// This ensures we don't show unnecessary intermediate nodes in the tree
 	nodesToRemove := make([]string, 0)
 	for id, node := range nodeMap {
 		if id != "" && node.NodeCount == 0 && len(node.Children) == 0 {
-			// This is an unnecessary intermediate node, mark for removal
 			nodesToRemove = append(nodesToRemove, id)
 		}
 	}
-	// Remove marked nodes from their parents and from nodeMap
 	for _, id := range nodesToRemove {
 		parentID := id[:len(id)-1]
 		if parent, ok := nodeMap[parentID]; ok {
@@ -608,11 +694,9 @@ func (m *Monitor) GetShardTree() *ShardTreeNode {
 		delete(hasParent, id)
 	}
 
-	// 5. Construct Final Tree
 	root := nodeMap[""]
 	sortChildren(root)
 
-	// Add unlinked orphans to root (ensuring no duplicates)
 	for id, node := range nodeMap {
 		if id != "" && !hasParent[id] {
 			exists := false
@@ -628,8 +712,6 @@ func (m *Monitor) GetShardTree() *ShardTreeNode {
 		}
 	}
 
-	// Root node count should only include nodes actually in root shard (""), not all nodes
-	// The shardCounts map already has the correct count for each shard
 	root.NodeCount = shardCounts[""]
 	m.treeCache = root
 	m.treeCacheTime = time.Now()
@@ -657,14 +739,11 @@ type discoveryNotifee struct {
 }
 
 func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
-	log.Printf("[Monitor] mDNS discovered peer: %s", pi.ID)
 	if n.h.Network().Connectedness(pi.ID) != network.Connected {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := n.h.Connect(ctx, pi); err != nil {
-			log.Printf("[Monitor] Failed to connect to discovered peer %s: %v", pi.ID, err)
-		} else {
-			log.Printf("[Monitor] Successfully connected to peer %s", pi.ID)
+			// log.Printf("[Monitor] Failed to connect to discovered peer %s: %v", pi.ID, err)
 		}
 	}
 }
@@ -707,6 +786,243 @@ func loadOrCreateMonitorIdentity() (crypto.PrivKey, error) {
 	return privKey, nil
 }
 
+func (m *Monitor) ensureShardSubscription(ctx context.Context, shardID string) {
+	if m.ps == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureShardSubscriptionUnlocked(ctx, shardID)
+}
+
+func (m *Monitor) ensureShardSubscriptionUnlocked(ctx context.Context, shardID string) {
+	if m.ps == nil {
+		return
+	}
+	if _, exists := m.shardTopics[shardID]; exists {
+		return
+	}
+
+	topicName := fmt.Sprintf("dlockss-creative-commons-shard-%s", shardID)
+	topic, err := m.ps.Join(topicName)
+	if err != nil {
+		log.Printf("[Monitor] Failed to join shard topic %s: %v", topicName, err)
+		return
+	}
+
+	sub, err := topic.Subscribe()
+	if err != nil {
+		log.Printf("[Monitor] Failed to subscribe to shard topic %s: %v", topicName, err)
+		return
+	}
+
+	m.shardTopics[shardID] = topic
+	go m.handleShardMessages(ctx, sub, shardID)
+
+	log.Printf("[Monitor] Subscribed to shard topic: %s (to track nodes)", shardID)
+}
+
+func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscription, shardID string) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			msg, err := sub.Next(ctx)
+			if err != nil {
+				if ctx.Err() == nil {
+					log.Printf("[Monitor] Error reading from shard %s: %v", shardID, err)
+				}
+				return
+			}
+
+			ip := ""
+			senderID := msg.GetFrom()
+			if m.host != nil && senderID != "" {
+				addrs := m.host.Peerstore().Addrs(senderID)
+				for _, addr := range addrs {
+					if ipVal, err := addr.ValueForProtocol(ma.P_IP4); err == nil {
+						ip = ipVal
+						break
+					}
+					if ipVal, err := addr.ValueForProtocol(ma.P_IP6); err == nil {
+						ip = ipVal
+						break
+					}
+				}
+			}
+
+			if len(msg.Data) > 0 && len(msg.Data) < 200 {
+				if string(msg.Data[:min(10, len(msg.Data))]) == "HEARTBEAT:" {
+					content := string(msg.Data)
+					parts := strings.Split(content, ":")
+					pinnedCount := 0
+					if len(parts) >= 3 {
+						fmt.Sscanf(parts[2], "%d", &pinnedCount)
+					}
+					m.handleHeartbeat(senderID, shardID, ip, pinnedCount)
+					continue
+				}
+			}
+
+			// Nodes re-announce pinned files in heartbeat batch as "PINNED:<ManifestCID>" (plain text)
+			if len(msg.Data) > 7 && string(msg.Data[:7]) == "PINNED:" {
+				manifestCIDStr := string(msg.Data[7:])
+				if manifestCID, err := cid.Decode(manifestCIDStr); err == nil {
+					im := schema.IngestMessage{ManifestCID: manifestCID, ShardID: shardID}
+					m.handleIngestMessage(&im, senderID, shardID, ip)
+					log.Printf("[Monitor] Replication: received PINNED manifest from %s (shard %s)", senderID.String()[:12], shardID)
+				} else {
+					log.Printf("[Monitor] Replication: PINNED decode failed (cid=%s) from %s: %v", manifestCIDStr[:min(20, len(manifestCIDStr))], senderID.String()[:12], err)
+				}
+				continue
+			}
+
+			var im schema.IngestMessage
+			if err := im.UnmarshalCBOR(msg.Data); err == nil {
+				targetShard := im.ShardID
+				if m.ps != nil {
+					m.mu.RLock()
+					_, alreadySubscribed := m.shardTopics[targetShard]
+					m.mu.RUnlock()
+					if !alreadySubscribed {
+						m.ensureShardSubscription(context.Background(), targetShard)
+					}
+				}
+				m.handleIngestMessage(&im, senderID, targetShard, ip)
+				log.Printf("[Monitor] Replication: received CBOR IngestMessage from %s (shard %s)", senderID.String()[:12], targetShard)
+				continue
+			}
+
+			var rr schema.ReplicationRequest
+			if err := rr.UnmarshalCBOR(msg.Data); err == nil {
+				m.handleHeartbeat(senderID, shardID, ip, 0)
+				continue
+			}
+
+			var ur schema.UnreplicateRequest
+			if err := ur.UnmarshalCBOR(msg.Data); err == nil {
+				m.handleHeartbeat(senderID, shardID, ip, 0)
+				continue
+			}
+		}
+	}
+}
+
+func (m *Monitor) subscribeToActiveShards(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.mu.RLock()
+			activeShards := make(map[string]bool)
+			shardCounts := make(map[string]int)
+
+			for _, node := range m.nodes {
+				if node.CurrentShard != "" {
+					activeShards[node.CurrentShard] = true
+					shardCounts[node.CurrentShard]++
+				} else {
+					activeShards[""] = true
+					shardCounts[""]++
+				}
+
+				for _, entry := range node.ShardHistory {
+					if time.Since(entry.FirstSeen) < 5*time.Minute {
+						activeShards[entry.ShardID] = true
+					}
+				}
+			}
+
+			splitShards := make(map[string]bool)
+			for shardID, count := range shardCounts {
+				if count >= 4 {
+					child0 := shardID + "0"
+					child1 := shardID + "1"
+					if shardID == "" {
+						child0 = "0"
+						child1 = "1"
+					}
+					splitShards[child0] = true
+					splitShards[child1] = true
+				}
+			}
+
+			for _, event := range m.splitEvents {
+				splitShards[event.ParentShard] = true
+				splitShards[event.ChildShard] = true
+				if event.ParentShard == "" {
+					splitShards["0"] = true
+					splitShards["1"] = true
+				}
+			}
+			m.mu.RUnlock()
+
+			for shardID := range activeShards {
+				if m.ps != nil {
+					m.ensureShardSubscription(ctx, shardID)
+				}
+			}
+
+			for shardID := range splitShards {
+				if m.ps != nil {
+					m.ensureShardSubscription(ctx, shardID)
+				}
+			}
+		}
+	}
+}
+
+func (m *Monitor) cleanupStaleCIDs(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cutoff := time.Now().Add(-30 * time.Minute)
+			m.mu.Lock()
+
+			removedCIDs := 0
+			for cid, lastSeen := range m.uniqueCIDs {
+				if lastSeen.Before(cutoff) {
+					delete(m.uniqueCIDs, cid)
+					removedCIDs++
+				}
+			}
+
+			removedFiles := 0
+			for nodeID, files := range m.nodeFiles {
+				for fileCID, lastSeen := range files {
+					if lastSeen.Before(cutoff) {
+						delete(files, fileCID)
+						removedFiles++
+						if nodeState, exists := m.nodes[nodeID]; exists && nodeState.announcedFiles != nil {
+							delete(nodeState.announcedFiles, fileCID)
+							nodeState.PinnedFiles = len(nodeState.announcedFiles)
+							nodeState.KnownFiles = len(nodeState.announcedFiles)
+						}
+					}
+				}
+				if len(files) == 0 {
+					delete(m.nodeFiles, nodeID)
+				}
+			}
+
+			m.mu.Unlock()
+			if removedCIDs > 0 || removedFiles > 0 {
+				log.Printf("[Monitor] Cleaned up %d stale CIDs and %d stale node files", removedCIDs, removedFiles)
+			}
+		}
+	}
+}
+
 func startLibP2P(ctx context.Context, monitor *Monitor) (host.Host, error) {
 	privKey, err := loadOrCreateMonitorIdentity()
 	if err != nil {
@@ -724,60 +1040,24 @@ func startLibP2P(ctx context.Context, monitor *Monitor) (host.Host, error) {
 
 	log.Printf("[Monitor] Peer ID: %s", h.ID())
 
-	// Initialize PubSub for monitor discovery
 	ps, err := pubsub.NewGossipSub(ctx, h)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize PubSub: %w", err)
 	}
 
-	// Join monitor discovery topic so nodes can discover us via PubSub
-	monitorTopic, err := ps.Join(MonitorDiscoveryTopic)
-	if err != nil {
-		log.Printf("[Monitor] Warning: Failed to join monitor discovery topic: %v", err)
-	} else {
-		log.Printf("[Monitor] Joined monitor discovery topic: %s (nodes will discover monitor via PubSub)", MonitorDiscoveryTopic)
-		// Keep topic reference to prevent it from being garbage collected
-		_ = monitorTopic
-	}
+	monitor.ps = ps
+	monitor.host = h
+
+	log.Printf("[Monitor] Monitor will listen on all shard topics for telemetry (silent listener)")
+	go monitor.cleanupStaleCIDs(ctx)
+	monitor.ensureShardSubscription(ctx, "")
+	go monitor.subscribeToActiveShards(ctx)
 
 	notifee := &discoveryNotifee{h: h}
 	mdnsSvc := mdns.NewMdnsService(h, DiscoveryServiceTag, notifee)
 	if err := mdnsSvc.Start(); err != nil {
 		return nil, fmt.Errorf("mdns error: %w", err)
 	}
-
-	h.SetStreamHandler(TelemetryProtocol, func(s network.Stream) {
-		defer s.Close()
-		s.SetDeadline(time.Now().Add(15 * time.Second))
-
-		peerID := s.Conn().RemotePeer()
-		ip := ""
-		if conn := s.Conn(); conn != nil {
-			remote := conn.RemoteMultiaddr()
-			ip, _ = remote.ValueForProtocol(ma.P_IP4)
-			if ip == "" {
-				ip, _ = remote.ValueForProtocol(ma.P_IP6)
-			}
-		}
-
-		gr, err := gzip.NewReader(s)
-		if err != nil {
-			log.Printf("[Monitor] Failed to create gzip reader from %s: %v", peerID, err)
-			return
-		}
-		defer gr.Close()
-
-		var status StatusResponse
-		if err := json.NewDecoder(gr).Decode(&status); err != nil {
-			log.Printf("[Monitor] Failed to decode telemetry from %s: %v", peerID, err)
-			return
-		}
-
-		// Log telemetry receipt for debugging (only log first few to avoid spam)
-		// Full logging happens in ProcessTelemetry
-		
-		monitor.ProcessTelemetry(ip, status)
-	})
 
 	return h, nil
 }
@@ -803,10 +1083,43 @@ func main() {
 		monitor.mu.RLock()
 		defer monitor.mu.RUnlock()
 
-		response := make(map[string]interface{}, len(monitor.nodes))
+		// Backend Search/Filtering Logic
+		query := strings.ToLower(r.URL.Query().Get("q"))
+
+		response := make(map[string]interface{})
 		for id, node := range monitor.nodes {
+			// Filter if query is present
+			if query != "" {
+				match := strings.Contains(strings.ToLower(id), query) ||
+					strings.Contains(strings.ToLower(node.Region), query) ||
+					strings.Contains(strings.ToLower(node.CurrentShard), query)
+				if !match {
+					continue
+				}
+			}
+
+			status := StatusResponse{
+				PeerID:       node.PeerID,
+				Version:      "1.0.0",
+				CurrentShard: node.CurrentShard,
+				PeersInShard: 0,
+				Storage: StorageStatus{
+					PinnedFiles: node.PinnedFiles,
+					KnownFiles:  node.KnownFiles,
+					KnownCIDs:   []string{},
+				},
+				Replication: ReplicationStatus{
+					QueueDepth:              0,
+					ActiveWorkers:           0,
+					AvgReplicationLevel:     0,
+					FilesAtTarget:           0,
+					ReplicationDistribution: [11]int{},
+				},
+				UptimeSeconds: time.Since(node.LastSeen).Seconds(),
+			}
+
 			response[id] = map[string]interface{}{
-				"data":      node.Data,
+				"data":      status,
 				"last_seen": node.LastSeen.Unix(),
 				"region":    node.Region,
 			}
@@ -822,6 +1135,37 @@ func main() {
 		json.NewEncoder(w).Encode(tree)
 	})
 
+	mux.HandleFunc("/api/unique-cids", func(w http.ResponseWriter, r *http.Request) {
+		monitor.mu.RLock()
+		count := len(monitor.uniqueCIDs)
+		monitor.mu.RUnlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"count": count,
+		})
+	})
+
+	mux.HandleFunc("/api/replication", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		dist, avg, atTarget := monitor.getReplicationStats()
+		totalManifests := 0
+		for _, n := range dist {
+			totalManifests += n
+		}
+		log.Printf("[Monitor] Replication: API request -> manifests=%d avg=%.2f atTarget=%d distribution=%v", totalManifests, avg, atTarget, dist)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"replication_distribution": dist,
+			"avg_replication_level":    avg,
+			"files_at_target":          atTarget,
+		})
+	})
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		w.Write([]byte(dashboardHTML))
@@ -835,7 +1179,6 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	// Start periodic status logging
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -848,35 +1191,19 @@ func main() {
 				nodeCount := len(monitor.nodes)
 				shardCounts := make(map[string]int)
 				totalPinned := 0
-				nodesWithPinnedFiles := 0
 				for _, node := range monitor.nodes {
-					if node.Data != nil {
-						shard := node.Data.CurrentShard
-						shardCounts[shard]++
-						totalPinned += node.Data.Storage.PinnedFiles
-						if node.Data.Storage.PinnedFiles > 0 {
-							nodesWithPinnedFiles++
-						}
+					var shard string
+					if len(node.ShardHistory) > 0 {
+						shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
+					} else {
+						shard = node.CurrentShard
 					}
+					shardCounts[shard]++
+					totalPinned += node.PinnedFiles
 				}
 				monitor.mu.RUnlock()
-				
-				log.Printf("[Monitor] Status: %d nodes tracked (expected: 30), %d shards, %d total pinned files (%d nodes have pinned files)", 
-					nodeCount, len(shardCounts), totalPinned, nodesWithPinnedFiles)
-				if nodeCount < 30 {
-					log.Printf("[Monitor] Warning: Missing %d nodes! Check node discovery logs.", 30-nodeCount)
-				}
-				if totalPinned == 0 && nodeCount > 0 {
-					log.Printf("[Monitor] Warning: No pinned files reported by any node! Check if files are being unpinned or telemetry is incorrect.")
-				}
-				if len(shardCounts) > 1 {
-					log.Printf("[Monitor] Shard breakdown: %v", shardCounts)
-				} else if len(shardCounts) == 1 {
-					// Only one shard - log which one
-					for shard, count := range shardCounts {
-						log.Printf("[Monitor] All %d nodes in shard: %s", count, shard)
-					}
-				}
+
+				log.Printf("[Monitor] Status: %d nodes, %d shards, %d pinned", nodeCount, len(shardCounts), totalPinned)
 			}
 		}
 	}()
@@ -1016,9 +1343,9 @@ const dashboardHTML = `<!DOCTYPE html>
         <div class="node-table">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
                 <h3 style="margin:0; text-transform:uppercase; font-size:1em;">Network Nodes</h3>
-                <input type="text" id="nodeSearch" placeholder="SEARCH ID/ALIAS..." 
+                <input type="text" id="nodeSearch" placeholder="SEARCH ID/REGION/SHARD..." 
                        style="padding: 8px; border: 1px solid #333; width: 300px; font-family:inherit;"
-                       onkeyup="filterNodes()">
+                       onkeyup="debouncedFilter()">
             </div>
             <table id="nodeTable">
                 <thead>
@@ -1046,6 +1373,7 @@ const dashboardHTML = `<!DOCTYPE html>
         const filesCtx = document.getElementById('filesChart').getContext('2d');
         const shardCtx = document.getElementById('shardChart').getContext('2d');
         const replicationCtx = document.getElementById('replicationChart').getContext('2d');
+        let searchTimeout;
         
         function escapeHtml(text) {
             const div = document.createElement('div');
@@ -1187,29 +1515,41 @@ const dashboardHTML = `<!DOCTYPE html>
         }
 
         function updateDashboard() {
-            fetch('/api/nodes').then(r=>r.json()).then(data => {
+            // Use backend search query
+            const q = document.getElementById('nodeSearch').value;
+            const url = '/api/nodes' + (q ? '?q=' + encodeURIComponent(q) : '');
+
+            fetch(url).then(r=>r.json()).then(data => {
                 const aliases = getAliases();
                 const nodes = Object.values(data).map(n => n.data);
                 const meta = data;
                 
                 document.getElementById('total-nodes').textContent = nodes.length;
                 document.getElementById('total-pinned').textContent = nodes.reduce((s,n) => s + n.storage.pinned_files, 0).toLocaleString();
-                const uCids = new Set();
-                nodes.forEach(n => (n.storage.known_cids||[]).forEach(c => uCids.add(c)));
-                document.getElementById('unique-files').textContent = uCids.size.toLocaleString();
+                
+                fetch('/api/unique-cids').then(r=>r.json()).then(data => {
+                    document.getElementById('unique-files').textContent = (data.count || 0).toLocaleString();
+                }).catch(() => {
+                    const uCids = new Set();
+                    nodes.forEach(n => (n.storage.known_cids||[]).forEach(c => uCids.add(c)));
+                    document.getElementById('unique-files').textContent = uCids.size.toLocaleString();
+                });
                 document.getElementById('total-shards').textContent = new Set(nodes.map(n => n.current_shard)).size;
 
-                // Update replication status chart (network-wide aggregation)
-                const replicationDist = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-                nodes.forEach(n => {
-                    if (n.replication && n.replication.replication_distribution) {
-                        for (let i = 0; i < 11; i++) {
-                            replicationDist[i] += n.replication.replication_distribution[i] || 0;
-                        }
+                // Replication chart: use inferred network-wide stats from /api/replication (eavesdrop on IngestMessage)
+                // Cache-bust so browser does not serve stale empty response
+                fetch('/api/replication?t=' + Date.now()).then(r=>r.json()).then(data => {
+                    const dist = data.replication_distribution || [0,0,0,0,0,0,0,0,0,0,0];
+                    if (replicationChart && replicationChart.data && replicationChart.data.datasets && replicationChart.data.datasets[0]) {
+                        replicationChart.data.datasets[0].data = Array.isArray(dist) ? dist : [0,0,0,0,0,0,0,0,0,0,0];
+                        replicationChart.update();
+                    }
+                }).catch(() => {
+                    if (replicationChart && replicationChart.data && replicationChart.data.datasets && replicationChart.data.datasets[0]) {
+                        replicationChart.data.datasets[0].data = [0,0,0,0,0,0,0,0,0,0,0];
+                        replicationChart.update();
                     }
                 });
-                replicationChart.data.datasets[0].data = replicationDist;
-                replicationChart.update();
 
                 filesChart.data.labels = nodes.map(n => aliases[n.peer_id] || n.peer_id.slice(-6));
                 filesChart.data.datasets[0].data = nodes.map(n => n.storage.pinned_files);
@@ -1219,7 +1559,7 @@ const dashboardHTML = `<!DOCTYPE html>
                 nodes.forEach(n => sCounts[n.current_shard] = (sCounts[n.current_shard]||0)+1);
                 shardChart.data.labels = Object.keys(sCounts);
                 shardChart.data.datasets[0].data = Object.values(sCounts);
-                // Colorful palette for shard distribution
+                
                 const colorPalette = [
                     '#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8',
                     '#F7DC6F', '#BB8FCE', '#85C1E2', '#F8B739', '#52BE80',
@@ -1263,20 +1603,24 @@ const dashboardHTML = `<!DOCTYPE html>
             });
         }
 
-        function filterNodes() {
-            const term = document.getElementById('nodeSearch').value.toLowerCase();
-            document.querySelectorAll('#nodeTableBody tr').forEach(row => {
-                row.style.display = row.innerText.toLowerCase().includes(term) ? '' : 'none';
-            });
+        function debouncedFilter() {
+            clearTimeout(searchTimeout);
+            searchTimeout = setTimeout(() => {
+                updateDashboard();
+            }, 300);
         }
 
         initCharts();
         updateDashboard();
         updateShardTree();
-        setInterval(() => { updateDashboard(); updateShardTree(); }, 2000);
+        setInterval(() => { 
+            // Only auto-refresh if not searching AND not editing, to avoid killing the input
+            if(!document.getElementById('nodeSearch').value && currentlyEditingPeerID === null) {
+                updateDashboard(); 
+                updateShardTree(); 
+            }
+        }, 2000);
     </script>
 </body>
 </html>
 `
-
-

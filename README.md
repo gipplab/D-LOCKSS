@@ -70,6 +70,9 @@ export DLOCKSS_MAX_REPLICATION=10
 
 # Network
 export DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/5001"
+
+# Logging
+export DLOCKSS_VERBOSE_LOGGING=true # Enable detailed metrics and status logs
 ```
 
 See [docs/project/REQUIREMENTS.md](docs/project/REQUIREMENTS.md) for detailed specs.
@@ -81,7 +84,7 @@ See [docs/project/REQUIREMENTS.md](docs/project/REQUIREMENTS.md) for detailed sp
 D-LOCKSS acts as a self-healing, sharded storage cluster using the IPFS/Libp2p stack.
 
 ### Key Components
-1.  **Shard Manager:** Dynamically splits responsibilities based on peer count to maintain scalability.
+1.  **Shard Manager:** Dynamically splits responsibilities based on peer count to maintain scalability. Nodes that join late (in ROOT with few peers after others have split) periodically explore deeper shards and join the branch that matches their peer ID so they catch up instead of staying stuck in ROOT.
 2.  **File Watcher:** Monitors the data directory to automatically ingest content.
 3.  **Replication Checker:** Periodically verifies replication levels (default: every 1 min). Uses dual-query hysteresis to prevent false alarms.
 4.  **Storage Monitor:** Protects nodes from disk exhaustion by rejecting custodial requests when full.

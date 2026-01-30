@@ -19,7 +19,7 @@ Monitoring --> OverReplicated: count > MaxReplication
 UnderReplicated --> Monitoring: Replication restored
 OverReplicated --> Monitoring: Unpinned (but still tracked)
 
-Responsible --> Removed: Shard split -> Not Responsible
+Responsible --> Removed: Shard split or discovery move\n-> Not Responsible
 Removed --> [*]
 
 note right of Custodial

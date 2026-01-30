@@ -22,7 +22,10 @@ Metrics --> ReplicationManager : reads stats
 
 note right of ShardManager
     Manages shard assignment
-    and PubSub topics
+    and PubSub topics.
+    Splits when overcrowded;
+    late joiners in ROOT
+    discover and join deeper shards.
 end note
 
 note right of StorageManager
