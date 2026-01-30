@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"sort"
 	"sync"
 	"time"
 
@@ -49,8 +50,13 @@ type ShardManager struct {
 	// We handle this by simply 'holding' a reference to the old shard for a duration.
 	// No special fields needed, just logic in splitShard.
 
-	msgCounter    int
-	lastPeerCheck time.Time
+	msgCounter        int
+	lastPeerCheck     time.Time
+	lastDiscoveryCheck time.Time
+	lastMessageTime   time.Time // Track when we last received a message to detect idle state
+	
+	// Track unique peers seen via messages (for more accurate counting)
+	seenPeers map[string]map[peer.ID]time.Time // shardID -> peerID -> last seen
 }
 
 func NewShardManager(
@@ -70,6 +76,7 @@ func NewShardManager(
 		reshardedFiles: NewKnownFiles(),
 		currentShard:   startShard,
 		shardSubs:      make(map[string]*shardSubscription),
+		seenPeers:      make(map[string]map[peer.ID]time.Time),
 	}
 	
 	// Join initial shard
@@ -84,6 +91,8 @@ func (sm *ShardManager) SetReplicationManager(rm *ReplicationManager) {
 
 func (sm *ShardManager) Run() {
 	go sm.runPeerCountChecker()
+	go sm.runHeartbeat()
+	go sm.runShardDiscovery()
 }
 
 // JoinShard increments the reference count for a shard topic.
@@ -187,6 +196,48 @@ func (sm *ShardManager) runPeerCountChecker() {
 	}
 }
 
+// runHeartbeat periodically sends heartbeat messages to the current shard topic
+// to help peers discover each other for accurate peer counting.
+func (sm *ShardManager) runHeartbeat() {
+	// Send heartbeats more frequently than peer checks to ensure accurate peer discovery
+	heartbeatInterval := ShardPeerCheckInterval / 3
+	if heartbeatInterval < 10*time.Second {
+		heartbeatInterval = 10 * time.Second // Minimum 10 seconds
+	}
+	
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-sm.ctx.Done():
+			return
+		case <-ticker.C:
+			sm.sendHeartbeat()
+		}
+	}
+}
+
+// sendHeartbeat sends a heartbeat message to the current shard topic
+func (sm *ShardManager) sendHeartbeat() {
+	sm.mu.RLock()
+	currentShard := sm.currentShard
+	sub, exists := sm.shardSubs[currentShard]
+	sm.mu.RUnlock()
+
+	if !exists || sub.topic == nil {
+		return
+	}
+
+	// Send lightweight heartbeat message for peer discovery
+	heartbeatMsg := []byte("HEARTBEAT:" + sm.h.ID().String())
+	if err := sub.topic.Publish(sm.ctx, heartbeatMsg); err != nil {
+		// Don't log every failure to avoid spam, but log occasionally
+		// Heartbeat failures are not critical
+		return
+	}
+}
+
 // processMessage decodes and dispatches a message to the appropriate handler.
 func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 	// Self-check
@@ -194,7 +245,22 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 		return
 	}
 
-	// Rate limit check
+	// Track peer in current shard (do this early for all messages, including heartbeats)
+	sm.mu.Lock()
+	if sm.seenPeers[shardID] == nil {
+		sm.seenPeers[shardID] = make(map[peer.ID]time.Time)
+	}
+	sm.seenPeers[shardID][msg.GetFrom()] = time.Now()
+	sm.lastMessageTime = time.Now() // Track activity for idle detection
+	sm.mu.Unlock()
+
+	// Check for heartbeat message (lightweight text message for peer discovery)
+	if len(msg.Data) > 0 && string(msg.Data[:min(10, len(msg.Data))]) == "HEARTBEAT:" {
+		// Heartbeat message - just track the peer, no further processing needed
+		return
+	}
+
+	// Rate limit check (skip for heartbeats, but apply to protocol messages)
 	if !checkRateLimit(msg.GetFrom()) {
 		incrementMetric(&metrics.messagesDropped)
 		log.Printf("[Shard] Dropped message from %s due to rate limiting (shard %s)", msg.GetFrom().String()[:12], shardID)
@@ -362,6 +428,8 @@ func (sm *ShardManager) handleUnreplicateRequest(msg *pubsub.Message, ur *schema
 }
 
 // getShardPeerCount returns peer count for the CURRENT shard.
+// Uses both ListPeers() (mesh peers) and seenPeers (peers that sent messages)
+// to get a more accurate count, especially during mesh formation.
 func (sm *ShardManager) getShardPeerCount() int {
 	sm.mu.RLock()
 	currentShard := sm.currentShard
@@ -372,8 +440,41 @@ func (sm *ShardManager) getShardPeerCount() int {
 		return 0
 	}
 
-	peers := sub.topic.ListPeers()
-	return len(peers) + 1
+	// Get mesh peers (connected and in mesh)
+	meshPeers := sub.topic.ListPeers()
+	meshCount := len(meshPeers) + 1 // +1 for self
+	
+	// Also count peers we've seen via messages (more inclusive)
+	sm.mu.RLock()
+	seenCount := 0
+	if seenMap, exists := sm.seenPeers[currentShard]; exists {
+		// Count peers seen in last 2 minutes (active peers)
+		cutoff := time.Now().Add(-2 * time.Minute)
+		for _, lastSeen := range seenMap {
+			if lastSeen.After(cutoff) {
+				seenCount++
+			}
+		}
+		// Include self
+		seenCount++
+	} else {
+		seenCount = meshCount // Fallback to mesh count
+	}
+	sm.mu.RUnlock()
+	
+	// Use the higher count (mesh might be forming, but we've seen more peers)
+	count := meshCount
+	if seenCount > meshCount {
+		count = seenCount
+	}
+	
+	// Log discrepancy for debugging
+	if currentShard == "" && meshCount < seenCount {
+		log.Printf("[Sharding] Root shard: mesh=%d, seen=%d (using %d) - mesh may still be forming", 
+			meshCount, seenCount, count)
+	}
+	
+	return count
 }
 
 // getShardInfo returns current shard ID and peer count.
@@ -471,9 +572,19 @@ func (sm *ShardManager) checkAndSplitIfNeeded() {
 	estimatedPeersAfterSplit := peerCount / 2
 	shouldSplit := peerCount > MaxPeersPerShard && estimatedPeersAfterSplit >= MinPeersPerShard
 
+	// Log peer count for debugging
+	if currentShard == "" {
+		log.Printf("[Sharding] Root shard peer count: %d (threshold: %d, min after split: %d)", 
+			peerCount, MaxPeersPerShard, MinPeersPerShard)
+	}
+
 	if shouldSplit {
 		log.Printf("[Sharding] Shard %s has %d peers. Splitting...", currentShard, peerCount)
 		sm.splitShard()
+	} else if peerCount > MaxPeersPerShard {
+		// Log why split didn't happen
+		log.Printf("[Sharding] Shard %s has %d peers (exceeds threshold %d) but won't split: estimated after split (%d) < minimum (%d)", 
+			currentShard, peerCount, MaxPeersPerShard, estimatedPeersAfterSplit, MinPeersPerShard)
 	}
 }
 
@@ -612,6 +723,36 @@ func (sm *ShardManager) AmIResponsibleFor(key string) bool {
 	return prefix == sm.currentShard
 }
 
+// GetShardPeers returns the list of peers in the current shard (mesh peers from pubsub)
+// This is more efficient than DHT queries since nodes already know each other via pubsub.
+func (sm *ShardManager) GetShardPeers() []peer.ID {
+	sm.mu.RLock()
+	currentShard := sm.currentShard
+	sub, exists := sm.shardSubs[currentShard]
+	sm.mu.RUnlock()
+	
+	if !exists || sub.topic == nil {
+		return nil
+	}
+	
+	// Get mesh peers (connected and in mesh) - these are peers we already know via pubsub
+	return sub.topic.ListPeers()
+}
+
+// GetShardPeerCount returns the peer count for a specific shard.
+// Returns 0 if we're not subscribed to that shard.
+func (sm *ShardManager) GetShardPeerCount(shardID string) int {
+	sm.mu.RLock()
+	sub, exists := sm.shardSubs[shardID]
+	sm.mu.RUnlock()
+	
+	if !exists || sub.topic == nil {
+		return 0
+	}
+	
+	return len(sub.topic.ListPeers())
+}
+
 func decodeCBORMessageType(data []byte) (schema.MessageType, error) {
 	nb := basicnode.Prototype.Any.NewBuilder()
 	if err := dagcbor.Decode(nb, bytes.NewReader(data)); err != nil {
@@ -627,6 +768,228 @@ func decodeCBORMessageType(data []byte) (schema.MessageType, error) {
 		return 0, err
 	}
 	return schema.MessageType(ti), nil
+}
+
+// generateDeeperShards generates all possible deeper shards in the branch starting from the current shard.
+// For example, if current shard is "1", it generates ["10", "11", "100", "101", "110", "111", ...]
+// up to maxDepth levels deeper.
+func (sm *ShardManager) generateDeeperShards(currentShard string, maxDepth int) []string {
+	if maxDepth <= 0 {
+		return nil
+	}
+	
+	var shards []string
+	queue := []string{currentShard}
+	maxShardLength := len(currentShard) + maxDepth
+	
+	for len(queue) > 0 {
+		shard := queue[0]
+		queue = queue[1:]
+		
+		// Generate children: append "0" and "1"
+		child0 := shard + "0"
+		child1 := shard + "1"
+		
+		// Only add if within max depth
+		if len(child0) <= maxShardLength {
+			shards = append(shards, child0, child1)
+			
+			// Add to queue for next level if we haven't reached max depth
+			if len(child0) < maxShardLength {
+				queue = append(queue, child0, child1)
+			}
+		}
+	}
+	
+	return shards
+}
+
+// probeShard temporarily joins a shard to check if it exists and has peers.
+// Returns the peer count if the shard exists and has activity, 0 otherwise.
+func (sm *ShardManager) probeShard(shardID string, probeTimeout time.Duration) int {
+	// Check if we're already in this shard
+	sm.mu.RLock()
+	sub, alreadyJoined := sm.shardSubs[shardID]
+	sm.mu.RUnlock()
+	
+	if alreadyJoined && sub.topic != nil {
+		// We're already in this shard, return peer count for this specific shard
+		meshPeers := sub.topic.ListPeers()
+		meshCount := len(meshPeers) + 1 // +1 for self
+		
+		sm.mu.RLock()
+		seenCount := 0
+		if seenMap, exists := sm.seenPeers[shardID]; exists {
+			cutoff := time.Now().Add(-2 * time.Minute)
+			for _, lastSeen := range seenMap {
+				if lastSeen.After(cutoff) {
+					seenCount++
+				}
+			}
+			seenCount++ // Include self
+		} else {
+			seenCount = meshCount
+		}
+		sm.mu.RUnlock()
+		
+		if seenCount > meshCount {
+			return seenCount
+		}
+		return meshCount
+	}
+	
+	// Temporarily join the shard
+	sm.JoinShard(shardID)
+	defer sm.LeaveShard(shardID)
+	
+	// Wait a bit for mesh to form and peers to be discovered
+	time.Sleep(probeTimeout)
+	
+	// Get peer count for the probed shard
+	sm.mu.RLock()
+	sub, exists := sm.shardSubs[shardID]
+	sm.mu.RUnlock()
+	
+	if !exists || sub.topic == nil {
+		return 0
+	}
+	
+	meshPeers := sub.topic.ListPeers()
+	meshCount := len(meshPeers) + 1 // +1 for self
+	
+	// Also check if we've seen any messages (indicates activity)
+	sm.mu.RLock()
+	seenCount := 0
+	if seenMap, exists := sm.seenPeers[shardID]; exists {
+		cutoff := time.Now().Add(-1 * time.Minute)
+		for _, lastSeen := range seenMap {
+			if lastSeen.After(cutoff) {
+				seenCount++
+			}
+		}
+		seenCount++ // Include self
+	} else {
+		seenCount = meshCount
+	}
+	sm.mu.RUnlock()
+	
+	// Return the higher count (mesh peers or seen peers)
+	if seenCount > meshCount {
+		return seenCount
+	}
+	return meshCount
+}
+
+// discoverAndMoveToDeeperShard checks for deeper shards in the branch and moves to the deepest appropriate one.
+func (sm *ShardManager) discoverAndMoveToDeeperShard() {
+	sm.mu.RLock()
+	currentShard := sm.currentShard
+	peerIDHash := getBinaryPrefix(sm.h.ID().String(), 256) // Full hash for comparison
+	sm.mu.RUnlock()
+	
+	// Generate deeper shards up to 3 levels deeper (reasonable limit)
+	deeperShards := sm.generateDeeperShards(currentShard, 3)
+	
+	// Filter to only shards that match our peer ID prefix
+	matchingShards := make([]string, 0)
+	for _, shard := range deeperShards {
+		// Check if this shard matches our peer ID prefix
+		if len(shard) <= len(peerIDHash) && peerIDHash[:len(shard)] == shard {
+			matchingShards = append(matchingShards, shard)
+		}
+	}
+	
+	if len(matchingShards) == 0 {
+		return
+	}
+	
+	// Sort by depth (longest first) to check deepest shards first
+	sort.Slice(matchingShards, func(i, j int) bool {
+		return len(matchingShards[i]) > len(matchingShards[j])
+	})
+	
+	// Probe each matching shard to see if it exists and has peers
+	probeTimeout := 3 * time.Second
+	deepestActiveShard := ""
+	
+	for _, shard := range matchingShards {
+		peerCount := sm.probeShard(shard, probeTimeout)
+		
+		// If shard has at least MinPeersPerShard peers, it's active
+		if peerCount >= MinPeersPerShard {
+			deepestActiveShard = shard
+			log.Printf("[ShardDiscovery] Found active deeper shard %s with %d peers (current: %s)", 
+				shard, peerCount, currentShard)
+			break // Found the deepest active shard
+		} else if peerCount > 0 {
+			log.Printf("[ShardDiscovery] Found deeper shard %s with %d peers (below minimum %d, skipping)", 
+				shard, peerCount, MinPeersPerShard)
+		}
+	}
+	
+	// If we found a deeper active shard, move to it
+	if deepestActiveShard != "" && deepestActiveShard != currentShard {
+		log.Printf("[ShardDiscovery] Moving from shard %s to deeper shard %s", 
+			currentShard, deepestActiveShard)
+		
+		sm.mu.Lock()
+		oldShard := sm.currentShard
+		sm.currentShard = deepestActiveShard
+		sm.msgCounter = 0
+		sm.mu.Unlock()
+		
+		// Join new shard
+		sm.JoinShard(deepestActiveShard)
+		
+		// Keep old shard for overlap duration, then leave
+		go func() {
+			time.Sleep(ShardOverlapDuration)
+			sm.LeaveShard(oldShard)
+		}()
+		
+		// Run reshard pass after delay
+		go func() {
+			time.Sleep(ReshardDelay)
+			sm.RunReshardPass(oldShard, deepestActiveShard)
+		}()
+	}
+}
+
+// runShardDiscovery periodically checks for deeper shards in the branch when the node is idle.
+// A node is considered idle if it hasn't received messages in the last minute.
+func (sm *ShardManager) runShardDiscovery() {
+	ticker := time.NewTicker(ShardDiscoveryInterval)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-sm.ctx.Done():
+			return
+		case <-ticker.C:
+			sm.mu.Lock()
+			now := time.Now()
+			// Check if we've already done a discovery check recently
+			if now.Sub(sm.lastDiscoveryCheck) < ShardDiscoveryInterval {
+				sm.mu.Unlock()
+				continue
+			}
+			sm.lastDiscoveryCheck = now
+			
+			// Check if node is idle (no messages in last minute)
+			isIdle := sm.lastMessageTime.IsZero() || now.Sub(sm.lastMessageTime) > 1*time.Minute
+			currentShard := sm.currentShard
+			sm.mu.Unlock()
+			
+			if !isIdle {
+				// Node is active, skip discovery
+				continue
+			}
+			
+			// Node is idle, check for deeper shards
+			log.Printf("[ShardDiscovery] Node idle in shard %s, checking for deeper shards...", currentShard)
+			sm.discoverAndMoveToDeeperShard()
+		}
+	}
 }
 
 func (sm *ShardManager) Close() {

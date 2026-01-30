@@ -214,15 +214,40 @@ func (rm *ReplicationManager) processJob(ctx context.Context, job CheckJob, resu
 	start := time.Now()
 
 	// Local Verification (Liar Detection)
+	// Skip verification for recently pinned files to allow DAG to be fully available
 	if job.Pinned {
-		ok, err := rm.verifyResearchObjectLocal(ctx, job.ManifestCID)
-		if err != nil {
-			log.Printf("[Replication] Local verification error for %s: %v", job.Key[:min(16, len(job.Key))]+"...", err)
-		}
-		if !ok {
-			log.Printf("[Replication] Local DAG incomplete or invalid for %s; unpinning local state", job.Key[:min(16, len(job.Key))]+"...")
-			rm.UnpinFile(ctx, job.Key, job.ManifestCID)
-			job.Pinned = false // Update job state
+		pinTime := rm.storageMgr.pinnedFiles.GetPinTime(job.Key)
+		if !pinTime.IsZero() {
+			timeSincePin := time.Since(pinTime)
+			if timeSincePin < ReplicationVerificationDelay {
+				// File was pinned recently, skip verification to allow DAG to be fully available
+				// This prevents false negatives where the DAG isn't ready yet
+				log.Printf("[Replication] Skipping verification for recently pinned file %s (pinned %v ago, grace period: %v)", 
+					truncateCID(job.Key, 16), timeSincePin, ReplicationVerificationDelay)
+			} else {
+				// File has been pinned long enough, perform verification
+				ok, err := rm.verifyResearchObjectLocal(ctx, job.ManifestCID)
+				if err != nil {
+					log.Printf("[Replication] Local verification error for %s: %v", job.Key[:min(16, len(job.Key))]+"...", err)
+				}
+				if !ok {
+					log.Printf("[Replication] Local DAG incomplete or invalid for %s; unpinning local state", job.Key[:min(16, len(job.Key))]+"...")
+					rm.UnpinFile(ctx, job.Key, job.ManifestCID)
+					job.Pinned = false // Update job state
+				}
+			}
+		} else {
+			// No pin time recorded (shouldn't happen, but handle gracefully)
+			// Perform verification anyway
+			ok, err := rm.verifyResearchObjectLocal(ctx, job.ManifestCID)
+			if err != nil {
+				log.Printf("[Replication] Local verification error for %s: %v", job.Key[:min(16, len(job.Key))]+"...", err)
+			}
+			if !ok {
+				log.Printf("[Replication] Local DAG incomplete or invalid for %s; unpinning local state", job.Key[:min(16, len(job.Key))]+"...")
+				rm.UnpinFile(ctx, job.Key, job.ManifestCID)
+				job.Pinned = false // Update job state
+			}
 		}
 	}
 
@@ -238,30 +263,59 @@ func (rm *ReplicationManager) processJob(ctx context.Context, job CheckJob, resu
 		return
 	}
 
-	// Query DHT
-	dhtCtx, dhtCancel := context.WithTimeout(ctx, DHTQueryTimeout)
-	defer dhtCancel()
+	var count int
 
-	incrementMetric(&metrics.dhtQueries)
-	provs := rm.dht.FindProvidersAsync(dhtCtx, job.ManifestCID, 0)
-	count := 0
-	maxCount := DHTMaxSampleSize
-
-	for range provs {
-		count++
-		if count >= maxCount {
-			break
+	// Replication is managed entirely within shards via pubsub, not DHT
+	// DHT is only for external IPFS users to access DLOCKSS replications
+	if rm.shardMgr != nil {
+		if job.Responsible {
+			// For files we're responsible for: use current shard peer count
+			shardPeers := rm.shardMgr.GetShardPeers()
+			count = len(shardPeers)
+			log.Printf("[Replication] Using shard peer count for responsible file %s: %d peers in shard", 
+				truncateCID(job.Key, 16), count)
+		} else {
+			// For custodial files: use target shard peer count
+			// Calculate target shard based on payload CID
+			payloadCIDStr := getPayloadCIDForShardAssignment(ctx, rm.ipfsClient, job.Key)
+			stableHex := keyToStableHex(payloadCIDStr)
+			
+			// Determine target shard depth (use current shard depth as reference)
+			rm.shardMgr.mu.RLock()
+			currentDepth := len(rm.shardMgr.currentShard)
+			rm.shardMgr.mu.RUnlock()
+			
+			if currentDepth == 0 {
+				currentDepth = 1
+			}
+			targetShard := getHexBinaryPrefix(stableHex, currentDepth)
+			
+			// Get peer count from target shard (we may already be in it via Tourist Mode)
+			count = rm.shardMgr.GetShardPeerCount(targetShard)
+			
+			if count == 0 {
+				// Not in target shard yet - this shouldn't happen for custodial files
+				// as they should have joined the target shard. Use current shard as fallback.
+				shardPeers := rm.shardMgr.GetShardPeers()
+				count = len(shardPeers)
+				log.Printf("[Replication] Warning: Not in target shard %s for custodial file %s, using current shard: %d peers", 
+					targetShard, truncateCID(job.Key, 16), count)
+			} else {
+				log.Printf("[Replication] Using target shard %s peer count for custodial file %s: %d peers", 
+					targetShard, truncateCID(job.Key, 16), count)
+			}
 		}
-	}
-
-	if dhtCtx.Err() == context.DeadlineExceeded {
-		incrementMetric(&metrics.dhtQueryTimeouts)
+	} else {
+		// Shard manager not available - this shouldn't happen in normal operation
+		log.Printf("[Replication] Warning: ShardManager not available for file %s, replication count unknown", 
+			truncateCID(job.Key, 16))
+		count = 0
 	}
 
 	resultQueue <- CheckResult{
 		Job:       job,
 		Count:     count,
-		Err:       dhtCtx.Err(),
+		Err:       nil, // No DHT errors - replication is managed via pubsub
 		FromCache: false,
 		Duration:  time.Since(start),
 	}

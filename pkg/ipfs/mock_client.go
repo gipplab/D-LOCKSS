@@ -69,6 +69,11 @@ func (m *MockClient) PutDagCBOR(ctx context.Context, block []byte) (cid.Cid, err
 	return c, nil
 }
 
+func (m *MockClient) GetPeerID(ctx context.Context) (string, error) {
+	// Return a mock IPFS peer ID for testing
+	return "12D3KooWMockIPFSPeerIDForTesting", nil
+}
+
 func (m *MockClient) GetBlock(ctx context.Context, blockCID cid.Cid) ([]byte, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

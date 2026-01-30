@@ -25,20 +25,22 @@ type DHTProvider interface {
 // PinnedSet tracks which files/manifests are currently pinned
 type PinnedSet struct {
 	mu sync.RWMutex
-	m  map[string]bool
+	m  map[string]time.Time // Map of key -> pin timestamp
 }
 
 func NewPinnedSet() *PinnedSet {
-	return &PinnedSet{m: make(map[string]bool)}
+	return &PinnedSet{m: make(map[string]time.Time)}
 }
 
 func (ps *PinnedSet) Add(key string) bool {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
-	if !ps.m[key] {
-		ps.m[key] = true
+	if _, exists := ps.m[key]; !exists {
+		ps.m[key] = time.Now()
 		return true
 	}
+	// File already exists - update timestamp to reflect latest pin time
+	ps.m[key] = time.Now()
 	return false
 }
 
@@ -49,6 +51,14 @@ func (ps *PinnedSet) Remove(key string) {
 }
 
 func (ps *PinnedSet) Has(key string) bool {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	_, exists := ps.m[key]
+	return exists
+}
+
+// GetPinTime returns when a file was pinned, or zero time if not pinned
+func (ps *PinnedSet) GetPinTime(key string) time.Time {
 	ps.mu.RLock()
 	defer ps.mu.RUnlock()
 	return ps.m[key]
@@ -64,8 +74,8 @@ func (ps *PinnedSet) All() map[string]bool {
 	ps.mu.RLock()
 	defer ps.mu.RUnlock()
 	result := make(map[string]bool, len(ps.m))
-	for k, v := range ps.m {
-		result[k] = v
+	for k := range ps.m {
+		result[k] = true
 	}
 	return result
 }
@@ -582,7 +592,7 @@ func (rc *ReplicationCache) Cleanup(cutoff time.Time) int {
 var (
 	// Globals that are still used directly or via legacy paths
 	// TODO: Continue refactoring to remove these
-	globalDHT   *dht.IpfsDHT
+	globalDHT   DHTProvider // Now uses IPFS DHT via adapter
 	shardMgr    *ShardManager
 	storageMgr  *StorageManager
 	replicationMgr *ReplicationManager

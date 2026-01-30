@@ -249,7 +249,7 @@ func reportMetrics() {
 		metrics.replicationDistribution[3], metrics.replicationDistribution[4], metrics.replicationDistribution[5],
 		metrics.replicationDistribution[6], metrics.replicationDistribution[7], metrics.replicationDistribution[8],
 		metrics.replicationDistribution[9], metrics.replicationDistribution[10])
-	log.Printf("[Metrics] Convergence: avg_replication=%.2f (network-wide DHT providers), converged_total=%d, converged_this_period=%d",
+	log.Printf("[Metrics] Convergence: avg_replication=%.2f (shard peers via pubsub), converged_total=%d, converged_this_period=%d",
 		metrics.avgReplicationLevel, metrics.filesConvergedTotal, metrics.filesConvergedThisPeriod)
 	log.Printf("[Metrics] Network: messages_received=%.1f/min, messages_dropped=%.1f/min, active_peers=%d (shard topic)",
 		msgRate, dropRate, activePeers)

@@ -24,6 +24,7 @@ type FileProcessor struct {
 	shardMgr   *ShardManager
 	storageMgr *StorageManager
 	privKey    crypto.PrivKey
+	semaphore  chan struct{} // Semaphore to limit concurrent file processing
 }
 
 // NewFileProcessor creates a new FileProcessor with dependencies.
@@ -38,6 +39,7 @@ func NewFileProcessor(
 		shardMgr:   sm,
 		storageMgr: stm,
 		privKey:    key,
+		semaphore:  make(chan struct{}, MaxConcurrentFileProcessing),
 	}
 }
 
@@ -134,8 +136,15 @@ func shouldProcessFileEvent(path string) bool {
 // processNewFile imports a newly detected file into IPFS, builds a ResearchObject
 // manifest, pins it, and announces it to the D-LOCKSS network.
 func (fp *FileProcessor) processNewFile(path string) {
+	// Acquire semaphore to limit concurrent processing
+	fp.semaphore <- struct{}{}
+	defer func() { <-fp.semaphore }()
+	
+	log.Printf("[FileOps] Starting processing: %s", path)
+	
 	// Validate path and check prerequisites
 	if !validateFilePath(path) {
+		log.Printf("[FileOps] File validation failed: %s", path)
 		return
 	}
 
@@ -148,25 +157,36 @@ func (fp *FileProcessor) processNewFile(path string) {
 	ctx, cancel := context.WithTimeout(context.Background(), FileImportTimeout)
 	defer cancel()
 
+	log.Printf("[FileOps] Importing file to IPFS: %s", path)
 	payloadCID, cleanupPayload, err := fp.importFileToIPFS(ctx, path)
 	if err != nil {
+		log.Printf("[FileOps] Failed to import file: %s, error: %v", path, err)
 		return
 	}
 	defer cleanupPayload()
+	log.Printf("[FileOps] File imported, PayloadCID: %s", payloadCID.String())
 
 	// Build and store ResearchObject
+	log.Printf("[FileOps] Building manifest for: %s", path)
 	manifestCID, manifestCIDStr, err := fp.buildAndStoreManifest(ctx, path, payloadCID, cleanupPayload)
 	if err != nil {
+		log.Printf("[FileOps] Failed to build manifest: %s, error: %v", path, err)
 		return
 	}
+	log.Printf("[FileOps] Manifest created, ManifestCID: %s", manifestCIDStr)
 
 	// Check BadBits and pin
+	log.Printf("[FileOps] Checking BadBits and pinning: %s", path)
 	if !fp.checkBadBitsAndPin(ctx, manifestCID, manifestCIDStr, path, cleanupPayload) {
+		log.Printf("[FileOps] BadBits check failed or pinning failed: %s", path)
 		return
 	}
+	log.Printf("[FileOps] File pinned successfully: %s", path)
 
 	// Track and announce
+	log.Printf("[FileOps] Tracking and announcing: %s", path)
 	fp.trackAndAnnounceFile(manifestCID, manifestCIDStr, payloadCID)
+	log.Printf("[FileOps] File processing completed: %s", path)
 }
 
 // validateFilePath validates that the file path is within the watch folder and returns true if valid.
@@ -296,11 +316,14 @@ func (fp *FileProcessor) checkBadBitsAndPin(ctx context.Context, manifestCID cid
 	}
 
 	// Pin recursively
+	log.Printf("[FileOps] Pinning manifest recursively: %s", manifestCIDStr)
 	if err := fp.ipfsClient.PinRecursive(ctx, manifestCID); err != nil {
+		log.Printf("[FileOps] Failed to pin ManifestCID %s: %v", manifestCIDStr, err)
 		logError("FileOps", "pin ManifestCID recursively", manifestCIDStr, err)
 		cleanupPayload()
 		return false
 	}
+	log.Printf("[FileOps] Successfully pinned manifest: %s", manifestCIDStr)
 
 	return true
 }
@@ -453,14 +476,22 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 		return fmt.Errorf("failed to watch data directory: %w", err)
 	}
 
+	// Track watched directories to avoid duplicates
+	watchedDirs := make(map[string]bool)
+	watchedDirs[FileWatchFolder] = true
+
 	// Recursive watch: Add all existing subdirectories
 	err = filepath.Walk(FileWatchFolder, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if info.IsDir() {
-			if err := watcher.Add(path); err != nil {
-				log.Printf("[Error] Failed to watch subdirectory %s: %v", path, err)
+			if !watchedDirs[path] {
+				if err := watcher.Add(path); err != nil {
+					log.Printf("[Error] Failed to watch subdirectory %s: %v", path, err)
+				} else {
+					watchedDirs[path] = true
+				}
 			}
 		}
 		return nil
@@ -470,6 +501,9 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 	}
 
 	log.Printf("[FileWatcher] Watching %s (and subdirectories) for new files...", FileWatchFolder)
+
+	// Thread-safe map for tracking watched directories
+	var watchedDirsMu sync.RWMutex
 
 	// Debounce timer (not strictly used with goroutine approach, but good practice concept)
 	// const debounceDuration = 100 * time.Millisecond
@@ -488,15 +522,85 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 			if event.Op&fsnotify.Create == fsnotify.Create {
 				info, err := os.Stat(event.Name)
 				if err == nil && info.IsDir() {
-					// It's a directory, watch it!
-					if err := watcher.Add(event.Name); err != nil {
-						log.Printf("[Error] Failed to watch new directory %s: %v", event.Name, err)
-					} else {
-						log.Printf("[FileWatcher] Added watch for new directory: %s", event.Name)
+					// It's a directory, watch it (if not already watched)
+					watchedDirsMu.RLock()
+					alreadyWatched := watchedDirs[event.Name]
+					watchedDirsMu.RUnlock()
+					
+					if !alreadyWatched {
+						if err := watcher.Add(event.Name); err != nil {
+							log.Printf("[Error] Failed to watch new directory %s: %v", event.Name, err)
+						} else {
+							watchedDirsMu.Lock()
+							watchedDirs[event.Name] = true
+							watchedDirsMu.Unlock()
+							log.Printf("[FileWatcher] Added watch for new directory: %s", event.Name)
+						}
 					}
-					// Also process any files that might have been copied in quickly with the folder?
-					// Usually files trigger their own create events, but if a folder move happens, 
-					// we might need to scan it. For now, rely on file events.
+					// Scan the new directory for existing files and nested subdirectories
+					// Do this in a goroutine to avoid blocking the watcher
+					go func(dirPath string) {
+						// Small delay to allow directory structure to stabilize
+						time.Sleep(FileProcessingDelay)
+						
+						fileCount := 0
+						dirCount := 0
+						
+						// Walk the directory once to handle both nested subdirectories and files
+						err := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+							if err != nil {
+								// Log but continue - might be transient
+								log.Printf("[Warning] Error accessing %s during directory scan: %v", path, err)
+								return nil
+							}
+							if info.IsDir() {
+								// Add nested subdirectories to the watcher (if not already watched)
+								if path != dirPath {
+									watchedDirsMu.RLock()
+									alreadyWatched := watchedDirs[path]
+									watchedDirsMu.RUnlock()
+									
+									if !alreadyWatched {
+										// Note: fsnotify.Add should be safe to call from goroutines
+										if err := watcher.Add(path); err != nil {
+											log.Printf("[Error] Failed to watch nested directory %s: %v", path, err)
+										} else {
+											watchedDirsMu.Lock()
+											watchedDirs[path] = true
+											watchedDirsMu.Unlock()
+											log.Printf("[FileWatcher] Added watch for nested directory: %s", path)
+											dirCount++
+										}
+									}
+								}
+								return nil
+							}
+							// Process existing files in the directory
+							// Validate path first
+							if !validateFilePath(path) {
+								// File filtered by validation (temp file, outside watch folder, etc.)
+								log.Printf("[FileWatcher] File filtered by validation: %s", path)
+								return nil
+							}
+							// Count all valid files (for accurate reporting)
+							fileCount++
+							// Always process files found during directory scans
+							// Deduplication only applies to real-time fsnotify events, not directory scans
+							// Files need to be processed until replication is confirmed
+							go func(p string) {
+								// Small delay to ensure file is fully written
+								time.Sleep(FileProcessingDelay)
+								log.Printf("[FileWatcher] Processing file from directory scan: %s", p)
+								fp.processNewFile(p)
+							}(path)
+							return nil
+						})
+						if err != nil {
+							log.Printf("[Error] Failed to scan new directory %s: %v", dirPath, err)
+						} else {
+							log.Printf("[FileWatcher] Scanned directory %s: found %d files, %d nested directories", dirPath, fileCount, dirCount)
+						}
+					}(event.Name)
 					continue 
 				}
 			}

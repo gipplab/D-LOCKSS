@@ -54,7 +54,7 @@ func (s *APIServer) Shutdown(ctx context.Context) error {
 
 // StatusResponse defines the JSON structure for /status
 type StatusResponse struct {
-	PeerID          string  `json:"peer_id"`
+	PeerID          string  `json:"peer_id"` // Now uses IPFS peer ID when available
 	Version         string  `json:"version"`
 	CurrentShard    string  `json:"current_shard"`
 	PeersInShard    int     `json:"peers_in_shard"`
@@ -64,13 +64,17 @@ type StatusResponse struct {
 }
 
 type StorageStatus struct {
-	PinnedFiles int `json:"pinned_files"`
-	KnownFiles  int `json:"known_files"`
+	PinnedFiles int      `json:"pinned_files"`
+	KnownFiles  int      `json:"known_files"`
+	KnownCIDs   []string `json:"known_cids,omitempty"` // CID list for monitor to compute unique files
 }
 
 type ReplicationStatus struct {
-	QueueDepth      int `json:"queue_depth"`
-	ActiveWorkers   int `json:"active_workers"`
+	QueueDepth           int     `json:"queue_depth"`
+	ActiveWorkers        int     `json:"active_workers"`
+	AvgReplicationLevel  float64 `json:"avg_replication_level"`
+	FilesAtTarget       int     `json:"files_at_target"`
+	ReplicationDistribution [11]int `json:"replication_distribution"` // 0-9, 10+
 }
 
 func handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -79,9 +83,9 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	known := metrics.knownFilesCount
 	startTime := metrics.startTime
 	metrics.RUnlock()
-	
+
 	shardID, peers := getShardInfo()
-	
+
 	activeWorkers := 0
 	queueDepth := 0
 	if replicationMgr != nil {
@@ -89,18 +93,38 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		// TODO: Expose queue depth from replication manager
 	}
 
+	knownCIDs := []string(nil)
+	if storageMgr != nil {
+		all := storageMgr.knownFiles.All()
+		knownCIDs = make([]string, 0, len(all))
+		for cid := range all {
+			knownCIDs = append(knownCIDs, cid)
+		}
+	}
+
+	// Get replication metrics
+	metrics.RLock()
+	avgReplication := metrics.avgReplicationLevel
+	filesAtTarget := metrics.filesAtTargetReplication
+	replicationDist := metrics.replicationDistribution
+	metrics.RUnlock()
+
 	status := StatusResponse{
-		PeerID:       selfPeerID.String(),
+		PeerID:       selfPeerID.String(), // Now uses IPFS peer ID when available
 		Version:      "1.0.0", // TODO: Get from build info
 		CurrentShard: shardID,
 		PeersInShard: peers,
 		Storage: StorageStatus{
 			PinnedFiles: pinned,
 			KnownFiles:  known,
+			KnownCIDs:   knownCIDs,
 		},
 		Replication: ReplicationStatus{
-			QueueDepth:    queueDepth,
-			ActiveWorkers: activeWorkers,
+			QueueDepth:            queueDepth,
+			ActiveWorkers:         activeWorkers,
+			AvgReplicationLevel:   avgReplication,
+			FilesAtTarget:        filesAtTarget,
+			ReplicationDistribution: replicationDist,
 		},
 		UptimeSeconds: time.Since(startTime).Seconds(),
 	}

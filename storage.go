@@ -37,22 +37,26 @@ func (sm *StorageManager) pinFile(manifestCIDStr string) bool {
 		return false
 	}
 
-	if sm.pinnedFiles.Add(manifestCIDStr) {
+	wasNew := sm.pinnedFiles.Add(manifestCIDStr)
+	if wasNew {
 		updateMetrics(func() {
 			metrics.pinnedFilesCount = sm.pinnedFiles.Size()
 		})
 		log.Printf("[Storage] Pinned ManifestCID: %s (total pinned: %d)", truncateCID(manifestCIDStr, 16), sm.pinnedFiles.Size())
-		
-		// Also announce to DHT (provide)
-		// We do this here to ensure anything we pin is also provided
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), DHTProvideTimeout)
-			defer cancel()
-			sm.provideFile(ctx, manifestCIDStr)
-		}()
-		
-		return true
+		log.Printf("[Storage] Metrics updated: pinnedFilesCount=%d", metrics.pinnedFilesCount)
+	} else {
+		// File was already pinned - timestamp was updated by Add() to reflect latest pin time
+		log.Printf("[Storage] ManifestCID already pinned (timestamp updated): %s (total pinned: %d)", truncateCID(manifestCIDStr, 16), sm.pinnedFiles.Size())
 	}
+	
+	// Also announce to DHT (provide)
+	// We do this here to ensure anything we pin is also provided
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), DHTProvideTimeout)
+		defer cancel()
+		sm.provideFile(ctx, manifestCIDStr)
+	}()
+	
 	return true
 }
 

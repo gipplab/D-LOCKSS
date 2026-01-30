@@ -4,7 +4,9 @@
 # Reduced to 15 nodes for bandwidth-limited environments
 # Each node runs its own isolated IPFS daemon
 NODE_COUNT=30
-BASE_DIR="testnet_data"
+# Make BASE_DIR absolute to avoid path resolution issues
+BASE_DIR_REL="testnet_data"
+BASE_DIR=$(cd "$BASE_DIR_REL" 2>/dev/null && pwd || echo "$(pwd)/$BASE_DIR_REL")
 BINARY_NAME="dlockss-node"
 PID_FILE="active_nodes.pids"
 IPFS_PID_FILE="active_ipfs.pids"
@@ -85,6 +87,10 @@ if ! command -v ipfs &> /dev/null; then
 fi
 
 echo -e "${YELLOW}--- Cleaning old data ---${NC}"
+# Ensure BASE_DIR is absolute before using it
+if [[ "$BASE_DIR" != /* ]]; then
+    BASE_DIR=$(cd "$BASE_DIR" 2>/dev/null && pwd || echo "$(pwd)/$BASE_DIR")
+fi
 rm -rf $BASE_DIR
 mkdir -p $BASE_DIR
 rm -f $PID_FILE
@@ -108,6 +114,8 @@ for i in $(seq 1 $NODE_COUNT); do
     fi
 
     IPFS_REPO="$NODE_DIR/ipfs_repo"
+    # BASE_DIR is now absolute, so construct absolute path directly
+    IPFS_REPO_ABS="$BASE_DIR/node_$i/ipfs_repo"
     IPFS_API_PORT=$((IPFS_API_BASE_PORT + i))
     IPFS_SWARM_PORT=$((IPFS_SWARM_BASE_PORT + i))
     IPFS_GATEWAY_PORT=$((IPFS_GATEWAY_BASE_PORT + i))
@@ -168,6 +176,8 @@ if [ ! -f "$IPFS_REPO/config" ]; then
 
     # 2. Run the node in background with testnet-optimized settings
     # See docs/TIMEOUTS_AND_DELAYS_ANALYSIS.md for rationale
+    # Export IPFS_PATH so D-LOCKSS can load IPFS identity (use absolute path)
+    IPFS_PATH="$IPFS_REPO_ABS" \
     DLOCKSS_METRICS_EXPORT="metrics.csv" \
     DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/$IPFS_API_PORT" \
     DLOCKSS_API_PORT=$DLOCKSS_API_PORT \
@@ -176,7 +186,7 @@ if [ ! -f "$IPFS_REPO/config" ]; then
     DLOCKSS_SHARD_PEER_CHECK_INTERVAL=10s \
     DLOCKSS_CHECK_INTERVAL=20s \
     DLOCKSS_REPLICATION_COOLDOWN=5s \
-    DLOCKSS_REPLICATION_VERIFICATION_DELAY=5s \
+    DLOCKSS_REPLICATION_VERIFICATION_DELAY=30s \
     DLOCKSS_REPLICATION_CACHE_TTL=1m \
     DLOCKSS_DHT_QUERY_TIMEOUT=30s \
     DLOCKSS_DHT_PROVIDE_TIMEOUT=15s \

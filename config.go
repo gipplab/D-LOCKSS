@@ -93,6 +93,7 @@ func logConfiguration() {
 	log.Printf("[Config] Signature Mode: %s", SignatureMode)
 	log.Printf("[Config] Signature Max Age: %v", SignatureMaxAge)
 	log.Printf("[Config] DHT Max Sample Size: %d", DHTMaxSampleSize)
+	log.Printf("[Config] Use PubSub for Replication: %v (min shard peers: %d)", UsePubsubForReplication, MinShardPeersForPubsubOnly)
 	log.Printf("[Config] Replication Cache TTL: %v", ReplicationCacheTTL)
 	log.Printf("[Config] Auto Replication Enabled: %v", AutoReplicationEnabled)
 	if AutoReplicationMaxSize > 0 {
@@ -105,8 +106,11 @@ func logConfiguration() {
 	// File operation configuration
 	log.Printf("[Config] File Import Timeout: %v", FileImportTimeout)
 	log.Printf("[Config] DHT Provide Timeout: %v", DHTProvideTimeout)
+	log.Printf("[Config] DHT Provide Retry Attempts: %d", DHTProvideRetryAttempts)
+	log.Printf("[Config] DHT Provide Retry Delay: %v", DHTProvideRetryDelay)
 	log.Printf("[Config] File Processing Delay: %v", FileProcessingDelay)
 	log.Printf("[Config] File Retry Delay: %v", FileRetryDelay)
+	log.Printf("[Config] Max Concurrent File Processing: %d", MaxConcurrentFileProcessing)
 
 	// Replication timeouts
 	log.Printf("[Config] Replication Workers: %d", ReplicationWorkers)
@@ -145,6 +149,7 @@ var (
 	MaxPeersPerShard               = getEnvInt("DLOCKSS_MAX_PEERS_PER_SHARD", 20)                        // Split when shard exceeds this many peers (default: 20)
 	MinPeersPerShard               = getEnvInt("DLOCKSS_MIN_PEERS_PER_SHARD", 10)                        // Don't split if result would be below this many peers (default: 10)
 	ShardPeerCheckInterval         = getEnvDuration("DLOCKSS_SHARD_PEER_CHECK_INTERVAL", 30*time.Second) // How often to check peer count
+	ShardDiscoveryInterval         = getEnvDuration("DLOCKSS_SHARD_DISCOVERY_INTERVAL", 2*time.Minute)    // How often to check for deeper shards when idle
 	MaxConcurrentReplicationChecks = getEnvInt("DLOCKSS_MAX_CONCURRENT_CHECKS", 10)
 	RateLimitWindow                = getEnvDuration("DLOCKSS_RATE_LIMIT_WINDOW", 1*time.Minute)
 	MaxMessagesPerWindow           = getEnvInt("DLOCKSS_MAX_MESSAGES_PER_WINDOW", 100)
@@ -158,7 +163,7 @@ var (
 	NodeCountry                    = getEnvString("DLOCKSS_NODE_COUNTRY", "US")
 	BadBitsPath                    = getEnvString("DLOCKSS_BADBITS_PATH", "badBits.csv")
 	ShardOverlapDuration           = getEnvDuration("DLOCKSS_SHARD_OVERLAP_DURATION", 2*time.Minute)
-	ReplicationVerificationDelay   = getEnvDuration("DLOCKSS_REPLICATION_VERIFICATION_DELAY", 30*time.Second)
+	ReplicationVerificationDelay   = getEnvDuration("DLOCKSS_REPLICATION_VERIFICATION_DELAY", 30*time.Second) // Grace period before verifying newly pinned files
 	DiskUsageHighWaterMark         = getEnvFloat("DLOCKSS_DISK_USAGE_HIGH_WATER_MARK", 90.0)
 	IPFSNodeAddress                = getEnvString("DLOCKSS_IPFS_NODE", "/ip4/127.0.0.1/tcp/5001")
 	TrustMode                      = getEnvString("DLOCKSS_TRUST_MODE", "open") // open | allowlist
@@ -166,16 +171,21 @@ var (
 	SignatureMode                  = getEnvString("DLOCKSS_SIGNATURE_MODE", "warn") // off | warn | strict
 	SignatureMaxAge                = getEnvDuration("DLOCKSS_SIGNATURE_MAX_AGE", 10*time.Minute)
 	DHTMaxSampleSize               = getEnvInt("DLOCKSS_DHT_MAX_SAMPLE_SIZE", 50)                      // Max providers to query per DHT lookup
+	UsePubsubForReplication        = getEnvBool("DLOCKSS_USE_PUBSUB_FOR_REPLICATION", true)            // Use pubsub peers first, DHT as fallback (avoids expensive DHT queries since nodes already know each other)
+	MinShardPeersForPubsubOnly     = getEnvInt("DLOCKSS_MIN_SHARD_PEERS_PUBSUB_ONLY", 5)               // Only use pubsub-only if shard has at least this many peers (otherwise query DHT for additional providers)
 	ReplicationCacheTTL            = getEnvDuration("DLOCKSS_REPLICATION_CACHE_TTL", 5*time.Minute)    // How long to cache replication counts
 	AutoReplicationEnabled         = getEnvBool("DLOCKSS_AUTO_REPLICATION_ENABLED", true)              // Enable automatic replication on ReplicationRequest
 	AutoReplicationMaxSize         = getEnvUint64("DLOCKSS_AUTO_REPLICATION_MAX_SIZE", 0)              // Max file size for auto-replication (0 = unlimited)
 	AutoReplicationTimeout         = getEnvDuration("DLOCKSS_AUTO_REPLICATION_TIMEOUT", 5*time.Minute) // Timeout for fetching files during replication
 
 	// File operation timeouts and delays
-	FileImportTimeout   = getEnvDuration("DLOCKSS_FILE_IMPORT_TIMEOUT", 2*time.Minute)          // Timeout for importing files to IPFS
-	DHTProvideTimeout   = getEnvDuration("DLOCKSS_DHT_PROVIDE_TIMEOUT", 30*time.Second)         // Timeout for providing files to DHT
-	FileProcessingDelay = getEnvDuration("DLOCKSS_FILE_PROCESSING_DELAY", 100*time.Millisecond) // Delay before processing new files
-	FileRetryDelay      = getEnvDuration("DLOCKSS_FILE_RETRY_DELAY", 200*time.Millisecond)      // Delay between file processing retries
+	FileImportTimeout           = getEnvDuration("DLOCKSS_FILE_IMPORT_TIMEOUT", 2*time.Minute)          // Timeout for importing files to IPFS
+	DHTProvideTimeout           = getEnvDuration("DLOCKSS_DHT_PROVIDE_TIMEOUT", 60*time.Second)         // Timeout for providing files to DHT (increased to account for retries)
+	DHTProvideRetryAttempts     = getEnvInt("DLOCKSS_DHT_PROVIDE_RETRY_ATTEMPTS", 3)                   // Number of retry attempts for DHT provide on transient errors
+	DHTProvideRetryDelay        = getEnvDuration("DLOCKSS_DHT_PROVIDE_RETRY_DELAY", 500*time.Millisecond) // Delay between retry attempts
+	FileProcessingDelay        = getEnvDuration("DLOCKSS_FILE_PROCESSING_DELAY", 100*time.Millisecond) // Delay before processing new files
+	FileRetryDelay             = getEnvDuration("DLOCKSS_FILE_RETRY_DELAY", 200*time.Millisecond)      // Delay between file processing retries
+	MaxConcurrentFileProcessing = getEnvInt("DLOCKSS_MAX_CONCURRENT_FILE_PROCESSING", 5)              // Maximum number of files processed concurrently
 
 	// Replication configuration
 	ReplicationWorkers   = getEnvInt("DLOCKSS_REPLICATION_WORKERS", 50)      // Number of concurrent network probers
@@ -202,5 +212,5 @@ var (
 	FutureSkewTolerance = getEnvDuration("DLOCKSS_FUTURE_SKEW_TOLERANCE", 30*time.Second) // Tolerance for future timestamps in signature verification
 
 	// Telemetry
-	MonitorPeerID = getEnvString("DLOCKSS_MONITOR_PEER_ID", "") // Centralized monitor PeerID (optional)
+	MonitorPeerID = getEnvString("DLOCKSS_MONITOR_PEER_ID", "12D3KooWAhqsRob8XojJamEWC83zeFyDRuujP3QMf3nByczhok7A") // Centralized monitor PeerID (optional)
 )

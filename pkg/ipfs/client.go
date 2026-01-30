@@ -22,11 +22,17 @@ type IPFSClient interface {
 	IsPinned(ctx context.Context, cid cid.Cid) (bool, error)
 	GetFileSize(ctx context.Context, cid cid.Cid) (uint64, error)
 	VerifyDAGCompleteness(ctx context.Context, rootCID cid.Cid) (bool, error)
+	GetPeerID(ctx context.Context) (string, error)
 }
 
 // Client wraps IPFS API operations for importing files and managing pins.
 type Client struct {
 	api *ipfsapi.Shell
+}
+
+// GetShell returns the underlying IPFS Shell for advanced operations
+func (c *Client) GetShell() *ipfsapi.Shell {
+	return c.api
 }
 
 // Ensure Client implements IPFSClient
@@ -184,4 +190,13 @@ func (c *Client) VerifyDAGCompleteness(ctx context.Context, rootCID cid.Cid) (bo
 	// TODO: Implement full recursive DAG verification.
 	// For now, treat "pinned" as the completeness signal.
 	return true, nil
+}
+
+// GetPeerID returns the IPFS node's peer ID.
+func (c *Client) GetPeerID(ctx context.Context) (string, error) {
+	id, err := c.api.ID()
+	if err != nil {
+		return "", fmt.Errorf("failed to get IPFS peer ID: %w", err)
+	}
+	return id.ID, nil
 }

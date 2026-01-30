@@ -2,35 +2,125 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
-	dht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/routing"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 
 	"dlockss/pkg/ipfs"
 )
 
+// loadIPFSIdentity attempts to load the IPFS node's private key to use as D-LOCKSS identity
+func loadIPFSIdentity() (crypto.PrivKey, error) {
+	// Try to find IPFS config file
+	ipfsPath := os.Getenv("IPFS_PATH")
+	
+	// If IPFS_PATH is set but is a relative path, convert it to absolute
+	if ipfsPath != "" && !filepath.IsAbs(ipfsPath) {
+		absPath, err := filepath.Abs(ipfsPath)
+		if err == nil {
+			ipfsPath = absPath
+			log.Printf("[Config] Resolved IPFS_PATH to absolute path: %s", ipfsPath)
+		}
+	}
+	
+	if ipfsPath == "" {
+		// Try to infer from IPFS node address if available
+		// In testnet, IPFS repos are often in a predictable location relative to the node
+		// Check common testnet patterns: ./ipfs_repo, ../ipfs_repo, etc.
+		cwd, err := os.Getwd()
+		if err == nil {
+			// Check if we're in a testnet node directory
+			testPaths := []string{
+				filepath.Join(cwd, "ipfs_repo"),
+				filepath.Join(cwd, "../ipfs_repo"),
+				filepath.Join(cwd, "..", "..", "ipfs_repo"),
+			}
+			for _, testPath := range testPaths {
+				if _, err := os.Stat(filepath.Join(testPath, "config")); err == nil {
+					ipfsPath = testPath
+					log.Printf("[Config] Auto-detected IPFS repo at: %s", ipfsPath)
+					break
+				}
+			}
+		}
+		
+		// Fallback to default home directory
+		if ipfsPath == "" {
+			homeDir, err := os.UserHomeDir()
+			if err != nil {
+				return nil, fmt.Errorf("cannot determine home directory: %w", err)
+			}
+			ipfsPath = filepath.Join(homeDir, ".ipfs")
+		}
+	}
+	
+	configPath := filepath.Join(ipfsPath, "config")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read IPFS config at %s: %w", configPath, err)
+	}
+	
+	var config struct {
+		Identity struct {
+			PrivKey string `json:"PrivKey"`
+		} `json:"Identity"`
+	}
+	
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("cannot parse IPFS config: %w", err)
+	}
+	
+	if config.Identity.PrivKey == "" {
+		return nil, fmt.Errorf("IPFS config has no PrivKey")
+	}
+	
+	// Decode base64 private key
+	keyBytes, err := base64.StdEncoding.DecodeString(config.Identity.PrivKey)
+	if err != nil {
+		return nil, fmt.Errorf("cannot decode IPFS private key: %w", err)
+	}
+	
+	// Unmarshal libp2p private key
+	privKey, err := crypto.UnmarshalPrivateKey(keyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("cannot unmarshal IPFS private key: %w", err)
+	}
+	
+	return privKey, nil
+}
+
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	h, err := libp2p.New(
+	// Try to use IPFS identity, fallback to generating new one
+	var libp2pOpts []libp2p.Option
+	ipfsPrivKey, err := loadIPFSIdentity()
+	if err != nil {
+		log.Printf("[Config] Could not load IPFS identity (%v), generating new D-LOCKSS identity", err)
+		log.Printf("[Config] Note: D-LOCKSS and IPFS will have different peer IDs")
+	} else {
+		log.Printf("[Config] Using IPFS identity - D-LOCKSS and IPFS will share the same peer ID")
+		libp2pOpts = append(libp2pOpts, libp2p.Identity(ipfsPrivKey))
+	}
+	
+	libp2pOpts = append(libp2pOpts,
 		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0", "/ip6/::/tcp/0"),
-		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
-			var err error
-			globalDHT, err = dht.New(ctx, h, dht.Mode(dht.ModeServer))
-			return globalDHT, err
-		}),
+		// No DHT routing - we'll use IPFS's DHT instead
 	)
+	
+	h, err := libp2p.New(libp2pOpts...)
 	if err != nil {
 		log.Fatalf("[Fatal] Failed to initialize libp2p host: %v", err)
 	}
@@ -43,9 +133,7 @@ func main() {
 		log.Fatalf("[Fatal] Failed to start mDNS service: %v", err)
 	}
 
-	if err = globalDHT.Bootstrap(ctx); err != nil {
-		log.Fatalf("[Fatal] Failed to bootstrap DHT: %v", err)
-	}
+	// DHT bootstrap removed - IPFS DHT doesn't need separate bootstrap
 
 	ps, err := pubsub.NewGossipSub(ctx, h)
 	if err != nil {
@@ -74,17 +162,21 @@ func main() {
 	log.Println("Initializing IPFS client...")
 	ipfsClient, err = ipfs.NewClient(IPFSNodeAddress)
 	if err != nil {
-		log.Printf("[Warning] Failed to initialize IPFS client: %v", err)
-		log.Printf("[Warning] File operations will be disabled. Ensure IPFS node is running at %s", IPFSNodeAddress)
-		// Continue without IPFS - file operations will fail gracefully
-	} else {
-		log.Printf("[System] IPFS client initialized successfully")
+		log.Fatalf("[Fatal] Failed to initialize IPFS client: %v", err)
+		log.Fatalf("[Fatal] D-LOCKSS now requires IPFS node to be running at %s", IPFSNodeAddress)
 	}
+	log.Printf("[System] IPFS client initialized successfully")
+	
+	// Create IPFS DHT adapter (uses IPFS's DHT via HTTP API)
+	ipfsDHTAdapter := ipfs.NewIPFSDHTAdapterWithRetry(ipfsClient.GetShell(), DHTProvideRetryAttempts, DHTProvideRetryDelay)
+	globalDHT = ipfsDHTAdapter
+	log.Printf("[System] Using IPFS DHT for provider lookups and announcements")
 
 	// Create managers
 	storageMgr = NewStorageManager(globalDHT)
 
-	initialShard := getBinaryPrefix(h.ID().String(), 1)
+	// Start all nodes in root shard "" - they will split naturally when threshold is exceeded
+	initialShard := ""
 	shardMgr = NewShardManager(ctx, h, ps, ipfsClient, storageMgr, initialShard)
 
 	replicationMgr = NewReplicationManager(ipfsClient, shardMgr, storageMgr, globalDHT)
@@ -100,7 +192,7 @@ func main() {
 
 	// Start Telemetry Client
 	if MonitorPeerID != "" {
-		telemetryClient := NewTelemetryClient(h, globalDHT, MonitorPeerID)
+		telemetryClient := NewTelemetryClient(h, ps, globalDHT, MonitorPeerID)
 		if telemetryClient != nil {
 			telemetryClient.Start(ctx)
 		}
@@ -146,9 +238,7 @@ func main() {
 	if shardMgr != nil {
 		shardMgr.Close()
 	}
-	if globalDHT != nil {
-		globalDHT.Close()
-	}
+	// IPFS DHT adapter doesn't need explicit close (uses HTTP API)
 	if h != nil {
 		if err := h.Close(); err != nil {
 			log.Printf("[Error] Error closing host: %v", err)
