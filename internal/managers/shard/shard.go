@@ -255,8 +255,9 @@ func (sm *ShardManager) sendHeartbeat() {
 		return
 	}
 
-	// Send lightweight heartbeat message for peer discovery
+	// Send lightweight heartbeat message for peer discovery.
 	// Format: HEARTBEAT:<PeerID>:<PinnedCount>
+	// When IPFS_PATH is set, D-LOCKSS uses the IPFS repo identity so there is one peer ID per node.
 	pinnedCount := 0
 	if sm.storageMgr != nil {
 		pinnedCount = sm.storageMgr.GetPinnedCount()
@@ -323,15 +324,14 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 
 		// Format: PINNED:<ManifestCID>
 		if len(msg.Data) > 7 && string(msg.Data[:7]) == "PINNED:" {
-			// Extract key (ManifestCID)
 			key := string(msg.Data[7:])
-			
-			// Record that this peer has this file
 			if sm.replicationMgr != nil && sm.replicationMgr.GetReplicationTracker() != nil {
 				sm.replicationMgr.GetReplicationTracker().RecordAnnouncement(key, msg.GetFrom())
-				// log.Printf("[Replication] Recorded announcement from heartbeat for %s (from %s)", truncateCID(key, 16), msg.GetFrom().String()[:12])
 			}
 			sm.storageMgr.AddKnownFile(key)
+			if manifestCID, err := common.KeyToCID(key); err == nil {
+				sm.tryReplicateFromAnnouncement(key, manifestCID, msg.GetFrom())
+			}
 			return
 		}
 	}
@@ -399,7 +399,58 @@ func (sm *ShardManager) handleIngestMessage(msg *pubsub.Message, im *schema.Inge
 	// Add to known files. If we are just a tourist, we still "know" about it,
 	// but the replication manager will eventually decide if we stick around.
 	sm.storageMgr.AddKnownFile(key)
-	// log.Printf("[Shard] Added file to known files: %s (from %s, shard %s)", truncateCID(key, 16), msg.GetFrom().String()[:12], shardID)
+	// Try to replicate if we're responsible and selected (so we don't wait only for ReplicationRequest)
+	sm.tryReplicateFromAnnouncement(key, im.ManifestCID, msg.GetFrom())
+}
+
+// tryReplicateFromAnnouncement runs responsibility check, XOR selection, and if selected starts replication.
+// Used for ReplicationRequest, IngestMessage, and PINNED so files reach MinReplication as soon as the shard has enough nodes.
+func (sm *ShardManager) tryReplicateFromAnnouncement(key string, manifestCID cid.Cid, sender peer.ID) bool {
+	payloadCIDStr := common.GetPayloadCIDForShardAssignment(sm.ctx, sm.ipfsClient, key)
+	if !sm.AmIResponsibleFor(payloadCIDStr) {
+		return false
+	}
+	if !config.AutoReplicationEnabled || sm.storageMgr.IsPinned(key) {
+		return false
+	}
+	xorDistance, err := calculateXORDistance(sm.h.ID(), manifestCID)
+	if err != nil {
+		sm.storageMgr.AddKnownFile(key)
+		return false
+	}
+	peersInShard := sm.getShardPeerCount()
+	if peersInShard == 0 {
+		peersInShard = config.MinReplication
+	}
+	selectionThreshold := config.MinReplication
+	if peersInShard >= config.MinReplication {
+		selectionThreshold = peersInShard
+	} else {
+		selectionThreshold = min(config.MinReplication+2, peersInShard)
+	}
+	distanceMod := new(big.Int).Mod(xorDistance, big.NewInt(int64(peersInShard)))
+	modValue := int(distanceMod.Int64())
+	if modValue >= selectionThreshold {
+		sm.storageMgr.AddKnownFile(key)
+		return false
+	}
+	if sm.replicationMgr == nil {
+		sm.storageMgr.AddKnownFile(key)
+		return false
+	}
+	go func() {
+		success, err := sm.replicationMgr.ReplicateFileFromRequest(sm.ctx, manifestCID, sender, true)
+		if err != nil {
+			log.Printf("[Replication] Failed to replicate %s: %v", key[:min(16, len(key))]+"...", err)
+			sm.storageMgr.RecordFailedOperation(key)
+		} else if success {
+			sm.storageMgr.AddKnownFile(key)
+			if sm.replicationMgr.GetReplicationTracker() != nil {
+				sm.replicationMgr.GetReplicationTracker().RecordAnnouncement(key, sm.h.ID())
+			}
+		}
+	}()
+	return true
 }
 
 // handleReplicationRequest processes a ReplicationRequest.
@@ -417,80 +468,9 @@ func (sm *ShardManager) handleReplicationRequest(msg *pubsub.Message, rr *schema
 	responsible := sm.AmIResponsibleFor(payloadCIDStr)
 
 	if !responsible {
-		// If we are a "Tourist" (Custodial Node watching its upload), we might see this.
-		// But tourists don't replicate other people's files.
-		// However, if WE sent the request (unlikely as we filter self), or if another node is requesting,
-		// we ignore it unless we are responsible.
 		return
 	}
-
-	// Attempt automatic replication if enabled and file is not pinned
-	if config.AutoReplicationEnabled && !sm.storageMgr.IsPinned(key) {
-		// XOR distance-based selection (IPFS/Kademlia style)
-		// Select the MinReplication nodes with smallest XOR distance to the content
-		xorDistance, err := calculateXORDistance(sm.h.ID(), manifestCID)
-		if err != nil {
-			log.Printf("[Replication] Failed to calculate XOR distance for %s: %v", key[:min(16, len(key))]+"...", err)
-			sm.storageMgr.AddKnownFile(key)
-			return
-		}
-
-		peersInShard := sm.getShardPeerCount()
-		if peersInShard == 0 {
-			peersInShard = config.MinReplication // Fallback
-		}
-
-		// XOR distance modulo: select nodes with smaller mod as "closer" to content.
-		// Use an inclusive threshold so we reliably reach MinReplication even when
-		// mod values cluster (e.g. many nodes with mod 5–7 would otherwise give only 3–4 replicas).
-		selectionThreshold := config.MinReplication
-		if peersInShard > config.MinReplication {
-			// Oversample slightly so we still hit MinReplication when mod values cluster
-			selectionThreshold = min(config.MinReplication+2, peersInShard)
-		}
-		// XOR distance modulo: select nodes with smaller mod as "closer" to content.
-		// Use an inclusive threshold so we reliably reach MinReplication even when
-		// mod values cluster (e.g. many nodes with mod 5–7 would otherwise give only 3–4 replicas).
-		selectionThreshold := config.MinReplication
-		if peersInShard > config.MinReplication {
-			// Oversample slightly so we still hit MinReplication when mod values cluster
-			selectionThreshold = min(config.MinReplication+2, peersInShard)
-		}
-		distanceMod := new(big.Int).Mod(xorDistance, big.NewInt(int64(peersInShard)))
-		modValue := int(distanceMod.Int64())
-
-		selected := modValue < selectionThreshold
-		selected := modValue < selectionThreshold
-
-		if !selected {
-			log.Printf("[Replication] Not selected to replicate %s (XOR distance mod %d/%d, need < %d, distance: %s)",
-				key[:min(16, len(key))]+"...", modValue, peersInShard, selectionThreshold, truncateBigInt(xorDistance, 16))
-				key[:min(16, len(key))]+"...", modValue, peersInShard, selectionThreshold, truncateBigInt(xorDistance, 16))
-			sm.storageMgr.AddKnownFile(key)
-			return
-		}
-
-		log.Printf("[Replication] Selected to replicate %s (XOR distance mod %d/%d, distance: %s)",
-			key[:min(16, len(key))]+"...", modValue, peersInShard, truncateBigInt(xorDistance, 16))
-
-		go func() {
-			if sm.replicationMgr == nil {
-				return
-			}
-			success, err := sm.replicationMgr.ReplicateFileFromRequest(sm.ctx, manifestCID, msg.GetFrom(), true) // responsible=true
-			if err != nil {
-				log.Printf("[Replication] Failed to replicate %s: %v", key[:min(16, len(key))]+"...", err)
-				sm.storageMgr.RecordFailedOperation(key)
-			} else if success {
-				log.Printf("[Replication] Successfully replicated %s", key[:min(16, len(key))]+"...")
-				sm.storageMgr.AddKnownFile(key)
-				// Record our own possession in the tracker so we don't undercount
-				if sm.replicationMgr.GetReplicationTracker() != nil {
-					sm.replicationMgr.GetReplicationTracker().RecordAnnouncement(key, sm.h.ID())
-				}
-			}
-		}()
-	} else {
+	if !sm.tryReplicateFromAnnouncement(key, manifestCID, msg.GetFrom()) {
 		sm.storageMgr.AddKnownFile(key)
 	}
 }
@@ -506,6 +486,13 @@ func (sm *ShardManager) handleUnreplicateRequest(msg *pubsub.Message, ur *schema
 	sm.metrics.IncrementMessagesReceived()
 
 	if !sm.storageMgr.IsPinned(key) {
+		return
+	}
+
+	// Never drop a file we are responsible for in our current shard.
+	// Over-replication drop only applies to extra replicas; custodians must keep the file.
+	payloadCIDStr := common.GetPayloadCIDForShardAssignment(sm.ctx, sm.ipfsClient, key)
+	if payloadCIDStr != "" && sm.AmIResponsibleFor(payloadCIDStr) {
 		return
 	}
 
@@ -720,6 +707,7 @@ func (sm *ShardManager) splitShard() {
 		sm.LeaveShard(oldShard)
 	}()
 
+	// Start reshard pass after a short delay
 	go func() {
 		time.Sleep(config.ReshardDelay)
 		sm.RunReshardPass(oldShard, peerIDHash)

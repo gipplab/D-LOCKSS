@@ -99,6 +99,10 @@ Optional monitor (dashboard):
 go build -o dlockss-monitor ./cmd/dlockss-monitor
 ./dlockss-monitor
 ```
+Open http://localhost:8080. Each node has **one peer ID**: when `IPFS_PATH` is set (e.g. in testnet), D-LOCKSS uses the IPFS repo identity so the same ID appears in the monitor and in `node_x.ipfs.log`.
+
+### Testnet
+From `testnet/`: `./run_testnet.sh` starts multiple D-LOCKSS nodes and IPFS daemons. Each node has **one peer ID** (D-LOCKSS loads the identity from the node's IPFS repo via `IPFS_PATH`). Press Enter in the script to shut down.
 
 ### Testing
 ```bash

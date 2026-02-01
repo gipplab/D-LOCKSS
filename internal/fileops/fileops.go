@@ -170,7 +170,10 @@ func (fp *FileProcessor) processNewFile(path string) {
 		log.Printf("[FileOps] Failed to import file: %s, error: %v", path, err)
 		return
 	}
-	defer cleanupPayload()
+	// Do NOT defer cleanupPayload() here unconditionally.
+	// We only want to cleanup if subsequent steps fail.
+	// If we succeed, we keep the payload pinned.
+	
 	log.Printf("[FileOps] File imported, PayloadCID: %s", payloadCID.String())
 
 	// Build and store ResearchObject
@@ -178,6 +181,7 @@ func (fp *FileProcessor) processNewFile(path string) {
 	manifestCID, manifestCIDStr, err := fp.buildAndStoreManifest(ctx, path, payloadCID, cleanupPayload)
 	if err != nil {
 		log.Printf("[FileOps] Failed to build manifest: %s, error: %v", path, err)
+		cleanupPayload() // Cleanup on failure
 		return
 	}
 	log.Printf("[FileOps] Manifest created, ManifestCID: %s", manifestCIDStr)
@@ -186,6 +190,7 @@ func (fp *FileProcessor) processNewFile(path string) {
 	log.Printf("[FileOps] Checking BadBits and pinning: %s", path)
 	if !fp.checkBadBitsAndPin(ctx, manifestCID, manifestCIDStr, path, cleanupPayload) {
 		log.Printf("[FileOps] BadBits check failed or pinning failed: %s", path)
+		// checkBadBitsAndPin calls cleanupPayload internally on failure
 		return
 	}
 	log.Printf("[FileOps] File pinned successfully: %s", path)

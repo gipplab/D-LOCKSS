@@ -38,10 +38,13 @@ const (
 	DiscoveryServiceTag     = "dlockss-prod"
 	WebUIPort               = 8080
 	NodeCleanupTimeout      = 10 * time.Minute
-	ReplicationAnnounceTTL  = 10 * time.Minute
+	// ReplicationAnnounceTTL: how long we count a peer as having a file after their last PINNED/Ingest.
+	// After a split, nodes unpin non-responsible files ~5s later (ReshardDelay); they stop announcing
+	// those files, so we expire them after this TTL. Shorter TTL = dashboard reflects unpins sooner.
+	ReplicationAnnounceTTL  = 2 * time.Minute
 	MonitorMinReplication   = 5
 	MonitorMaxReplication   = 10
-	ReplicationCleanupEvery = 2 * time.Minute
+	ReplicationCleanupEvery = 1 * time.Minute
 	GeoIPCacheDuration      = 24 * time.Hour
 	MaxGeoQueueSize         = 1000
 	MonitorIdentityFile     = "monitor_identity.key"
@@ -52,7 +55,7 @@ const (
 // --- Data Models ---
 
 type StatusResponse struct {
-	PeerID        string            `json:"peer_id"`
+	PeerID        string            `json:"peer_id"` // Single peer ID per node (D-LOCKSS uses IPFS repo identity when IPFS_PATH set)
 	Version       string            `json:"version"`
 	CurrentShard  string            `json:"current_shard"`
 	PeersInShard  int               `json:"peers_in_shard"`
@@ -188,9 +191,7 @@ func (m *Monitor) handleIngestMessage(im *schema.IngestMessage, senderID peer.ID
 		nodeState.announcedFiles = make(map[string]time.Time)
 	}
 
-	if _, alreadyExists := nodeState.announcedFiles[manifestCIDStr]; !alreadyExists {
-		nodeState.PinnedFiles++
-	}
+	// PinnedFiles is updated only from heartbeat; do not infer from PINNED announcements to avoid chart jumps.
 	nodeState.announcedFiles[manifestCIDStr] = now
 
 	if m.nodeFiles[peerIDStr] == nil {
@@ -244,7 +245,8 @@ func (m *Monitor) handleHeartbeat(senderID peer.ID, shardID string, ip string, p
 		m.treeDirty = true
 	} else {
 		nodeState.LastSeen = now
-		if pinnedCount > nodeState.PinnedFiles {
+		// Trust heartbeat pinned count (single source of truth). -1 means "don't update" (e.g. non-HEARTBEAT message).
+		if pinnedCount >= 0 {
 			nodeState.PinnedFiles = pinnedCount
 		}
 		if nodeState.CurrentShard == "" {
@@ -816,8 +818,9 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 					}
 				}
 			}
-			if len(msg.Data) > 0 && len(msg.Data) < 200 && string(msg.Data[:min(10, len(msg.Data))]) == "HEARTBEAT:" {
-				parts := strings.Split(string(msg.Data), ":")
+			if len(msg.Data) > 0 && len(msg.Data) < 500 && string(msg.Data[:min(10, len(msg.Data))]) == "HEARTBEAT:" {
+				// Format: HEARTBEAT:<PeerID>:<PinnedCount> (optional 4th field ignored for backward compat)
+				parts := strings.SplitN(string(msg.Data), ":", 4)
 				pinnedCount := 0
 				if len(parts) >= 3 {
 					fmt.Sscanf(parts[2], "%d", &pinnedCount)
@@ -849,12 +852,12 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 			}
 			var rr schema.ReplicationRequest
 			if err := rr.UnmarshalCBOR(msg.Data); err == nil {
-				m.handleHeartbeat(senderID, shardID, ip, 0)
+				m.handleHeartbeat(senderID, shardID, ip, -1)
 				continue
 			}
 			var ur schema.UnreplicateRequest
 			if err := ur.UnmarshalCBOR(msg.Data); err == nil {
-				m.handleHeartbeat(senderID, shardID, ip, 0)
+				m.handleHeartbeat(senderID, shardID, ip, -1)
 				continue
 			}
 		}
@@ -941,7 +944,7 @@ func (m *Monitor) cleanupStaleCIDs(ctx context.Context) {
 						delete(files, fileCID)
 						if nodeState, exists := m.nodes[nodeID]; exists && nodeState.announcedFiles != nil {
 							delete(nodeState.announcedFiles, fileCID)
-							nodeState.PinnedFiles = len(nodeState.announcedFiles)
+							// Keep heartbeat as single source of truth for PinnedFiles; only update KnownFiles from our view of announcements.
 							nodeState.KnownFiles = len(nodeState.announcedFiles)
 						}
 					}
@@ -1003,6 +1006,15 @@ func main() {
 		monitor.PruneStaleNodes()
 		monitor.mu.RLock()
 		defer monitor.mu.RUnlock()
+		// Count nodes per shard for PeersInShard
+		shardCounts := make(map[string]int)
+		for _, node := range monitor.nodes {
+			shard := node.CurrentShard
+			if shard == "" && len(node.ShardHistory) > 0 {
+				shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
+			}
+			shardCounts[shard]++
+		}
 		query := strings.ToLower(r.URL.Query().Get("q"))
 		response := make(map[string]interface{})
 		for id, node := range monitor.nodes {
@@ -1014,14 +1026,28 @@ func main() {
 					continue
 				}
 			}
+			shard := node.CurrentShard
+			if shard == "" && len(node.ShardHistory) > 0 {
+				shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
+			}
+			peersInShard := shardCounts[shard]
+			if peersInShard < 1 {
+				peersInShard = 1
+			}
+			// Uptime = time since we first saw this node (not time since last heartbeat).
+			firstSeen := node.LastSeen
+			if len(node.ShardHistory) > 0 {
+				firstSeen = node.ShardHistory[0].FirstSeen
+			}
+			uptimeSeconds := time.Since(firstSeen).Seconds()
 			status := StatusResponse{
 				PeerID:        node.PeerID,
 				Version:       "1.0.0",
 				CurrentShard:  node.CurrentShard,
-				PeersInShard:  0,
+				PeersInShard:  peersInShard,
 				Storage:       StorageStatus{PinnedFiles: node.PinnedFiles, KnownFiles: node.KnownFiles, KnownCIDs: []string{}},
 				Replication:   ReplicationStatus{},
-				UptimeSeconds: time.Since(node.LastSeen).Seconds(),
+				UptimeSeconds: uptimeSeconds,
 			}
 			response[id] = map[string]interface{}{
 				"data":      status,

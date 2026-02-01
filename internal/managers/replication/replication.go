@@ -283,8 +283,12 @@ func (rm *ReplicationManager) verifyLocalDAG(ctx context.Context, job CheckJob) 
 				log.Printf("[Replication] Repair failed for %s: %v", common.TruncateCID(job.Key, 16), err)
 			}
 		} else {
-			log.Printf("[Replication] Local DAG incomplete for custodial file %s; unpinning", common.TruncateCID(job.Key, 16))
-			rm.UnpinFile(ctx, job.Key, job.ManifestCID)
+			// Re-verify we are not responsible before unpinning (job may be stale or used manifest fallback).
+			payloadCIDStr := common.GetPayloadCIDForShardAssignment(ctx, rm.ipfsClient, job.Key)
+			if payloadCIDStr != job.Key && !rm.shardMgr.AmIResponsibleFor(payloadCIDStr) {
+				log.Printf("[Replication] Local DAG incomplete for custodial file %s; unpinning", common.TruncateCID(job.Key, 16))
+				rm.UnpinFile(ctx, job.Key, job.ManifestCID)
+			}
 			return false
 		}
 	}
@@ -312,8 +316,17 @@ func (rm *ReplicationManager) getReplicationCount(ctx context.Context, job Check
 	if count == 0 {
 		// Fallback to shard peer count
 		if job.Responsible {
-			shardPeers := rm.shardMgr.GetShardPeers()
-			count = len(shardPeers)
+			// If we are responsible but don't have it (count=0), we should NOT assume everyone else has it.
+			// However, if we assume 0, we might trigger panic-fetching.
+			// But if we assume len(shardPeers), we NEVER fetch.
+			// Compromise: If we are responsible, we assume at least 1 (us) if we are pinned (handled above).
+			// If we are NOT pinned, we effectively have 0.
+			// We should return 0 so reconcile triggers fetch.
+			// OLD: shardPeers := rm.shardMgr.GetShardPeers(); count = len(shardPeers)
+			
+			// NEW: If we are responsible and unpinned, count is 0.
+			// We want to trigger replication.
+			count = 0
 		} else {
 			// Custodial fallback
 			payloadCIDStr := common.GetPayloadCIDForShardAssignment(ctx, rm.ipfsClient, job.Key)
@@ -456,7 +469,11 @@ func (rm *ReplicationManager) handleUnderReplication(ctx context.Context, job Ch
 
 func (rm *ReplicationManager) handleOverReplication(ctx context.Context, job CheckJob, count int) {
 	if !job.Responsible {
-		rm.UnpinFile(ctx, job.Key, job.ManifestCID)
+		// Re-verify we are not responsible before unpinning (job may be stale or used manifest fallback).
+		payloadCIDStr := common.GetPayloadCIDForShardAssignment(ctx, rm.ipfsClient, job.Key)
+		if payloadCIDStr != job.Key && !rm.shardMgr.AmIResponsibleFor(payloadCIDStr) {
+			rm.UnpinFile(ctx, job.Key, job.ManifestCID)
+		}
 		return
 	}
 
@@ -478,11 +495,19 @@ func (rm *ReplicationManager) handleOverReplication(ctx context.Context, job Che
 }
 
 func (rm *ReplicationManager) handleCustodialHandoff(ctx context.Context, job CheckJob, count int) {
+	// Re-verify we are not responsible before unpinning (job may be stale or used manifest fallback).
+	payloadCIDStr := common.GetPayloadCIDForShardAssignment(ctx, rm.ipfsClient, job.Key)
+	if payloadCIDStr == job.Key {
+		// Fallback to manifest CID (fetch failed) — don't unpin; we can't be sure we're custodian.
+		return
+	}
+	if rm.shardMgr.AmIResponsibleFor(payloadCIDStr) {
+		return
+	}
 	log.Printf("[Replication] Handoff Complete (%d/%d copies found). Unpinning custodial file %s", count, config.MinReplication, job.Key)
 	rm.UnpinFile(ctx, job.Key, job.ManifestCID)
-	
+
 	// Tourist Mode Exit
-	payloadCIDStr := common.GetPayloadCIDForShardAssignment(ctx, rm.ipfsClient, job.Key)
 	stableHex := common.KeyToStableHex(payloadCIDStr)
 	currentShard, _ := rm.shardMgr.GetShardInfo()
 	currentDepth := len(currentShard)
@@ -513,6 +538,7 @@ func (rm *ReplicationManager) verifyResearchObjectLocal(ctx context.Context, man
 		return false, fmt.Errorf("check payload pin: %w", err)
 	}
 	if !isPinned {
+		log.Printf("[Replication] Verify failed: Payload %s is NOT pinned", ro.Payload)
 		return false, nil
 	}
 
@@ -522,6 +548,7 @@ func (rm *ReplicationManager) verifyResearchObjectLocal(ctx context.Context, man
 			return false, fmt.Errorf("check payload size: %w", err)
 		}
 		if size != ro.TotalSize {
+			log.Printf("[Replication] Verify failed: Size mismatch for %s. Expected %d, got %d", ro.Payload, ro.TotalSize, size)
 			return false, fmt.Errorf("size mismatch: expected %d, got %d", ro.TotalSize, size)
 		}
 	}
@@ -534,6 +561,21 @@ func (rm *ReplicationManager) pinKeyV2(ctx context.Context, key string, manifest
 		if err := rm.ipfsClient.PinRecursive(ctx, manifestCID); err != nil {
 			rm.storageMgr.RecordFailedOperation(key)
 			return err
+		}
+		// Ensure payload is pinned so verifyResearchObjectLocal passes (mirrors ReplicateFileFromRequest).
+		manifestBytes, err := rm.ipfsClient.GetBlock(ctx, manifestCID)
+		if err == nil {
+			var ro schema.ResearchObject
+			if err := ro.UnmarshalCBOR(manifestBytes); err == nil {
+				isPinned, err := rm.ipfsClient.IsPinned(ctx, ro.Payload)
+				if err != nil || !isPinned {
+					if err := rm.ipfsClient.PinRecursive(ctx, ro.Payload); err != nil {
+						log.Printf("[Replication] Warning: pinKeyV2 payload %s explicit pin failed: %v", ro.Payload, err)
+					} else {
+						log.Printf("[Replication] pinKeyV2 explicitly pinned payload %s", ro.Payload)
+					}
+				}
+			}
 		}
 	}
 	rm.storageMgr.PinFile(key)
@@ -602,6 +644,22 @@ func (rm *ReplicationManager) ReplicateFileFromRequest(ctx context.Context, mani
 
 	if err := rm.ipfsClient.PinRecursive(replCtx, manifestCID); err != nil {
 		return false, fmt.Errorf("pin manifest: %w", err)
+	}
+
+	// Verify payload pin immediately after pinning manifest.
+	// PinRecursive should have pinned the payload too, but let's verify.
+	isPinned, err := rm.ipfsClient.IsPinned(replCtx, ro.Payload)
+	if err != nil || !isPinned {
+		// If payload is not pinned, try pinning it explicitly.
+		// This handles cases where manifest pin didn't propagate to payload correctly or quickly enough.
+		// Use a separate context to not fail the whole operation if this is just a check.
+		// Actually, we should enforce it.
+		if err := rm.ipfsClient.PinRecursive(replCtx, ro.Payload); err != nil {
+			log.Printf("[Replication] Warning: Payload %s not pinned after manifest pin, and explicit pin failed: %v", ro.Payload, err)
+			// Don't fail the whole replication, but log it.
+		} else {
+			log.Printf("[Replication] Explicitly pinned payload %s to ensure verification passes", ro.Payload)
+		}
 	}
 
 	if !rm.storageMgr.PinFile(manifestCIDStr) {
