@@ -3,12 +3,13 @@
 name: Build
 
 on:
+  # Run on push to any branch (so pushing your branch triggers the build)
   push:
-    branches: [main, master]
   pull_request:
     branches: [main, master]
   release:
     types: [published]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -18,10 +19,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Show ref and cmd/
+        run: |
+          echo "Branch / ref: ${{ github.ref }} (head: ${{ github.sha }})"
+          ls -la
+          ls -la cmd/ 2>/dev/null || echo "cmd/ missing or empty"
+          ls -la cmd/dlockss/ 2>/dev/null || echo "cmd/dlockss/ missing"
+          ls -la cmd/dlockss-monitor/ 2>/dev/null || echo "cmd/dlockss-monitor/ missing"
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+
+      - name: Verify cmd/ in repo
+        run: |
+          if [ ! -d "cmd/dlockss" ] || [ ! -d "cmd/dlockss-monitor" ]; then
+            echo "::error::cmd/dlockss or cmd/dlockss-monitor missing. Fix .gitignore (use /dlockss not dlockss) then: git add cmd/ && git commit -m 'Track cmd/' && git push"
+            ls -la cmd/ 2>/dev/null || true
+            exit 1
+          fi
 
       - name: Build
         run: |

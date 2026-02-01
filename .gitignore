@@ -1,4 +1,6 @@
-dlockss
+# Root-level binaries only (do not ignore cmd/dlockss or cmd/dlockss-monitor)
+/dlockss
+/dlockss-monitor
 
 context.txt
 
@@ -28,5 +30,4 @@ shard_test.go
 
 # Binaries
 main
-dlockss-monitor
 testnet/dlockss-monitor
