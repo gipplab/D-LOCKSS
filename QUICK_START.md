@@ -2,81 +2,48 @@
 
 Get a D-LOCKSS node running in 5 minutes!
 
-## Prerequisites Check
+## Prerequisites
+
+- **Go 1.21+:** [Install Go](https://go.dev/doc/install)
+- **IPFS (Kubo):** [Install IPFS](https://docs.ipfs.tech/install/command-line/)
 
 ```bash
-# Check Go (need 1.20+)
-go version
-
-# Check IPFS
+go version   # 1.21+
 ipfs version
 ```
 
-If missing, install:
-- Go: https://go.dev/doc/install
-- IPFS: https://docs.ipfs.tech/install/command-line/
+## Build and Run
 
-## Option 1: Automated Setup (Easiest)
-
+### 1. Start IPFS (separate terminal)
 ```bash
-# Run the setup script
-./setup.sh
-
-# Follow the prompts
-# Start the node
-~/.dlockss/run.sh
-```
-
-That's it! The script handles everything.
-
-## Option 2: Manual Setup (5 Steps)
-
-### 1. Initialize IPFS (if needed)
-```bash
-ipfs init
-```
-
-### 2. Start IPFS
-```bash
+ipfs init    # first time only
 ipfs daemon
 ```
-(Keep this running in a separate terminal)
 
-### 3. Build D-LOCKSS
+### 2. Build the node
 ```bash
-go build -o dlockss .
+git clone https://github.com/gipplab/D-LOCKSS
+cd D-LOCKSS
+go build -o dlockss ./cmd/dlockss
 ```
 
-### 4. Create data directory
+### 3. Data directory and run
 ```bash
 mkdir -p data
-```
-
-### 5. Run
-```bash
 ./dlockss
 ```
 
-## Option 3: Docker (No Dependencies)
-
-```bash
-# Start IPFS and D-LOCKSS together
-docker-compose up -d
-
-# View logs
-docker-compose logs -f dlockss
-
-# Add files
-cp my-file.pdf ./data/
-```
+Optional: build the monitor dashboard with `go build -o dlockss-monitor ./cmd/dlockss-monitor` (see [README](README.md)).
 
 ## Verify It's Working
 
 You should see:
 ```
 --- Node ID: 12D3KooW... ---
-[System] Joined Control Channel: dlockss-v2-creative-commons-control
-[Sharding] Active Data Shard: 0
+[Sharding] Joined shard  (Topic: dlockss-creative-commons-shard-)
+[Config] ...
+[API] Starting observability server on :5050
+[FileWatcher] Watching ./data (and subdirectories) for new files...
 ```
 
 ## Add Your First File
@@ -92,33 +59,9 @@ cp my-document.pdf ./data/
 
 ## Common Commands
 
-**Check status:**
-```bash
-# If using systemd
-sudo systemctl status dlockss
+**View logs:** Run `./dlockss` in foreground, or redirect output if running in background.
 
-# If using Docker
-docker-compose ps
-```
-
-**View logs:**
-```bash
-# Direct run
-./dlockss
-
-# Systemd
-sudo journalctl -u dlockss -f
-
-# Docker
-docker-compose logs -f dlockss
-```
-
-**Stop node:**
-```bash
-# Direct: Ctrl+C
-# Systemd: sudo systemctl stop dlockss
-# Docker: docker-compose down
-```
+**Stop node:** Ctrl+C if running in foreground.
 
 ## Configuration
 
@@ -131,7 +74,7 @@ export DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/5001"
 export DLOCKSS_NODE_COUNTRY="DE"
 ```
 
-See `NODE_SETUP.md` for full configuration options.
+See [README](README.md#configuration) for full configuration options.
 
 ## Troubleshooting
 
@@ -143,9 +86,7 @@ See `NODE_SETUP.md` for full configuration options.
 - Ensure ports 4001/tcp and 4001/udp are open
 - Check firewall settings
 
-**Need more help?**
-- See [NODE_SETUP.md](NODE_SETUP.md) for detailed guide
-- Check [README.md](README.md) for full documentation
+**Need more help?** See [README](README.md) and [docs/DLOCKSS_PROTOCOL.md](docs/DLOCKSS_PROTOCOL.md).
 
 ## Next Steps
 

@@ -2,17 +2,7 @@
 
 **Distributed Lots of Copies Keep Stuff Safe**
 
-> 🚀 **New to D-LOCKSS?** Install in one command:
->
-> **Linux/macOS:**
-> ```bash
-> curl -fsSL https://raw.githubusercontent.com/your-org/dlockss/main/install.sh | sh
-> ```
->
-> **Windows (PowerShell):**
-> ```powershell
-> irm https://raw.githubusercontent.com/your-org/dlockss/main/install.ps1 | iex
-> ```
+> **Build from source:** `go build -o dlockss ./cmd/dlockss` then run `./dlockss` (see [Building from Source](#building-from-source)).
 
 ## 1. Summary & Vision
 
@@ -36,25 +26,15 @@
     *   [Install IPFS CLI](https://docs.ipfs.tech/install/command-line/)
     *   Run: `ipfs daemon`
 
-### Installation
-The one-line installer above will:
-1.  Detect your OS/Arch.
-2.  Download the latest optimized binary.
-3.  Install to `~/.local/bin` (Linux/macOS) or `%LOCALAPPDATA%\dlockss\bin` (Windows).
-4.  Set up the data directory.
-
 ### Usage
-1.  **Start the Node:**
+1.  **Start the Node:** Run the binary (see [Building from Source](#building-from-source) to build it):
     ```bash
-    dlockss
+    ./dlockss
     ```
     *(Windows: `dlockss.exe`)*
 
 2.  **Add Files:**
-    Copy any file (e.g., PDF) into the `data` directory created by the installer.
-    *   Linux/macOS: `~/dlockss-data`
-    *   Windows: `%USERPROFILE%\dlockss-data`
-
+    Copy any file (e.g., PDF) into the data directory (default `./data` or `DLOCKSS_DATA_DIR`).
     The node will automatically detect, ingest, pin, and replicate the file.
 
 ### Configuration
@@ -75,7 +55,7 @@ export DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/5001"
 export DLOCKSS_VERBOSE_LOGGING=true # Enable detailed metrics and status logs
 ```
 
-See [docs/project/REQUIREMENTS.md](docs/project/REQUIREMENTS.md) for detailed specs.
+See [docs/DLOCKSS_PROTOCOL.md](docs/DLOCKSS_PROTOCOL.md) for protocol details.
 
 ---
 
@@ -95,26 +75,30 @@ D-LOCKSS acts as a self-healing, sharded storage cluster using the IPFS/Libp2p s
 *   **Redundancy -> Replication:** Enforces `MinReplication` (5) and `MaxReplication` (10).
 *   **Write Cache -> Custodial Mode:** Nodes temporarily hold files they don't own until they can hand them off to the responsible shard.
 
-For deep dives, see:
-*   [Protocol Specification](docs/architecture/DLOCKSS_PROTOCOL.md)
-*   [Async Replication Pipeline](docs/architecture/ASYNC_REPLICATION_PIPELINE_DESIGN.md)
-*   [Logging Strategy](docs/architecture/LOGGING.md)
+Documentation:
+*   [Protocol specification](docs/DLOCKSS_PROTOCOL.md)
+*   [Replication performance](docs/REPLICATION_PERFORMANCE.md)
+*   Architecture diagrams (PlantUML) in `docs/`
 
 ---
 
 ## 4. Development
 
 ### Building from Source
-Requires Go 1.20+.
+Requires Go 1.21+.
 
 ```bash
-git clone https://github.com/your-org/dlockss
-cd dlockss
-go build -ldflags="-s -w" -o dlockss .
+git clone https://github.com/gipplab/D-LOCKSS
+cd D-LOCKSS
+go build -ldflags="-s -w" -o dlockss ./cmd/dlockss
 ./dlockss
 ```
 
-See [docs/development/BUILDING_RELEASES.md](docs/development/BUILDING_RELEASES.md) for release builds.
+Optional monitor (dashboard):
+```bash
+go build -o dlockss-monitor ./cmd/dlockss-monitor
+./dlockss-monitor
+```
 
 ### Testing
 ```bash
@@ -135,4 +119,4 @@ go test ./... -v
 ---
 
 ## 6. License
-MIT / Apache 2.0 (Dual Licensed)
+Dual licensed under the [MIT License](LICENSE) or [Apache License 2.0](LICENSE-Apache-2.0), at your option.

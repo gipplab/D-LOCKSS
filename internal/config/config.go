@@ -174,6 +174,7 @@ var (
 	ReplicationVerificationDelay   = getEnvDuration("DLOCKSS_REPLICATION_VERIFICATION_DELAY", 2*time.Minute) // Grace period before verifying newly pinned files
 	DiskUsageHighWaterMark         = getEnvFloat("DLOCKSS_DISK_USAGE_HIGH_WATER_MARK", 90.0)
 	IPFSNodeAddress                = getEnvString("DLOCKSS_IPFS_NODE", "/ip4/127.0.0.1/tcp/5001")
+	APIPort                        = getEnvInt("DLOCKSS_API_PORT", 5050) // observability /metrics and /status
 	TrustMode                      = getEnvString("DLOCKSS_TRUST_MODE", "open") // open | allowlist
 	TrustStorePath                 = getEnvString("DLOCKSS_TRUST_STORE", "trusted_peers.json")
 	SignatureMode                  = getEnvString("DLOCKSS_SIGNATURE_MODE", "warn") // off | warn | strict
@@ -224,5 +225,5 @@ var (
 	TelemetryInterval    = getEnvDuration("DLOCKSS_TELEMETRY_INTERVAL", 30*time.Second) // How often to send telemetry
 	TelemetryIncludeCIDs = getEnvBool("DLOCKSS_TELEMETRY_INCLUDE_CIDS", false)          // Include full CID list in telemetry (disabled by default - monitor tracks via pubsub)
 	HeartbeatInterval    = getEnvDuration("DLOCKSS_HEARTBEAT_INTERVAL", 0)              // Heartbeat interval (0 = auto-calculate from ShardPeerCheckInterval/3, min 10s)
-	VerboseLogging       = getEnvBool("DLOCKSS_VERBOSE_LOGGING", false)                 // Enable extra debug logs (shard discovery, split, metrics, etc.)
+	VerboseLogging       = getEnvBool("DLOCKSS_VERBOSE_LOGGING", false)                 // extra debug (shard discovery, split, metrics)
 )

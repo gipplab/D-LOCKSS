@@ -969,21 +969,17 @@ func (sm *ShardManager) probeShard(shardID string, probeTimeout time.Duration) i
 	return meshCount
 }
 
-// checkAndMergeUpIfAlone migrates up to the parent shard when this node is alone (or nearly) in a deep shard,
-// the parent has room, and the sibling branch is empty. E.g. one node in "011" with parent "01" (7 nodes)
-// and no nodes in "010" should move up to "01".
+// checkAndMergeUpIfAlone moves to the parent shard when alone in a leaf, parent has room, sibling empty.
 func (sm *ShardManager) checkAndMergeUpIfAlone() {
 	sm.mu.RLock()
 	currentShard := sm.currentShard
 	sm.mu.RUnlock()
 
-	// Need at least 2 chars to have a parent (e.g. "01" -> "0", "011" -> "01")
 	if len(currentShard) < 2 {
 		return
 	}
 
 	currentPeerCount := sm.getShardPeerCount()
-	// Merge up only when alone in this shard (no point staying in a leaf with just self)
 	if currentPeerCount > 1 {
 		return
 	}
@@ -992,14 +988,12 @@ func (sm *ShardManager) checkAndMergeUpIfAlone() {
 	probeTimeout := 3 * time.Second
 	parentPeerCount := sm.probeShard(parentShard, probeTimeout)
 	if parentPeerCount >= config.MaxPeersPerShard {
-		return // Parent would be overcrowded
+		return
 	}
 
-	// Sibling: same parent, other bit (011 -> 010, 010 -> 011)
 	lastBit := currentShard[len(currentShard)-1]
 	siblingShard := parentShard + string([]byte{'0' + (1 - (lastBit - '0'))})
 	siblingPeerCount := sm.probeShard(siblingShard, probeTimeout)
-	// Only merge up when sibling branch is empty (no siblings)
 	if siblingPeerCount > 0 {
 		if config.VerboseLogging {
 			log.Printf("[ShardMergeUp] Shard %s has %d peers but sibling %s has %d peers, not merging up",
@@ -1008,8 +1002,8 @@ func (sm *ShardManager) checkAndMergeUpIfAlone() {
 		return
 	}
 
-	log.Printf("[ShardMergeUp] Alone in %s (%d peers), parent %s has %d peers, sibling %s empty — migrating up",
-		currentShard, currentPeerCount, parentShard, parentPeerCount, siblingShard)
+	log.Printf("[ShardMergeUp] Alone in %s (%d peers), parent %s has %d, sibling %s empty -> moving to %s",
+		currentShard, currentPeerCount, parentShard, parentPeerCount, siblingShard, parentShard)
 
 	sm.mu.Lock()
 	oldShard := sm.currentShard
@@ -1028,84 +1022,66 @@ func (sm *ShardManager) checkAndMergeUpIfAlone() {
 	}()
 }
 
-// discoverAndMoveToDeeperShard checks for deeper shards in the branch and moves to the deepest appropriate one.
+// discoverAndMoveToDeeperShard probes deeper shards in our branch and moves to the deepest one with peers.
 func (sm *ShardManager) discoverAndMoveToDeeperShard() {
 	sm.mu.RLock()
 	currentShard := sm.currentShard
-	peerIDHash := common.GetBinaryPrefix(sm.h.ID().String(), 256) // Full hash for comparison
+	peerIDHash := common.GetBinaryPrefix(sm.h.ID().String(), 256)
 	sm.mu.RUnlock()
-	
-	// Generate deeper shards up to 3 levels deeper (reasonable limit)
+
 	deeperShards := sm.generateDeeperShards(currentShard, 3)
-	
-	// Filter to only shards that match our peer ID prefix
 	matchingShards := make([]string, 0)
 	for _, shard := range deeperShards {
-		// Check if this shard matches our peer ID prefix
 		if len(shard) <= len(peerIDHash) && peerIDHash[:len(shard)] == shard {
 			matchingShards = append(matchingShards, shard)
 		}
 	}
-	
+
 	if len(matchingShards) == 0 {
 		return
 	}
-	
-	// Sort by depth (longest first) to check deepest shards first
+
 	sort.Slice(matchingShards, func(i, j int) bool {
 		return len(matchingShards[i]) > len(matchingShards[j])
 	})
-	
-	// Accept any deeper shard in our branch that has at least one peer, so we migrate into
-	// existing deeper shards (e.g. "00" -> "000" or "001", or ROOT -> "0"/"1").
-	minPeersToJoin := 1
-	
+
 	probeTimeout := 3 * time.Second
 	deepestActiveShard := ""
-	
 	for _, shard := range matchingShards {
 		peerCount := sm.probeShard(shard, probeTimeout)
-		
-		if peerCount >= minPeersToJoin {
+		if peerCount >= 1 {
 			deepestActiveShard = shard
-			log.Printf("[ShardDiscovery] Found active deeper shard %s with %d peers (current: %s)", 
+			log.Printf("[ShardDiscovery] Found active deeper shard %s with %d peers (current: %s)",
 				shard, peerCount, currentShard)
 			break
 		}
 	}
-	
-	// If we found a deeper active shard, move to it
-	if deepestActiveShard != "" && deepestActiveShard != currentShard {
-		log.Printf("[ShardDiscovery] Moving from shard %s to deeper shard %s", 
-			currentShard, deepestActiveShard)
-		
-		sm.mu.Lock()
-		oldShard := sm.currentShard
-		sm.currentShard = deepestActiveShard
-		sm.msgCounter = 0
-		sm.mu.Unlock()
-		
-		// Join new shard
-		sm.JoinShard(deepestActiveShard)
-		
-		// Keep old shard for overlap duration, then leave
-		go func() {
-			time.Sleep(config.ShardOverlapDuration)
-			sm.LeaveShard(oldShard)
-		}()
-		
-		// Run reshard pass after delay
-		go func() {
-			time.Sleep(config.ReshardDelay)
-			sm.RunReshardPass(oldShard, deepestActiveShard)
-		}()
+
+	if deepestActiveShard == "" || deepestActiveShard == currentShard {
+		return
 	}
+
+	log.Printf("[ShardDiscovery] Moving from shard %s to deeper shard %s",
+		currentShard, deepestActiveShard)
+
+	sm.mu.Lock()
+	oldShard := sm.currentShard
+	sm.currentShard = deepestActiveShard
+	sm.msgCounter = 0
+	sm.mu.Unlock()
+
+	sm.JoinShard(deepestActiveShard)
+	go func() {
+		time.Sleep(config.ShardOverlapDuration)
+		sm.LeaveShard(oldShard)
+	}()
+	go func() {
+		time.Sleep(config.ReshardDelay)
+		sm.RunReshardPass(oldShard, deepestActiveShard)
+	}()
 }
 
-// runShardDiscovery periodically checks for deeper shards. Discovery runs when:
-// - The node is idle (no messages in the last minute), or
-// - The current shard has few peers (<= MaxPeersPerShard): late joiner in ROOT, or nodes in a parent shard
-//   (e.g. "00") that should discover and migrate into existing deeper shards (e.g. "000", "001").
+// runShardDiscovery runs when idle or when current shard has few peers; then merge-up if alone, else discover deeper.
 func (sm *ShardManager) runShardDiscovery() {
 	ticker := time.NewTicker(config.ShardDiscoveryInterval)
 	defer ticker.Stop()
@@ -1126,25 +1102,16 @@ func (sm *ShardManager) runShardDiscovery() {
 			currentShard := sm.currentShard
 			sm.mu.Unlock()
 			
-			// Few peers in current shard: explore deeper (late joiner in ROOT, or e.g. 8 nodes in "00" should migrate to "000"/"001").
 			peerCount := sm.getShardPeerCount()
 			fewPeersInShard := peerCount <= config.MaxPeersPerShard
-			shouldDiscover := isIdle || fewPeersInShard
-			
-			if !shouldDiscover {
+			if !isIdle && !fewPeersInShard {
 				continue
 			}
-			
+
 			if config.VerboseLogging {
-				if fewPeersInShard && !isIdle {
-					log.Printf("[ShardDiscovery] Shard %s with %d peers, checking for deeper shards...", currentShard, peerCount)
-				} else if isIdle {
-					log.Printf("[ShardDiscovery] Node idle in shard %s, checking for deeper shards...", currentShard)
-				}
+				log.Printf("[ShardDiscovery] Shard %s (%d peers), checking merge-up / deeper...", currentShard, peerCount)
 			}
-			// First: merge up if alone in a deep shard with no siblings (e.g. 011 -> 01)
 			sm.checkAndMergeUpIfAlone()
-			// Then: discover and migrate into deeper shards if any exist (e.g. 00 -> 000/001)
 			sm.discoverAndMoveToDeeperShard()
 		}
 	}
