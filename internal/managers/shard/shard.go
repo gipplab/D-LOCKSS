@@ -448,13 +448,23 @@ func (sm *ShardManager) handleReplicationRequest(msg *pubsub.Message, rr *schema
 			// Oversample slightly so we still hit MinReplication when mod values cluster
 			selectionThreshold = min(config.MinReplication+2, peersInShard)
 		}
+		// XOR distance modulo: select nodes with smaller mod as "closer" to content.
+		// Use an inclusive threshold so we reliably reach MinReplication even when
+		// mod values cluster (e.g. many nodes with mod 5–7 would otherwise give only 3–4 replicas).
+		selectionThreshold := config.MinReplication
+		if peersInShard > config.MinReplication {
+			// Oversample slightly so we still hit MinReplication when mod values cluster
+			selectionThreshold = min(config.MinReplication+2, peersInShard)
+		}
 		distanceMod := new(big.Int).Mod(xorDistance, big.NewInt(int64(peersInShard)))
 		modValue := int(distanceMod.Int64())
 
 		selected := modValue < selectionThreshold
+		selected := modValue < selectionThreshold
 
 		if !selected {
 			log.Printf("[Replication] Not selected to replicate %s (XOR distance mod %d/%d, need < %d, distance: %s)",
+				key[:min(16, len(key))]+"...", modValue, peersInShard, selectionThreshold, truncateBigInt(xorDistance, 16))
 				key[:min(16, len(key))]+"...", modValue, peersInShard, selectionThreshold, truncateBigInt(xorDistance, 16))
 			sm.storageMgr.AddKnownFile(key)
 			return
@@ -775,7 +785,9 @@ func (sm *ShardManager) RunReshardPass(oldShard, newShard string) {
 				if sm.replicationMgr != nil {
 					sm.replicationMgr.UnpinFile(sm.ctx, key, manifestCID)
 				} else {
-					_ = sm.ipfsClient.UnpinRecursive(sm.ctx, manifestCID)
+					if sm.ipfsClient != nil {
+						_ = sm.ipfsClient.UnpinRecursive(sm.ctx, manifestCID)
+					}
 					sm.storageMgr.UnpinFile(key)
 				}
 			}
@@ -1031,9 +1043,6 @@ func (sm *ShardManager) checkAndMergeUpIfAlone() {
 	}()
 }
 
-<<<<<<< HEAD
-// discoverAndMoveToDeeperShard probes deeper shards in our branch and moves to the deepest one with peers.
-=======
 // minPeersToJoinDeeperShard is the minimum peer count required to move into a deeper shard.
 // Must be at least 2 so we don't move into a shard where we'd be alone (probe counts self as 1).
 const minPeersToJoinDeeperShard = 2
@@ -1041,19 +1050,15 @@ const minPeersToJoinDeeperShard = 2
 // discoverAndMoveToDeeperShard probes deeper shards in our branch and moves only when:
 // - current shard is over the limit (MaxPeersPerShard), or
 // - a deeper shard has strictly more peers than current (so we don't leave healthy 7–8 node shards).
->>>>>>> 1323eb8 (fixed sticky pinning after shard split)
 func (sm *ShardManager) discoverAndMoveToDeeperShard() {
 	sm.mu.RLock()
 	currentShard := sm.currentShard
 	peerIDHash := common.GetBinaryPrefix(sm.h.ID().String(), 256)
 	sm.mu.RUnlock()
 
-<<<<<<< HEAD
-=======
 	currentPeerCount := sm.getShardPeerCount()
 	currentOverLimit := currentPeerCount > config.MaxPeersPerShard
 
->>>>>>> 1323eb8 (fixed sticky pinning after shard split)
 	deeperShards := sm.generateDeeperShards(currentShard, 3)
 	matchingShards := make([]string, 0)
 	for _, shard := range deeperShards {
@@ -1074,12 +1079,6 @@ func (sm *ShardManager) discoverAndMoveToDeeperShard() {
 	deepestActiveShard := ""
 	for _, shard := range matchingShards {
 		peerCount := sm.probeShard(shard, probeTimeout)
-<<<<<<< HEAD
-		if peerCount >= 1 {
-			deepestActiveShard = shard
-			log.Printf("[ShardDiscovery] Found active deeper shard %s with %d peers (current: %s)",
-				shard, peerCount, currentShard)
-=======
 		if peerCount < minPeersToJoinDeeperShard {
 			continue
 		}
@@ -1092,7 +1091,6 @@ func (sm *ShardManager) discoverAndMoveToDeeperShard() {
 			}
 			log.Printf("[ShardDiscovery] Found active deeper shard %s with %d peers (current: %s has %d, %s)",
 				shard, peerCount, currentShard, currentPeerCount, reason)
->>>>>>> 1323eb8 (fixed sticky pinning after shard split)
 			break
 		}
 	}

@@ -1,28 +1,38 @@
-<<<<<<< HEAD
-// Command dlockss-monitor runs a minimal observability server (metrics/status endpoints).
-// It does not run a full D-LOCKSS node; use it to scrape metrics from nodes or as a placeholder
-// for a future dashboard that aggregates multiple nodes.
-=======
 // Command dlockss-monitor runs the D-LOCKSS network monitor: listens on all shard
 // topics via libp2p/pubsub, discovers nodes via heartbeats and ingest messages,
 // and serves a web UI with node list, shard tree, and replication charts.
->>>>>>> 1323eb8 (fixed sticky pinning after shard split)
 package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
 	"syscall"
+	"time"
 
-	"dlockss/internal/api"
-	"dlockss/internal/config"
-	"dlockss/internal/telemetry"
+	"github.com/ipfs/go-cid"
+	"github.com/libp2p/go-libp2p"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	ma "github.com/multiformats/go-multiaddr"
+
+	"dlockss/pkg/schema"
 )
 
-<<<<<<< HEAD
-=======
 // --- Configuration Constants ---
 const (
 	DiscoveryServiceTag     = "dlockss-prod"
@@ -66,14 +76,14 @@ type ReplicationStatus struct {
 }
 
 type NodeState struct {
-	PeerID       string              `json:"peer_id"`
-	CurrentShard string              `json:"current_shard"`
-	PinnedFiles  int                 `json:"pinned_files"`
-	KnownFiles   int                 `json:"known_files"`
-	LastSeen     time.Time           `json:"last_seen"`
-	ShardHistory []ShardHistoryEntry `json:"shard_history"`
-	IPAddress    string              `json:"ip_address"`
-	Region       string              `json:"region"`
+	PeerID         string              `json:"peer_id"`
+	CurrentShard   string              `json:"current_shard"`
+	PinnedFiles    int                 `json:"pinned_files"`
+	KnownFiles     int                 `json:"known_files"`
+	LastSeen       time.Time           `json:"last_seen"`
+	ShardHistory   []ShardHistoryEntry `json:"shard_history"`
+	IPAddress      string              `json:"ip_address"`
+	Region         string              `json:"region"`
 	announcedFiles map[string]time.Time
 }
 
@@ -105,22 +115,22 @@ type GeoLocation struct {
 // --- Core State Engine ---
 
 type Monitor struct {
-	mu           sync.RWMutex
-	nodes        map[string]*NodeState
-	splitEvents  []ShardSplitEvent
-	geoCache     map[string]*GeoLocation
-	geoCacheTime map[string]time.Time
-	geoFailures      int
-	geoCooldownUntil time.Time
-	treeCache     *ShardTreeNode
-	treeCacheTime time.Time
-	treeDirty     bool
-	geoQueue chan geoRequest
-	uniqueCIDs  map[string]time.Time
-	shardTopics map[string]*pubsub.Topic
-	ps          *pubsub.PubSub
-	host        host.Host
-	nodeFiles map[string]map[string]time.Time
+	mu                  sync.RWMutex
+	nodes               map[string]*NodeState
+	splitEvents         []ShardSplitEvent
+	geoCache            map[string]*GeoLocation
+	geoCacheTime        map[string]time.Time
+	geoFailures         int
+	geoCooldownUntil    time.Time
+	treeCache           *ShardTreeNode
+	treeCacheTime       time.Time
+	treeDirty           bool
+	geoQueue            chan geoRequest
+	uniqueCIDs          map[string]time.Time
+	shardTopics         map[string]*pubsub.Topic
+	ps                  *pubsub.PubSub
+	host                host.Host
+	nodeFiles           map[string]map[string]time.Time
 	manifestReplication map[string]map[string]time.Time
 }
 
@@ -976,26 +986,10 @@ func startLibP2P(ctx context.Context, monitor *Monitor) (host.Host, error) {
 	return h, nil
 }
 
->>>>>>> 1323eb8 (fixed sticky pinning after shard split)
 func main() {
-	_, cancel := context.WithCancel(context.Background())
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-<<<<<<< HEAD
-	metrics := telemetry.NewMetricsManager()
-	apiServer := api.NewAPIServer(config.APIPort, metrics)
-	apiServer.Start()
-
-	log.Printf("[Monitor] Observability server on :%d (/metrics, /status, /health)", config.APIPort)
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
-	log.Printf("[Monitor] Shutting down...")
-	cancel()
-	_ = apiServer.Shutdown(context.Background())
-	os.Exit(0)
-=======
 	monitor := NewMonitor()
 	h, err := startLibP2P(ctx, monitor)
 	if err != nil {
@@ -1021,12 +1015,12 @@ func main() {
 				}
 			}
 			status := StatusResponse{
-				PeerID:       node.PeerID,
-				Version:      "1.0.0",
-				CurrentShard: node.CurrentShard,
-				PeersInShard: 0,
-				Storage:      StorageStatus{PinnedFiles: node.PinnedFiles, KnownFiles: node.KnownFiles, KnownCIDs: []string{}},
-				Replication:  ReplicationStatus{},
+				PeerID:        node.PeerID,
+				Version:       "1.0.0",
+				CurrentShard:  node.CurrentShard,
+				PeersInShard:  0,
+				Storage:       StorageStatus{PinnedFiles: node.PinnedFiles, KnownFiles: node.KnownFiles, KnownCIDs: []string{}},
+				Replication:   ReplicationStatus{},
 				UptimeSeconds: time.Since(node.LastSeen).Seconds(),
 			}
 			response[id] = map[string]interface{}{
@@ -1063,11 +1057,11 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"replication_distribution":   dist,
-			"avg_replication_level":      avg,
-			"files_at_target":            atTarget,
-			"files_at_target_per_shard":  byShard,
-			"replication_note":           "Counts are network-wide (all shards). Nodes unpin files that no longer belong to their shard after a split.",
+			"replication_distribution":  dist,
+			"avg_replication_level":     avg,
+			"files_at_target":           atTarget,
+			"files_at_target_per_shard": byShard,
+			"replication_note":          "Counts are network-wide (all shards). Nodes unpin files that no longer belong to their shard after a split.",
 		})
 	})
 
@@ -1126,5 +1120,4 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("HTTP Shutdown Error: %v", err)
 	}
->>>>>>> 1323eb8 (fixed sticky pinning after shard split)
 }
