@@ -440,18 +440,22 @@ func (sm *ShardManager) handleReplicationRequest(msg *pubsub.Message, rr *schema
 			peersInShard = config.MinReplication // Fallback
 		}
 
-		// Simple approach: Use XOR distance modulo to select nodes
-		// Nodes with smaller distance mod values are "closer" and should replicate
-		// We select nodes where (distance % peersInShard) < MinReplication
-		// This ensures roughly MinReplication nodes participate per file
+		// XOR distance modulo: select nodes with smaller mod as "closer" to content.
+		// Use an inclusive threshold so we reliably reach MinReplication even when
+		// mod values cluster (e.g. many nodes with mod 5–7 would otherwise give only 3–4 replicas).
+		selectionThreshold := config.MinReplication
+		if peersInShard > config.MinReplication {
+			// Oversample slightly so we still hit MinReplication when mod values cluster
+			selectionThreshold = min(config.MinReplication+2, peersInShard)
+		}
 		distanceMod := new(big.Int).Mod(xorDistance, big.NewInt(int64(peersInShard)))
 		modValue := int(distanceMod.Int64())
 
-		selected := modValue < config.MinReplication
+		selected := modValue < selectionThreshold
 
 		if !selected {
 			log.Printf("[Replication] Not selected to replicate %s (XOR distance mod %d/%d, need < %d, distance: %s)",
-				key[:min(16, len(key))]+"...", modValue, peersInShard, config.MinReplication, truncateBigInt(xorDistance, 16))
+				key[:min(16, len(key))]+"...", modValue, peersInShard, selectionThreshold, truncateBigInt(xorDistance, 16))
 			sm.storageMgr.AddKnownFile(key)
 			return
 		}
@@ -751,7 +755,7 @@ func (sm *ShardManager) RunReshardPass(oldShard, newShard string) {
 		// But in the new "Tourist" model, we rely on the network to pick it up.
 		// If we are responsible now, we should announce Ingest to our new shard so others know.
 
-		if isResponsible {
+		if isResponsible && sm.storageMgr.IsPinned(key) {
 			im := schema.IngestMessage{
 				Type:        schema.MessageTypeIngest,
 				ManifestCID: manifestCID,
@@ -764,12 +768,17 @@ func (sm *ShardManager) RunReshardPass(oldShard, newShard string) {
 				}
 			}
 		} else if wasResponsible {
-			// We lost responsibility. We effectively become custodial.
-			// We should "Join" the target shard as a tourist to ensure handoff?
-			// Or just let the new responsible nodes find it via DHT?
-			// Providing to DHT is enough if nodes query.
-			// But for proactive handoff, we could Join(targetNew) -> Announce -> Wait -> Leave.
-			// For simplicity in this pass, we skip proactive handoff logic for now.
+			// We lost responsibility: file belongs to the other branch after the split.
+			// Unpin so the responsible shard holds the replicas instead of early nodes.
+			if sm.storageMgr.IsPinned(key) {
+				log.Printf("[Reshard] Unpinning file that no longer belongs to shard %s: %s", newShard, common.TruncateCID(key, 16))
+				if sm.replicationMgr != nil {
+					sm.replicationMgr.UnpinFile(sm.ctx, key, manifestCID)
+				} else {
+					_ = sm.ipfsClient.UnpinRecursive(sm.ctx, manifestCID)
+					sm.storageMgr.UnpinFile(key)
+				}
+			}
 		}
 
 		sm.reshardedFiles.Add(key)
@@ -1022,13 +1031,29 @@ func (sm *ShardManager) checkAndMergeUpIfAlone() {
 	}()
 }
 
+<<<<<<< HEAD
 // discoverAndMoveToDeeperShard probes deeper shards in our branch and moves to the deepest one with peers.
+=======
+// minPeersToJoinDeeperShard is the minimum peer count required to move into a deeper shard.
+// Must be at least 2 so we don't move into a shard where we'd be alone (probe counts self as 1).
+const minPeersToJoinDeeperShard = 2
+
+// discoverAndMoveToDeeperShard probes deeper shards in our branch and moves only when:
+// - current shard is over the limit (MaxPeersPerShard), or
+// - a deeper shard has strictly more peers than current (so we don't leave healthy 7–8 node shards).
+>>>>>>> 1323eb8 (fixed sticky pinning after shard split)
 func (sm *ShardManager) discoverAndMoveToDeeperShard() {
 	sm.mu.RLock()
 	currentShard := sm.currentShard
 	peerIDHash := common.GetBinaryPrefix(sm.h.ID().String(), 256)
 	sm.mu.RUnlock()
 
+<<<<<<< HEAD
+=======
+	currentPeerCount := sm.getShardPeerCount()
+	currentOverLimit := currentPeerCount > config.MaxPeersPerShard
+
+>>>>>>> 1323eb8 (fixed sticky pinning after shard split)
 	deeperShards := sm.generateDeeperShards(currentShard, 3)
 	matchingShards := make([]string, 0)
 	for _, shard := range deeperShards {
@@ -1049,10 +1074,25 @@ func (sm *ShardManager) discoverAndMoveToDeeperShard() {
 	deepestActiveShard := ""
 	for _, shard := range matchingShards {
 		peerCount := sm.probeShard(shard, probeTimeout)
+<<<<<<< HEAD
 		if peerCount >= 1 {
 			deepestActiveShard = shard
 			log.Printf("[ShardDiscovery] Found active deeper shard %s with %d peers (current: %s)",
 				shard, peerCount, currentShard)
+=======
+		if peerCount < minPeersToJoinDeeperShard {
+			continue
+		}
+		// Only move if current shard is over limit, or deeper shard has more peers than current
+		if currentOverLimit || peerCount > currentPeerCount {
+			deepestActiveShard = shard
+			reason := "deeper has more peers"
+			if currentOverLimit {
+				reason = "current over limit"
+			}
+			log.Printf("[ShardDiscovery] Found active deeper shard %s with %d peers (current: %s has %d, %s)",
+				shard, peerCount, currentShard, currentPeerCount, reason)
+>>>>>>> 1323eb8 (fixed sticky pinning after shard split)
 			break
 		}
 	}

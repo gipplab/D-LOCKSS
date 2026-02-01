@@ -25,15 +25,17 @@ type provideRequest struct {
 
 // IPFSDHTAdapter implements DHTProvider using IPFS's DHT via HTTP API
 type IPFSDHTAdapter struct {
-	api            *ipfsapi.Shell
-	retryAttempts  int
-	retryDelay     time.Duration
-	provideTimeout time.Duration // Timeout for provide operations
-	provideQueue   chan *provideRequest
-	workerCtx      context.Context
-	workerCancel   context.CancelFunc
-	workerStarted  bool
-	workerMu       sync.Mutex
+	api             *ipfsapi.Shell
+	retryAttempts   int
+	retryDelay      time.Duration
+	provideTimeout  time.Duration // Timeout for provide operations
+	provideInterval time.Duration // Min delay between provide ops (0 = no delay) to avoid overwhelming the DHT
+	provideQueue    chan *provideRequest
+	workerCtx       context.Context
+	workerCancel    context.CancelFunc
+	workerStarted   bool
+	workerMu        sync.Mutex
+	intervalMu      sync.RWMutex
 }
 
 // NewIPFSDHTAdapter creates a new DHT adapter that uses IPFS's DHT
@@ -71,6 +73,14 @@ func NewIPFSDHTAdapterWithTimeout(api *ipfsapi.Shell, retryAttempts int, retryDe
 	}
 	adapter.startWorker()
 	return adapter
+}
+
+// SetProvideInterval sets the minimum delay between processing provide operations.
+// Use > 0 (e.g. 3s) to avoid overwhelming the DHT when many files are announced.
+func (a *IPFSDHTAdapter) SetProvideInterval(d time.Duration) {
+	a.intervalMu.Lock()
+	defer a.intervalMu.Unlock()
+	a.provideInterval = d
 }
 
 // startWorker starts the worker goroutine that processes provide operations one at a time
@@ -122,6 +132,18 @@ func (a *IPFSDHTAdapter) worker() {
 			case req.resultCh <- err:
 			case <-req.ctx.Done():
 				// Caller cancelled, result channel might be closed
+			}
+			
+			// Rate limit: wait before next provide so the DHT/host is not overwhelmed
+			a.intervalMu.RLock()
+			interval := a.provideInterval
+			a.intervalMu.RUnlock()
+			if interval > 0 {
+				select {
+				case <-a.workerCtx.Done():
+					return
+				case <-time.After(interval):
+				}
 			}
 		}
 	}
