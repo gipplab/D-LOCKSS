@@ -3,8 +3,9 @@
 actor User
 participant "File System" as FS
 participant "File Watcher" as Watcher
-participant "File Ops" as FileOps
-participant "Storage" as Storage
+participant "FileProcessor" as FileOps
+participant "StorageManager" as Storage
+participant "IPFS" as IPFS
 participant "ShardManager" as ShardMgr
 participant "DHT" as DHT
 participant "PubSub" as PubSub
@@ -14,25 +15,35 @@ User -> FS: Drop file into ./data
 FS -> Watcher: File created event
 Watcher -> FileOps: processNewFile(path)
 
-FileOps -> FileOps: calculateFileHash(path)
-FileOps -> Storage: pinFile(hash)
-Storage -> Storage: Add to pinnedFiles 
+FileOps -> IPFS: Import file (UnixFS)\nPayloadCID
+FileOps -> FileOps: Build ResearchObject (CBOR)\n{meta_ref, payload, size}
+FileOps -> IPFS: Put dag-cbor manifest block\nManifestCID
+FileOps -> FileOps: Check BadBits (ManifestCID)\n(blocked for node country?)
+alt BadBits check fails
+    FileOps -> IPFS: UnpinRecursive(PayloadCID)\n(reject file)
+    FileOps -> FileOps: Log refusal and return
+else BadBits check passes
+    FileOps -> IPFS: PinRecursive(ManifestCID)\n(recursive pin)
+    FileOps -> Storage: pinFile(ManifestCID)
+end
 
-FileOps -> DHT: provideFile(hash)
-FileOps -> Storage: addKnownFile(hash)
+FileOps -> Storage: addKnownFile(ManifestCID)
 
-FileOps -> ShardMgr: AmIResponsibleFor(hash)
+FileOps -> ShardMgr: AmIResponsibleFor(PayloadCID)
 
 alt Node is responsible
-    FileOps -> PubSub: PublishToShard("NEW:" + hash)
-    PubSub -> Nodes: Broadcast NEW message
-    Nodes -> Nodes: Add to knownFiles, check replication
+    FileOps -> Storage: provideFile(ManifestCID)\n(via StorageManager)
+    Storage -> DHT: Provide(ManifestCID)
+    FileOps -> ShardMgr: PublishToShard(IngestMessage)
+    ShardMgr -> PubSub: Publish IngestMessage
+    PubSub -> Nodes: Broadcast IngestMessage
 else Node is NOT responsible (Custodial Mode)
-    FileOps -> ShardMgr: getHexBinaryPrefix(hash)
-    FileOps -> PubSub: PublishToControl("DELEGATE:" + hash + ":" + prefix)
-    PubSub -> Nodes: Broadcast DELEGATE message
-    Nodes -> Nodes: Responsible node accepts delegation
-    Nodes -> Nodes: checkReplication(hash)
+    Note over FileOps: Tourist Pattern
+    FileOps -> ShardMgr: JoinShard(TargetShard)
+    FileOps -> ShardMgr: PublishToShard(IngestMessage, TargetShard)
+    ShardMgr -> PubSub: Publish IngestMessage (to Target Shard)
+    PubSub -> Nodes: Broadcast IngestMessage
+    Note over FileOps: Wait for handoff (ReplicationManager checks)
 end
 
 @enduml

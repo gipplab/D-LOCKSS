@@ -1,50 +1,21 @@
-@startuml Delegation Sequence
+@startuml
+title Custodial Delegation (Tourist Pattern)
 
-participant "Custodial Node" as Custodial
-participant "PubSub Control" as Control
-participant "Responsible Node" as Responsible
-participant "Storage" as Storage
-participant "Replication Checker" as ReplChecker
-participant "DHT" as DHT
+participant "NewNode" as NN
+participant "TargetShard" as TS
+participant "Discovery" as DISC
+participant "PubSub" as PS
 
-Custodial -> Custodial: processNewFile()\nFile hash doesn't match shard
-Custodial -> Custodial: pinFile(hash) [temporary]
-Custodial -> DHT: provideFile(hash)
-Custodial -> Control: PublishToControl("DELEGATE:" + hash + ":" + prefix)
+NN -> DISC: Find peers for target shard
+DISC --> NN: Peer list
 
-Control -> Responsible: Broadcast DELEGATE message
-Responsible -> Responsible: checkRateLimitForMessage(peerID, "DELEGATE")
-Responsible -> Responsible: Check disk usage
+NN -> TS: Connect to peers
+note right: Node connects to peers in the swarm
 
-alt Rate limit OK AND disk usage OK
-    Responsible -> Responsible: Check if targetPrefix == myShard
-    
-    alt Prefix matches
-    Responsible -> Storage: addKnownFile(hash)
-    Responsible -> ReplChecker: checkReplication(hash)
-    ReplChecker -> DHT: FindProvidersAsync(cid)
-    DHT -> ReplChecker: Provider count
-    
-    alt count < MinReplication
-        ReplChecker -> Storage: pinFile(hash)
-        ReplChecker -> DHT: provideFile(hash)
-    end
-    
-    Note over Responsible: File now properly replicated
-    
-    alt Replication reaches MinReplication
-        Custodial -> Custodial: checkReplication(hash)
-        Custodial -> DHT: FindProvidersAsync(cid)
-        DHT -> Custodial: count >= MinReplication
-        Custodial -> Storage: unpinFile(hash)
-        Note over Custodial: Custodial handoff complete
-    end
-    else Prefix doesn't match
-        Responsible -> Responsible: Ignore message
-    end
-else Rate limit exceeded OR disk usage high
-    Responsible -> Responsible: Reject DELEGATE message
-    Note over Responsible: Disk usage protection\nprevents accepting custodial files
-end
+NN -> PS: Join PubSub topic for Shard
+note right: Implicit delegation via "Tourist Pattern"\nNode joins topic and begins participating
+PS --> NN: Subscribed
 
+NN -> TS: Begin replication checks
+NN -> TS: Participate in consensus/storage
 @enduml

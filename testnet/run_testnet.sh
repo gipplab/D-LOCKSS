@@ -1,10 +1,20 @@
 #!/bin/bash
 
 # Configuration
-NODE_COUNT=50
-BASE_DIR="testnet_data"
+# Reduced to 15 nodes for bandwidth-limited environments
+# Each node runs its own isolated IPFS daemon
+NODE_COUNT=15
+# Make BASE_DIR absolute to avoid path resolution issues
+BASE_DIR_REL="testnet_data"
+BASE_DIR=$(cd "$BASE_DIR_REL" 2>/dev/null && pwd || echo "$(pwd)/$BASE_DIR_REL")
 BINARY_NAME="dlockss-node"
 PID_FILE="active_nodes.pids"
+IPFS_PID_FILE="active_ipfs.pids"
+
+# Per-node IPFS ports (avoid collisions)
+IPFS_API_BASE_PORT=5010
+IPFS_SWARM_BASE_PORT=4010
+IPFS_GATEWAY_BASE_PORT=8090
 
 # Colors for pretty printing
 GREEN='\033[0;32m'
@@ -14,19 +24,38 @@ NC='\033[0m' # No Color
 
 function cleanup {
     echo -e "\n${RED}--- SHUTTING DOWN NETWORK ---${NC}"
+    
+    # 1. Kill processes listed in PID files immediately (Force Kill)
     if [ -f "$PID_FILE" ]; then
         while read pid; do
-            kill $pid 2>/dev/null
+            # Check if process is running (-0) then force kill (-9)
+            kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
         done < "$PID_FILE"
-        rm "$PID_FILE"
+        rm -f "$PID_FILE"
     fi
-    # Force kill any stragglers matching binary name
-    pkill -f "$BINARY_NAME"
+
+    if [ -f "$IPFS_PID_FILE" ]; then
+        while read pid; do
+            kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+        done < "$IPFS_PID_FILE"
+        rm -f "$IPFS_PID_FILE"
+    fi
+
+    # 2. Sweep by name using SIGKILL (-9)
+    # Using full command line matching (-f) to catch the nodes
+    pkill -9 -f "$BINARY_NAME"
+    pkill -9 -f "ipfs daemon"
+    
+    # 3. Nuclear Option: Kill the entire process group
+    # This ensures any background jobs spawned by this shell are terminated.
+    # We trap SIGKILL to prevent the script from killing itself instantly before the echo.
+    trap '' SIGTERM && kill -9 0 2>/dev/null
+
     echo -e "${GREEN}Network successfully scorched earth.${NC}"
 }
 
-# Trap ctrl-c to ensure cleanup
-trap cleanup EXIT
+# Trap EXIT (normal end), INT (Ctrl+C), and TERM (kill command)
+trap cleanup EXIT INT TERM
 
 echo -e "${YELLOW}--- Building Binary ---${NC}"
 # Check if binary exists and is newer than all Go source files
@@ -42,18 +71,42 @@ if [ -f "$BINARY_NAME" ]; then
 fi
 
 if [ "$NEED_REBUILD" = true ]; then
-    (cd .. && go build -o testnet/$BINARY_NAME)
+    # Detect script directory to handle running from root or testnet dir
+    SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+    ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+    
+    echo "Building from $ROOT_DIR..."
+    (cd "$ROOT_DIR" && go build -o "$SCRIPT_DIR/$BINARY_NAME" ./cmd/dlockss)
     if [ $? -ne 0 ]; then
         echo "Build failed."
         exit 1
     fi
+    
+    echo "Building Monitor..."
+    (cd "$ROOT_DIR" && go build -o "$SCRIPT_DIR/dlockss-monitor" ./cmd/dlockss-monitor)
+    if [ $? -ne 0 ]; then
+        echo "Monitor build failed (continuing anyway)..."
+    fi
+
     echo "Build completed."
 fi
 
+# Check for IPFS binary
+if ! command -v ipfs &> /dev/null; then
+    echo -e "${RED}Error: ipfs binary not found in PATH. Install IPFS (kubo) to run the V2 testnet.${NC}"
+    echo "Installation: https://docs.ipfs.tech/install/command-line/"
+    exit 1
+fi
+
 echo -e "${YELLOW}--- Cleaning old data ---${NC}"
+# Ensure BASE_DIR is absolute before using it
+if [[ "$BASE_DIR" != /* ]]; then
+    BASE_DIR=$(cd "$BASE_DIR" 2>/dev/null && pwd || echo "$(pwd)/$BASE_DIR")
+fi
 rm -rf $BASE_DIR
 mkdir -p $BASE_DIR
 rm -f $PID_FILE
+rm -f $IPFS_PID_FILE
 
 echo -e "${GREEN}--- Spawning $NODE_COUNT Nodes ---${NC}"
 
@@ -63,16 +116,118 @@ for i in $(seq 1 $NODE_COUNT); do
     mkdir -p "$NODE_DIR"
     
     # Copy binary to node dir (so they don't lock the same file if OS is strict)
-    cp $BINARY_NAME "$NODE_DIR/"
+    # Detect script directory if not already set (re-evaluating for safety)
+    SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+    cp "$SCRIPT_DIR/$BINARY_NAME" "$NODE_DIR/"
+
+    # --- Start a per-node IPFS daemon ---
+    # Each node gets an isolated IPFS repo and unique ports.
+    if ! command -v ipfs >/dev/null 2>&1; then
+        echo -e "\n${RED}Error: ipfs binary not found in PATH. Install IPFS (kubo) to run the V2 testnet.${NC}"
+        exit 1
+    fi
+
+    IPFS_REPO="$NODE_DIR/ipfs_repo"
+    # BASE_DIR is now absolute, so construct absolute path directly
+    IPFS_REPO_ABS="$BASE_DIR/node_$i/ipfs_repo"
+    IPFS_API_PORT=$((IPFS_API_BASE_PORT + i))
+    IPFS_SWARM_PORT=$((IPFS_SWARM_BASE_PORT + i))
+    IPFS_GATEWAY_PORT=$((IPFS_GATEWAY_BASE_PORT + i))
+    DLOCKSS_API_PORT=$((5050 + i))
+
+    mkdir -p "$IPFS_REPO"
+
+if [ ! -f "$IPFS_REPO/config" ]; then
+        # 1. Init with 'lowpower' profile to keep background overhead low
+        (export IPFS_PATH="$IPFS_REPO" && ipfs init -e --profile=lowpower >/dev/null 2>&1)
+
+        # 2. Connection Limits (Bandwidth Protection)
+        #    Increased to allow full mesh in root shard (25 nodes) and facilitate discovery
+        (export IPFS_PATH="$IPFS_REPO" && ipfs config Swarm.ConnMgr.LowWater --json 30)
+        (export IPFS_PATH="$IPFS_REPO" && ipfs config Swarm.ConnMgr.HighWater --json 60)
+        
+        # 3. Enable DHT Server Mode
+        #    CRITICAL: In a closed testnet, nodes must act as DHT servers to find each other/content.
+        (export IPFS_PATH="$IPFS_REPO" && ipfs config Routing.Type "dhtserver")
+
+        # 4. ENABLE MDNS (Automatic Discovery)
+        #    Since you have CPU power, this allows nodes to find each other 
+        #    automatically on localhost without manual wiring.
+        (export IPFS_PATH="$IPFS_REPO" && ipfs config Discovery.MDNS.Enabled --json true)
+
+        # 5. Disable AutoNAT
+        (export IPFS_PATH="$IPFS_REPO" && ipfs config AutoNAT.ServiceMode "disabled")
+
+        # Bind addresses
+        (export IPFS_PATH="$IPFS_REPO" && ipfs config Addresses.API "/ip4/127.0.0.1/tcp/$IPFS_API_PORT" >/dev/null)
+        (export IPFS_PATH="$IPFS_REPO" && ipfs config Addresses.Gateway "/ip4/127.0.0.1/tcp/$IPFS_GATEWAY_PORT" >/dev/null)
+        (export IPFS_PATH="$IPFS_REPO" && ipfs config Addresses.Swarm --json "[\"/ip4/0.0.0.0/tcp/$IPFS_SWARM_PORT\",\"/ip4/0.0.0.0/udp/$IPFS_SWARM_PORT/quic-v1\"]" >/dev/null)
+    fi
+
+    # Start daemon in background (log into testnet/testnet_data/)
+    (export IPFS_PATH="$IPFS_REPO" && ipfs daemon --enable-gc > "$BASE_DIR/node_$i.ipfs.log" 2>&1 & echo $! >> "$IPFS_PID_FILE")
+
+    # Wait for IPFS API to become ready before starting the D-LOCKSS node.
+    # This avoids the startup race where D-LOCKSS can't connect and disables file ops.
+    IPFS_READY=false
+    for attempt in $(seq 1 200); do
+        if (export IPFS_PATH="$IPFS_REPO" && ipfs --api "/ip4/127.0.0.1/tcp/$IPFS_API_PORT" id >/dev/null 2>&1); then
+            IPFS_READY=true
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "$IPFS_READY" != true ]; then
+        echo -e "\n${RED}Error: IPFS API did not become ready for node $i on /ip4/127.0.0.1/tcp/$IPFS_API_PORT${NC}"
+        echo "Check logs: $BASE_DIR/node_$i.ipfs.log"
+        exit 1
+    fi
     
-    # Run the node in background, redirect logs
-    # We cd into the dir so "./my-pdfs" is created inside node_X/
-    # Enable metrics export for each node
-    (cd "$NODE_DIR" && DLOCKSS_METRICS_EXPORT="metrics.csv" ./$BINARY_NAME > "../node_$i.log" 2>&1 & echo $! >> "../../$PID_FILE")
+# --- Start Node (Main Scope Fix) ---
     
-    # Don't start all at exact same millisecond, helps mDNS storm
-    # aggressive start: 0.1s delay
-    sleep 0.1
+    # 1. Change directory safely without a subshell
+    pushd "$NODE_DIR" >/dev/null
+
+    # 2. Run the node in background with testnet-optimized settings
+    # See docs/TIMEOUTS_AND_DELAYS_ANALYSIS.md for rationale
+    # Export IPFS_PATH so D-LOCKSS can load IPFS identity (use absolute path)
+    IPFS_PATH="$IPFS_REPO_ABS" \
+    DLOCKSS_METRICS_EXPORT="metrics.csv" \
+    DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/$IPFS_API_PORT" \
+    DLOCKSS_API_PORT=$DLOCKSS_API_PORT \
+    DLOCKSS_MAX_PEERS_PER_SHARD=12 \
+    DLOCKSS_MIN_PEERS_PER_SHARD=6 \
+    DLOCKSS_SHARD_PEER_CHECK_INTERVAL=10s \
+    DLOCKSS_CHECK_INTERVAL=20s \
+    DLOCKSS_REPLICATION_COOLDOWN=5s \
+    DLOCKSS_REPLICATION_VERIFICATION_DELAY=30s \
+    DLOCKSS_REPLICATION_CACHE_TTL=1m \
+    DLOCKSS_DHT_QUERY_TIMEOUT=30s \
+    DLOCKSS_DHT_PROVIDE_TIMEOUT=15s \
+    DLOCKSS_INITIAL_BACKOFF=3s \
+    DLOCKSS_MAX_BACKOFF=2m \
+    DLOCKSS_BACKOFF_MULTIPLIER=1.8 \
+    DLOCKSS_AUTO_REPLICATION_TIMEOUT=2m \
+    DLOCKSS_AUTO_REPLICATION_ENABLED=true \
+    DLOCKSS_SHARD_OVERLAP_DURATION=1m \
+    DLOCKSS_RESHARD_DELAY=2s \
+    DLOCKSS_REMOVED_COOLDOWN=30s \
+    DLOCKSS_MAX_CONCURRENT_CHECKS=20 \
+    ./$BINARY_NAME > "../node_$i.log" 2>&1 &
+    
+    # 3. Capture PID
+    NODE_PID=$!
+    echo $NODE_PID >> "../../$PID_FILE"
+    
+    # 4. Disown IMMEDIATELY from the main script
+    # This prevents the script from reporting "Killed" when cleanup runs
+    disown $NODE_PID
+    
+    # 5. Return to previous directory
+    popd >/dev/null
+    
+    # Don't start all at exact same millisecond; also gives IPFS time to settle.
+    sleep 0.2
     echo -ne "\rStarted node $i/$NODE_COUNT..."
 done
 
@@ -81,7 +236,7 @@ echo "Logs are located in $BASE_DIR/node_X.log"
 echo "Active PIDs stored in $PID_FILE"
 
 echo -e "\n${YELLOW}--- TEST INSTRUCTIONS ---${NC}"
-echo "1. To trigger replication: cp your-file.pdf $BASE_DIR/node_1/my-pdfs/"
+echo "1. To trigger ingestion: cp your-file.pdf $BASE_DIR/node_1/data/"
 echo "2. Watch logs: tail -f $BASE_DIR/node_*.log"
 echo "3. Metrics are exported to: $BASE_DIR/node_X/metrics.csv"
 echo "4. Press [ENTER] to kill the network and generate charts."

@@ -1,0 +1,72 @@
+# Build D-LOCKSS binaries for multiple OS/arch.
+# Artifacts are available on the Actions run page; optionally attach to Releases.
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  release:
+    types: [published]
+
+jobs:
+  build:
+    name: Build binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: |
+          set -e
+          export CGO_ENABLED=0
+          mkdir -p dist
+          for binary in dlockss dlockss-monitor; do
+            case $binary in
+              dlockss) PKG="./cmd/dlockss" ;;
+              dlockss-monitor) PKG="./cmd/dlockss-monitor" ;;
+            esac
+            for goos in linux darwin windows; do
+              for goarch in amd64 arm64; do
+                [ "$goos" = "windows" ] && [ "$goarch" = "arm64" ] && continue
+                suffix=""
+                [ "$goos" = "windows" ] && suffix=".exe"
+                out="dist/${binary}-${goos}-${goarch}${suffix}"
+                echo "Building $out"
+                GOOS=$goos GOARCH=$goarch go build -ldflags="-s -w" -o "$out" "$PKG"
+              done
+            done
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: dist/
+
+  # Optional: upload binaries to GitHub Release when a release is published
+  release:
+    name: Upload to Release
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release' && github.event.action == 'published'
+    needs: build
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          release_id: ${{ github.event.release.id }}
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

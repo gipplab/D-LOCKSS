@@ -12,3 +12,21 @@ mardi-pdfs
 scripts/__pycache__
 
 charts
+
+/testnet/active_ipfs.pids
+/testnet/active_nodes.pids
+
+docs/architecture
+docs/development
+docs/project
+
+testnet/TESTNET_OPTIMIZATIONS.md
+docs/README.md
+
+replication_test.go
+shard_test.go
+
+# Binaries
+main
+dlockss-monitor
+testnet/dlockss-monitor

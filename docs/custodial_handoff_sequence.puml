@@ -1,0 +1,52 @@
+@startuml Custodial Handoff Sequence (Tourist Pattern)
+
+participant "Custodial Node" as Custodial
+participant "Shard Manager" as ShardMgr
+participant "PubSub Target" as PubSub
+participant "Responsible Node" as Responsible
+participant "StorageManager" as Storage
+participant "ReplicationManager" as ReplMgr
+participant "IPFS" as IPFS
+participant "DHT" as DHT
+
+Custodial -> Custodial: processNewFile()\nPayloadCID not in my shard
+Custodial -> IPFS: PinRecursive(ManifestCID)\n[temporary custodial hold]
+Custodial -> Storage: pinFile(ManifestCID)
+Note over Custodial: Do NOT announce to DHT
+
+Custodial -> ShardMgr: JoinShard(TargetShard)
+Custodial -> PubSub: PublishToShard(IngestMessage)
+Note over Custodial: Temporary "Tourist" subscription
+
+PubSub -> Responsible: Broadcast IngestMessage
+Responsible -> Responsible: Check if responsible for PayloadCID
+
+alt Responsible
+    Responsible -> Storage: addKnownFile(ManifestCID)
+    Note over Responsible: Added to known files, picked up by ReplManager
+    Responsible -> ReplMgr: runScheduler() -> runProber()
+    ReplMgr -> DHT: FindProvidersAsync(ManifestCID)
+    DHT -> ReplMgr: Provider count
+    
+    alt count < MinReplication (in Reconciler)
+        ReplMgr -> IPFS: PinRecursive(ManifestCID)
+        ReplMgr -> Storage: pinFile(ManifestCID) (Provides)
+        ReplMgr -> DHT: Provide(ManifestCID)
+    end
+    
+    Note over Responsible: File now properly replicated
+    
+    alt Replication reaches MinReplication
+        Custodial -> ReplMgr: runProber(ManifestCID)
+        Custodial -> DHT: FindProvidersAsync(ManifestCID)
+        DHT -> Custodial: count >= MinReplication
+        Custodial -> IPFS: UnpinRecursive(ManifestCID)
+        Custodial -> Storage: unpinFile(ManifestCID)
+        Custodial -> ShardMgr: LeaveShard(TargetShard)
+        Note over Custodial: Custodial handoff complete, left ephemeral shard
+    end
+else Not Responsible
+    Responsible -> Responsible: Ignore message
+end
+
+@enduml

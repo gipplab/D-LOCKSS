@@ -5,14 +5,15 @@
 package "D-LOCKSS Node" {
     [Main] as main
     [ShardManager] as shardMgr
-    [File Operations] as fileOps
-    [Replication Checker] as replChecker
-    [Storage Manager] as storage
+    [FileProcessor] as fileOps
+    [ReplicationManager] as replMgr
+    [StorageManager] as storage
     [Storage Monitor] as storageMonitor
     [Metrics Reporter] as metrics
     [Rate Limiter] as rateLimit
-    [Backoff Manager] as backoff
     [Discovery Service] as discovery
+    [IPFS Client] as ipfsClient
+    [Signing & Trust] as signingTrust
 }
 
 package "libp2p Stack" {
@@ -34,38 +35,41 @@ package "External" {
 
 main --> shardMgr : manages
 main --> fileOps : orchestrates
-main --> replChecker : starts
+main --> replMgr : starts
 main --> storage : uses
 main --> metrics : collects
 main --> rateLimit : uses
-main --> backoff : uses
 main --> discovery : initializes
+main --> signingTrust : initializes
 
 shardMgr --> pubsub : subscribes/publishes
 shardMgr --> host : uses
+shardMgr --> signingTrust : verifies messages
+shardMgr --> storage : uses (resharding)
 
-fileOps --> storage : pins/unpins
+fileOps --> storage : pins/unpins (via mgr)
 fileOps --> shardMgr : checks responsibility
-fileOps --> dht : provides files
 fileOps --> watcher : triggered by
+fileOps --> ipfsClient : imports/pins
+fileOps --> signingTrust : signs manifests/messages
 
-replChecker --> dht : queries providers
-replChecker --> shardMgr : publishes NEED
-replChecker --> storage : manages pins
-replChecker --> backoff : checks backoff
+replMgr --> dht : queries providers
+replMgr --> shardMgr : publishes NEED
+replMgr --> storage : manages pins, check backoff
+replMgr --> ipfsClient : verifies DAG
+replMgr --> signingTrust : verifies manifests
 
 storage --> dht : provides files
+storage --> ipfsClient : pin/unpin DAGs
 
 metrics --> storage : reads state
-metrics --> replChecker : tracks stats
+metrics --> replMgr : tracks stats
 metrics --> shardMgr : reads shard info
 
 rateLimit --> pubsub : filters messages
-rateLimit --> storageMonitor : checks disk usage for DELEGATE
+rateLimit --> storageMonitor : checks disk usage for Custodial
 
 storageMonitor --> dataDir : monitors disk usage
-
-backoff --> replChecker : controls retries
 
 discovery --> mdns : uses
 discovery --> host : connects peers
