@@ -134,4 +134,51 @@ jobs:
           cache-from: type=gha,scope=docker
           cache-to: type=gha,mode=max,scope=docker
 
+  build-monitor-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5.10.0
+        with:
+          images: ghcr.io/gipplab/dlockss-monitor
+          tags: |
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.description=Dlockss monitor
+            org.opencontainers.image.title=Dlockss monitor
+          annotations: |
+            org.opencontainers.image.description=Dlockss monitor
+            org.opencontainers.image.title=Dlockss monitor
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3.12.0
+
+      - name: Build and push Docker jobrunner image
+        uses: docker/build-push-action@v6.18.0
+        with:
+          file: ./Dockerfile_monitor
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          no-cache: ${{ github.event.inputs.no_cache || false }}
+          cache-from: type=gha,scope=docker-monitor
+          cache-to: type=gha,mode=max,scope=docker-monitor
+
 
