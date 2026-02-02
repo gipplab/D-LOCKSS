@@ -35,9 +35,9 @@ import (
 
 // --- Configuration Constants ---
 const (
-	DiscoveryServiceTag     = "dlockss-prod"
-	WebUIPort               = 8080
-	NodeCleanupTimeout      = 10 * time.Minute
+	DiscoveryServiceTag    = "dlockss-prod"
+	WebUIPort              = 8080
+	DefaultNodeCleanupTimeout = 10 * time.Minute
 	// ReplicationAnnounceTTL: how long we count a peer as having a file after their last PINNED/Ingest.
 	// After a split, nodes unpin non-responsible files ~5s later (ReshardDelay); they stop announcing
 	// those files, so we expire them after this TTL. Shorter TTL = dashboard reflects unpins sooner.
@@ -51,6 +51,11 @@ const (
 	GeoFailureThreshold     = 5
 	GeoCooldownDuration     = 5 * time.Minute
 )
+
+// nodeCleanupTimeout: after this duration without any message (heartbeat, Ingest, etc.) a node is pruned.
+// Configurable via DLOCKSS_MONITOR_NODE_CLEANUP_TIMEOUT (e.g. "30m", "1h"). For Pi-only or remote networks
+// where connectivity can be intermittent, use a longer value so nodes are not pruned during brief gaps.
+var nodeCleanupTimeout = DefaultNodeCleanupTimeout
 
 // --- Data Models ---
 
@@ -405,14 +410,14 @@ func (m *Monitor) PruneStaleNodes() {
 	changed := false
 	prunedCount := 0
 	for id, node := range m.nodes {
-		if now.Sub(node.LastSeen) > NodeCleanupTimeout {
+		if now.Sub(node.LastSeen) > nodeCleanupTimeout {
 			delete(m.nodes, id)
 			changed = true
 			prunedCount++
 		}
 	}
 	if prunedCount > 0 {
-		log.Printf("[Monitor] Pruned %d stale nodes.", prunedCount)
+		log.Printf("[Monitor] Pruned %d stale nodes (no message for > %s). Consider DLOCKSS_MONITOR_NODE_CLEANUP_TIMEOUT for remote/Pi networks.", prunedCount, nodeCleanupTimeout)
 		m.treeDirty = true
 	}
 	if changed {
@@ -975,6 +980,13 @@ func startLibP2P(ctx context.Context, monitor *Monitor) (host.Host, error) {
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	if v := os.Getenv("DLOCKSS_MONITOR_NODE_CLEANUP_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			nodeCleanupTimeout = d
+			log.Printf("[Monitor] Node cleanup timeout: %s (from env)", nodeCleanupTimeout)
+		}
+	}
 
 	monitor := NewMonitor()
 	h, err := startLibP2P(ctx, monitor)

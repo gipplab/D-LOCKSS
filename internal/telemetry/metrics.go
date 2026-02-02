@@ -112,6 +112,9 @@ type ReplicationInfoProvider interface {
 type MetricsManager struct {
 	mu sync.RWMutex
 
+	// Peer ID (set from host so /status returns it; matches monitor and ipfs id when IPFS_PATH set)
+	peerID string
+
 	// Metrics state
 	pinnedFilesCount              int
 	knownFilesCount               int
@@ -156,6 +159,12 @@ func NewMetricsManager() *MetricsManager {
 		lastReportTime: time.Now(),
 		startTime:      time.Now(),
 	}
+}
+
+func (m *MetricsManager) SetPeerID(peerID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.peerID = peerID
 }
 
 func (m *MetricsManager) RegisterProviders(s ShardInfoProvider, st StorageInfoProvider, r ReplicationInfoProvider, rl *common.RateLimiter) {
@@ -447,13 +456,13 @@ func (m *MetricsManager) GetStatus() common.StatusResponse {
 	if m.storageInfo != nil && config.TelemetryIncludeCIDs {
 		_, _, knownCIDs, _ = m.storageInfo.GetStorageStatus()
 	}
-	
-	// Assuming peerID is managed elsewhere or we add it to MetricsManager
-	// For now leaving PeerID empty or TODO
-	peerID := "" 
+
+	m.mu.RLock()
+	peerID := m.peerID
+	m.mu.RUnlock()
 
 	return common.StatusResponse{
-		PeerID:       peerID, // Need to inject or pass
+		PeerID:       peerID,
 		Version:      "1.0.0",
 		CurrentShard: shardID,
 		PeersInShard: peers,

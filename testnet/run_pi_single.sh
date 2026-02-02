@@ -277,10 +277,13 @@ if ! kill -0 "$(cat "$DLOCKSS_PID_FILE")" 2>/dev/null; then
 fi
 
 printf '%b--- Node running ---%b\n' "$GREEN" "$NC"
-echo "  IPFS API:     http://127.0.0.1:$IPFS_API_PORT"
-echo "  D-LOCKSS API: http://127.0.0.1:$DLOCKSS_API_PORT"
-echo "  Data:         $BASE_DIR/data"
-echo "  Logs:         $LOG_IPFS, $LOG_DLOCKSS"
+echo "  IPFS API:       http://127.0.0.1:$IPFS_API_PORT"
+echo "  D-LOCKSS API:   http://127.0.0.1:$DLOCKSS_API_PORT"
+echo "  Data:           $BASE_DIR/data"
+echo "  D-LOCKSS log:   $LOG_DLOCKSS"
+echo "  IPFS log:       $LOG_IPFS"
+echo ""
+echo "  To confirm heartbeats: DLOCKSS_VERBOSE_LOGGING=true (then restart); tail -f $LOG_DLOCKSS"
 echo ""
 echo "Press Enter to stop."
 read -r _

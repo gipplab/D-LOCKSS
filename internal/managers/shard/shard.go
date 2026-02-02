@@ -268,6 +268,9 @@ func (sm *ShardManager) sendHeartbeat() {
 		// Heartbeat failures are not critical
 		return
 	}
+	if config.VerboseLogging {
+		log.Printf("[Heartbeat] sent to shard %s (pinned: %d)", currentShard, pinnedCount)
+	}
 
 	// Also rotate through pinned files and announce a BATCH per heartbeat interval
 	// This ensures new peers eventually learn about old files without full graph traversal.
