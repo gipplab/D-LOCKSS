@@ -919,8 +919,11 @@ func (sm *ShardManager) probeShard(shardID string, probeTimeout time.Duration) i
 	return sm.getProbePeerCount(shardID, sub.topic, 1*time.Minute)
 }
 
-// getProbePeerCount returns peer count for a shard using seen-only when available,
-// so monitor-only subscribers are not counted.
+// getProbePeerCount returns peer count for a shard. When we have little or no "seen"
+// data (e.g. we just joined the topic and waited only 3s), we use the mesh count so
+// ROOT nodes can see that shard "0" or "1" has peers and migrate. We return the
+// maximum of seen and mesh so probing does not undercount; probe may include
+// passive subscribers (e.g. monitor) but that is acceptable for migration decisions.
 func (sm *ShardManager) getProbePeerCount(shardID string, topic interface{ ListPeers() []peer.ID }, activeWindow time.Duration) int {
 	meshPeers := topic.ListPeers()
 	meshCount := len(meshPeers) + 1
@@ -938,7 +941,8 @@ func (sm *ShardManager) getProbePeerCount(shardID string, topic interface{ ListP
 	}
 	sm.mu.RUnlock()
 
-	if seenCount > 0 {
+	// Use max so we don't undercount when we've just joined and have few heartbeats (fixes ROOT stuck)
+	if seenCount > meshCount {
 		return seenCount
 	}
 	return meshCount
@@ -1034,6 +1038,20 @@ func (sm *ShardManager) discoverAndMoveToDeeperShard() {
 	probeTimeout := 3 * time.Second
 	deepestActiveShard := ""
 	for _, shard := range matchingShards {
+		// Do not move to a shard more than one level deeper unless its parent has at least
+		// MinPeersPerShard peers (e.g. don't move to 110 when 11 only has 4 nodes).
+		if len(shard) > len(currentShard)+1 {
+			parentShard := shard[:len(shard)-1]
+			parentPeerCount := sm.probeShard(parentShard, probeTimeout)
+			if parentPeerCount < config.MinPeersPerShard {
+				if config.VerboseLogging {
+					log.Printf("[ShardDiscovery] Skipping deeper shard %s: parent %s has %d peers (need >= %d)",
+						shard, parentShard, parentPeerCount, config.MinPeersPerShard)
+				}
+				continue
+			}
+		}
+
 		peerCount := sm.probeShard(shard, probeTimeout)
 		if peerCount < minPeersToJoinDeeperShard {
 			continue
