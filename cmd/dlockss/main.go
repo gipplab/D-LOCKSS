@@ -62,7 +62,6 @@ func main() {
 		// Prioritize Noise over TLS to avoid handshake issues during simultaneous connect
 		libp2p.ChainOptions(
 			libp2p.Security(noise.ID, noise.New),
-			libp2p.Security(libp2ptls.ID, libp2ptls.New),
 		),
 	)
 	if err != nil {
