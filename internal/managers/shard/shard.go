@@ -1001,10 +1001,11 @@ func (sm *ShardManager) checkAndMergeUpIfAlone() {
 // Must be at least 2 so we don't move into a shard where we'd be alone (probe counts self as 1).
 const minPeersToJoinDeeperShard = 2
 
-// discoverAndMoveToDeeperShard probes deeper shards in our branch and moves when:
+// discoverAndMoveToDeeperShard probes deeper shards in our branch and moves only when:
 // - current shard is over the limit (MaxPeersPerShard), or
-// - a deeper shard has strictly more peers than current, or
-// - a strictly deeper shard has at least minPeersToJoinDeeperShard peers (drain parent into children).
+// - a deeper shard has strictly more peers than current.
+// We do not move when current is under the limit and the deeper shard has fewer peers
+// (e.g. 7 nodes in current must not move to a deeper shard with 2–3 nodes).
 func (sm *ShardManager) discoverAndMoveToDeeperShard() {
 	sm.mu.RLock()
 	currentShard := sm.currentShard
@@ -1037,17 +1038,13 @@ func (sm *ShardManager) discoverAndMoveToDeeperShard() {
 		if peerCount < minPeersToJoinDeeperShard {
 			continue
 		}
-		// Move if: over limit; or deeper has more peers; or strictly deeper has enough peers (drain parent)
-		isStrictlyDeeper := len(shard) > len(currentShard)
+		// Move only when over limit or deeper has strictly more peers (never drain when current is under limit)
 		moveBecauseDeeperHasMore := peerCount > currentPeerCount
-		moveBecauseDrain := isStrictlyDeeper && peerCount >= minPeersToJoinDeeperShard
-		if currentOverLimit || moveBecauseDeeperHasMore || moveBecauseDrain {
+		if currentOverLimit || moveBecauseDeeperHasMore {
 			deepestActiveShard = shard
 			reason := "deeper has more peers"
 			if currentOverLimit {
 				reason = "current over limit"
-			} else if moveBecauseDrain && !moveBecauseDeeperHasMore {
-				reason = "drain to deeper shard"
 			}
 			log.Printf("[ShardDiscovery] Found active deeper shard %s with %d peers (current: %s has %d, %s)",
 				shard, peerCount, currentShard, currentPeerCount, reason)
