@@ -30,6 +30,7 @@ import (
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 )
 
@@ -57,6 +58,10 @@ func main() {
 	h, err := libp2p.New(
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0", "/ip6/::/tcp/0"),
+		// Prioritize Noise over TLS to avoid handshake issues during simultaneous connect
+		libp2p.ChainOptions(
+			libp2p.Security(noise.ID, noise.New),
+		),
 	)
 	if err != nil {
 		log.Fatalf("[Fatal] Failed to create libp2p host: %v", err)
@@ -95,6 +100,7 @@ func main() {
 	shardMgr.SetReplicationManager(repMgr)
 
 	metrics.RegisterProviders(shardMgr, storageMgr, repMgr, rateLimiter)
+	metrics.SetPeerID(h.ID().String())
 
 	// Telemetry and API
 	tc := telemetry.NewTelemetryClient(h, ps, metrics)

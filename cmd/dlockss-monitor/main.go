@@ -35,9 +35,9 @@ import (
 
 // --- Configuration Constants ---
 const (
-	DiscoveryServiceTag     = "dlockss-prod"
-	WebUIPort               = 8080
-	NodeCleanupTimeout      = 10 * time.Minute
+	DiscoveryServiceTag    = "dlockss-prod"
+	WebUIPort              = 8080
+	DefaultNodeCleanupTimeout = 10 * time.Minute
 	// ReplicationAnnounceTTL: how long we count a peer as having a file after their last PINNED/Ingest.
 	// After a split, nodes unpin non-responsible files ~5s later (ReshardDelay); they stop announcing
 	// those files, so we expire them after this TTL. Shorter TTL = dashboard reflects unpins sooner.
@@ -51,6 +51,11 @@ const (
 	GeoFailureThreshold     = 5
 	GeoCooldownDuration     = 5 * time.Minute
 )
+
+// nodeCleanupTimeout: after this duration without any message (heartbeat, Ingest, etc.) a node is pruned.
+// Configurable via DLOCKSS_MONITOR_NODE_CLEANUP_TIMEOUT (e.g. "30m", "1h"). For Pi-only or remote networks
+// where connectivity can be intermittent, use a longer value so nodes are not pruned during brief gaps.
+var nodeCleanupTimeout = DefaultNodeCleanupTimeout
 
 // --- Data Models ---
 
@@ -405,14 +410,14 @@ func (m *Monitor) PruneStaleNodes() {
 	changed := false
 	prunedCount := 0
 	for id, node := range m.nodes {
-		if now.Sub(node.LastSeen) > NodeCleanupTimeout {
+		if now.Sub(node.LastSeen) > nodeCleanupTimeout {
 			delete(m.nodes, id)
 			changed = true
 			prunedCount++
 		}
 	}
 	if prunedCount > 0 {
-		log.Printf("[Monitor] Pruned %d stale nodes.", prunedCount)
+		log.Printf("[Monitor] Pruned %d stale nodes (no message for > %s). Consider DLOCKSS_MONITOR_NODE_CLEANUP_TIMEOUT for remote/Pi networks.", prunedCount, nodeCleanupTimeout)
 		m.treeDirty = true
 	}
 	if changed {
@@ -607,58 +612,57 @@ func (m *Monitor) GetShardTree() *ShardTreeNode {
 	for id := range allShardIDs {
 		nodeMap[id] = &ShardTreeNode{ShardID: id, Children: make([]*ShardTreeNode, 0), NodeCount: shardCounts[id]}
 	}
-	hasParent := make(map[string]bool)
+	// Apply split-event timestamps for display (optional)
 	for _, e := range m.splitEvents {
-		if parent, ok := nodeMap[e.ParentShard]; ok {
-			if child, ok := nodeMap[e.ChildShard]; ok {
-				exists := false
-				for _, c := range parent.Children {
-					if c.ShardID == child.ShardID {
-						exists = true
-						break
-					}
-				}
-				if !exists {
-					parent.Children = append(parent.Children, child)
-					hasParent[e.ChildShard] = true
-					t := e.Timestamp
-					child.SplitTime = &t
-				}
-			}
+		if child, ok := nodeMap[e.ChildShard]; ok {
+			t := e.Timestamp
+			child.SplitTime = &t
 		}
 	}
-	var sortedIDs []string
+	// Build tree purely from prefix (depth): parent of id is id[:len(id)-1].
+	// Process in order of increasing depth so parents exist when we attach children.
+	var orderedIDs []string
 	for id := range nodeMap {
-		if id != "" && !hasParent[id] {
-			sortedIDs = append(sortedIDs, id)
+		if id != "" {
+			orderedIDs = append(orderedIDs, id)
 		}
 	}
-	sort.Slice(sortedIDs, func(i, j int) bool {
-		if len(sortedIDs[i]) != len(sortedIDs[j]) {
-			return len(sortedIDs[i]) < len(sortedIDs[j])
+	sort.Slice(orderedIDs, func(i, j int) bool {
+		if len(orderedIDs[i]) != len(orderedIDs[j]) {
+			return len(orderedIDs[i]) < len(orderedIDs[j])
 		}
-		return sortedIDs[i] < sortedIDs[j]
+		return orderedIDs[i] < orderedIDs[j]
 	})
-	for _, id := range sortedIDs {
-		child := nodeMap[id]
-		if id == "" {
+	for _, id := range orderedIDs {
+		parentID := id[:len(id)-1]
+		parent, hasParent := nodeMap[parentID]
+		if !hasParent {
 			continue
 		}
-		parentID := id[:len(id)-1]
-		if parent, ok := nodeMap[parentID]; ok {
-			exists := false
-			for _, c := range parent.Children {
-				if c.ShardID == child.ShardID {
-					exists = true
-					break
-				}
+		child := nodeMap[id]
+		exists := false
+		for _, c := range parent.Children {
+			if c.ShardID == id {
+				exists = true
+				break
 			}
-			if !exists {
-				parent.Children = append(parent.Children, child)
-				hasParent[id] = true
+		}
+		if !exists {
+			parent.Children = append(parent.Children, child)
+		}
+	}
+	// Root's children must be only depth-1 shards (e.g. "0", "1"). Clear and set explicitly
+	// so deeper shards (10, 11, 100, 101) never appear on the same level as 0/1.
+	root := nodeMap[""]
+	root.Children = nil
+	for i := 1; i <= 1; i++ {
+		for id, node := range nodeMap {
+			if id != "" && len(id) == i {
+				root.Children = append(root.Children, node)
 			}
 		}
 	}
+	sort.Slice(root.Children, func(i, j int) bool { return root.Children[i].ShardID < root.Children[j].ShardID })
 	nodesToRemove := make([]string, 0)
 	for id, node := range nodeMap {
 		if id != "" && node.NodeCount == 0 && len(node.Children) == 0 {
@@ -676,25 +680,9 @@ func (m *Monitor) GetShardTree() *ShardTreeNode {
 			}
 		}
 		delete(nodeMap, id)
-		delete(hasParent, id)
-	}
-	root := nodeMap[""]
-	sortChildren(root)
-	for id, node := range nodeMap {
-		if id != "" && !hasParent[id] {
-			exists := false
-			for _, c := range root.Children {
-				if c.ShardID == node.ShardID {
-					exists = true
-					break
-				}
-			}
-			if !exists {
-				root.Children = append(root.Children, node)
-			}
-		}
 	}
 	root.NodeCount = shardCounts[""]
+	sortChildren(root)
 	m.treeCache = root
 	m.treeCacheTime = time.Now()
 	m.treeDirty = false
@@ -992,6 +980,13 @@ func startLibP2P(ctx context.Context, monitor *Monitor) (host.Host, error) {
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	if v := os.Getenv("DLOCKSS_MONITOR_NODE_CLEANUP_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			nodeCleanupTimeout = d
+			log.Printf("[Monitor] Node cleanup timeout: %s (from env)", nodeCleanupTimeout)
+		}
+	}
 
 	monitor := NewMonitor()
 	h, err := startLibP2P(ctx, monitor)

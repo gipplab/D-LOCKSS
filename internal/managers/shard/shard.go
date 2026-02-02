@@ -268,6 +268,9 @@ func (sm *ShardManager) sendHeartbeat() {
 		// Heartbeat failures are not critical
 		return
 	}
+	if config.VerboseLogging {
+		log.Printf("[Heartbeat] sent to shard %s (pinned: %d)", currentShard, pinnedCount)
+	}
 
 	// Also rotate through pinned files and announce a BATCH per heartbeat interval
 	// This ensures new peers eventually learn about old files without full graph traversal.
@@ -515,8 +518,9 @@ func (sm *ShardManager) handleUnreplicateRequest(msg *pubsub.Message, ur *schema
 }
 
 // getShardPeerCount returns peer count for the CURRENT shard.
-// Uses both ListPeers() (mesh peers) and seenPeers (peers that sent messages)
-// to get a more accurate count, especially during mesh formation.
+// Counts only peers that have sent a message (HEARTBEAT or protocol) in the last 2 minutes,
+// so monitor-only subscribers (which do not publish) are not counted and cannot trigger
+// premature splits or migration.
 func (sm *ShardManager) getShardPeerCount() int {
 	sm.mu.RLock()
 	currentShard := sm.currentShard
@@ -527,41 +531,28 @@ func (sm *ShardManager) getShardPeerCount() int {
 		return 0
 	}
 
-	// Get mesh peers (connected and in mesh)
 	meshPeers := sub.topic.ListPeers()
 	meshCount := len(meshPeers) + 1 // +1 for self
-	
-	// Also count peers we've seen via messages (more inclusive)
+
 	sm.mu.RLock()
 	seenCount := 0
 	if seenMap, exists := sm.seenPeers[currentShard]; exists {
-		// Count peers seen in last 2 minutes (active peers)
 		cutoff := time.Now().Add(-2 * time.Minute)
 		for _, lastSeen := range seenMap {
 			if lastSeen.After(cutoff) {
 				seenCount++
 			}
 		}
-		// Include self
-		seenCount++
-	} else {
-		seenCount = meshCount // Fallback to mesh count
+		seenCount++ // Include self
 	}
 	sm.mu.RUnlock()
-	
-	// Use the higher count (mesh might be forming, but we've seen more peers)
-	count := meshCount
-	if seenCount > meshCount {
-		count = seenCount
+
+	// Prefer seen count so we don't count silent mesh peers (e.g. monitor).
+	// Use mesh only when we have no seen data yet (fresh shard / mesh forming).
+	if seenCount > 0 {
+		return seenCount
 	}
-	
-	// Log discrepancy for debugging
-	if currentShard == "" && meshCount < seenCount {
-		log.Printf("[Sharding] Root shard: mesh=%d, seen=%d (using %d) - mesh may still be forming", 
-			meshCount, seenCount, count)
-	}
-	
-	return count
+	return meshCount
 }
 
 // GetShardInfo returns current shard ID and peer count.
@@ -911,67 +902,49 @@ func (sm *ShardManager) probeShard(shardID string, probeTimeout time.Duration) i
 	sm.mu.RUnlock()
 	
 	if alreadyJoined && sub.topic != nil {
-		// We're already in this shard, return peer count for this specific shard
-		meshPeers := sub.topic.ListPeers()
-		meshCount := len(meshPeers) + 1 // +1 for self
-		
-		sm.mu.RLock()
-		seenCount := 0
-		if seenMap, exists := sm.seenPeers[shardID]; exists {
-			cutoff := time.Now().Add(-2 * time.Minute)
-			for _, lastSeen := range seenMap {
-				if lastSeen.After(cutoff) {
-					seenCount++
-				}
-			}
-			seenCount++ // Include self
-		} else {
-			seenCount = meshCount
-		}
-		sm.mu.RUnlock()
-		
-		if seenCount > meshCount {
-			return seenCount
-		}
-		return meshCount
+		return sm.getProbePeerCount(shardID, sub.topic, 2*time.Minute)
 	}
-	
+
 	// Temporarily join the shard
 	sm.JoinShard(shardID)
 	defer sm.LeaveShard(shardID)
-	
-	// Wait a bit for mesh to form and peers to be discovered
+
 	time.Sleep(probeTimeout)
-	
-	// Get peer count for the probed shard
+
 	sm.mu.RLock()
 	sub, exists := sm.shardSubs[shardID]
 	sm.mu.RUnlock()
-	
+
 	if !exists || sub.topic == nil {
 		return 0
 	}
-	
-	meshPeers := sub.topic.ListPeers()
-	meshCount := len(meshPeers) + 1 // +1 for self
-	
-	// Also check if we've seen any messages (indicates activity)
+
+	return sm.getProbePeerCount(shardID, sub.topic, 1*time.Minute)
+}
+
+// getProbePeerCount returns peer count for a shard. When we have little or no "seen"
+// data (e.g. we just joined the topic and waited only 3s), we use the mesh count so
+// ROOT nodes can see that shard "0" or "1" has peers and migrate. We return the
+// maximum of seen and mesh so probing does not undercount; probe may include
+// passive subscribers (e.g. monitor) but that is acceptable for migration decisions.
+func (sm *ShardManager) getProbePeerCount(shardID string, topic interface{ ListPeers() []peer.ID }, activeWindow time.Duration) int {
+	meshPeers := topic.ListPeers()
+	meshCount := len(meshPeers) + 1
+
 	sm.mu.RLock()
 	seenCount := 0
 	if seenMap, exists := sm.seenPeers[shardID]; exists {
-		cutoff := time.Now().Add(-1 * time.Minute)
+		cutoff := time.Now().Add(-activeWindow)
 		for _, lastSeen := range seenMap {
 			if lastSeen.After(cutoff) {
 				seenCount++
 			}
 		}
-		seenCount++ // Include self
-	} else {
-		seenCount = meshCount
+		seenCount++
 	}
 	sm.mu.RUnlock()
-	
-	// Return the higher count (mesh peers or seen peers)
+
+	// Use max so we don't undercount when we've just joined and have few heartbeats (fixes ROOT stuck)
 	if seenCount > meshCount {
 		return seenCount
 	}
@@ -1037,7 +1010,9 @@ const minPeersToJoinDeeperShard = 2
 
 // discoverAndMoveToDeeperShard probes deeper shards in our branch and moves only when:
 // - current shard is over the limit (MaxPeersPerShard), or
-// - a deeper shard has strictly more peers than current (so we don't leave healthy 7–8 node shards).
+// - a deeper shard has strictly more peers than current.
+// We do not move when current is under the limit and the deeper shard has fewer peers
+// (e.g. 7 nodes in current must not move to a deeper shard with 2–3 nodes).
 func (sm *ShardManager) discoverAndMoveToDeeperShard() {
 	sm.mu.RLock()
 	currentShard := sm.currentShard
@@ -1066,12 +1041,27 @@ func (sm *ShardManager) discoverAndMoveToDeeperShard() {
 	probeTimeout := 3 * time.Second
 	deepestActiveShard := ""
 	for _, shard := range matchingShards {
+		// Do not move to a shard more than one level deeper unless its parent has at least
+		// MinPeersPerShard peers (e.g. don't move to 110 when 11 only has 4 nodes).
+		if len(shard) > len(currentShard)+1 {
+			parentShard := shard[:len(shard)-1]
+			parentPeerCount := sm.probeShard(parentShard, probeTimeout)
+			if parentPeerCount < config.MinPeersPerShard {
+				if config.VerboseLogging {
+					log.Printf("[ShardDiscovery] Skipping deeper shard %s: parent %s has %d peers (need >= %d)",
+						shard, parentShard, parentPeerCount, config.MinPeersPerShard)
+				}
+				continue
+			}
+		}
+
 		peerCount := sm.probeShard(shard, probeTimeout)
 		if peerCount < minPeersToJoinDeeperShard {
 			continue
 		}
-		// Only move if current shard is over limit, or deeper shard has more peers than current
-		if currentOverLimit || peerCount > currentPeerCount {
+		// Move only when over limit or deeper has strictly more peers (never drain when current is under limit)
+		moveBecauseDeeperHasMore := peerCount > currentPeerCount
+		if currentOverLimit || moveBecauseDeeperHasMore {
 			deepestActiveShard = shard
 			reason := "deeper has more peers"
 			if currentOverLimit {
