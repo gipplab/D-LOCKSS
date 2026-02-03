@@ -3,7 +3,6 @@ package shard
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"log"
 	"math/big"
@@ -31,12 +30,6 @@ import (
 	"dlockss/pkg/schema"
 )
 
-type ReplicationManager interface {
-	ReplicateFileFromRequest(ctx context.Context, manifestCID cid.Cid, from peer.ID, responsible bool) (bool, error)
-	UnpinFile(ctx context.Context, key string, manifestCID cid.Cid)
-	GetReplicationTracker() *common.ReplicationTracker
-}
-
 type shardSubscription struct {
 	topic    *pubsub.Topic
 	sub      *pubsub.Subscription
@@ -51,7 +44,6 @@ type ShardManager struct {
 	ps             *pubsub.PubSub
 	ipfsClient     ipfs.IPFSClient
 	storageMgr     *storage.StorageManager
-	replicationMgr ReplicationManager
 	clusterMgr     *clusters.ClusterManager // NEW: Cluster Manager
 	metrics        *telemetry.MetricsManager
 	signer         *signing.Signer
@@ -115,10 +107,6 @@ func NewShardManager(
 	sm.JoinShard(startShard)
 
 	return sm
-}
-
-func (sm *ShardManager) SetReplicationManager(rm ReplicationManager) {
-	sm.replicationMgr = rm
 }
 
 func (sm *ShardManager) Run() {
@@ -340,13 +328,9 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 		// Format: PINNED:<ManifestCID>
 		if len(msg.Data) > 7 && string(msg.Data[:7]) == "PINNED:" {
 			key := string(msg.Data[7:])
-			if sm.replicationMgr != nil && sm.replicationMgr.GetReplicationTracker() != nil {
-				sm.replicationMgr.GetReplicationTracker().RecordAnnouncement(key, msg.GetFrom())
-			}
+			// Legacy PINNED message handling removed (replicationMgr was nil check before anyway)
 			sm.storageMgr.AddKnownFile(key)
-			if manifestCID, err := common.KeyToCID(key); err == nil {
-				sm.tryReplicateFromAnnouncement(key, manifestCID, msg.GetFrom())
-			}
+			// No longer trigger replication from here; Cluster handles it.
 			return
 		}
 	}
@@ -376,20 +360,6 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 			return
 		}
 		sm.handleIngestMessage(msg, &im, shardID)
-
-	case schema.MessageTypeReplicationRequest:
-		var rr schema.ReplicationRequest
-		if err := rr.UnmarshalCBOR(msg.Data); err != nil {
-			return
-		}
-		sm.handleReplicationRequest(msg, &rr, shardID)
-
-	case schema.MessageTypeUnreplicateRequest:
-		var ur schema.UnreplicateRequest
-		if err := ur.UnmarshalCBOR(msg.Data); err != nil {
-			return
-		}
-		sm.handleUnreplicateRequest(msg, &ur, shardID)
 	}
 }
 
@@ -403,128 +373,19 @@ func (sm *ShardManager) handleIngestMessage(msg *pubsub.Message, im *schema.Inge
 	key := im.ManifestCID.String()
 	sm.metrics.IncrementMessagesReceived()
 
-	// Record this announcement in the internal replication tracker
-	// This tracks actual D-LOCKSS replication, not IPFS DHT
-	if sm.replicationMgr != nil && sm.replicationMgr.GetReplicationTracker() != nil {
-		sm.replicationMgr.GetReplicationTracker().RecordAnnouncement(key, msg.GetFrom())
-		// log.Printf("[Replication] Recorded announcement for %s from peer %s (internal replication tracking)",
-		// 	truncateCID(key, 16), msg.GetFrom().String()[:12])
-	}
-
-	// Add to known files. If we are just a tourist, we still "know" about it,
-	// but the replication manager will eventually decide if we stick around.
+	// Add to known files. If we are just a tourist, we still "know" about it.
 	sm.storageMgr.AddKnownFile(key)
-	// Try to replicate if we're responsible and selected (so we don't wait only for ReplicationRequest)
-	sm.tryReplicateFromAnnouncement(key, im.ManifestCID, msg.GetFrom())
-}
 
-// tryReplicateFromAnnouncement runs responsibility check, XOR selection, and if selected starts replication.
-// Used for ReplicationRequest, IngestMessage, and PINNED so files reach MinReplication as soon as the shard has enough nodes.
-func (sm *ShardManager) tryReplicateFromAnnouncement(key string, manifestCID cid.Cid, sender peer.ID) bool {
+	// Check if we are responsible for this file
 	payloadCIDStr := common.GetPayloadCIDForShardAssignment(sm.ctx, sm.ipfsClient, key)
-	if !sm.AmIResponsibleFor(payloadCIDStr) {
-		return false
-	}
-	if !config.AutoReplicationEnabled || sm.storageMgr.IsPinned(key) {
-		return false
-	}
-	xorDistance, err := calculateXORDistance(sm.h.ID(), manifestCID)
-	if err != nil {
-		sm.storageMgr.AddKnownFile(key)
-		return false
-	}
-	peersInShard := sm.getShardPeerCount()
-	if peersInShard == 0 {
-		peersInShard = config.MinReplication
-	}
-	selectionThreshold := config.MinReplication
-	if peersInShard >= config.MinReplication {
-		selectionThreshold = peersInShard
-	} else {
-		selectionThreshold = min(config.MinReplication+2, peersInShard)
-	}
-	distanceMod := new(big.Int).Mod(xorDistance, big.NewInt(int64(peersInShard)))
-	modValue := int(distanceMod.Int64())
-	if modValue >= selectionThreshold {
-		sm.storageMgr.AddKnownFile(key)
-		return false
-	}
-	if sm.replicationMgr == nil {
-		sm.storageMgr.AddKnownFile(key)
-		return false
-	}
-	go func() {
-		success, err := sm.replicationMgr.ReplicateFileFromRequest(sm.ctx, manifestCID, sender, true)
-		if err != nil {
-			log.Printf("[Replication] Failed to replicate %s: %v", key[:min(16, len(key))]+"...", err)
-			sm.storageMgr.RecordFailedOperation(key)
-		} else if success {
-			sm.storageMgr.AddKnownFile(key)
-			if sm.replicationMgr.GetReplicationTracker() != nil {
-				sm.replicationMgr.GetReplicationTracker().RecordAnnouncement(key, sm.h.ID())
-			}
-		}
-	}()
-	return true
-}
-
-// handleReplicationRequest processes a ReplicationRequest.
-func (sm *ShardManager) handleReplicationRequest(msg *pubsub.Message, rr *schema.ReplicationRequest, shardID string) {
-	logPrefix := fmt.Sprintf("ReplicationRequest (Shard %s)", shardID)
-	if sm.signer.VerifyAndAuthorizeMessage(msg.GetFrom(), rr.SenderID, rr.Timestamp, rr.Nonce, rr.Sig, rr.MarshalCBORForSigning, logPrefix) {
-		return
-	}
-	key := rr.ManifestCID.String()
-	manifestCID := rr.ManifestCID
-	sm.metrics.IncrementMessagesReceived()
-
-	// Check responsibility
-	payloadCIDStr := common.GetPayloadCIDForShardAssignment(sm.ctx, sm.ipfsClient, key)
-	responsible := sm.AmIResponsibleFor(payloadCIDStr)
-
-	if !responsible {
-		return
-	}
-	if !sm.tryReplicateFromAnnouncement(key, manifestCID, msg.GetFrom()) {
-		sm.storageMgr.AddKnownFile(key)
-	}
-}
-
-// handleUnreplicateRequest processes an UnreplicateRequest.
-func (sm *ShardManager) handleUnreplicateRequest(msg *pubsub.Message, ur *schema.UnreplicateRequest, shardID string) {
-	logPrefix := fmt.Sprintf("UnreplicateRequest (Shard %s)", shardID)
-	if sm.signer.VerifyAndAuthorizeMessage(msg.GetFrom(), ur.SenderID, ur.Timestamp, ur.Nonce, ur.Sig, ur.MarshalCBORForSigning, logPrefix) {
-		return
-	}
-	key := ur.ManifestCID.String()
-	manifestCID := ur.ManifestCID
-	sm.metrics.IncrementMessagesReceived()
-
-	if !sm.storageMgr.IsPinned(key) {
-		return
-	}
-
-	// Never drop a file we are responsible for in our current shard.
-	// Over-replication drop only applies to extra replicas; custodians must keep the file.
-	payloadCIDStr := common.GetPayloadCIDForShardAssignment(sm.ctx, sm.ipfsClient, key)
-	if payloadCIDStr != "" && sm.AmIResponsibleFor(payloadCIDStr) {
-		return
-	}
-
-	// Deterministic selection to drop
-	selectionKey := key + sm.h.ID().String()
-	hash := sha256.Sum256([]byte(selectionKey))
-	var hashInt uint64
-	for i := 0; i < 8 && i < len(hash); i++ {
-		hashInt = (hashInt << 8) | uint64(hash[i])
-	}
-
-	selected := (hashInt % uint64(ur.CurrentCount)) < uint64(ur.ExcessCount)
-
-	if selected {
-		log.Printf("[Replication] Selected to drop over-replicated file %s", key[:min(16, len(key))]+"...")
-		if sm.replicationMgr != nil {
-			sm.replicationMgr.UnpinFile(sm.ctx, key, manifestCID)
+	if sm.AmIResponsibleFor(payloadCIDStr) {
+		// Pin to cluster
+		// This replaces the old tryReplicateFromAnnouncement logic
+		// We use -1 for replication factor to mean "Cluster Default" (which is effectively All for CRDT mode without allocator)
+		if err := sm.clusterMgr.Pin(sm.ctx, shardID, im.ManifestCID, -1, -1); err != nil {
+			log.Printf("[Shard] Failed to pin ingested file %s to cluster: %v", key, err)
+		} else {
+			log.Printf("[Shard] Automatically pinned ingested file %s to cluster %s", key, shardID)
 		}
 	}
 }
@@ -790,14 +651,23 @@ func (sm *ShardManager) RunReshardPass(oldShard, newShard string) {
 			// Unpin so the responsible shard holds the replicas instead of early nodes.
 			if sm.storageMgr.IsPinned(key) {
 				log.Printf("[Reshard] Unpinning file that no longer belongs to shard %s: %s", newShard, common.TruncateCID(key, 16))
-				if sm.replicationMgr != nil {
-					sm.replicationMgr.UnpinFile(sm.ctx, key, manifestCID)
-				} else {
-					if sm.ipfsClient != nil {
-						_ = sm.ipfsClient.UnpinRecursive(sm.ctx, manifestCID)
+
+				// Use Cluster Manager to unpin from state
+				if sm.clusterMgr != nil {
+					if err := sm.clusterMgr.Unpin(sm.ctx, oldShard, manifestCID); err != nil {
+						log.Printf("[Reshard] Warning: Failed to unpin from old shard cluster: %v", err)
 					}
-					sm.storageMgr.UnpinFile(key)
 				}
+
+				// Also explicit local cleanup if needed, but Cluster Unpin should trigger tracker.
+				// However, if we LEFT the old shard, the tracker might be stopped.
+				// But ReshardPass runs during overlap/after split.
+				// If we left the shard, we can't unpin via consensus.
+				// We should unpin locally if we are no longer tracking that shard.
+				if sm.ipfsClient != nil {
+					_ = sm.ipfsClient.UnpinRecursive(sm.ctx, manifestCID)
+				}
+				sm.storageMgr.UnpinFile(key)
 			}
 		}
 

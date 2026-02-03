@@ -19,7 +19,6 @@ import (
 	"dlockss/internal/config"
 	"dlockss/internal/discovery"
 	"dlockss/internal/fileops"
-	"dlockss/internal/managers/replication"
 	"dlockss/internal/managers/shard"
 	"dlockss/internal/managers/storage"
 	"dlockss/internal/signing"
@@ -106,10 +105,8 @@ func main() {
 
 	// Shard manager (replication set later to break cycle)
 	shardMgr := shard.NewShardManager(ctx, h, ps, ipfsClient, storageMgr, metrics, signer, rateLimiter, dstore, dht, "")
-	repMgr := replication.NewReplicationManager(ipfsClient, shardMgr, storageMgr, metrics, signer, dht)
-	shardMgr.SetReplicationManager(repMgr)
 
-	metrics.RegisterProviders(shardMgr, storageMgr, repMgr, rateLimiter)
+	metrics.RegisterProviders(shardMgr, storageMgr, rateLimiter)
 	metrics.SetPeerID(h.ID().String())
 
 	// Telemetry and API
@@ -128,7 +125,6 @@ func main() {
 
 	// Run managers
 	shardMgr.Run()
-	repMgr.StartReplicationPipeline(ctx)
 
 	// Graceful shutdown
 	sigCh := make(chan os.Signal, 1)

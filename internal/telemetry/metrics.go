@@ -51,7 +51,7 @@ var (
 		Name: "dlockss_shard_splits_total",
 		Help: "Total number of shard split events",
 	})
-	
+
 	// Gauges
 	promPinnedFiles = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "dlockss_pinned_files",
@@ -104,11 +104,6 @@ type StorageInfoProvider interface {
 	GetReplicationLevels() map[string]int
 }
 
-type ReplicationInfoProvider interface {
-	GetActiveWorkers() int
-	GetQueueDepth() int
-}
-
 type MetricsManager struct {
 	mu sync.RWMutex
 
@@ -150,7 +145,6 @@ type MetricsManager struct {
 	// Providers
 	shardInfo   ShardInfoProvider
 	storageInfo StorageInfoProvider
-	replInfo    ReplicationInfoProvider
 	rateLimiter *common.RateLimiter
 }
 
@@ -167,12 +161,12 @@ func (m *MetricsManager) SetPeerID(peerID string) {
 	m.peerID = peerID
 }
 
-func (m *MetricsManager) RegisterProviders(s ShardInfoProvider, st StorageInfoProvider, r ReplicationInfoProvider, rl *common.RateLimiter) {
+// RegisterProviders registers components that provide metrics.
+func (m *MetricsManager) RegisterProviders(s ShardInfoProvider, st StorageInfoProvider, rl *common.RateLimiter) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.shardInfo = s
 	m.storageInfo = st
-	m.replInfo = r
 	m.rateLimiter = rl
 }
 
@@ -216,6 +210,7 @@ func (m *MetricsManager) IncrementReplicationFailures() {
 	promReplicationFailures.Inc()
 }
 
+// IncrementDHTQueries increments the number of DHT queries.
 func (m *MetricsManager) IncrementDHTQueries() {
 	m.mu.Lock()
 	m.dhtQueries++
@@ -224,6 +219,7 @@ func (m *MetricsManager) IncrementDHTQueries() {
 	promDHTQueries.Inc()
 }
 
+// IncrementDHTQueryTimeouts increments the number of DHT query timeouts.
 func (m *MetricsManager) IncrementDHTQueryTimeouts() {
 	m.mu.Lock()
 	m.dhtQueryTimeouts++
@@ -232,6 +228,7 @@ func (m *MetricsManager) IncrementDHTQueryTimeouts() {
 	promDHTTimeouts.Inc()
 }
 
+// IncrementShardSplits increments the number of shard splits.
 func (m *MetricsManager) IncrementShardSplits() {
 	m.mu.Lock()
 	m.shardSplits++
@@ -279,19 +276,14 @@ func (m *MetricsManager) RunMetricsReporter(ctx context.Context) {
 func (m *MetricsManager) UpdateGauges() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	// Use stored values for pinned/known since they are pushed by storage
 	promPinnedFiles.Set(float64(m.pinnedFilesCount))
 	promKnownFiles.Set(float64(m.knownFilesCount))
-	
+
 	if m.shardInfo != nil {
 		_, activePeers := m.shardInfo.GetShardInfo()
 		promActivePeers.Set(float64(activePeers))
-	}
-	
-	if m.replInfo != nil {
-		promWorkerPoolActive.Set(float64(m.replInfo.GetActiveWorkers()))
-		promQueueDepth.Set(float64(m.replInfo.GetQueueDepth()))
 	}
 }
 
@@ -306,7 +298,6 @@ func (m *MetricsManager) ReportMetrics() {
 
 	msgRate := float64(m.messagesReceived) / minutes
 	dropRate := float64(m.messagesDropped) / minutes
-	checkRate := float64(m.replicationChecks) / minutes
 
 	shardID := ""
 	activePeers := 0
@@ -326,11 +317,7 @@ func (m *MetricsManager) ReportMetrics() {
 		levelsMap = m.storageInfo.GetReplicationLevels()
 	}
 
-	activeWorkers := 0
-	if m.replInfo != nil {
-		activeWorkers = m.replInfo.GetActiveWorkers()
-	}
-	maxWorkers := config.ReplicationWorkers
+	// maxWorkers := config.ReplicationWorkers
 
 	m.mu.RUnlock() // Unlock for calculation
 
@@ -358,7 +345,7 @@ func (m *MetricsManager) ReportMetrics() {
 			filesAtTarget++
 		}
 	}
-	
+
 	lowReplication := 0
 	highReplication := 0
 	for _, count := range levelsMap {
@@ -392,22 +379,20 @@ func (m *MetricsManager) ReportMetrics() {
 			avgReplication, m.filesConvergedTotal, m.filesConvergedThisPeriod)
 		log.Printf("[Metrics] Network: messages_received=%.1f/min, messages_dropped=%.1f/min, active_peers=%d (shard topic)",
 			msgRate, dropRate, activePeers)
-		log.Printf("[Metrics] DHT: queries=%d, timeouts=%d", m.dhtQueries, m.dhtQueryTimeouts)
-		log.Printf("[Metrics] Performance: worker_pool_active=%d/%d, checks_rate=%.1f/min",
-			activeWorkers, maxWorkers, checkRate)
+		// log.Printf("[Metrics] DHT: queries=%d, timeouts=%d", m.dhtQueries, m.dhtQueryTimeouts)
+		// log.Printf("[Metrics] Performance: worker_pool_active=%d/%d, checks_rate=%.1f/min",
+		// 	activeWorkers, maxWorkers, checkRate)
 		log.Printf("[Metrics] System: shard_splits=%d, current_shard=%s, rate_limited_peers=%d, files_in_backoff=%d",
 			m.shardSplits, shardID, rateLimitedPeers, backoffCount)
 
 		uptime := now.Sub(m.startTime)
-		log.Printf("[Metrics] Cumulative (since startup): uptime=%v, msgs=%d (dropped=%d), checks=%d (success=%d, failures=%d), dht_queries=%d (timeouts=%d), shard_splits=%d",
+		log.Printf("[Metrics] Cumulative (since startup): uptime=%v, msgs=%d (dropped=%d), checks=%d (success=%d, failures=%d), shard_splits=%d",
 			uptime.Round(time.Second),
 			m.cumulativeMessagesReceived,
 			m.cumulativeMessagesDropped,
 			m.cumulativeReplicationChecks,
 			m.cumulativeReplicationSuccess,
 			m.cumulativeReplicationFailures,
-			m.cumulativeDhtQueries,
-			m.cumulativeDhtQueryTimeouts,
 			m.cumulativeShardSplits)
 		log.Printf("[Metrics] ================================")
 	}
@@ -423,8 +408,6 @@ func (m *MetricsManager) ReportMetrics() {
 	m.replicationChecks = 0
 	m.replicationSuccess = 0
 	m.replicationFailures = 0
-	m.dhtQueries = 0
-	m.dhtQueryTimeouts = 0
 	m.filesConvergedThisPeriod = 0
 	m.mu.Unlock()
 }
@@ -447,10 +430,6 @@ func (m *MetricsManager) GetStatus() common.StatusResponse {
 
 	activeWorkers := 0
 	queueDepth := 0
-	if m.replInfo != nil {
-		activeWorkers = m.replInfo.GetActiveWorkers()
-		queueDepth = m.replInfo.GetQueueDepth()
-	}
 
 	knownCIDs := []string(nil)
 	if m.storageInfo != nil && config.TelemetryIncludeCIDs {
@@ -484,42 +463,44 @@ func (m *MetricsManager) GetStatus() common.StatusResponse {
 
 func (m *MetricsManager) ExportMetricsToFile(timestamp time.Time) {
 	// ... similar to previous export code ...
-    // Implementation is long but simple file I/O.
-    // I'll skip full implementation here for brevity if allowed, but better to include it.
-    // I'll include a simplified version.
-    
-    path := config.MetricsExportPath
-    if path == "" { return }
-    
-    dir := filepath.Dir(path)
-    if err := os.MkdirAll(dir, 0755); err != nil {
-        log.Printf("[Error] Failed to create metrics export directory: %v", err)
-        return
-    }
-    
-    file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-    if err != nil {
-        log.Printf("[Error] Failed to open metrics export file: %v", err)
-        return
-    }
-    defer file.Close()
-    
-    writer := csv.NewWriter(file)
-    defer writer.Flush()
-    
-    // Header writing logic omitted for brevity (assumed done or checking file stats)
-    
-    // Write record
-    m.mu.RLock()
-    defer m.mu.RUnlock()
-    
-    uptime := timestamp.Sub(m.startTime).Seconds()
-    record := []string{
-        timestamp.Format(time.RFC3339),
-        fmt.Sprintf("%.2f", uptime),
-        strconv.Itoa(m.pinnedFilesCount),
-        strconv.Itoa(m.knownFilesCount),
-        // ... other fields
-    }
-    writer.Write(record)
+	// Implementation is long but simple file I/O.
+	// I'll skip full implementation here for brevity if allowed, but better to include it.
+	// I'll include a simplified version.
+
+	path := config.MetricsExportPath
+	if path == "" {
+		return
+	}
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Printf("[Error] Failed to create metrics export directory: %v", err)
+		return
+	}
+
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("[Error] Failed to open metrics export file: %v", err)
+		return
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	// Header writing logic omitted for brevity (assumed done or checking file stats)
+
+	// Write record
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	uptime := timestamp.Sub(m.startTime).Seconds()
+	record := []string{
+		timestamp.Format(time.RFC3339),
+		fmt.Sprintf("%.2f", uptime),
+		strconv.Itoa(m.pinnedFilesCount),
+		strconv.Itoa(m.knownFilesCount),
+		// ... other fields
+	}
+	writer.Write(record)
 }
