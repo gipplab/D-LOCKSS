@@ -2,12 +2,47 @@
 skinparam classAttributeIconSize 0
 skinparam linetype ortho
 
+class ClusterManager {
+    - host: host.Host
+    - ipfsClient: IPFSClient
+    - pubsub: *pubsub.PubSub
+    - dht: routing.Routing
+    - datastore: datastore.Datastore
+    - clusters: map[string]*EmbeddedCluster
+    --
+    + JoinShard(ctx, shardID, peers)
+    + LeaveShard(shardID)
+    + Pin(ctx, shardID, cid, ...)
+    + Unpin(ctx, shardID, cid)
+    + GetAllocations(ctx, shardID, cid)
+}
+
+class EmbeddedCluster {
+    + ShardID: string
+    + Consensus: ConsensusClient (CRDT)
+    + PinTracker: *LocalPinTracker
+}
+
+class LocalPinTracker {
+    - ipfsClient: IPFSClient
+    - shardID: string
+    --
+    + Start(consensus)
+    + syncLoop()
+    + syncState()
+}
+
+ShardManager --> ClusterManager : manages
+ClusterManager --> EmbeddedCluster : contains
+EmbeddedCluster --> LocalPinTracker : owns
+
 class ShardManager {
     - ctx: context.Context
     - h: host.Host
     - ps: *pubsub.PubSub
     - mu: sync.RWMutex
     - currentShard: string
+    - clusterMgr: *ClusterManager
     - shardTopic: *pubsub.Topic
     - shardSub: *pubsub.Subscription
     - oldShardName: string

@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"dlockss/internal/api"
@@ -27,11 +27,12 @@ import (
 	"dlockss/internal/trust"
 	"dlockss/pkg/ipfs"
 
+	leveldb "github.com/ipfs/go-ds-leveldb"
 	"github.com/libp2p/go-libp2p"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
 )
 
 func main() {
@@ -88,6 +89,15 @@ func main() {
 		log.Printf("[Config] Trust store load failed: %v", err)
 	}
 
+	// Initialize persistent datastore for cluster state
+	// We place this OUTSIDE the FileWatchFolder (ingest dir) to avoid the node trying to ingest its own database files.
+	dsPath := "cluster_store"
+	dstore, err := leveldb.NewDatastore(dsPath, nil)
+	if err != nil {
+		log.Fatalf("[Fatal] Failed to create datastore at %s: %v", dsPath, err)
+	}
+	defer dstore.Close()
+
 	nonceStore := common.NewNonceStore()
 	rateLimiter := common.NewRateLimiter()
 	metrics := telemetry.NewMetricsManager()
@@ -95,7 +105,7 @@ func main() {
 	signer := signing.NewSigner(h, privKey, h.ID(), nonceStore, trustMgr, dht)
 
 	// Shard manager (replication set later to break cycle)
-	shardMgr := shard.NewShardManager(ctx, h, ps, ipfsClient, storageMgr, metrics, signer, rateLimiter, "")
+	shardMgr := shard.NewShardManager(ctx, h, ps, ipfsClient, storageMgr, metrics, signer, rateLimiter, dstore, dht, "")
 	repMgr := replication.NewReplicationManager(ipfsClient, shardMgr, storageMgr, metrics, signer, dht)
 	shardMgr.SetReplicationManager(repMgr)
 

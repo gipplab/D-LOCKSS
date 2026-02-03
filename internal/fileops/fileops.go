@@ -30,14 +30,14 @@ type FileProcessor struct {
 	shardMgr   *shard.ShardManager
 	storageMgr *storage.StorageManager
 	privKey    crypto.PrivKey
-	semaphore  chan struct{} // Semaphore to limit concurrent file processing
+	semaphore  chan struct{}   // Semaphore to limit concurrent file processing
 	signer     *signing.Signer // Add signer for manual signing if needed, or use FileProcessor methods
 }
 
 // NewFileProcessor creates a new FileProcessor with dependencies.
 func NewFileProcessor(
-	client ipfs.IPFSClient, 
-	sm *shard.ShardManager, 
+	client ipfs.IPFSClient,
+	sm *shard.ShardManager,
 	stm *storage.StorageManager,
 	key crypto.PrivKey,
 ) *FileProcessor {
@@ -76,8 +76,8 @@ func (fp *FileProcessor) ScanExistingFiles() {
 
 // fileEventInfo tracks file metadata to detect actual content changes.
 type fileEventInfo struct {
-	size    int64
-	modTime time.Time
+	size     int64
+	modTime  time.Time
 	lastSeen time.Time
 }
 
@@ -94,7 +94,7 @@ var fileEventDeduper = struct {
 func shouldProcessFileEvent(path string) bool {
 	const window = 2 * time.Second
 	now := time.Now()
-	
+
 	// Get current file metadata
 	info, err := os.Stat(path)
 	if err != nil {
@@ -104,31 +104,31 @@ func shouldProcessFileEvent(path string) bool {
 	if info.IsDir() {
 		return false // Directories are handled separately
 	}
-	
+
 	currentSize := info.Size()
 	currentModTime := info.ModTime()
-	
+
 	fileEventDeduper.mu.Lock()
 	defer fileEventDeduper.mu.Unlock()
-	
+
 	// Check if we've seen this exact file content recently
 	if last, ok := fileEventDeduper.info[path]; ok {
 		// Same size + mtime within window = duplicate event, skip
-		if last.size == currentSize && 
-		   last.modTime.Equal(currentModTime) && 
-		   now.Sub(last.lastSeen) < window {
+		if last.size == currentSize &&
+			last.modTime.Equal(currentModTime) &&
+			now.Sub(last.lastSeen) < window {
 			return false
 		}
 		// Different size or mtime = legitimate modification, process
 	}
-	
+
 	// Record this file state
 	fileEventDeduper.info[path] = fileEventInfo{
 		size:     currentSize,
-		modTime:   currentModTime,
-		lastSeen:  now,
+		modTime:  currentModTime,
+		lastSeen: now,
 	}
-	
+
 	// Opportunistic cleanup to avoid unbounded growth
 	cutoff := now.Add(-10 * window)
 	for k, v := range fileEventDeduper.info {
@@ -136,7 +136,7 @@ func shouldProcessFileEvent(path string) bool {
 			delete(fileEventDeduper.info, k)
 		}
 	}
-	
+
 	return true
 }
 
@@ -146,9 +146,9 @@ func (fp *FileProcessor) processNewFile(path string) {
 	// Acquire semaphore to limit concurrent processing
 	fp.semaphore <- struct{}{}
 	defer func() { <-fp.semaphore }()
-	
+
 	log.Printf("[FileOps] Starting processing: %s", path)
-	
+
 	// Validate path and check prerequisites
 	if !validateFilePath(path) {
 		log.Printf("[FileOps] File validation failed: %s", path)
@@ -173,7 +173,7 @@ func (fp *FileProcessor) processNewFile(path string) {
 	// Do NOT defer cleanupPayload() here unconditionally.
 	// We only want to cleanup if subsequent steps fail.
 	// If we succeed, we keep the payload pinned.
-	
+
 	log.Printf("[FileOps] File imported, PayloadCID: %s", payloadCID.String())
 
 	// Build and store ResearchObject
@@ -351,6 +351,16 @@ func (fp *FileProcessor) trackAndAnnounceFile(manifestCID cid.Cid, manifestCIDSt
 	}
 	log.Printf("[FileOps] pinFile succeeded for: %s", common.TruncateCID(manifestCIDStr, 16))
 
+	// Pin to Cluster (CRDT State Sync)
+	// This triggers replication to all other nodes in the shard.
+	log.Printf("[FileOps] Pinning to Cluster for: %s", common.TruncateCID(manifestCIDStr, 16))
+	if err := fp.shardMgr.PinToCluster(context.Background(), manifestCID); err != nil {
+		log.Printf("[FileOps] Error pinning to cluster: %v", err)
+		// Don't return, proceed to announce via legacy pubsub just in case
+	} else {
+		log.Printf("[FileOps] Successfully pinned to Cluster state")
+	}
+
 	// Check if shardMgr is nil (shouldn't happen, but safety check)
 	if fp.shardMgr == nil {
 		log.Printf("[FileOps] ERROR: shardMgr is nil! Cannot announce file %s", common.TruncateCID(manifestCIDStr, 16))
@@ -375,7 +385,7 @@ func (fp *FileProcessor) trackAndAnnounceFile(manifestCID cid.Cid, manifestCIDSt
 	log.Printf("[FileOps] Checking responsibility for PayloadCID: %s", common.TruncateCID(payloadCIDStr, 16))
 	isResponsible := fp.shardMgr.AmIResponsibleFor(payloadCIDStr)
 	log.Printf("[FileOps] Responsibility check for %s: responsible=%v", common.TruncateCID(payloadCIDStr, 16), isResponsible)
-	
+
 	if isResponsible {
 		log.Printf("[FileOps] Calling announceResponsibleFile for %s", common.TruncateCID(manifestCIDStr, 16))
 		fp.announceResponsibleFile(manifestCID, manifestCIDStr, payloadCIDStr)
@@ -406,7 +416,7 @@ func (fp *FileProcessor) announceResponsibleFile(manifestCID cid.Cid, manifestCI
 	// The original code used a helper `signProtocolMessage` which used globals.
 	// I'll assume I need to implement signing here or use a helper.
 	// Since I have privKey, I can sign.
-	
+
 	// Helper to sign
 	if err := fp.SignProtocolMessage(&im); err != nil {
 		common.LogError("FileOps", "sign IngestMessage", manifestCIDStr, err)
@@ -426,7 +436,7 @@ func (fp *FileProcessor) announceResponsibleFile(manifestCID cid.Cid, manifestCI
 	// I'll skip this if I can't easily access it, or use public method on ShardManager if I add one.
 	// ShardManager has `GetReplicationManager`? No.
 	// But `trackAndAnnounceFile` is called within the node context where everything is wired.
-	
+
 	// Announce to DHT
 	provideCtx, provideCancel := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
 	go func() {
@@ -469,7 +479,7 @@ func (fp *FileProcessor) announceCustodialFile(manifestCID cid.Cid, manifestCIDS
 		fp.shardMgr.PublishToShardCBOR(b, targetShard)
 		log.Printf("[Core] Published IngestMessage to target shard %s", targetShard)
 	}
-	
+
 	// We DO NOT LeaveShard here immediately. We must remain in the shard to listen for
 	// status updates or simply hold the reference until the file is safe.
 }
@@ -568,7 +578,7 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 					watchedDirsMu.RLock()
 					alreadyWatched := watchedDirs[event.Name]
 					watchedDirsMu.RUnlock()
-					
+
 					if !alreadyWatched {
 						if err := watcher.Add(event.Name); err != nil {
 							log.Printf("[Error] Failed to watch new directory %s: %v", event.Name, err)
@@ -582,10 +592,10 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 					// Scan the new directory for existing files and nested subdirectories
 					go func(dirPath string) {
 						time.Sleep(config.FileProcessingDelay)
-						
+
 						fileCount := 0
 						dirCount := 0
-						
+
 						err := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
 							if err != nil {
 								log.Printf("[Warning] Error accessing %s during directory scan: %v", path, err)
@@ -596,7 +606,7 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 									watchedDirsMu.RLock()
 									alreadyWatched := watchedDirs[path]
 									watchedDirsMu.RUnlock()
-									
+
 									if !alreadyWatched {
 										if err := watcher.Add(path); err != nil {
 											log.Printf("[Error] Failed to watch nested directory %s: %v", path, err)
@@ -629,14 +639,14 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 							log.Printf("[FileWatcher] Scanned directory %s: found %d files, %d nested directories", dirPath, fileCount, dirCount)
 						}
 					}(event.Name)
-					continue 
+					continue
 				}
 			}
 
 			// Handle Create and Write events for files
 			if event.Op&fsnotify.Create == fsnotify.Create || event.Op&fsnotify.Write == fsnotify.Write {
 				path := event.Name
-				
+
 				if !validateFilePath(path) {
 					continue
 				}
@@ -668,8 +678,10 @@ func (fp *FileProcessor) SignProtocolMessage(msg interface{}) error {
 	// But wait, NewNonce was in signing.go which used crypto/rand.
 	// I should duplicate NewNonce in fileops or use common if I move it.
 	// For now, I'll implement simple nonce here.
-	if err != nil { return err }
-	
+	if err != nil {
+		return err
+	}
+
 	ts := time.Now().Unix()
 
 	switch m := msg.(type) {
@@ -678,13 +690,17 @@ func (fp *FileProcessor) SignProtocolMessage(msg interface{}) error {
 		m.Timestamp = ts
 		m.Nonce = nonce
 		m.Sig = nil
-		
+
 		unsigned, err := m.MarshalCBORForSigning()
-		if err != nil { return err }
-		
+		if err != nil {
+			return err
+		}
+
 		sig, err := fp.privKey.Sign(unsigned)
-		if err != nil { return err }
-		
+		if err != nil {
+			return err
+		}
+
 		m.Sig = sig
 		return nil
 	default:

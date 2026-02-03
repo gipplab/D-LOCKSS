@@ -6,7 +6,16 @@ participant "Node B" as B
 participant "Node C" as C
 participant "DHT" as DHT
 
-== File Ingestion ==
+== Cluster State Sync ==
+A -> CRDT: LogPin(ManifestCID)
+CRDT -> B: Sync (PubSub)
+CRDT -> C: Sync (PubSub)
+B -> B: PinTracker sees new CID
+B -> IPFS: PinRecursive(ManifestCID)
+C -> C: PinTracker sees new CID
+C -> IPFS: PinRecursive(ManifestCID)
+
+== File Ingestion (Legacy Announcement) ==
 A -> GS: IngestMessage(CBOR)\n{manifest_cid, shard_id, hint_size, ts, nonce, sig} (shard topic)
 GS -> B: Forward message
 GS -> C: Forward message

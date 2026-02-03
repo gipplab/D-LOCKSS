@@ -20,6 +20,15 @@ alt peerCount > MaxPeersPerShard\nAND estimatedPeersAfterSplit >= MinPeersPerSha
     Note over ShardMgr: Entering Overlap State
     
     ShardMgr -> PubSub: Join new shard topic
+    
+    Note over ShardMgr: Dual-Homing Cluster
+    ShardMgr -> ClusterMgr: JoinShard(newShard)
+    ClusterMgr -> CRDT: Initialize new consensus
+    ClusterMgr -> PinTracker: Start tracking new shard
+    
+    ShardMgr -> ClusterMgr: MigratePins(oldShard, newShard)
+    Note right of ClusterMgr: Background migration:\nRead old CRDT -> Pin to new CRDT
+    
     ShardMgr -> ShardMgr: Keep old shard subscription active
     ShardMgr -> ShardMgr: Set overlap end time
     ShardMgr -> OldReader: Start readOldShard() goroutine
@@ -46,6 +55,8 @@ alt peerCount > MaxPeersPerShard\nAND estimatedPeersAfterSplit >= MinPeersPerSha
     
     alt Overlap period expired
         ShardMgr -> PubSub: Cancel old shard subscription
+        ShardMgr -> ClusterMgr: LeaveShard(oldShard)
+        ClusterMgr -> CRDT: Shutdown old consensus
         ShardMgr -> ShardMgr: Set inOverlap = false
         Note over ShardMgr: Overlap complete\nOnly new shard active
     end

@@ -1,78 +1,36 @@
-@startuml Replication Check Sequence
+@startuml Cluster State Sync Sequence
 
-participant "ReplicationManager" as ReplMgr
-participant "StorageManager" as Storage
-participant "ShardManager" as ShardMgr
-participant "DHT" as DHT
-participant "PubSub" as PubSub
-participant "Other Nodes" as Nodes
+participant "ClusterManager" as ClusterMgr
+participant "CRDT Consensus" as CRDT
+participant "LocalPinTracker" as PinTracker
+participant "IPFS Daemon" as IPFS
+participant "Other Peers" as Peers
 
-ReplMgr -> ReplMgr: runScheduler() / runProber() / runReconciler()
+== Pinning (Ingest) ==
 
-loop For each known file (Scheduler)
-    ReplMgr -> Storage: shouldSkipDueToBackoff(hash)
-    alt In backoff period
-        ReplMgr -> ReplMgr: Skip this file
-    else Not in backoff
-        ReplMgr -> ReplMgr: Enqueue check job
+ClusterMgr -> CRDT: LogPin(ManifestCID)
+CRDT -> CRDT: Update local Merkle-DAG
+CRDT -> Peers: PubSub Broadcast (Heads)
+Peers -> CRDT: Sync State
+
+== Replication (PinTracker Loop) ==
+
+PinTracker -> CRDT: State() (Poll/Watch)
+CRDT -> PinTracker: Global Pin List
+
+loop For each Pin in State
+    PinTracker -> IPFS: IsPinned(CID)?
+    alt Not Pinned Locally
+        PinTracker -> IPFS: PinRecursive(CID)
+        Note over PinTracker: Content replicated locally
     end
 end
 
-Note over ReplMgr: Prober (Workers)
-ReplMgr -> Storage: isPinned(hash)
-ReplMgr -> ShardMgr: AmIResponsibleFor(PayloadCID)
+== Unpinning (Removal) ==
 
-alt Not responsible AND not pinned
-    ReplMgr -> Storage: removeKnownFile(hash)
-else Responsible OR pinned
-    ReplMgr -> ReplMgr: Check replicationCache first
-    alt Cache miss or expired
-        ReplMgr -> DHT: FindProvidersAsync(ManifestCID)
-        DHT -> ReplMgr: Provider count
-        ReplMgr -> ReplMgr: Store count in replicationCache
-    else Cache hit
-        ReplMgr -> ReplMgr: Use cached provider count
-    end
-    
-    ReplMgr -> ReplMgr: Send result to Reconciler
-end
-
-Note over ReplMgr: Reconciler
-ReplMgr -> Storage: Update fileReplicationLevels
-
-alt count < MinReplication
-    ReplMgr -> ReplMgr: Check pendingVerifications
-    alt No pending verification
-        Note over ReplMgr: Hysteresis: Verify before Act
-        ReplMgr -> ReplMgr: Schedule verification
-    else Verification time reached
-        ReplMgr -> DHT: FindProvidersAsync(cid) (SECOND QUERY)
-        DHT -> ReplMgr: Provider count (verification)
-        alt Verification confirms under-replication
-            alt Responsible AND not pinned
-                ReplMgr -> IPFS: PinRecursive(ManifestCID)
-                ReplMgr -> Storage: pinFileV2(ManifestCID) (includes Provide)
-            end
-            ReplMgr -> ShardMgr: PublishToShard(ReplicationRequest)
-            ShardMgr -> PubSub: Publish ReplicationRequest
-        else Verification shows adequate replication
-            ReplMgr -> ReplMgr: Remove pending verification
-        end
-    end
-else count > MaxReplication
-    alt Responsible AND pinned
-        ReplMgr -> Storage: unpinFileV2(hash)
-    end
-else count >= MinReplication AND count <= MaxReplication
-    alt Not responsible BUT pinned (custodial)
-        ReplMgr -> Storage: unpinFileV2(hash)
-    end
-end
-
-alt DHT query failed
-    ReplMgr -> Storage: recordFailedOperation(hash)
-else DHT query succeeded
-    ReplMgr -> Storage: clearBackoff(hash)
-end
+ClusterMgr -> CRDT: LogUnpin(ManifestCID)
+CRDT -> Peers: Sync State
+PinTracker -> CRDT: State()
+PinTracker -> IPFS: UnpinRecursive(CID)
 
 @enduml

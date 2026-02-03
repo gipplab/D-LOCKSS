@@ -5,13 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sync"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ipfs/go-cid"
 	ipfsapi "github.com/ipfs/go-ipfs-api"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/routing"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
@@ -24,6 +25,7 @@ type provideRequest struct {
 }
 
 // IPFSDHTAdapter implements DHTProvider using IPFS's DHT via HTTP API
+// It also implements routing.Routing to be compatible with libp2p/ipfs-cluster.
 type IPFSDHTAdapter struct {
 	api             *ipfsapi.Shell
 	retryAttempts   int
@@ -38,14 +40,17 @@ type IPFSDHTAdapter struct {
 	intervalMu      sync.RWMutex
 }
 
+// Ensure IPFSDHTAdapter implements routing.Routing
+var _ routing.Routing = (*IPFSDHTAdapter)(nil)
+
 // NewIPFSDHTAdapter creates a new DHT adapter that uses IPFS's DHT
 func NewIPFSDHTAdapter(api *ipfsapi.Shell) *IPFSDHTAdapter {
 	ctx, cancel := context.WithCancel(context.Background())
 	adapter := &IPFSDHTAdapter{
 		api:            api,
-		retryAttempts:  3, // Default retry attempts
-		retryDelay:     500 * time.Millisecond, // Default retry delay
-		provideTimeout: 60 * time.Second, // Default timeout
+		retryAttempts:  3,                               // Default retry attempts
+		retryDelay:     500 * time.Millisecond,          // Default retry delay
+		provideTimeout: 60 * time.Second,                // Default timeout
 		provideQueue:   make(chan *provideRequest, 100), // Buffer up to 100 queued operations
 		workerCtx:      ctx,
 		workerCancel:   cancel,
@@ -87,11 +92,11 @@ func (a *IPFSDHTAdapter) SetProvideInterval(d time.Duration) {
 func (a *IPFSDHTAdapter) startWorker() {
 	a.workerMu.Lock()
 	defer a.workerMu.Unlock()
-	
+
 	if a.workerStarted {
 		return
 	}
-	
+
 	go a.worker()
 	a.workerStarted = true
 }
@@ -103,38 +108,27 @@ func (a *IPFSDHTAdapter) worker() {
 		case <-a.workerCtx.Done():
 			return
 		case req := <-a.provideQueue:
-			// Create a fresh context for the actual operation
-			// This ensures each operation gets adequate time to complete,
-			// regardless of how long it waited in the queue.
-			// Use the configured timeout to ensure consistency.
 			opCtx := req.ctx
 			if deadline, ok := req.ctx.Deadline(); ok {
 				remaining := time.Until(deadline)
-				// If less than half the configured timeout remaining (likely waited in queue), give fresh timeout
-				// This ensures operations get adequate time even if they waited in the queue
 				if remaining < a.provideTimeout/2 {
 					var cancel context.CancelFunc
 					opCtx, cancel = context.WithTimeout(context.Background(), a.provideTimeout)
 					defer cancel()
 				}
 			} else {
-				// No deadline set, create one to prevent operations from hanging forever
 				var cancel context.CancelFunc
 				opCtx, cancel = context.WithTimeout(context.Background(), a.provideTimeout)
 				defer cancel()
 			}
-			
-			// Process the provide operation with the fresh context
+
 			err := a.provideInternal(opCtx, req.key, req.broadcast)
-			
-			// Send result back to caller
+
 			select {
 			case req.resultCh <- err:
 			case <-req.ctx.Done():
-				// Caller cancelled, result channel might be closed
 			}
-			
-			// Rate limit: wait before next provide so the DHT/host is not overwhelmed
+
 			a.intervalMu.RLock()
 			interval := a.provideInterval
 			a.intervalMu.RUnlock()
@@ -155,44 +149,40 @@ func (a *IPFSDHTAdapter) Close() {
 }
 
 // FindProvidersAsync finds providers of a CID using IPFS DHT
-// This operation uses the local gateway and is not expensive, so it runs directly
-// without queuing (unlike Provide operations which are queued).
 func (a *IPFSDHTAdapter) FindProvidersAsync(ctx context.Context, key cid.Cid, count int) <-chan peer.AddrInfo {
 	ch := make(chan peer.AddrInfo, 10)
-	
+
 	go func() {
 		defer close(ch)
-		
-		// Use IPFS routing findprovs API (dht/findprovs was deprecated)
+
 		var result struct {
 			Responses []struct {
 				ID    string   `json:"ID"`
 				Addrs []string `json:"Addrs"`
 			} `json:"Responses"`
 		}
-		
-	req := a.api.Request("routing/findprovs", key.String())
-	if count > 0 {
-		req.Option("num-providers", count)
-	}
-	
-	if err := req.Exec(ctx, &result); err != nil {
-		// If routing API fails, try old dht API as fallback
-		req2 := a.api.Request("dht/findprovs", key.String())
+
+		req := a.api.Request("routing/findprovs", key.String())
 		if count > 0 {
-			req2.Option("num-providers", count)
+			req.Option("num-providers", count)
 		}
-		if err2 := req2.Exec(ctx, &result); err2 != nil {
-			return // Both failed, give up
+
+		if err := req.Exec(ctx, &result); err != nil {
+			req2 := a.api.Request("dht/findprovs", key.String())
+			if count > 0 {
+				req2.Option("num-providers", count)
+			}
+			if err2 := req2.Exec(ctx, &result); err2 != nil {
+				return
+			}
 		}
-	}
-		
+
 		for _, resp := range result.Responses {
 			peerID, err := peer.Decode(resp.ID)
 			if err != nil {
 				continue
 			}
-			
+
 			var addrs []ma.Multiaddr
 			for _, addrStr := range resp.Addrs {
 				addr, err := ma.NewMultiaddr(addrStr)
@@ -201,7 +191,7 @@ func (a *IPFSDHTAdapter) FindProvidersAsync(ctx context.Context, key cid.Cid, co
 				}
 				addrs = append(addrs, addr)
 			}
-			
+
 			select {
 			case ch <- peer.AddrInfo{ID: peerID, Addrs: addrs}:
 			case <-ctx.Done():
@@ -209,7 +199,7 @@ func (a *IPFSDHTAdapter) FindProvidersAsync(ctx context.Context, key cid.Cid, co
 			}
 		}
 	}()
-	
+
 	return ch
 }
 
@@ -218,55 +208,36 @@ func (a *IPFSDHTAdapter) isTransientError(err error) bool {
 	if err == nil {
 		return false
 	}
-	
-	// Check for EOF errors (connection closed prematurely)
 	if errors.Is(err, io.EOF) {
 		return true
 	}
-	
-	// Check for EOF in error string (go-ipfs-api might wrap it)
 	errStr := strings.ToLower(err.Error())
 	if strings.Contains(errStr, "eof") {
 		return true
 	}
-	
-	// Check for connection-related errors
-	if strings.Contains(errStr, "connection") && 
-	   (strings.Contains(errStr, "reset") || strings.Contains(errStr, "closed") || strings.Contains(errStr, "refused")) {
+	if strings.Contains(errStr, "connection") &&
+		(strings.Contains(errStr, "reset") || strings.Contains(errStr, "closed") || strings.Contains(errStr, "refused")) {
 		return true
 	}
-	
 	return false
 }
 
 // Provide announces that this node provides a CID using IPFS DHT
-// This method queues the operation to ensure only one provide operation runs at a time.
-// Provide operations are expensive and can overwhelm the IPFS node if run concurrently.
-// Note: DHT queries (FindProvidersAsync, FindPeer) are NOT queued as they use the
-// cheaper local gateway and can safely run concurrently.
 func (a *IPFSDHTAdapter) Provide(ctx context.Context, key cid.Cid, broadcast bool) error {
-	// Ensure worker is started
 	a.startWorker()
-	
-	// Create request with result channel
 	req := &provideRequest{
 		ctx:       ctx,
 		key:       key,
 		broadcast: broadcast,
 		resultCh:  make(chan error, 1),
 	}
-	
-	// Enqueue the request
 	select {
 	case a.provideQueue <- req:
-		// Successfully queued
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-a.workerCtx.Done():
 		return fmt.Errorf("DHT adapter is closed")
 	}
-	
-	// Wait for result
 	select {
 	case err := <-req.resultCh:
 		return err
@@ -279,99 +250,76 @@ func (a *IPFSDHTAdapter) Provide(ctx context.Context, key cid.Cid, broadcast boo
 
 // provideInternal performs the actual provide operation (called by worker)
 func (a *IPFSDHTAdapter) provideInternal(ctx context.Context, key cid.Cid, broadcast bool) error {
-	// Use IPFS routing provide API (dht/provide was deprecated)
 	var result struct {
 		Extra string `json:"Extra"`
 	}
-	
+
 	var lastErr error
 	var lastErr2 error
-	
-	// Retry logic for transient errors with exponential backoff
+
 	for attempt := 0; attempt <= a.retryAttempts; attempt++ {
 		if attempt > 0 {
-			// Exponential backoff: delay increases with each retry
-			// delay = baseDelay * 2^(attempt-1)
-			backoffMultiplier := 1 << uint(attempt-1) // 2^(attempt-1)
+			backoffMultiplier := 1 << uint(attempt-1)
 			backoffDelay := time.Duration(int64(a.retryDelay) * int64(backoffMultiplier))
-			// Cap at 5 seconds to avoid excessive delays
 			if backoffDelay > 5*time.Second {
 				backoffDelay = 5 * time.Second
 			}
-			
-			// Check if we have enough time left in context
 			if deadline, ok := ctx.Deadline(); ok {
 				timeRemaining := time.Until(deadline)
-				// If we don't have at least 2x the backoff delay remaining, don't retry
 				if timeRemaining < backoffDelay*2 {
 					return fmt.Errorf("context deadline too soon for retry: %v remaining", timeRemaining)
 				}
 			}
-			
-			// Wait before retrying with exponential backoff
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-time.After(backoffDelay):
 			}
 		}
-		
+
 		req := a.api.Request("routing/provide", key.String())
 		if broadcast {
 			req.Option("recursive", false)
 		}
-		
+
 		err := req.Exec(ctx, &result)
 		if err == nil {
-			// Success!
 			return nil
 		}
-		
+
 		lastErr = err
-		
-		// If routing API fails with a transient error, retry
+
 		if a.isTransientError(err) && attempt < a.retryAttempts {
 			continue
 		}
-		
-		// If routing API fails, try old dht API as fallback
+
 		req2 := a.api.Request("dht/provide", key.String())
 		if broadcast {
 			req2.Option("recursive", false)
 		}
 		err2 := req2.Exec(ctx, &result)
 		if err2 == nil {
-			// Old API succeeded
 			return nil
 		}
-		
+
 		lastErr2 = err2
-		
-		// If dht API also fails with a transient error, retry
+
 		if a.isTransientError(err2) && attempt < a.retryAttempts {
 			continue
 		}
-		
-		// If both failed and error is not transient, return error immediately
+
 		if !a.isTransientError(err) && !a.isTransientError(err2) {
-			// Check if error is context deadline or cancelled
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				return err // Don't retry, just fail
+				return err
 			}
 			return fmt.Errorf("both routing/provide and dht/provide failed: routing=%v, dht=%v", err, err2)
 		}
 	}
-	
-	// All retries exhausted
 	return fmt.Errorf("both routing/provide and dht/provide failed after %d retries: routing=%v, dht=%v", a.retryAttempts, lastErr, lastErr2)
 }
 
 // FindPeer finds a peer by ID using IPFS DHT
-// This operation uses the local gateway and is not expensive, so it runs directly
-// without queuing (unlike Provide operations which are queued).
 func (a *IPFSDHTAdapter) FindPeer(ctx context.Context, id peer.ID) (peer.AddrInfo, error) {
-	// Use IPFS routing findpeer API (dht/findpeer was deprecated)
-	// The routing API returns a different format - it streams responses
 	var result struct {
 		Responses []struct {
 			ID    string   `json:"ID"`
@@ -379,26 +327,25 @@ func (a *IPFSDHTAdapter) FindPeer(ctx context.Context, id peer.ID) (peer.AddrInf
 		} `json:"Responses"`
 		Extra string `json:"Extra,omitempty"`
 	}
-	
+
 	req := a.api.Request("routing/findpeer", id.String())
 	if err := req.Exec(ctx, &result); err != nil {
-		// If routing API fails, try the old dht/findpeer as fallback
 		req2 := a.api.Request("dht/findpeer", id.String())
 		if err2 := req2.Exec(ctx, &result); err2 != nil {
 			return peer.AddrInfo{}, fmt.Errorf("peer lookup failed: %w (routing: %v)", err2, err)
 		}
 	}
-	
+
 	if len(result.Responses) == 0 {
 		return peer.AddrInfo{}, fmt.Errorf("peer not found")
 	}
-	
+
 	resp := result.Responses[0]
 	peerID, err := peer.Decode(resp.ID)
 	if err != nil {
 		return peer.AddrInfo{}, fmt.Errorf("invalid peer ID in response: %w", err)
 	}
-	
+
 	var addrs []ma.Multiaddr
 	for _, addrStr := range resp.Addrs {
 		addr, err := ma.NewMultiaddr(addrStr)
@@ -407,10 +354,58 @@ func (a *IPFSDHTAdapter) FindPeer(ctx context.Context, id peer.ID) (peer.AddrInf
 		}
 		addrs = append(addrs, addr)
 	}
-	
+
 	if len(addrs) == 0 {
 		return peer.AddrInfo{}, fmt.Errorf("no valid addresses found for peer")
 	}
-	
+
 	return peer.AddrInfo{ID: peerID, Addrs: addrs}, nil
+}
+
+// PutValue implements routing.ValueStore.
+func (a *IPFSDHTAdapter) PutValue(ctx context.Context, key string, val []byte, opts ...routing.Option) error {
+	// IPFS API dht/put
+	// Note: We ignore opts for now
+	return a.api.Request("dht/put", key).Body(strings.NewReader(string(val))).Exec(ctx, nil)
+}
+
+// GetValue implements routing.ValueStore.
+func (a *IPFSDHTAdapter) GetValue(ctx context.Context, key string, opts ...routing.Option) ([]byte, error) {
+	// IPFS API dht/get
+	var result struct {
+		Values [][]byte `json:"Values"`
+	}
+	if err := a.api.Request("dht/get", key).Exec(ctx, &result); err != nil {
+		return nil, err
+	}
+	if len(result.Values) == 0 {
+		return nil, routing.ErrNotFound
+	}
+	// Return first value
+	return result.Values[0], nil
+}
+
+// SearchValue implements routing.ValueStore.
+func (a *IPFSDHTAdapter) SearchValue(ctx context.Context, key string, opts ...routing.Option) (<-chan []byte, error) {
+	// IPFS API doesn't easily expose streaming search values via HTTP client in this way,
+	// but GetValue (dht/get) returns the best value.
+	// We'll just return a channel with the result of GetValue for compatibility.
+	out := make(chan []byte, 1)
+	go func() {
+		defer close(out)
+		val, err := a.GetValue(ctx, key, opts...)
+		if err == nil {
+			select {
+			case out <- val:
+			case <-ctx.Done():
+			}
+		}
+	}()
+	return out, nil
+}
+
+// Bootstrap implements routing.Routing.
+func (a *IPFSDHTAdapter) Bootstrap(ctx context.Context) error {
+	// IPFS daemon handles its own bootstrap. We can just return nil.
+	return nil
 }

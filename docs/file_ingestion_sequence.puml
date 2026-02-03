@@ -5,6 +5,8 @@ participant "File System" as FS
 participant "File Watcher" as Watcher
 participant "FileProcessor" as FileOps
 participant "StorageManager" as Storage
+participant "ClusterManager" as ClusterMgr
+participant "CRDT" as CRDT
 participant "IPFS" as IPFS
 participant "ShardManager" as ShardMgr
 participant "DHT" as DHT
@@ -25,6 +27,10 @@ alt BadBits check fails
 else BadBits check passes
     FileOps -> IPFS: PinRecursive(ManifestCID)\n(recursive pin)
     FileOps -> Storage: pinFile(ManifestCID)
+    
+    FileOps -> ClusterMgr: Pin(ManifestCID)
+    ClusterMgr -> CRDT: LogPin(ManifestCID)
+    Note right of ClusterMgr: CRDT syncs state to all peers in shard
 end
 
 FileOps -> Storage: addKnownFile(ManifestCID)

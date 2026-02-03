@@ -12,15 +12,18 @@ import (
 	"time"
 
 	"github.com/ipfs/go-cid"
+	"github.com/ipfs/go-datastore"
 	"github.com/ipld/go-ipld-prime/codec/dagcbor"
 	"github.com/ipld/go-ipld-prime/node/basicnode"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/multiformats/go-multihash"
 
 	"dlockss/internal/common"
 	"dlockss/internal/config"
+	"dlockss/internal/managers/clusters"
 	"dlockss/internal/managers/storage"
 	"dlockss/internal/signing"
 	"dlockss/internal/telemetry"
@@ -49,6 +52,7 @@ type ShardManager struct {
 	ipfsClient     ipfs.IPFSClient
 	storageMgr     *storage.StorageManager
 	replicationMgr ReplicationManager
+	clusterMgr     *clusters.ClusterManager // NEW: Cluster Manager
 	metrics        *telemetry.MetricsManager
 	signer         *signing.Signer
 	reshardedFiles *common.KnownFiles
@@ -82,6 +86,8 @@ func NewShardManager(
 	metrics *telemetry.MetricsManager,
 	signer *signing.Signer,
 	rateLimiter *common.RateLimiter,
+	ds datastore.Datastore,
+	dht routing.Routing,
 	startShard string,
 ) *ShardManager {
 	sm := &ShardManager{
@@ -90,6 +96,7 @@ func NewShardManager(
 		ps:             ps,
 		ipfsClient:     ipfsClient,
 		storageMgr:     stm,
+		clusterMgr:     clusters.NewClusterManager(h, ps, dht, ds, ipfsClient), // Initialize Cluster Manager with proper args
 		metrics:        metrics,
 		signer:         signer,
 		rateLimiter:    rateLimiter,
@@ -97,6 +104,11 @@ func NewShardManager(
 		currentShard:   startShard,
 		shardSubs:      make(map[string]*shardSubscription),
 		seenPeers:      make(map[string]map[peer.ID]time.Time),
+	}
+
+	// Initialize cluster for start shard
+	if err := sm.clusterMgr.JoinShard(ctx, startShard, nil); err != nil {
+		log.Printf("[Sharding] Failed to join cluster for start shard %s: %v", startShard, err)
 	}
 
 	// Join initial shard
@@ -230,7 +242,7 @@ func (sm *ShardManager) runHeartbeat() {
 			heartbeatInterval = 10 * time.Second
 		}
 	}
-	
+
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 
@@ -282,14 +294,14 @@ func (sm *ShardManager) announcePinnedFilesBatch(topic *pubsub.Topic, batchSize 
 	if sm.storageMgr == nil {
 		return
 	}
-	
+
 	for i := 0; i < batchSize; i++ {
 		// Get next file to announce from storage manager
 		key := sm.storageMgr.GetNextFileToAnnounce()
 		if key == "" {
 			return
 		}
-		
+
 		// Lightweight announcement format: PINNED:<ManifestCID>
 		msg := []byte(fmt.Sprintf("PINNED:%s", key))
 		_ = topic.Publish(sm.ctx, msg)
@@ -681,7 +693,7 @@ func (sm *ShardManager) splitShard() {
 	peerIDHash := common.GetBinaryPrefix(sm.h.ID().String(), nextDepth)
 	sm.currentShard = peerIDHash
 	sm.msgCounter = 0
-	
+
 	// Update local state is done, unlock before calling external systems
 	sm.mu.Unlock()
 
@@ -692,10 +704,27 @@ func (sm *ShardManager) splitShard() {
 	// Join new shard
 	sm.JoinShard(peerIDHash)
 
+	// Initialize new cluster for the new shard (Dual-Homing)
+	if err := sm.clusterMgr.JoinShard(sm.ctx, peerIDHash, nil); err != nil {
+		log.Printf("[Sharding] Failed to join cluster for new shard %s: %v", peerIDHash, err)
+	}
+
+	// Trigger migration from old cluster to new cluster
+	go func() {
+		if err := sm.clusterMgr.MigratePins(sm.ctx, oldShard, peerIDHash); err != nil {
+			log.Printf("[Sharding] Migration failed: %v", err)
+		}
+	}()
+
 	// Keep old shard for overlap duration, then leave
 	go func() {
 		time.Sleep(config.ShardOverlapDuration)
 		sm.LeaveShard(oldShard)
+
+		// Leave the old cluster as well
+		if err := sm.clusterMgr.LeaveShard(oldShard); err != nil {
+			log.Printf("[Sharding] Failed to leave old cluster %s: %v", oldShard, err)
+		}
 	}()
 
 	// Start reshard pass after a short delay
@@ -812,6 +841,16 @@ func (sm *ShardManager) AmIResponsibleFor(key string) bool {
 	return prefix == sm.currentShard
 }
 
+// PinToCluster pins a CID to the current shard's cluster state.
+func (sm *ShardManager) PinToCluster(ctx context.Context, c cid.Cid) error {
+	sm.mu.RLock()
+	currentShard := sm.currentShard
+	sm.mu.RUnlock()
+
+	// Default to -1 (recursive) and no specific replication factor (use cluster default/all)
+	return sm.clusterMgr.Pin(ctx, currentShard, c, -1, -1)
+}
+
 // GetShardPeers returns the list of peers in the current shard (mesh peers from pubsub)
 // This is more efficient than DHT queries since nodes already know each other via pubsub.
 func (sm *ShardManager) GetShardPeers() []peer.ID {
@@ -819,11 +858,11 @@ func (sm *ShardManager) GetShardPeers() []peer.ID {
 	currentShard := sm.currentShard
 	sub, exists := sm.shardSubs[currentShard]
 	sm.mu.RUnlock()
-	
+
 	if !exists || sub.topic == nil {
 		return nil
 	}
-	
+
 	// Get mesh peers (connected and in mesh) - these are peers we already know via pubsub
 	return sub.topic.ListPeers()
 }
@@ -834,11 +873,11 @@ func (sm *ShardManager) GetShardPeerCount(shardID string) int {
 	sm.mu.RLock()
 	sub, exists := sm.shardSubs[shardID]
 	sm.mu.RUnlock()
-	
+
 	if !exists || sub.topic == nil {
 		return 0
 	}
-	
+
 	return len(sub.topic.ListPeers())
 }
 
@@ -866,30 +905,30 @@ func (sm *ShardManager) generateDeeperShards(currentShard string, maxDepth int) 
 	if maxDepth <= 0 {
 		return nil
 	}
-	
+
 	var shards []string
 	queue := []string{currentShard}
 	maxShardLength := len(currentShard) + maxDepth
-	
+
 	for len(queue) > 0 {
 		shard := queue[0]
 		queue = queue[1:]
-		
+
 		// Generate children: append "0" and "1"
 		child0 := shard + "0"
 		child1 := shard + "1"
-		
+
 		// Only add if within max depth
 		if len(child0) <= maxShardLength {
 			shards = append(shards, child0, child1)
-			
+
 			// Add to queue for next level if we haven't reached max depth
 			if len(child0) < maxShardLength {
 				queue = append(queue, child0, child1)
 			}
 		}
 	}
-	
+
 	return shards
 }
 
@@ -900,7 +939,7 @@ func (sm *ShardManager) probeShard(shardID string, probeTimeout time.Duration) i
 	sm.mu.RLock()
 	sub, alreadyJoined := sm.shardSubs[shardID]
 	sm.mu.RUnlock()
-	
+
 	if alreadyJoined && sub.topic != nil {
 		return sm.getProbePeerCount(shardID, sub.topic, 2*time.Minute)
 	}
@@ -1101,7 +1140,7 @@ func (sm *ShardManager) discoverAndMoveToDeeperShard() {
 func (sm *ShardManager) runShardDiscovery() {
 	ticker := time.NewTicker(config.ShardDiscoveryInterval)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-sm.ctx.Done():
@@ -1117,7 +1156,7 @@ func (sm *ShardManager) runShardDiscovery() {
 			isIdle := sm.lastMessageTime.IsZero() || now.Sub(sm.lastMessageTime) > 1*time.Minute
 			currentShard := sm.currentShard
 			sm.mu.Unlock()
-			
+
 			peerCount := sm.getShardPeerCount()
 			fewPeersInShard := peerCount <= config.MaxPeersPerShard
 			if !isIdle && !fewPeersInShard {

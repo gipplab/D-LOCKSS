@@ -12,12 +12,12 @@ Custodial --> Delegated: DELEGATE message sent
 Delegated --> HandoffComplete: Replication >= MinReplication
 HandoffComplete --> [*]: unpinFile()
 
-Responsible --> Monitoring: Replication in range
-Monitoring --> UnderReplicated: count < MinReplication
-Monitoring --> OverReplicated: count > MaxReplication
+Responsible --> Monitoring: Replication in range (Cluster Sync)
+Monitoring --> UnderReplicated: CRDT State has new Pin
+Monitoring --> OverReplicated: CRDT State removed Pin
 
-UnderReplicated --> Monitoring: Replication restored
-OverReplicated --> Monitoring: Unpinned (but still tracked)
+UnderReplicated --> Monitoring: Local Pin Added
+OverReplicated --> Monitoring: Local Pin Removed
 
 Responsible --> Removed: Shard split or discovery move\n-> Not Responsible
 Removed --> [*]

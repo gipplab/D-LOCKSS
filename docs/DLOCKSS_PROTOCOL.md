@@ -4,7 +4,7 @@
 
 D-LOCKSS (Distributed Lots of Copies Keep Stuff Safe) is a decentralized preservation network that ensures long-term data durability through cooperative replication. It functions as a "Networked RAID", where independent nodes collaboratively maintain a target replication level for datasets.
 
-The protocol is built on top of the **IPFS** (InterPlanetary File System) and **libp2p** stack, utilizing content-addressing, peer-to-peer messaging (GossipSub), and distributed hash tables (DHT).
+The protocol is built on top of the **IPFS** (InterPlanetary File System) and **libp2p** stack, utilizing content-addressing, peer-to-peer messaging (GossipSub), distributed hash tables (DHT), and **IPFS Cluster CRDTs** for state consensus.
 
 ### Key Concepts
 
@@ -12,6 +12,7 @@ The protocol is built on top of the **IPFS** (InterPlanetary File System) and **
 *   **ManifestCID**: The Content ID of the Research Object. Used for tracking and referencing.
 *   **PayloadCID**: The Content ID of the actual raw data/file.
 *   **Responsibility**: Nodes are assigned to "shards". A node is responsible for a file if the file's PayloadCID hash maps to the node's shard prefix.
+*   **Cluster Consensus**: Each shard operates as an embedded IPFS Cluster. Nodes in the same shard sync their pinning state via CRDTs, ensuring automatic replication.
 *   **Custodial Mode**: A node temporarily holds a file it is not responsible for until a responsible node accepts it.
 
 ---
@@ -162,28 +163,23 @@ When a shard becomes too large (too many peers):
 
 ### 6.2 Replication & Repair
 
-Nodes run a periodic replication pipeline:
+Replication is handled automatically by the **Cluster Manager** using CRDTs:
 
-1.  **Scheduler**: Periodically scans all "Known Files".
-2.  **Prober**:
-    *   Checks local storage.
-    *   Queries DHT for providers (`FindProvidersAsync`).
-    *   Verifies local content integrity (Liar Detection: checks size/signature).
-3.  **Reconciler**:
-    *   **Under-Replication** (`Count < MinReplication`):
-        *   Broadcast `ReplicationRequest` to Shard Topic.
-        *   Responsible nodes receiving this will fetch and pin the file.
-    *   **Over-Replication** (`Count > MaxReplication`):
-        *   If locally pinned and we are excess, unpin.
-        *   Broadcast `UnreplicateRequest` if needed.
+1.  **Pinning**: When a responsible node ingests or accepts a file, it calls `Pin()` on the local embedded cluster.
+2.  **State Sync**: The CRDT (Merkle-DAG based) propagates this operation to all other peers in the shard via PubSub (`dlockss-shard-<id>`).
+3.  **Local Pin Tracker**:
+    *   Each node runs a `LocalPinTracker` that watches the CRDT state.
+    *   When it sees a new CID in the state that is not pinned locally, it triggers `ipfs pin add`.
+    *   This ensures that all nodes in the shard eventually hold all files assigned to that shard.
+4.  **Repair**: If a node goes offline and comes back, the CRDT automatically syncs missing operations, and the node catches up on pinning.
 
 ### 6.3 Custodial Handoff
 
 1.  **Custodial Node** sends `DelegateMessage` (target: "10").
 2.  **Responsible Node** (in shard "10") receives message.
-3.  Responsible Node fetches and pins the file (becoming a replica).
-4.  Responsible Node announces to DHT.
-5.  **Custodial Node** detects replication count increased.
+3.  Responsible Node pins the file to its **Cluster State**.
+4.  The Cluster syncs, and all nodes in shard "10" begin fetching the file.
+5.  **Custodial Node** detects replication count increased (via DHT or status check).
 6.  **Custodial Node** unpins the file (freeing space).
 
 ---
