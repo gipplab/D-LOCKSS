@@ -31,7 +31,10 @@ type FileProcessor struct {
 	storageMgr *storage.StorageManager
 	privKey    crypto.PrivKey
 	semaphore  chan struct{}   // Semaphore to limit concurrent file processing
+	jobQueue   chan string     // Queue for file paths to process
 	signer     *signing.Signer // Add signer for manual signing if needed, or use FileProcessor methods
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 // NewFileProcessor creates a new FileProcessor with dependencies.
@@ -41,13 +44,41 @@ func NewFileProcessor(
 	stm *storage.StorageManager,
 	key crypto.PrivKey,
 ) *FileProcessor {
-	return &FileProcessor{
+	ctx, cancel := context.WithCancel(context.Background())
+	fp := &FileProcessor{
 		ipfsClient: client,
 		shardMgr:   sm,
 		storageMgr: stm,
 		privKey:    key,
 		semaphore:  make(chan struct{}, config.MaxConcurrentFileProcessing),
+		jobQueue:   make(chan string, config.MaxConcurrentFileProcessing*100), // Buffer size
+		ctx:        ctx,
+		cancel:     cancel,
 	}
+	fp.startWorkers()
+	return fp
+}
+
+func (fp *FileProcessor) startWorkers() {
+	for i := 0; i < config.MaxConcurrentFileProcessing; i++ {
+		go fp.workerLoop()
+	}
+}
+
+func (fp *FileProcessor) workerLoop() {
+	for {
+		select {
+		case <-fp.ctx.Done():
+			return
+		case path := <-fp.jobQueue:
+			fp.processNewFile(path)
+		}
+	}
+}
+
+// Stop stops the file processor workers.
+func (fp *FileProcessor) Stop() {
+	fp.cancel()
 }
 
 // ScanExistingFiles walks the data directory and processes any existing files.
@@ -63,7 +94,8 @@ func (fp *FileProcessor) ScanExistingFiles() {
 			return nil
 		}
 		// File ingestion goes through the ResearchObject path in processNewFile.
-		fp.processNewFile(path)
+		// Use TryEnqueue to avoid blocking scan if queue is full
+		fp.TryEnqueue(path)
 		fileCount++
 		return nil
 	})
@@ -140,10 +172,25 @@ func shouldProcessFileEvent(path string) bool {
 	return true
 }
 
+// TryEnqueue attempts to add a file to the processing queue.
+// Returns false if the queue is full (backpressure).
+func (fp *FileProcessor) TryEnqueue(path string) bool {
+	select {
+	case fp.jobQueue <- path:
+		return true
+	default:
+		log.Printf("[FileOps] Queue full, dropping file: %s", path)
+		return false
+	}
+}
+
 // processNewFile imports a newly detected file into IPFS, builds a ResearchObject
 // manifest, pins it, and announces it to the D-LOCKSS network.
 func (fp *FileProcessor) processNewFile(path string) {
 	// Acquire semaphore to limit concurrent processing
+	// Note: We already have worker pool limit, but semaphore is double safety or for other uses.
+	// Actually, with worker pool, semaphore inside workerLoop is redundant if pool size == semaphore size.
+	// But let's keep it if we want to limit specifically the heavy lifting part.
 	fp.semaphore <- struct{}{}
 	defer func() { <-fp.semaphore }()
 
@@ -626,11 +673,11 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 								return nil
 							}
 							fileCount++
-							go func(p string) {
-								time.Sleep(config.FileProcessingDelay)
-								log.Printf("[FileWatcher] Processing file from directory scan: %s", p)
-								fp.processNewFile(p)
-							}(path)
+
+							// Enqueue instead of spawning goroutine
+							if !fp.TryEnqueue(path) {
+								log.Printf("[FileWatcher] Dropped file %s due to backpressure", path)
+							}
 							return nil
 						})
 						if err != nil {
@@ -657,10 +704,10 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 				}
 
 				if shouldProcessFileEvent(path) {
-					go func(p string) {
-						time.Sleep(config.FileProcessingDelay)
-						fp.processNewFile(p)
-					}(path)
+					// Enqueue instead of spawning goroutine
+					if !fp.TryEnqueue(path) {
+						log.Printf("[FileWatcher] Dropped file %s due to backpressure", path)
+					}
 				}
 			}
 		case err, ok := <-watcher.Errors:
