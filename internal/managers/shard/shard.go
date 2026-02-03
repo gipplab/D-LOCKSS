@@ -231,6 +231,11 @@ func (sm *ShardManager) runHeartbeat() {
 		}
 	}
 
+	// Increase interval if Cluster is healthy to save bandwidth
+	if sm.clusterMgr != nil {
+		heartbeatInterval = 5 * time.Minute
+	}
+
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 
@@ -239,6 +244,8 @@ func (sm *ShardManager) runHeartbeat() {
 		case <-sm.ctx.Done():
 			return
 		case <-ticker.C:
+			// Only send heartbeat if we haven't sent anything else recently?
+			// Or just send it less frequently.
 			sm.sendHeartbeat()
 		}
 	}

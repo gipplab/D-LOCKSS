@@ -35,8 +35,8 @@ import (
 
 // --- Configuration Constants ---
 const (
-	DiscoveryServiceTag    = "dlockss-prod"
-	WebUIPort              = 8080
+	DiscoveryServiceTag       = "dlockss-prod"
+	WebUIPort                 = 8080
 	DefaultNodeCleanupTimeout = 10 * time.Minute
 	// ReplicationAnnounceTTL: how long we count a peer as having a file after their last PINNED/Ingest.
 	// After a split, nodes unpin non-responsible files ~5s later (ReshardDelay); they stop announcing
@@ -779,6 +779,8 @@ func (m *Monitor) ensureShardSubscriptionUnlocked(ctx context.Context, shardID s
 	log.Printf("[Monitor] Subscribed to shard topic: %s", shardID)
 }
 
+// handleShardMessages processes messages from a shard topic.
+// It detects peers based on ANY message activity, not just Heartbeats.
 func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscription, shardID string) {
 	for {
 		select {
@@ -806,6 +808,12 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 					}
 				}
 			}
+
+			// Implicit Heartbeat: Any message counts as "I am alive in this shard"
+			// We pass -1 for pinnedCount to indicate "don't update pinned count, just update timestamp"
+			// unless it's an explicit heartbeat.
+			m.handleHeartbeat(senderID, shardID, ip, -1)
+
 			if len(msg.Data) > 0 && len(msg.Data) < 500 && string(msg.Data[:min(10, len(msg.Data))]) == "HEARTBEAT:" {
 				// Format: HEARTBEAT:<PeerID>:<PinnedCount> (optional 4th field ignored for backward compat)
 				parts := strings.SplitN(string(msg.Data), ":", 4)
@@ -813,6 +821,7 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 				if len(parts) >= 3 {
 					fmt.Sscanf(parts[2], "%d", &pinnedCount)
 				}
+				// Update with explicit pinned count
 				m.handleHeartbeat(senderID, shardID, ip, pinnedCount)
 				continue
 			}
@@ -838,16 +847,7 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 				m.handleIngestMessage(&im, senderID, targetShard, ip)
 				continue
 			}
-			var rr schema.ReplicationRequest
-			if err := rr.UnmarshalCBOR(msg.Data); err == nil {
-				m.handleHeartbeat(senderID, shardID, ip, -1)
-				continue
-			}
-			var ur schema.UnreplicateRequest
-			if err := ur.UnmarshalCBOR(msg.Data); err == nil {
-				m.handleHeartbeat(senderID, shardID, ip, -1)
-				continue
-			}
+			// Other messages (CRDT syncs, etc.) are already handled by the implicit heartbeat above.
 		}
 	}
 }
