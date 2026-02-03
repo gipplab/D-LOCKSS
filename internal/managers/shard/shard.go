@@ -391,19 +391,31 @@ func (sm *ShardManager) handleIngestMessage(msg *pubsub.Message, im *schema.Inge
 }
 
 // getShardPeerCount returns peer count for the CURRENT shard.
-// Counts only peers that have sent a message (HEARTBEAT or protocol) in the last 2 minutes,
-// so monitor-only subscribers (which do not publish) are not counted and cannot trigger
-// premature splits or migration.
+// It prioritizes the Cluster Consensus Peer Count (CRDT) for stability.
+// If that fails or returns 0 (e.g. during bootstrap), it falls back to the local PubSub mesh count.
 func (sm *ShardManager) getShardPeerCount() int {
 	sm.mu.RLock()
 	currentShard := sm.currentShard
 	sub, exists := sm.shardSubs[currentShard]
 	sm.mu.RUnlock()
 
+	// 1. Try Cluster Consensus (CRDT)
+	// This is the preferred source of truth as it represents the set of nodes
+	// that have actually joined the consensus, avoiding split-brain from transient network partitions.
+	if sm.clusterMgr != nil {
+		count, err := sm.clusterMgr.GetPeerCount(sm.ctx, currentShard)
+		if err == nil && count > 0 {
+			// CRDT count includes self? Usually yes.
+			return count
+		}
+		// If error or 0, fall back to PubSub
+	}
+
 	if !exists || sub.topic == nil {
 		return 0
 	}
 
+	// 2. Fallback: PubSub Mesh + Seen Peers
 	meshPeers := sub.topic.ListPeers()
 	meshCount := len(meshPeers) + 1 // +1 for self
 
@@ -420,8 +432,6 @@ func (sm *ShardManager) getShardPeerCount() int {
 	}
 	sm.mu.RUnlock()
 
-	// Prefer seen count so we don't count silent mesh peers (e.g. monitor).
-	// Use mesh only when we have no seen data yet (fresh shard / mesh forming).
 	if seenCount > 0 {
 		return seenCount
 	}

@@ -38,6 +38,7 @@ type ConsensusClient interface {
 	LogPin(ctx context.Context, pin api.Pin) error
 	LogUnpin(ctx context.Context, pin api.Pin) error
 	State(ctx context.Context) (state.ReadOnly, error)
+	Peers(ctx context.Context) ([]peer.ID, error)
 }
 
 // EmbeddedCluster represents a single shard's consensus state (CRDT).
@@ -103,6 +104,38 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string, bootstr
 	// Start PinTracker
 	tracker := NewLocalPinTracker(cm.ipfsClient, shardID)
 	tracker.Start(consensus)
+
+	// Start Signal Listener (Event-Driven Updates)
+	// We subscribe to the same topic that CRDT uses to detect activity.
+	// When we see a message, we trigger the tracker to sync immediately.
+	topicName := cfg.ClusterName
+	topic, err := cm.pubsub.Join(topicName)
+	if err == nil {
+		sub, err := topic.Subscribe()
+		if err == nil {
+			go func() {
+				defer sub.Cancel()
+				defer topic.Close()
+				for {
+					select {
+					case <-subCtx.Done():
+						return
+					default:
+						_, err := sub.Next(subCtx)
+						if err != nil {
+							return
+						}
+						// Trigger sync on any message
+						tracker.TriggerSync()
+					}
+				}
+			}()
+		} else {
+			log.Printf("[Cluster] Warning: Failed to subscribe to signal topic %s: %v", topicName, err)
+		}
+	} else {
+		log.Printf("[Cluster] Warning: Failed to join signal topic %s: %v", topicName, err)
+	}
 
 	cm.clusters[shardID] = &EmbeddedCluster{
 		ShardID:    shardID,
@@ -211,4 +244,21 @@ func (cm *ClusterManager) GetAllocations(ctx context.Context, shardID string, c 
 		}
 	}
 	return nil, fmt.Errorf("pin not found in state")
+}
+
+// GetPeerCount returns the number of peers in the shard's consensus cluster.
+func (cm *ClusterManager) GetPeerCount(ctx context.Context, shardID string) (int, error) {
+	cm.mu.RLock()
+	cluster, exists := cm.clusters[shardID]
+	cm.mu.RUnlock()
+
+	if !exists {
+		return 0, fmt.Errorf("not a member of shard %s", shardID)
+	}
+
+	peers, err := cluster.Consensus.Peers(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return len(peers), nil
 }

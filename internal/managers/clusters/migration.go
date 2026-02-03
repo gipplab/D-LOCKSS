@@ -2,8 +2,12 @@ package clusters
 
 import (
 	"context"
+	"fmt"
 	"log"
 
+	"dlockss/internal/common"
+
+	"github.com/ipfs-cluster/ipfs-cluster/api"
 	"github.com/ipfs/go-cid"
 )
 
@@ -16,32 +20,71 @@ func (cm *ClusterManager) MigratePins(ctx context.Context, sourceShardID, destSh
 	// In a real implementation, we would query the local state of the source CRDT.
 	// allocations, err := cm.clusters[sourceShardID].Consensus.ListPins()
 
-	// Placeholder: Retrieve pins from source (mocked)
+	// Since we don't have a direct ListPins on ConsensusClient yet (only State()),
+	// we need to use State() which returns GlobalPinInfo.
+
 	allocations := []cid.Cid{}
+
+	cm.mu.RLock()
+	sourceCluster, exists := cm.clusters[sourceShardID]
+	cm.mu.RUnlock()
+
+	if !exists {
+		log.Printf("[ClusterMigration] Source shard %s not found, skipping migration", sourceShardID)
+		return nil
+	}
+
+	state, err := sourceCluster.Consensus.State(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get state for source shard %s: %w", sourceShardID, err)
+	}
+
+	// Stream pins from state
+	out := make(chan api.Pin)
+	go func() {
+		defer close(out)
+		_ = state.List(ctx, out)
+	}()
+
+	for pin := range out {
+		allocations = append(allocations, pin.Cid.Cid)
+	}
+
+	log.Printf("[ClusterMigration] Found %d pins in source shard %s", len(allocations), sourceShardID)
+
+	destDepth := len(destShardID)
 
 	for _, c := range allocations {
 		// 2. Check responsibility: Does this CID belong to the NEW shard?
-		// We need access to the common.GetPayloadCIDForShardAssignment logic here.
-		// For now, we assume ALL pins from the old shard that match the new prefix should be moved.
+		// We need to check if the CID's hash prefix matches the destShardID.
+		// Note: This checks the ManifestCID itself. Ideally we check PayloadCID but
+		// we might not have it handy without fetching the block.
+		// For migration, we assume the key used for sharding is the one we have.
+		// If D-LOCKSS uses PayloadCID for sharding, we need to resolve it.
+		// However, `common.GetPayloadCIDForShardAssignment` requires IPFS access.
+		// We have `cm.ipfsClient`.
+
+		key := c.String()
+		payloadCIDStr := common.GetPayloadCIDForShardAssignment(ctx, cm.ipfsClient, key)
+		stableHex := common.KeyToStableHex(payloadCIDStr)
+		targetPrefix := common.GetHexBinaryPrefix(stableHex, destDepth)
+
+		if targetPrefix != destShardID {
+			// This pin belongs to the OTHER sibling (e.g. we moved to "00", this belongs to "01")
+			// We do NOT migrate it. It will be dropped when we leave the old shard.
+			continue
+		}
 
 		// 3. Pin to the new cluster
-		// We use default replication factors for now, or preserve from old pin.
-		if err := cm.Pin(ctx, destShardID, c, 5, 10); err != nil {
+		// We use default replication factors for now (-1).
+		if err := cm.Pin(ctx, destShardID, c, -1, -1); err != nil {
 			log.Printf("[ClusterMigration] Failed to migrate pin %s: %v", c, err)
 			continue
 		}
 
-		// 4. Unpin from the old cluster?
-		// OPTION A: Immediate unpin. Good for cleanup, bad if revert needed.
-		// OPTION B: Let the old cluster "die" naturally when we LeaveShard.
-		// Since CRDT state is local, we don't strictly need to unpin from the old one
-		// if we are about to destroy the entire old cluster instance.
-		// However, if the old cluster persists (e.g. overlap period), we should unpin
-		// to stop tracking it there.
-
-		if err := cm.Unpin(ctx, sourceShardID, c); err != nil {
-			log.Printf("[ClusterMigration] Failed to cleanup old pin %s: %v", c, err)
-		}
+		// 4. Unpin from old?
+		// We leave it for now; it will disappear when we close the old cluster.
+		// Explicit unpinning might cause churn if we are still syncing with peers who haven't split yet.
 	}
 
 	log.Printf("[ClusterMigration] Migration finished from %s -> %s", sourceShardID, destShardID)

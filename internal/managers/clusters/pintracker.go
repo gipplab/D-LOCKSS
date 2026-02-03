@@ -2,6 +2,7 @@ package clusters
 
 import (
 	"context"
+	"io"
 	"log"
 	"sync"
 	"time"
@@ -15,6 +16,15 @@ type IPFSClient interface {
 	PinRecursive(ctx context.Context, c cid.Cid) error
 	UnpinRecursive(ctx context.Context, c cid.Cid) error
 	IsPinned(ctx context.Context, c cid.Cid) (bool, error)
+	GetBlock(ctx context.Context, c cid.Cid) ([]byte, error)
+	GetFileSize(ctx context.Context, c cid.Cid) (uint64, error)
+	GetPeerID(ctx context.Context) (string, error)
+	ImportFile(ctx context.Context, path string) (cid.Cid, error)
+	ImportReader(ctx context.Context, r io.Reader) (cid.Cid, error)
+	PutDagCBOR(ctx context.Context, data []byte) (cid.Cid, error)
+	// GetShell() interface{} // Removed to avoid interface mismatch if not needed by ClusterManager directly
+	SwarmConnect(ctx context.Context, addrs []string) error
+	VerifyDAGCompleteness(ctx context.Context, c cid.Cid) (bool, error)
 }
 
 // LocalPinTracker monitors the CRDT state and syncs it to the local IPFS node.
@@ -29,6 +39,9 @@ type LocalPinTracker struct {
 	// Lifecycle
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// Trigger channel for event-driven updates
+	trigger chan struct{}
 }
 
 func NewLocalPinTracker(ipfsClient IPFSClient, shardID string) *LocalPinTracker {
@@ -38,6 +51,16 @@ func NewLocalPinTracker(ipfsClient IPFSClient, shardID string) *LocalPinTracker 
 		shardID:    shardID,
 		ctx:        ctx,
 		cancel:     cancel,
+		trigger:    make(chan struct{}, 1),
+	}
+}
+
+// TriggerSync forces an immediate sync check.
+func (pt *LocalPinTracker) TriggerSync() {
+	select {
+	case pt.trigger <- struct{}{}:
+	default:
+		// Already triggered
 	}
 }
 
@@ -52,7 +75,7 @@ func (pt *LocalPinTracker) Stop() {
 }
 
 func (pt *LocalPinTracker) syncLoop(consensus ConsensusClient) {
-	ticker := time.NewTicker(30 * time.Second) // Poll state every 30s for now
+	ticker := time.NewTicker(30 * time.Second) // Poll state every 30s as backup
 	defer ticker.Stop()
 
 	for {
@@ -60,6 +83,8 @@ func (pt *LocalPinTracker) syncLoop(consensus ConsensusClient) {
 		case <-pt.ctx.Done():
 			return
 		case <-ticker.C:
+			pt.syncState(consensus)
+		case <-pt.trigger:
 			pt.syncState(consensus)
 		}
 	}
