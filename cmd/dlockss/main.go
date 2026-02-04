@@ -11,13 +11,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
+	"time"
 
 	"dlockss/internal/api"
 	"dlockss/internal/badbits"
 	"dlockss/internal/common"
 	"dlockss/internal/config"
-	"dlockss/internal/discovery"
 	"dlockss/internal/fileops"
 	"dlockss/internal/managers/clusters"
 	"dlockss/internal/managers/shard"
@@ -29,9 +30,13 @@ import (
 
 	leveldb "github.com/ipfs/go-ds-leveldb"
 	"github.com/libp2p/go-libp2p"
+	kaddht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
+	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 )
 
@@ -76,12 +81,56 @@ func main() {
 		log.Fatalf("[Fatal] Failed to create pubsub: %v", err)
 	}
 
-	// mDNS discovery so nodes and monitor find each other on the same LAN (same tag as monitor)
-	notifee := &discovery.DiscoveryNotifee{H: h, Ctx: ctx}
-	mdnsSvc := mdns.NewMdnsService(h, config.DiscoveryServiceTag, notifee)
-	if err := mdnsSvc.Start(); err != nil {
-		log.Printf("[Config] mDNS start failed: %v (peer/monitor discovery limited)", err)
+	// Initialize DHT for discovery (replacing mDNS)
+	// Note: This DHT is separate from the IPFS daemon's DHT. It is used solely for
+	// finding other D-LOCKSS nodes/monitors via the "dlockss-prod" rendezvous tag.
+	kademliaDHT, err := kaddht.New(ctx, h)
+	if err != nil {
+		log.Fatalf("[Fatal] Failed to create DHT: %v", err)
 	}
+	if err = kademliaDHT.Bootstrap(ctx); err != nil {
+		log.Fatalf("[Fatal] Failed to bootstrap DHT: %v", err)
+	}
+
+	// Connect to default bootstrap peers
+	var wg sync.WaitGroup
+	for _, peerAddr := range kaddht.DefaultBootstrapPeers {
+		peerinfo, _ := peer.AddrInfoFromP2pAddr(peerAddr)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := h.Connect(ctx, *peerinfo); err != nil {
+				// log.Printf("Bootstrap warning: %s", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Setup Routing Discovery
+	routingDiscovery := routing.NewRoutingDiscovery(kademliaDHT)
+	dutil.Advertise(ctx, routingDiscovery, config.DiscoveryServiceTag)
+	log.Printf("[Config] Advertising service on DHT: %s", config.DiscoveryServiceTag)
+
+	// Find peers (e.g. monitor)
+	go func() {
+		for {
+			peerChan, err := routingDiscovery.FindPeers(ctx, config.DiscoveryServiceTag)
+			if err != nil {
+				log.Printf("[Discovery] FindPeers error: %v", err)
+				time.Sleep(10 * time.Second)
+				continue
+			}
+			for peer := range peerChan {
+				if peer.ID == h.ID() {
+					continue
+				}
+				if h.Network().Connectedness(peer.ID) != network.Connected {
+					h.Connect(ctx, peer)
+				}
+			}
+			time.Sleep(30 * time.Second)
+		}
+	}()
 
 	// Trust (optional: load peers if file exists)
 	trustMgr := trust.NewTrustManager(config.TrustMode)

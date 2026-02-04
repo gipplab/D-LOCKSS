@@ -22,12 +22,14 @@ import (
 
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
+	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 	ma "github.com/multiformats/go-multiaddr"
 
 	"dlockss/pkg/schema"
@@ -969,11 +971,56 @@ func startLibP2P(ctx context.Context, monitor *Monitor) (host.Host, error) {
 	go monitor.cleanupStaleCIDs(ctx)
 	monitor.ensureShardSubscription(ctx, "")
 	go monitor.subscribeToActiveShards(ctx)
-	notifee := &discoveryNotifee{h: h}
-	mdnsSvc := mdns.NewMdnsService(h, DiscoveryServiceTag, notifee)
-	if err := mdnsSvc.Start(); err != nil {
-		return nil, fmt.Errorf("mdns error: %w", err)
+
+	// Initialize DHT for discovery (replacing mDNS)
+	kademliaDHT, err := dht.New(ctx, h)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create DHT: %w", err)
 	}
+	if err = kademliaDHT.Bootstrap(ctx); err != nil {
+		return nil, fmt.Errorf("failed to bootstrap DHT: %w", err)
+	}
+
+	// Connect to default bootstrap peers
+	var wg sync.WaitGroup
+	for _, peerAddr := range dht.DefaultBootstrapPeers {
+		peerinfo, _ := peer.AddrInfoFromP2pAddr(peerAddr)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := h.Connect(ctx, *peerinfo); err != nil {
+				// log.Printf("Bootstrap warning: %s", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Setup Routing Discovery
+	routingDiscovery := routing.NewRoutingDiscovery(kademliaDHT)
+	dutil.Advertise(ctx, routingDiscovery, DiscoveryServiceTag)
+	log.Printf("[Monitor] Advertising service: %s", DiscoveryServiceTag)
+
+	// Find peers
+	go func() {
+		for {
+			peerChan, err := routingDiscovery.FindPeers(ctx, DiscoveryServiceTag)
+			if err != nil {
+				log.Printf("[Monitor] FindPeers error: %v", err)
+				time.Sleep(10 * time.Second)
+				continue
+			}
+			for peer := range peerChan {
+				if peer.ID == h.ID() {
+					continue
+				}
+				if h.Network().Connectedness(peer.ID) != network.Connected {
+					h.Connect(ctx, peer)
+				}
+			}
+			time.Sleep(30 * time.Second)
+		}
+	}()
+
 	return h, nil
 }
 
