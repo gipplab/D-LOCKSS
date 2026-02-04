@@ -161,7 +161,7 @@ func NewReplicationTracker(entryTTL time.Duration) *ReplicationTracker {
 func (rt *ReplicationTracker) RecordAnnouncement(fileKey string, peerID peer.ID) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	
+
 	if rt.fileReplicas[fileKey] == nil {
 		rt.fileReplicas[fileKey] = make(map[peer.ID]time.Time)
 	}
@@ -172,12 +172,12 @@ func (rt *ReplicationTracker) RecordAnnouncement(fileKey string, peerID peer.ID)
 func (rt *ReplicationTracker) GetReplicationCount(fileKey string) int {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
-	
+
 	replicas, exists := rt.fileReplicas[fileKey]
 	if !exists {
 		return 0
 	}
-	
+
 	// Count only non-stale entries
 	now := time.Now()
 	count := 0
@@ -193,12 +193,12 @@ func (rt *ReplicationTracker) GetReplicationCount(fileKey string) int {
 func (rt *ReplicationTracker) GetReplicas(fileKey string) []peer.ID {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
-	
+
 	replicas, exists := rt.fileReplicas[fileKey]
 	if !exists {
 		return nil
 	}
-	
+
 	// Return only non-stale entries
 	now := time.Now()
 	var result []peer.ID
@@ -214,7 +214,7 @@ func (rt *ReplicationTracker) GetReplicas(fileKey string) []peer.ID {
 func (rt *ReplicationTracker) Cleanup() {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	
+
 	now := time.Now()
 	for fileKey, replicas := range rt.fileReplicas {
 		// Remove stale peer entries
@@ -234,7 +234,7 @@ func (rt *ReplicationTracker) Cleanup() {
 func (rt *ReplicationTracker) RemovePeer(peerID peer.ID) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	
+
 	for fileKey, replicas := range rt.fileReplicas {
 		delete(replicas, peerID)
 		if len(replicas) == 0 {
@@ -275,6 +275,16 @@ func (tp *TrustedPeers) SetAll(peers map[peer.ID]bool) {
 	tp.mu.Lock()
 	defer tp.mu.Unlock()
 	tp.m = peers
+}
+
+func (tp *TrustedPeers) All() []peer.ID {
+	tp.mu.RLock()
+	defer tp.mu.RUnlock()
+	peers := make([]peer.ID, 0, len(tp.m))
+	for pid := range tp.m {
+		peers = append(peers, pid)
+	}
+	return peers
 }
 
 // NonceStore tracks seen nonces for replay protection
@@ -445,7 +455,7 @@ func (bt *BackoffTable) RecordFailure(key string) {
 	if backoff.delay > config.MaxBackoffDelay {
 		backoff.delay = config.MaxBackoffDelay
 	}
-	
+
 	// Add jitter: random variation between -25% and +25% of delay
 	// This spreads out retries when many operations fail simultaneously,
 	// preventing thundering herd problems where all retries happen at once

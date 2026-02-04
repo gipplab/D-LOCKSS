@@ -11,13 +11,11 @@ import (
 	"time"
 
 	"github.com/ipfs/go-cid"
-	"github.com/ipfs/go-datastore"
 	"github.com/ipld/go-ipld-prime/codec/dagcbor"
 	"github.com/ipld/go-ipld-prime/node/basicnode"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/multiformats/go-multihash"
 
 	"dlockss/internal/common"
@@ -44,7 +42,7 @@ type ShardManager struct {
 	ps             *pubsub.PubSub
 	ipfsClient     ipfs.IPFSClient
 	storageMgr     *storage.StorageManager
-	clusterMgr     *clusters.ClusterManager // NEW: Cluster Manager
+	clusterMgr     clusters.ClusterManagerInterface // NEW: Cluster Manager Interface
 	metrics        *telemetry.MetricsManager
 	signer         *signing.Signer
 	reshardedFiles *common.KnownFiles
@@ -78,8 +76,7 @@ func NewShardManager(
 	metrics *telemetry.MetricsManager,
 	signer *signing.Signer,
 	rateLimiter *common.RateLimiter,
-	ds datastore.Datastore,
-	dht routing.Routing,
+	clusterMgr clusters.ClusterManagerInterface,
 	startShard string,
 ) *ShardManager {
 	sm := &ShardManager{
@@ -88,7 +85,7 @@ func NewShardManager(
 		ps:             ps,
 		ipfsClient:     ipfsClient,
 		storageMgr:     stm,
-		clusterMgr:     clusters.NewClusterManager(h, ps, dht, ds, ipfsClient), // Initialize Cluster Manager with proper args
+		clusterMgr:     clusterMgr,
 		metrics:        metrics,
 		signer:         signer,
 		rateLimiter:    rateLimiter,

@@ -61,6 +61,10 @@ func (tm *TrustManager) IsPeerTrusted(peerID peer.ID) bool {
 	return tm.trustedPeers.Has(peerID)
 }
 
+func (tm *TrustManager) GetTrustedPeers() []peer.ID {
+	return tm.trustedPeers.All()
+}
+
 // AuthorizeIncomingSender enforces:
 // - SenderID must match libp2p's ReceivedFrom (prevents in-message spoofing)
 // - If TrustMode == "allowlist", sender must be present in trust store

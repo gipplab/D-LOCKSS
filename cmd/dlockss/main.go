@@ -19,6 +19,7 @@ import (
 	"dlockss/internal/config"
 	"dlockss/internal/discovery"
 	"dlockss/internal/fileops"
+	"dlockss/internal/managers/clusters"
 	"dlockss/internal/managers/shard"
 	"dlockss/internal/managers/storage"
 	"dlockss/internal/signing"
@@ -104,7 +105,8 @@ func main() {
 	signer := signing.NewSigner(h, privKey, h.ID(), nonceStore, trustMgr, dht)
 
 	// Shard manager (replication set later to break cycle)
-	shardMgr := shard.NewShardManager(ctx, h, ps, ipfsClient, storageMgr, metrics, signer, rateLimiter, dstore, dht, "")
+	clusterMgr := clusters.NewClusterManager(h, ps, dht, dstore, ipfsClient, trustMgr.GetTrustedPeers())
+	shardMgr := shard.NewShardManager(ctx, h, ps, ipfsClient, storageMgr, metrics, signer, rateLimiter, clusterMgr, "")
 
 	metrics.RegisterProviders(shardMgr, storageMgr, rateLimiter)
 	metrics.SetPeerID(h.ID().String())

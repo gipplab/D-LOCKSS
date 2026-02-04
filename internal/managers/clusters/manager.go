@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"dlockss/internal/config"
+
 	"github.com/ipfs-cluster/ipfs-cluster/api"
 	"github.com/ipfs-cluster/ipfs-cluster/consensus/crdt"
 	"github.com/ipfs-cluster/ipfs-cluster/state"
@@ -20,14 +22,26 @@ import (
 	"github.com/multiformats/go-multiaddr"
 )
 
+// ClusterManagerInterface defines the interface for ClusterManager to allow mocking.
+type ClusterManagerInterface interface {
+	JoinShard(ctx context.Context, shardID string, bootstrapPeers []multiaddr.Multiaddr) error
+	LeaveShard(shardID string) error
+	Pin(ctx context.Context, shardID string, c cid.Cid, replicationFactorMin, replicationFactorMax int) error
+	Unpin(ctx context.Context, shardID string, c cid.Cid) error
+	GetAllocations(ctx context.Context, shardID string, c cid.Cid) ([]peer.ID, error)
+	GetPeerCount(ctx context.Context, shardID string) (int, error)
+	MigratePins(ctx context.Context, fromShard, toShard string) error
+}
+
 // ClusterManager manages multiple embedded IPFS Cluster instances (Consensus/PinTracker)
 // sharing the same underlying IPFS node.
 type ClusterManager struct {
-	host       host.Host
-	ipfsClient IPFSClient // Used for PinTracker
-	pubsub     *pubsub.PubSub
-	dht        routing.Routing
-	datastore  datastore.Datastore
+	host         host.Host
+	ipfsClient   IPFSClient // Used for PinTracker
+	pubsub       *pubsub.PubSub
+	dht          routing.Routing
+	datastore    datastore.Datastore
+	trustedPeers []peer.ID
 
 	mu       sync.RWMutex
 	clusters map[string]*EmbeddedCluster
@@ -53,14 +67,15 @@ type EmbeddedCluster struct {
 	cancel context.CancelFunc
 }
 
-func NewClusterManager(h host.Host, ps *pubsub.PubSub, dht routing.Routing, ds datastore.Datastore, ipfsClient IPFSClient) *ClusterManager {
+func NewClusterManager(h host.Host, ps *pubsub.PubSub, dht routing.Routing, ds datastore.Datastore, ipfsClient IPFSClient, trustedPeers []peer.ID) *ClusterManager {
 	return &ClusterManager{
-		host:       h,
-		pubsub:     ps,
-		dht:        dht,
-		datastore:  ds,
-		ipfsClient: ipfsClient,
-		clusters:   make(map[string]*EmbeddedCluster),
+		host:         h,
+		pubsub:       ps,
+		dht:          dht,
+		datastore:    ds,
+		ipfsClient:   ipfsClient,
+		trustedPeers: trustedPeers,
+		clusters:     make(map[string]*EmbeddedCluster),
 	}
 }
 
@@ -78,12 +93,18 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string, bootstr
 	shardDS := namespace.Wrap(cm.datastore, datastore.NewKey(shardID))
 
 	// Configure CRDT
+	trustAll := true
+	if config.TrustMode == "allowlist" {
+		trustAll = false
+	}
+
 	cfg := &crdt.Config{
 		ClusterName:         "dlockss-shard-" + shardID,
 		PeersetMetric:       "ping",
 		RebroadcastInterval: 5 * time.Minute,
 		DatastoreNamespace:  datastore.NewKey("consensus").String(),
-		TrustAll:            true,
+		TrustAll:            trustAll,
+		TrustedPeers:        cm.trustedPeers,
 		Batching: crdt.BatchingConfig{
 			MaxBatchSize: 50,
 			MaxBatchAge:  500 * time.Millisecond,
