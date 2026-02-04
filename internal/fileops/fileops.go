@@ -364,7 +364,7 @@ func (fp *FileProcessor) signResearchObject(ro *schema.ResearchObject) error {
 // checkBadBitsAndPin checks BadBits and pins the manifest if allowed.
 func (fp *FileProcessor) checkBadBitsAndPin(ctx context.Context, manifestCID cid.Cid, manifestCIDStr, path string, cleanupPayload func()) bool {
 	// Check BadBits
-	if badbits.IsCIDBlocked(manifestCIDStr, config.NodeCountry) {
+	if badbits.IsCIDBlocked(manifestCIDStr) {
 		log.Printf("[FileOps] Refused to process file %s (blocked ManifestCID: %s)", path, manifestCIDStr)
 		cleanupPayload()
 		// Also ensure manifest is not pinned (PutDagCBOR might pin it?)

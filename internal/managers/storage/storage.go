@@ -43,7 +43,7 @@ func (sm *StorageManager) GetNextFileToAnnounce() string {
 	if len(files) == 0 {
 		return ""
 	}
-	
+
 	// Just pick the first one since we removed the index
 	for k := range files {
 		return k
@@ -54,9 +54,9 @@ func (sm *StorageManager) GetNextFileToAnnounce() string {
 // PinFile pins a file using its ManifestCID string.
 // It tracks the ManifestCID in our internal state and announces to DHT.
 func (sm *StorageManager) PinFile(manifestCIDStr string) bool {
-	// Only pin if allowed
-	if badbits.IsCIDBlocked(manifestCIDStr, config.NodeCountry) {
-		log.Printf("[Storage] Refused to pin blocked CID: %s (blocked in %s)", common.TruncateCID(manifestCIDStr, 16), config.NodeCountry)
+	// Check BadBits
+	if badbits.IsCIDBlocked(manifestCIDStr) {
+		log.Printf("[Storage] Refused to pin blocked CID: %s", common.TruncateCID(manifestCIDStr, 16))
 		return false
 	}
 
@@ -70,14 +70,14 @@ func (sm *StorageManager) PinFile(manifestCIDStr string) bool {
 		// File was already pinned - timestamp was updated by Add() to reflect latest pin time
 		log.Printf("[Storage] ManifestCID already pinned (timestamp updated): %s (total pinned: %d)", common.TruncateCID(manifestCIDStr, 16), sm.pinnedFiles.Size())
 	}
-	
-		// Also announce to DHT (provide)
-		// We do this here to ensure anything we pin is also provided
-		// go func() {
-		// 	ctx, cancel := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
-		// 	defer cancel()
-		// 	sm.ProvideFile(ctx, manifestCIDStr)
-		// }()
+
+	// Also announce to DHT (provide)
+	// We do this here to ensure anything we pin is also provided
+	// go func() {
+	// 	ctx, cancel := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
+	// 	defer cancel()
+	// 	sm.ProvideFile(ctx, manifestCIDStr)
+	// }()
 
 	return true
 }
@@ -92,7 +92,7 @@ func (sm *StorageManager) UnpinFile(key string) {
 			sm.metrics.SetPinnedFilesCount(sm.pinnedFiles.Size())
 		}
 		timeSincePin := time.Since(pinTime)
-		log.Printf("[Storage] Unpinned file: %s (was pinned for %v, remaining pinned: %d)", 
+		log.Printf("[Storage] Unpinned file: %s (was pinned for %v, remaining pinned: %d)",
 			common.TruncateCID(key, 16), timeSincePin, sm.pinnedFiles.Size())
 	} else {
 		log.Printf("[Storage] Attempted to unpin file that wasn't pinned: %s", common.TruncateCID(key, 16))
@@ -116,7 +116,7 @@ func (sm *StorageManager) AddKnownFile(key string) {
 			sm.metrics.SetKnownFilesCount(sm.knownFiles.Size())
 		}
 	}
-	
+
 	// Ensure we track replication level for new files, starting at 0 (or 1 if pinned)
 	if sm.pinnedFiles.Has(key) {
 		sm.fileReplicationLevels.Set(key, 1)
@@ -187,13 +187,13 @@ func (sm *StorageManager) GetStorageStatus() (int, int, []string, int) {
 	pinned := sm.pinnedFiles.Size()
 	known := sm.knownFiles.Size()
 	backoff := sm.failedOperations.Size()
-	
+
 	// Convert known files to list
 	allKnown := sm.knownFiles.All()
 	knownCIDs := make([]string, 0, len(allKnown))
 	for k := range allKnown {
 		knownCIDs = append(knownCIDs, k)
 	}
-	
+
 	return pinned, known, knownCIDs, backoff
 }

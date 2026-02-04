@@ -82,7 +82,7 @@ func LogConfiguration() {
 	}
 	log.Printf("[Config] Replication Cooldown: %v", ReplicationCheckCooldown)
 	log.Printf("[Config] Removed File Cooldown: %v", RemovedFileCooldown)
-	log.Printf("[Config] Node Country: %s", NodeCountry)
+	// log.Printf("[Config] Node Country: %s", NodeCountry)
 	log.Printf("[Config] BadBits Path: %s", BadBitsPath)
 	log.Printf("[Config] Shard Overlap Duration: %v", ShardOverlapDuration)
 	log.Printf("[Config] Replication Verification Delay: %v", ReplicationVerificationDelay)
@@ -168,24 +168,24 @@ var (
 	ReplicationCheckCooldown       = getEnvDuration("DLOCKSS_REPLICATION_COOLDOWN", 1*time.Minute) // Increased to reduce bandwidth
 	RemovedFileCooldown            = getEnvDuration("DLOCKSS_REMOVED_COOLDOWN", 2*time.Minute)
 	MetricsExportPath              = getEnvString("DLOCKSS_METRICS_EXPORT", "")
-	NodeCountry                    = getEnvString("DLOCKSS_NODE_COUNTRY", "US")
-	BadBitsPath                    = getEnvString("DLOCKSS_BADBITS_PATH", "badBits.csv")
-	ShardOverlapDuration           = getEnvDuration("DLOCKSS_SHARD_OVERLAP_DURATION", 2*time.Minute)
-	ReplicationVerificationDelay   = getEnvDuration("DLOCKSS_REPLICATION_VERIFICATION_DELAY", 2*time.Minute) // Grace period before verifying newly pinned files
-	DiskUsageHighWaterMark         = getEnvFloat("DLOCKSS_DISK_USAGE_HIGH_WATER_MARK", 90.0)
-	IPFSNodeAddress                = getEnvString("DLOCKSS_IPFS_NODE", "/ip4/127.0.0.1/tcp/5001")
-	APIPort                        = getEnvInt("DLOCKSS_API_PORT", 5050) // observability /metrics and /status
-	TrustMode                      = getEnvString("DLOCKSS_TRUST_MODE", "open") // open | allowlist
-	TrustStorePath                 = getEnvString("DLOCKSS_TRUST_STORE", "trusted_peers.json")
-	SignatureMode                  = getEnvString("DLOCKSS_SIGNATURE_MODE", "warn") // off | warn | strict
-	SignatureMaxAge                = getEnvDuration("DLOCKSS_SIGNATURE_MAX_AGE", 10*time.Minute)
-	DHTMaxSampleSize               = getEnvInt("DLOCKSS_DHT_MAX_SAMPLE_SIZE", 50)                      // Max providers to query per DHT lookup
-	UsePubsubForReplication        = getEnvBool("DLOCKSS_USE_PUBSUB_FOR_REPLICATION", true)            // Use pubsub peers first, DHT as fallback (avoids expensive DHT queries since nodes already know each other)
-	MinShardPeersForPubsubOnly     = getEnvInt("DLOCKSS_MIN_SHARD_PEERS_PUBSUB_ONLY", 5)               // Only use pubsub-only if shard has at least this many peers (otherwise query DHT for additional providers)
-	ReplicationCacheTTL            = getEnvDuration("DLOCKSS_REPLICATION_CACHE_TTL", 5*time.Minute)    // How long to cache replication counts
-	AutoReplicationEnabled         = getEnvBool("DLOCKSS_AUTO_REPLICATION_ENABLED", true)              // Enable automatic replication on ReplicationRequest
-	AutoReplicationMaxSize         = getEnvUint64("DLOCKSS_AUTO_REPLICATION_MAX_SIZE", 0)              // Max file size for auto-replication (0 = unlimited)
-	AutoReplicationTimeout         = getEnvDuration("DLOCKSS_AUTO_REPLICATION_TIMEOUT", 5*time.Minute) // Timeout for fetching files during replication
+	// NodeCountry                    = getEnvString("DLOCKSS_NODE_COUNTRY", "US") // Deprecated: Country-specific blocking removed
+	BadBitsPath                  = getEnvString("DLOCKSS_BADBITS_PATH", "badBits.csv")
+	ShardOverlapDuration         = getEnvDuration("DLOCKSS_SHARD_OVERLAP_DURATION", 2*time.Minute)
+	ReplicationVerificationDelay = getEnvDuration("DLOCKSS_REPLICATION_VERIFICATION_DELAY", 2*time.Minute) // Grace period before verifying newly pinned files
+	DiskUsageHighWaterMark       = getEnvFloat("DLOCKSS_DISK_USAGE_HIGH_WATER_MARK", 90.0)
+	IPFSNodeAddress              = getEnvString("DLOCKSS_IPFS_NODE", "/ip4/127.0.0.1/tcp/5001")
+	APIPort                      = getEnvInt("DLOCKSS_API_PORT", 5050)        // observability /metrics and /status
+	TrustMode                    = getEnvString("DLOCKSS_TRUST_MODE", "open") // open | allowlist
+	TrustStorePath               = getEnvString("DLOCKSS_TRUST_STORE", "trusted_peers.json")
+	SignatureMode                = getEnvString("DLOCKSS_SIGNATURE_MODE", "warn") // off | warn | strict
+	SignatureMaxAge              = getEnvDuration("DLOCKSS_SIGNATURE_MAX_AGE", 10*time.Minute)
+	DHTMaxSampleSize             = getEnvInt("DLOCKSS_DHT_MAX_SAMPLE_SIZE", 50)                      // Max providers to query per DHT lookup
+	UsePubsubForReplication      = getEnvBool("DLOCKSS_USE_PUBSUB_FOR_REPLICATION", true)            // Use pubsub peers first, DHT as fallback (avoids expensive DHT queries since nodes already know each other)
+	MinShardPeersForPubsubOnly   = getEnvInt("DLOCKSS_MIN_SHARD_PEERS_PUBSUB_ONLY", 5)               // Only use pubsub-only if shard has at least this many peers (otherwise query DHT for additional providers)
+	ReplicationCacheTTL          = getEnvDuration("DLOCKSS_REPLICATION_CACHE_TTL", 5*time.Minute)    // How long to cache replication counts
+	AutoReplicationEnabled       = getEnvBool("DLOCKSS_AUTO_REPLICATION_ENABLED", true)              // Enable automatic replication on ReplicationRequest
+	AutoReplicationMaxSize       = getEnvUint64("DLOCKSS_AUTO_REPLICATION_MAX_SIZE", 0)              // Max file size for auto-replication (0 = unlimited)
+	AutoReplicationTimeout       = getEnvDuration("DLOCKSS_AUTO_REPLICATION_TIMEOUT", 5*time.Minute) // Timeout for fetching files during replication
 
 	// File operation timeouts and delays
 	FileImportTimeout           = getEnvDuration("DLOCKSS_FILE_IMPORT_TIMEOUT", 2*time.Minute)            // Timeout for importing files to IPFS

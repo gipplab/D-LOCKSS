@@ -10,11 +10,11 @@ import (
 
 var (
 	badBits = struct {
-		mu    sync.RWMutex
-		cids  map[string]map[string]bool
+		mu     sync.RWMutex
+		cids   map[string]bool
 		loaded bool
 	}{
-		cids: make(map[string]map[string]bool),
+		cids: make(map[string]bool),
 	}
 )
 
@@ -22,13 +22,13 @@ func LoadBadBits(path string) error {
 	badBits.mu.Lock()
 	defer badBits.mu.Unlock()
 
-	badBits.cids = make(map[string]map[string]bool)
+	badBits.cids = make(map[string]bool)
 	badBits.loaded = false
 
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.Printf("[BadBits] File not found: %s (DMCA blocking disabled)", path)
+			log.Printf("[BadBits] File not found: %s (Content blocking disabled)", path)
 			return nil
 		}
 		return err
@@ -41,36 +41,33 @@ func LoadBadBits(path string) error {
 		return err
 	}
 
-	if len(records) < 2 {
-		log.Printf("[BadBits] Empty or header-only file: %s", path)
+	if len(records) < 1 {
+		log.Printf("[BadBits] Empty file: %s", path)
 		return nil
 	}
 
 	for i, record := range records {
+		// Skip header if it looks like one
 		if i == 0 {
 			continue
 		}
-		if len(record) < 2 {
+		if len(record) < 1 {
 			continue
 		}
 		cid := strings.TrimSpace(record[0])
-		country := strings.ToUpper(strings.TrimSpace(record[1]))
-		if cid == "" || country == "" {
+		if cid == "" {
 			continue
 		}
 
-		if badBits.cids[cid] == nil {
-			badBits.cids[cid] = make(map[string]bool)
-		}
-		badBits.cids[cid][country] = true
+		badBits.cids[cid] = true
 	}
 
 	badBits.loaded = true
-	log.Printf("[BadBits] Loaded %d blocked CID entries from %s", len(badBits.cids), path)
+	log.Printf("[BadBits] Loaded %d blocked CIDs from %s", len(badBits.cids), path)
 	return nil
 }
 
-func IsCIDBlocked(cid string, country string) bool {
+func IsCIDBlocked(cid string) bool {
 	badBits.mu.RLock()
 	defer badBits.mu.RUnlock()
 
@@ -79,11 +76,5 @@ func IsCIDBlocked(cid string, country string) bool {
 	}
 
 	cid = strings.TrimSpace(cid)
-	country = strings.ToUpper(strings.TrimSpace(country))
-	countries, exists := badBits.cids[cid]
-	if !exists {
-		return false
-	}
-
-	return countries[country]
+	return badBits.cids[cid]
 }

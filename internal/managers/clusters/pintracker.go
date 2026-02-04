@@ -7,6 +7,9 @@ import (
 	"sync"
 	"time"
 
+	"dlockss/internal/badbits"
+	// "dlockss/internal/config"
+
 	"github.com/ipfs-cluster/ipfs-cluster/api"
 	"github.com/ipfs/go-cid"
 )
@@ -119,6 +122,13 @@ func (pt *LocalPinTracker) syncState(consensus ConsensusClient) {
 		// Optimization: Check allocations later.
 
 		c := pin.Cid.Cid
+
+		// Check BadBits before syncing (Compliance Check)
+		if badbits.IsCIDBlocked(c.String()) {
+			log.Printf("[PinTracker:%s] Refusing to sync blocked content %s", pt.shardID, c)
+			continue
+		}
+
 		isPinned, _ := pt.ipfsClient.IsPinned(pt.ctx, c)
 		if !isPinned {
 			log.Printf("[PinTracker:%s] Syncing pin %s to local IPFS", pt.shardID, c)
