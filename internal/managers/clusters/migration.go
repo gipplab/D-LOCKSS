@@ -2,12 +2,10 @@ package clusters
 
 import (
 	"context"
-	"fmt"
 	"log"
 
 	"dlockss/internal/common"
 
-	"github.com/ipfs-cluster/ipfs-cluster/api"
 	"github.com/ipfs/go-cid"
 )
 
@@ -16,37 +14,15 @@ import (
 func (cm *ClusterManager) MigratePins(ctx context.Context, sourceShardID, destShardID string) error {
 	log.Printf("[ClusterMigration] Starting migration from %s -> %s", sourceShardID, destShardID)
 
-	// 1. Get all allocations (pins) from the source cluster
-	// In a real implementation, we would query the local state of the source CRDT.
-	// allocations, err := cm.clusters[sourceShardID].Consensus.ListPins()
-
-	// Since we don't have a direct ListPins on ConsensusClient yet (only State()),
-	// we need to use State() which returns GlobalPinInfo.
-
-	allocations := []cid.Cid{}
-
-	cm.mu.RLock()
-	sourceCluster, exists := cm.clusters[sourceShardID]
-	cm.mu.RUnlock()
-
-	if !exists {
-		log.Printf("[ClusterMigration] Source shard %s not found, skipping migration", sourceShardID)
+	// 1. Get all pins from the source cluster (CRDT state)
+	pins, err := cm.ListPins(ctx, sourceShardID)
+	if err != nil {
+		log.Printf("[ClusterMigration] Source shard %s not found or error: %v", sourceShardID, err)
 		return nil
 	}
 
-	state, err := sourceCluster.Consensus.State(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get state for source shard %s: %w", sourceShardID, err)
-	}
-
-	// Stream pins from state
-	out := make(chan api.Pin)
-	go func() {
-		defer close(out)
-		_ = state.List(ctx, out)
-	}()
-
-	for pin := range out {
+	allocations := make([]cid.Cid, 0, len(pins))
+	for _, pin := range pins {
 		allocations = append(allocations, pin.Cid.Cid)
 	}
 

@@ -12,6 +12,7 @@ import (
 
 	"github.com/ipfs-cluster/ipfs-cluster/api"
 	"github.com/ipfs/go-cid"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 // IPFSClient defines the subset of ipfs.IPFSClient needed for pinning
@@ -30,14 +31,28 @@ type IPFSClient interface {
 	VerifyDAGCompleteness(ctx context.Context, c cid.Cid) (bool, error)
 }
 
+// OnPinSynced is called when a pin is present locally (after sync or already pinned).
+// Used so the node can register the CID with storage and announce it (e.g. PINNED on pubsub),
+// allowing the monitor to count replication per file.
+type OnPinSynced func(cid string)
+
+// OnPinRemoved is called when we unpin a CID (no longer allocated). Used so storage/heartbeat count stays correct.
+type OnPinRemoved func(cid string)
+
 // LocalPinTracker monitors the CRDT state and syncs it to the local IPFS node.
 // It acts as a bridge between the Cluster Consensus and the actual IPFS Daemon.
+// Tracks which CIDs we pinned from this shard so we can unpin when no longer allocated.
 type LocalPinTracker struct {
-	ipfsClient IPFSClient
-	shardID    string
+	ipfsClient   IPFSClient
+	shardID      string
+	onPinSynced  OnPinSynced
+	onPinRemoved OnPinRemoved
 
 	// State
 	mu sync.RWMutex
+
+	// pinnedByUs: CIDs we pinned from this shard's CRDT (so we can unpin when no longer allocated)
+	pinnedByUs map[string]struct{}
 
 	// Lifecycle
 	ctx    context.Context
@@ -47,14 +62,17 @@ type LocalPinTracker struct {
 	trigger chan struct{}
 }
 
-func NewLocalPinTracker(ipfsClient IPFSClient, shardID string) *LocalPinTracker {
+func NewLocalPinTracker(ipfsClient IPFSClient, shardID string, onPinSynced OnPinSynced, onPinRemoved OnPinRemoved) *LocalPinTracker {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &LocalPinTracker{
-		ipfsClient: ipfsClient,
-		shardID:    shardID,
-		ctx:        ctx,
-		cancel:     cancel,
-		trigger:    make(chan struct{}, 1),
+		ipfsClient:   ipfsClient,
+		shardID:      shardID,
+		onPinSynced:  onPinSynced,
+		onPinRemoved: onPinRemoved,
+		pinnedByUs:   make(map[string]struct{}),
+		ctx:          ctx,
+		cancel:       cancel,
+		trigger:      make(chan struct{}, 1),
 	}
 }
 
@@ -78,7 +96,7 @@ func (pt *LocalPinTracker) Stop() {
 }
 
 func (pt *LocalPinTracker) syncLoop(consensus ConsensusClient) {
-	ticker := time.NewTicker(30 * time.Second) // Poll state every 30s as backup
+	ticker := time.NewTicker(10 * time.Second) // Poll state every 10s so peers replicate sooner
 	defer ticker.Stop()
 
 	for {
@@ -101,30 +119,48 @@ func (pt *LocalPinTracker) syncState(consensus ConsensusClient) {
 		return
 	}
 
-	// 2. Iterate pins
+	// 2. Iterate pins (state.List closes out when done; do not close it here)
 	out := make(chan api.Pin)
 	go func() {
-		defer close(out)
 		_ = state.List(pt.ctx, out)
 	}()
 
-	for pin := range out {
-		// Check if we are allocated
-		// Note: CRDT allocates to specific Peer IDs.
-		// If we are not in Allocations, we should NOT pin it (unless replication factor says everyone).
-		// For now, in CRDT mode, usually everyone pins if they are part of the cluster?
-		// No, usually IPFS Cluster assigns allocations.
-		// BUT: D-LOCKSS model is "everyone in shard replicates".
-		// Does CRDT automatically add everyone to allocations?
-		// If we use "ReplicationFactorMax: -1" (all), then everyone should pin.
+	// Resolve our peer ID once per sync (for allocation check).
+	ourPeerIDStr, err := pt.ipfsClient.GetPeerID(pt.ctx)
+	if err != nil {
+		log.Printf("[PinTracker:%s] Failed to get our peer ID: %v", pt.shardID, err)
+		return
+	}
+	ourPeerID, err := peer.Decode(ourPeerIDStr)
+	if err != nil {
+		log.Printf("[PinTracker:%s] Invalid peer ID %s: %v", pt.shardID, ourPeerIDStr, err)
+		return
+	}
 
-		// For now, we assume if it's in the state, we pin it (Full Replication per Shard).
-		// Optimization: Check allocations later.
+	// CIDs we should have pinned (we are allocated for these, or Allocations is empty).
+	shouldHave := make(map[string]struct{})
+
+	for pin := range out {
+		// Allocation-aware: only pin if we are in Allocations, or if Allocations is empty (full replication).
+		if len(pin.Allocations) > 0 {
+			weAreAllocated := false
+			for _, p := range pin.Allocations {
+				if p == ourPeerID {
+					weAreAllocated = true
+					break
+				}
+			}
+			if !weAreAllocated {
+				continue
+			}
+		}
 
 		c := pin.Cid.Cid
+		cStr := c.String()
+		shouldHave[cStr] = struct{}{}
 
 		// Check BadBits before syncing (Compliance Check)
-		if badbits.IsCIDBlocked(c.String()) {
+		if badbits.IsCIDBlocked(cStr) {
 			log.Printf("[PinTracker:%s] Refusing to sync blocked content %s", pt.shardID, c)
 			continue
 		}
@@ -134,7 +170,45 @@ func (pt *LocalPinTracker) syncState(consensus ConsensusClient) {
 			log.Printf("[PinTracker:%s] Syncing pin %s to local IPFS", pt.shardID, c)
 			if err := pt.ipfsClient.PinRecursive(pt.ctx, c); err != nil {
 				log.Printf("[PinTracker:%s] Failed to pin %s: %v", pt.shardID, c, err)
+				continue
 			}
 		}
+		pt.mu.Lock()
+		pt.pinnedByUs[cStr] = struct{}{}
+		pt.mu.Unlock()
+		// Notify so storage can register this CID and we announce PINNED on pubsub;
+		// the monitor then sees this node has the file and can show replication > 1.
+		if pt.onPinSynced != nil {
+			pt.onPinSynced(cStr)
+		}
 	}
+
+	// Unpin CIDs we previously pinned from this shard but are no longer allocated for.
+	pt.mu.Lock()
+	for cidStr := range pt.pinnedByUs {
+		if _, ok := shouldHave[cidStr]; ok {
+			continue
+		}
+		c, err := cid.Decode(cidStr)
+		if err != nil {
+			delete(pt.pinnedByUs, cidStr)
+			continue
+		}
+		pt.mu.Unlock()
+		log.Printf("[PinTracker:%s] Unpinning %s (no longer allocated)", pt.shardID, cidStr)
+		_ = pt.ipfsClient.UnpinRecursive(pt.ctx, c)
+		if pt.onPinRemoved != nil {
+			pt.onPinRemoved(cidStr)
+		}
+		pt.mu.Lock()
+		delete(pt.pinnedByUs, cidStr)
+	}
+	pt.mu.Unlock()
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

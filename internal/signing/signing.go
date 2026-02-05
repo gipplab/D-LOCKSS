@@ -147,16 +147,16 @@ func (s *Signer) verifySignedMessage(receivedFrom peer.ID, sender peer.ID, ts in
 			// DHT lookup should be very rare - only if peer is truly not found via PubSub
 			if len(addrs) == 0 {
 				// This should rarely happen - peers are discovered via PubSub topics
-				log.Printf("[Sig] Warning: Peer %s not in peerstore (should be discovered via PubSub). Trying DHT as last resort...", sender.String()[:12])
+				log.Printf("[Sig] Warning: Peer %s not in peerstore (should be discovered via PubSub). Trying DHT as last resort...", sender.String())
 
 				if s.dht != nil {
 					addrInfo, err := s.dht.FindPeer(ctx, sender)
 					if err == nil {
 						s.h.Peerstore().AddAddrs(addrInfo.ID, addrInfo.Addrs, 10*time.Minute)
 						addrs = addrInfo.Addrs
-						log.Printf("[Sig] Found peer %s via DHT (unusual - should be via PubSub)", sender.String()[:12])
+						log.Printf("[Sig] Found peer %s via DHT (unusual - should be via PubSub)", sender.String())
 					} else {
-						log.Printf("[Sig] DHT lookup failed for %s: %v", sender.String()[:12], err)
+						log.Printf("[Sig] DHT lookup failed for %s: %v", sender.String(), err)
 					}
 				}
 			}
@@ -164,7 +164,7 @@ func (s *Signer) verifySignedMessage(receivedFrom peer.ID, sender peer.ID, ts in
 			if len(addrs) > 0 {
 				if err := s.h.Connect(ctx, peer.AddrInfo{ID: sender, Addrs: addrs}); err != nil {
 					// Connection failed, but continue - connection attempt may have populated peerstore
-					log.Printf("[Sig] Failed to connect to %s to fetch public key: %v", sender.String()[:12], err)
+					log.Printf("[Sig] Failed to connect to %s to fetch public key: %v", sender.String(), err)
 				}
 			}
 		}
@@ -172,7 +172,7 @@ func (s *Signer) verifySignedMessage(receivedFrom peer.ID, sender peer.ID, ts in
 		// Try again after potential connection
 		pk = s.h.Peerstore().PubKey(sender)
 		if pk == nil {
-			return fmt.Errorf("missing public key for sender %s (peer should be discovered via PubSub)", sender.String()[:12])
+			return fmt.Errorf("missing public key for sender %s (peer should be discovered via PubSub)", sender.String())
 		}
 	}
 

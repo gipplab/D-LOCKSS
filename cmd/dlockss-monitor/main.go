@@ -28,10 +28,13 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 	ma "github.com/multiformats/go-multiaddr"
+	mh "github.com/multiformats/go-multihash"
 
+	"dlockss/internal/common"
 	"dlockss/pkg/schema"
 )
 
@@ -39,11 +42,11 @@ import (
 const (
 	DiscoveryServiceTag       = "dlockss-prod"
 	WebUIPort                 = 8080
-	DefaultNodeCleanupTimeout = 10 * time.Minute
+	DefaultNodeCleanupTimeout = 350 * time.Second
 	// ReplicationAnnounceTTL: how long we count a peer as having a file after their last PINNED/Ingest.
 	// After a split, nodes unpin non-responsible files ~5s later (ReshardDelay); they stop announcing
 	// those files, so we expire them after this TTL. Shorter TTL = dashboard reflects unpins sooner.
-	ReplicationAnnounceTTL  = 2 * time.Minute
+	ReplicationAnnounceTTL  = 350 * time.Second
 	MonitorMinReplication   = 5
 	MonitorMaxReplication   = 10
 	ReplicationCleanupEvery = 1 * time.Minute
@@ -72,9 +75,10 @@ type StatusResponse struct {
 }
 
 type StorageStatus struct {
-	PinnedFiles int      `json:"pinned_files"`
-	KnownFiles  int      `json:"known_files"`
-	KnownCIDs   []string `json:"known_cids,omitempty"`
+	PinnedFiles   int      `json:"pinned_files"`
+	PinnedInShard int      `json:"pinned_in_shard,omitempty"` // Pins relevant to node's shard (for chart/table after split)
+	KnownFiles    int      `json:"known_files"`
+	KnownCIDs     []string `json:"known_cids,omitempty"`
 }
 
 type ReplicationStatus struct {
@@ -142,6 +146,9 @@ type Monitor struct {
 	host                host.Host
 	nodeFiles           map[string]map[string]time.Time
 	manifestReplication map[string]map[string]time.Time
+	// peerShardLastSeen: last time we saw this peer announce (HEARTBEAT or PINNED) on this shard.
+	// Used so "pinned in shard" only counts nodes that have announced on that shard recently (drops stale pre-split data).
+	peerShardLastSeen map[string]map[string]time.Time
 }
 
 type geoRequest struct {
@@ -160,6 +167,7 @@ func NewMonitor() *Monitor {
 		shardTopics:         make(map[string]*pubsub.Topic),
 		nodeFiles:           make(map[string]map[string]time.Time),
 		manifestReplication: make(map[string]map[string]time.Time),
+		peerShardLastSeen:   make(map[string]map[string]time.Time),
 	}
 	go m.geoWorker()
 	go m.runReplicationCleanup()
@@ -175,7 +183,7 @@ func (m *Monitor) handleIngestMessage(im *schema.IngestMessage, senderID peer.ID
 
 	nodeState, exists := m.nodes[peerIDStr]
 	if !exists {
-		log.Printf("[Monitor] New node discovered via IngestMessage: %s (shard: %s)", peerIDStr[:min(12, len(peerIDStr))]+"...", shardID)
+		log.Printf("[Monitor] New node discovered via IngestMessage: %s (shard: %s)", peerIDStr, shardID)
 		nodeState = &NodeState{
 			PeerID:         peerIDStr,
 			CurrentShard:   shardID,
@@ -198,7 +206,7 @@ func (m *Monitor) handleIngestMessage(im *schema.IngestMessage, senderID peer.ID
 		nodeState.announcedFiles = make(map[string]time.Time)
 	}
 
-	// PinnedFiles is updated only from heartbeat; do not infer from PINNED announcements to avoid chart jumps.
+	// PinnedFiles is updated from heartbeat; we also raise it from PINNED/Ingest so "pinned per node" keeps up with replication.
 	nodeState.announcedFiles[manifestCIDStr] = now
 
 	if m.nodeFiles[peerIDStr] == nil {
@@ -207,12 +215,21 @@ func (m *Monitor) handleIngestMessage(im *schema.IngestMessage, senderID peer.ID
 	m.nodeFiles[peerIDStr][manifestCIDStr] = now
 
 	nodeState.KnownFiles = len(nodeState.announcedFiles)
+	// Keep PinnedFiles in sync with replication: use announced count when it exceeds heartbeat-derived count.
+	if n := len(nodeState.announcedFiles); n > nodeState.PinnedFiles {
+		nodeState.PinnedFiles = n
+	}
 	m.uniqueCIDs[manifestCIDStr] = now
 
 	if m.manifestReplication[manifestCIDStr] == nil {
 		m.manifestReplication[manifestCIDStr] = make(map[string]time.Time)
 	}
 	m.manifestReplication[manifestCIDStr][peerIDStr] = now
+	m.setPeerShardLastSeenUnlocked(peerIDStr, shardID, now)
+
+	// Log who pins what at what time for observability (who pins what, when, which shard).
+	log.Printf("[Monitor] PIN peer=%s manifest=%s shard=%s",
+		senderID.String(), manifestCIDStr, shardID)
 
 	if m.ps != nil {
 		m.ensureShardSubscriptionUnlocked(context.Background(), shardID)
@@ -228,6 +245,13 @@ func (m *Monitor) handleIngestMessage(im *schema.IngestMessage, senderID peer.ID
 	}
 }
 
+func (m *Monitor) setPeerShardLastSeenUnlocked(peerIDStr, shardID string, t time.Time) {
+	if m.peerShardLastSeen[peerIDStr] == nil {
+		m.peerShardLastSeen[peerIDStr] = make(map[string]time.Time)
+	}
+	m.peerShardLastSeen[peerIDStr][shardID] = t
+}
+
 func (m *Monitor) handleHeartbeat(senderID peer.ID, shardID string, ip string, pinnedCount int) {
 	now := time.Now()
 	peerIDStr := senderID.String()
@@ -235,9 +259,11 @@ func (m *Monitor) handleHeartbeat(senderID peer.ID, shardID string, ip string, p
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.setPeerShardLastSeenUnlocked(peerIDStr, shardID, now)
+
 	nodeState, exists := m.nodes[peerIDStr]
 	if !exists {
-		log.Printf("[Monitor] New node discovered via heartbeat: %s (shard: %s, pinned: %d)", peerIDStr[:min(12, len(peerIDStr))]+"...", shardID, pinnedCount)
+		log.Printf("[Monitor] New node discovered via heartbeat: %s (shard: %s, pinned: %d)", peerIDStr, shardID, pinnedCount)
 		nodeState = &NodeState{
 			PeerID:         peerIDStr,
 			CurrentShard:   shardID,
@@ -255,6 +281,24 @@ func (m *Monitor) handleHeartbeat(senderID peer.ID, shardID string, ip string, p
 		// Trust heartbeat pinned count (single source of truth). -1 means "don't update" (e.g. non-HEARTBEAT message).
 		if pinnedCount >= 0 {
 			nodeState.PinnedFiles = pinnedCount
+			// When a node reports pinned=0, stop counting it as a replica for any file immediately
+			// (otherwise we'd wait for ReplicationAnnounceTTL after their last PINNED).
+			if pinnedCount == 0 {
+				removedFromManifests := 0
+				for manifest, peers := range m.manifestReplication {
+					if _, had := peers[peerIDStr]; had {
+						delete(peers, peerIDStr)
+						removedFromManifests++
+						if len(peers) == 0 {
+							delete(m.manifestReplication, manifest)
+						}
+					}
+				}
+				if removedFromManifests > 0 {
+					log.Printf("[Monitor] UNPIN_ALL peer=%s shard=%s (pinned=0, removed from %d manifests)",
+						peerIDStr, shardID, removedFromManifests)
+				}
+			}
 		}
 		if nodeState.CurrentShard == "" {
 			nodeState.CurrentShard = shardID
@@ -277,6 +321,21 @@ func (m *Monitor) handleHeartbeat(senderID peer.ID, shardID string, ip string, p
 	}
 }
 
+// handleLeaveShard records that a peer left the given shard (so we stop counting them in that shard until next heartbeat).
+func (m *Monitor) handleLeaveShard(peerID peer.ID, shardID string) {
+	peerIDStr := peerID.String()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	node, exists := m.nodes[peerIDStr]
+	if !exists {
+		return
+	}
+	if node.CurrentShard == shardID {
+		node.CurrentShard = ""
+		m.treeDirty = true
+	}
+}
+
 func (m *Monitor) updateNodeShardLocked(node *NodeState, newShard string, timestamp time.Time) {
 	if len(node.ShardHistory) == 0 {
 		return
@@ -285,8 +344,11 @@ func (m *Monitor) updateNodeShardLocked(node *NodeState, newShard string, timest
 
 	if lastShard != newShard {
 		m.treeDirty = true
+		// Who is in what shard: log every shard change (split or discovery move).
+		log.Printf("[Monitor] SHARD_MOVE peer=%s from=%s to=%s",
+			node.PeerID, lastShard, newShard)
 		if len(newShard) > len(lastShard) && strings.HasPrefix(newShard, lastShard) {
-			log.Printf("[Monitor] Detected shard split: %s -> %s (node: %s)", lastShard, newShard, node.PeerID[:min(12, len(node.PeerID))]+"...")
+			log.Printf("[Monitor] Detected shard split: %s -> %s (node: %s)", lastShard, newShard, node.PeerID)
 			m.splitEvents = append(m.splitEvents, ShardSplitEvent{
 				ParentShard: lastShard,
 				ChildShard:  newShard,
@@ -309,7 +371,97 @@ func (m *Monitor) updateNodeShardLocked(node *NodeState, newShard string, timest
 		}
 		node.CurrentShard = newShard
 		node.ShardHistory = append(node.ShardHistory, ShardHistoryEntry{ShardID: newShard, FirstSeen: timestamp})
+
+		// Clean up manifestReplication: remove this node from manifests that belong to other shards,
+		// so "pinned per node" chart and replication stats only show in-shard pins after split.
+		peerIDStr := node.PeerID
+		depth := 0
+		for _, n := range m.nodes {
+			shard := n.CurrentShard
+			if shard == "" && len(n.ShardHistory) > 0 {
+				shard = n.ShardHistory[len(n.ShardHistory)-1].ShardID
+			}
+			if len(shard) > depth {
+				depth = len(shard)
+			}
+		}
+		removed := 0
+		for manifest, peers := range m.manifestReplication {
+			if _, had := peers[peerIDStr]; !had {
+				continue
+			}
+			if targetShardForManifest(manifest, depth) != newShard {
+				delete(peers, peerIDStr)
+				removed++
+				if len(peers) == 0 {
+					delete(m.manifestReplication, manifest)
+				}
+			}
+		}
+		if removed > 0 {
+			log.Printf("[Monitor] Shard move: removed peer %s from %d manifests (now only in shard %s)",
+				peerIDStr, removed, newShard)
+		}
 	}
+}
+
+// getPinnedInShardForNode returns how many manifests belonging to nodeShard include this node
+// and we've seen this node announce on that shard recently. This drops stale pre-split data:
+// after a node moves to shard "0", we stop seeing it on root, so we only count it for manifests
+// in "0" where we've seen it announce on "0" within ReplicationAnnounceTTL.
+func (m *Monitor) getPinnedInShardForNode(peerIDStr string, nodeShard string) int {
+	depth := m.replicationNetworkDepth()
+	cutoff := time.Now().Add(-ReplicationAnnounceTTL)
+	// Only count node for this shard if we've seen them announce on this shard recently.
+	if m.peerShardLastSeen[peerIDStr] != nil {
+		if last := m.peerShardLastSeen[peerIDStr][nodeShard]; last.Before(cutoff) {
+			return 0
+		}
+	}
+	count := 0
+	for manifest, peers := range m.manifestReplication {
+		if _, ok := peers[peerIDStr]; !ok {
+			continue
+		}
+		if targetShardForManifest(manifest, depth) != nodeShard {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+// ensureMinPinnedForPeer sets a node's PinnedFiles to at least min when we see them announce a PINNED
+// (fallback so UI shows replication when HEARTBEAT with count hasn't been received yet).
+func (m *Monitor) ensureMinPinnedForPeer(peerIDStr string, min int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	node, ok := m.nodes[peerIDStr]
+	if !ok {
+		return
+	}
+	if node.PinnedFiles < min {
+		node.PinnedFiles = min
+	}
+}
+
+// getShardMembership returns shard -> list of peer short IDs (who is in what shard).
+func (m *Monitor) getShardMembership() map[string][]string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	shardToPeers := make(map[string][]string)
+	for peerIDStr, node := range m.nodes {
+		shard := node.CurrentShard
+		if shard == "" && len(node.ShardHistory) > 0 {
+			shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
+		}
+		short := peerIDStr
+		shardToPeers[shard] = append(shardToPeers[shard], short)
+	}
+	for shard := range shardToPeers {
+		sort.Strings(shardToPeers[shard])
+	}
+	return shardToPeers
 }
 
 func (m *Monitor) runReplicationCleanup() {
@@ -329,22 +481,116 @@ func (m *Monitor) runReplicationCleanup() {
 			}
 		}
 		m.mu.Unlock()
+
+		// Periodic snapshot: who is in what shard, replication per shard, so operators can see full picture.
+		dist, avgLevel, filesAtTarget := m.getReplicationStats()
+		byShard := m.getReplicationByShard()
+		membership := m.getShardMembership()
+		var totalFiles int
+		for _, c := range dist {
+			totalFiles += c
+		}
+		shardLabels := make([]string, 0, len(membership))
+		totalNodes := 0
+		for s, peers := range membership {
+			shardLabels = append(shardLabels, s)
+			totalNodes += len(peers)
+		}
+		sort.Strings(shardLabels)
+		var b strings.Builder
+		for _, shard := range shardLabels {
+			peers := membership[shard]
+			atTarget := byShard[shard]
+			shardLabel := shard
+			if shardLabel == "" {
+				shardLabel = "(root)"
+			}
+			fmt.Fprintf(&b, " %s: %d nodes [%s] %d files at target;", shardLabel, len(peers), strings.Join(peers, ","), atTarget)
+		}
+		log.Printf("[Monitor] SNAPSHOT total_nodes=%d total_manifests=%d total_at_target=%d avg_replication=%.2f |%s",
+			totalNodes, totalFiles, filesAtTarget, avgLevel, strings.TrimSpace(b.String()))
 	}
 }
 
-// getReplicationStats returns network-wide replication distribution.
-// Replication is counted across all shards: each distinct peer that has announced
-// a file (via PINNED or IngestMessage) in the last ReplicationAnnounceTTL is
-// counted once per manifest. Nodes unpin files that no longer belong to their
-// shard after a split, so replication should reflect per-shard responsibility.
+// targetShardForManifest returns the shard that owns this manifest at the given depth.
+// depth 0 => root "" (all nodes at root); depth 1 => "0"/"1"; depth 2 => "00","01",...
+// Uses manifest CID hash so we don't need to fetch ResearchObject.
+func targetShardForManifest(manifestCIDStr string, depth int) string {
+	if depth <= 0 {
+		return ""
+	}
+	hexStr := common.KeyToStableHex(manifestCIDStr)
+	return common.GetHexBinaryPrefix(hexStr, depth)
+}
+
+// replicationNetworkDepth returns the effective shard depth from current node membership:
+// 0 = all at root; 1 = have "0"/"1"; 2 = have "00","01",... so we count replication for root and child shards.
+func (m *Monitor) replicationNetworkDepth() int {
+	maxLen := 0
+	for _, node := range m.nodes {
+		shard := node.CurrentShard
+		if shard == "" && len(node.ShardHistory) > 0 {
+			shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
+		}
+		if len(shard) > maxLen {
+			maxLen = len(shard)
+		}
+	}
+	return maxLen
+}
+
+// getReplicationStats returns replication distribution and at-target count.
+// Replication is per target shard: for each manifest we only count peers in that
+// manifest's target shard, and cap "at target" at shard size (e.g. 4-node shard max 4x).
 func (m *Monitor) getReplicationStats() (distribution [11]int, avgLevel float64, filesAtTarget int) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	// Peer count per shard (root "", "0", "1", "00", "01", ...)
+	shardPeerCount := make(map[string]int)
+	for _, node := range m.nodes {
+		shard := node.CurrentShard
+		if shard == "" && len(node.ShardHistory) > 0 {
+			shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
+		}
+		shardPeerCount[shard]++
+	}
+
+	depth := m.replicationNetworkDepth()
+	cutoff := time.Now().Add(-ReplicationAnnounceTTL)
+
 	var totalReplication int
 	var manifestCount int
-	for _, peers := range m.manifestReplication {
-		count := len(peers)
+	for manifest, peers := range m.manifestReplication {
+		if len(peers) == 0 {
+			continue
+		}
+		targetShard := targetShardForManifest(manifest, depth)
+		maxRep := shardPeerCount[targetShard]
+		if maxRep == 0 {
+			maxRep = len(peers) // fallback if shard unknown
+		}
+		// Count only peers in target shard that have announced on that shard recently (drops stale pre-split data).
+		count := 0
+		for peerID := range peers {
+			node, ok := m.nodes[peerID]
+			if !ok {
+				continue
+			}
+			shard := node.CurrentShard
+			if shard == "" && len(node.ShardHistory) > 0 {
+				shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
+			}
+			if shard != targetShard {
+				continue
+			}
+			if m.peerShardLastSeen[peerID] != nil {
+				if last := m.peerShardLastSeen[peerID][targetShard]; last.Before(cutoff) {
+					continue
+				}
+			}
+			count++
+		}
 		if count == 0 {
 			continue
 		}
@@ -355,7 +601,11 @@ func (m *Monitor) getReplicationStats() (distribution [11]int, avgLevel float64,
 		} else {
 			distribution[count]++
 		}
-		if count >= MonitorMinReplication && count <= MonitorMaxReplication {
+		minRep := MonitorMinReplication
+		if maxRep > 0 && minRep > maxRep {
+			minRep = maxRep
+		}
+		if count >= minRep && count <= maxRep {
 			filesAtTarget++
 		}
 	}
@@ -365,14 +615,25 @@ func (m *Monitor) getReplicationStats() (distribution [11]int, avgLevel float64,
 	return distribution, avgLevel, filesAtTarget
 }
 
-// getReplicationByShard returns, for each shard, how many manifests have at least
-// MonitorMinReplication replicas in that shard. Useful to verify both sides of a
-// split have sufficient replication.
+// getReplicationByShard returns, for each shard, how many manifests that belong to
+// that shard have replication at target (>= min(MinReplication, shard size) and <= shard size).
 func (m *Monitor) getReplicationByShard() map[string]int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	// manifest -> shard -> peer count
+	shardPeerCount := make(map[string]int)
+	for _, node := range m.nodes {
+		shard := node.CurrentShard
+		if shard == "" && len(node.ShardHistory) > 0 {
+			shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
+		}
+		shardPeerCount[shard]++
+	}
+
+	depth := m.replicationNetworkDepth()
+	cutoff := time.Now().Add(-ReplicationAnnounceTTL)
+
+	// manifest -> shard -> peer count (only peers that announced on that shard recently)
 	perManifestPerShard := make(map[string]map[string]int)
 	for manifest, peers := range m.manifestReplication {
 		if len(peers) == 0 {
@@ -388,17 +649,30 @@ func (m *Monitor) getReplicationByShard() map[string]int {
 			if shard == "" && len(node.ShardHistory) > 0 {
 				shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
 			}
+			if m.peerShardLastSeen[peerID] != nil {
+				if last := m.peerShardLastSeen[peerID][shard]; last.Before(cutoff) {
+					continue
+				}
+			}
 			perManifestPerShard[manifest][shard]++
 		}
 	}
 
-	// shard -> number of manifests with >= MinReplication in that shard
+	// shard -> number of manifests that belong to this shard and are at target
 	filesAtTargetPerShard := make(map[string]int)
-	for _, shardCounts := range perManifestPerShard {
-		for shard, count := range shardCounts {
-			if count >= MonitorMinReplication {
-				filesAtTargetPerShard[shard]++
-			}
+	for manifest, shardCounts := range perManifestPerShard {
+		targetShard := targetShardForManifest(manifest, depth)
+		count := shardCounts[targetShard]
+		maxRep := shardPeerCount[targetShard]
+		if maxRep == 0 {
+			continue
+		}
+		minRep := MonitorMinReplication
+		if minRep > maxRep {
+			minRep = maxRep
+		}
+		if count >= minRep && count <= maxRep {
+			filesAtTargetPerShard[targetShard]++
 		}
 	}
 	return filesAtTargetPerShard
@@ -811,22 +1085,77 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 				}
 			}
 
-			// Implicit Heartbeat: Any message counts as "I am alive in this shard"
-			// We pass -1 for pinnedCount to indicate "don't update pinned count, just update timestamp"
-			// unless it's an explicit heartbeat.
-			m.handleHeartbeat(senderID, shardID, ip, -1)
-
+			// HEARTBEAT carries the author PeerID in the payload; use it so we attribute to the real node
+			// (GetFrom() can be the mesh forwarder in GossipSub, so we'd otherwise only see one node per shard).
+			// Payload author can be base58 multihash (e.g. "Cov..." for Ed25519 identity, "12D3KooW..." for RSA/SHA256) or CID; decode properly.
 			if len(msg.Data) > 0 && len(msg.Data) < 500 && string(msg.Data[:min(10, len(msg.Data))]) == "HEARTBEAT:" {
 				// Format: HEARTBEAT:<PeerID>:<PinnedCount> (optional 4th field ignored for backward compat)
 				parts := strings.SplitN(string(msg.Data), ":", 4)
-				pinnedCount := 0
-				if len(parts) >= 3 {
-					fmt.Sscanf(parts[2], "%d", &pinnedCount)
+				// Use payload author when non-empty; decode string (base58 or CID) to peer.ID so both "12D3KooW..." and "Cov..." work.
+				if len(parts) >= 2 && parts[1] != "" {
+					authorID, err := peer.Decode(parts[1])
+					if err != nil {
+						// peer.Decode only accepts "Qm"/"1" or CID; try raw base58 multihash (e.g. "Cov..." for Ed25519 identity).
+						if mhBytes, mhErr := mh.FromB58String(parts[1]); mhErr == nil {
+							authorID, err = peer.IDFromBytes(mhBytes)
+						}
+						if err != nil {
+							// Still invalid (e.g. truncated); attribute to sender so we don't drop the heartbeat.
+							authorID = senderID
+						}
+					}
+					pinnedCount := 0
+					if len(parts) >= 3 {
+						fmt.Sscanf(parts[2], "%d", &pinnedCount)
+					}
+					// Log HEARTBEATs on non-root shards so we can verify we receive from all nodes (not just one).
+					if shardID != "" {
+						log.Printf("[Monitor] HEARTBEAT shard=%s author=%s pinned=%d", shardID, authorID.String(), pinnedCount)
+					}
+					m.handleHeartbeat(authorID, shardID, ip, -1)
+					m.handleHeartbeat(authorID, shardID, ip, pinnedCount)
 				}
-				// Update with explicit pinned count
-				m.handleHeartbeat(senderID, shardID, ip, pinnedCount)
 				continue
 			}
+
+			// LEAVE:<PeerID> — node is leaving this shard; update state so we don't count them in this shard.
+			if len(msg.Data) > 6 && string(msg.Data[:6]) == "LEAVE:" {
+				peerIDStr := strings.TrimSpace(string(msg.Data[6:]))
+				if peerIDStr != "" {
+					leaveID, err := peer.Decode(peerIDStr)
+					if err != nil {
+						if mhBytes, mhErr := mh.FromB58String(peerIDStr); mhErr == nil {
+							leaveID, err = peer.IDFromBytes(mhBytes)
+						}
+					}
+					if err == nil {
+						m.handleLeaveShard(leaveID, shardID)
+						log.Printf("[Monitor] SHARD_LEAVE peer=%s shard=%s", leaveID.String(), shardID)
+					}
+				}
+				continue
+			}
+
+			// JOIN:<PeerID> — node joined this shard; register so we count them and show in correct shard.
+			if len(msg.Data) > 5 && string(msg.Data[:5]) == "JOIN:" {
+				peerIDStr := strings.TrimSpace(string(msg.Data[5:]))
+				if peerIDStr != "" {
+					joinID, err := peer.Decode(peerIDStr)
+					if err != nil {
+						if mhBytes, mhErr := mh.FromB58String(peerIDStr); mhErr == nil {
+							joinID, err = peer.IDFromBytes(mhBytes)
+						}
+					}
+					if err == nil {
+						m.handleHeartbeat(joinID, shardID, ip, -1)
+						log.Printf("[Monitor] SHARD_JOIN peer=%s shard=%s", joinID.String(), shardID)
+					}
+				}
+				continue
+			}
+
+			// Implicit: any other message counts as "I am alive in this shard" (use GetFrom() as fallback).
+			m.handleHeartbeat(senderID, shardID, ip, -1)
 			if len(msg.Data) > 7 && string(msg.Data[:7]) == "PINNED:" {
 				manifestCIDStr := string(msg.Data[7:])
 				if manifestCID, err := cid.Decode(manifestCIDStr); err == nil {
@@ -846,7 +1175,15 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 						m.ensureShardSubscription(context.Background(), targetShard)
 					}
 				}
-				m.handleIngestMessage(&im, senderID, targetShard, ip)
+				// Use signed SenderID so we attribute to the real author (not mesh forwarder).
+				authorID := im.SenderID
+				if authorID == "" {
+					authorID = senderID
+				}
+				m.handleIngestMessage(&im, authorID, targetShard, ip)
+				m.ensureMinPinnedForPeer(authorID.String(), 1)
+				// Update author's shard so monitor shows them in the correct deeper shard.
+				m.handleHeartbeat(authorID, targetShard, ip, -1)
 				continue
 			}
 			// Other messages (CRDT syncs, etc.) are already handled by the implicit heartbeat above.
@@ -879,23 +1216,25 @@ func (m *Monitor) subscribeToActiveShards(ctx context.Context) {
 					}
 				}
 			}
-			splitShards := make(map[string]bool)
-			for shardID, count := range shardCounts {
-				if count >= 4 {
-					child0, child1 := shardID+"0", shardID+"1"
-					if shardID == "" {
-						child0, child1 = "0", "1"
-					}
-					splitShards[child0] = true
-					splitShards[child1] = true
+			// Subscribe to potential child shards of every active shard so we notice
+			// second-level splits (e.g. 00, 01) as soon as nodes move there. We used to
+			// only add children when count >= 4, so after 0 -> 00/01 we never subscribed
+			// to 00/01 if 0 had fewer than 4 nodes, and the monitor missed second level.
+			potentialChildren := make(map[string]bool)
+			for shardID := range activeShards {
+				child0, child1 := shardID+"0", shardID+"1"
+				if shardID == "" {
+					child0, child1 = "0", "1"
 				}
+				potentialChildren[child0] = true
+				potentialChildren[child1] = true
 			}
 			for _, event := range m.splitEvents {
-				splitShards[event.ParentShard] = true
-				splitShards[event.ChildShard] = true
+				potentialChildren[event.ParentShard] = true
+				potentialChildren[event.ChildShard] = true
 				if event.ParentShard == "" {
-					splitShards["0"] = true
-					splitShards["1"] = true
+					potentialChildren["0"] = true
+					potentialChildren["1"] = true
 				}
 			}
 			m.mu.RUnlock()
@@ -904,7 +1243,7 @@ func (m *Monitor) subscribeToActiveShards(ctx context.Context) {
 					m.ensureShardSubscription(ctx, shardID)
 				}
 			}
-			for shardID := range splitShards {
+			for shardID := range potentialChildren {
 				if m.ps != nil {
 					m.ensureShardSubscription(ctx, shardID)
 				}
@@ -1000,6 +1339,13 @@ func startLibP2P(ctx context.Context, monitor *Monitor) (host.Host, error) {
 	dutil.Advertise(ctx, routingDiscovery, DiscoveryServiceTag)
 	log.Printf("[Monitor] Advertising service: %s", DiscoveryServiceTag)
 
+	// mDNS discovery so nodes and monitor find each other on the same LAN (same tag as monitor)
+	notifee := &discoveryNotifee{h: h}
+	mdnsSvc := mdns.NewMdnsService(h, DiscoveryServiceTag, notifee)
+	if err := mdnsSvc.Start(); err != nil {
+		log.Printf("[Monitor] mDNS start failed: %v", err)
+	}
+
 	// Find peers
 	go func() {
 		for {
@@ -1082,12 +1428,17 @@ func main() {
 				firstSeen = node.ShardHistory[0].FirstSeen
 			}
 			uptimeSeconds := time.Since(firstSeen).Seconds()
+			pinnedFiles := node.PinnedFiles
+			if pinnedFiles < 0 {
+				pinnedFiles = 0
+			}
+			pinnedInShard := monitor.getPinnedInShardForNode(id, shard)
 			status := StatusResponse{
 				PeerID:        node.PeerID,
 				Version:       "1.0.0",
 				CurrentShard:  node.CurrentShard,
 				PeersInShard:  peersInShard,
-				Storage:       StorageStatus{PinnedFiles: node.PinnedFiles, KnownFiles: node.KnownFiles, KnownCIDs: []string{}},
+				Storage:       StorageStatus{PinnedFiles: pinnedFiles, PinnedInShard: pinnedInShard, KnownFiles: node.KnownFiles, KnownCIDs: []string{}},
 				Replication:   ReplicationStatus{},
 				UptimeSeconds: uptimeSeconds,
 			}
@@ -1159,17 +1510,32 @@ func main() {
 				shardCounts := make(map[string]int)
 				totalPinned := 0
 				for _, node := range monitor.nodes {
-					var shard string
-					if len(node.ShardHistory) > 0 {
+					// Use CurrentShard (topic they're sending on); fallback to last in ShardHistory when empty
+					shard := node.CurrentShard
+					if shard == "" && len(node.ShardHistory) > 0 {
 						shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
-					} else {
-						shard = node.CurrentShard
 					}
 					shardCounts[shard]++
-					totalPinned += node.PinnedFiles
+					if node.PinnedFiles > 0 {
+						totalPinned += node.PinnedFiles
+					}
 				}
 				monitor.mu.RUnlock()
-				log.Printf("[Monitor] Status: %d nodes, %d shards, %d pinned", nodeCount, len(shardCounts), totalPinned)
+				// Log per-shard breakdown so logs match UI (e.g. root: 12, 0: 0, 1: 3)
+				shardIDs := make([]string, 0, len(shardCounts))
+				for sid := range shardCounts {
+					shardIDs = append(shardIDs, sid)
+				}
+				sort.Strings(shardIDs)
+				parts := make([]string, 0, len(shardIDs))
+				for _, sid := range shardIDs {
+					label := sid
+					if label == "" {
+						label = "root"
+					}
+					parts = append(parts, fmt.Sprintf("%s: %d", label, shardCounts[sid]))
+				}
+				log.Printf("[Monitor] Status: %d nodes, %d shards, %d pinned (%s)", nodeCount, len(shardCounts), totalPinned, strings.Join(parts, ", "))
 			}
 		}
 	}()

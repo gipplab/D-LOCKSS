@@ -88,6 +88,7 @@ func (m *MockClusterManager) GetPeerCount(ctx context.Context, shardID string) (
 func (m *MockClusterManager) MigratePins(ctx context.Context, fromShard, toShard string) error {
 	return nil
 }
+func (m *MockClusterManager) TriggerSync(shardID string) {}
 
 func TestSplitShard_NoDeadlock(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

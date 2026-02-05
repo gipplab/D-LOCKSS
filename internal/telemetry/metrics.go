@@ -73,6 +73,20 @@ var (
 		Name: "dlockss_replication_queue_depth",
 		Help: "Current depth of the replication job queue",
 	})
+
+	// Cluster-style metrics (per shard, from CRDT)
+	promClusterPinsTotal = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "dlockss_cluster_pins_total",
+		Help: "Number of pins in the shard's CRDT consensus state",
+	}, []string{"shard"})
+	promClusterPeersTotal = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "dlockss_cluster_peers_total",
+		Help: "Number of peers in the shard's CRDT cluster (from PeerMonitor)",
+	}, []string{"shard"})
+	promClusterAllocationsTotal = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "dlockss_cluster_allocations_total",
+		Help: "Total allocation count in the shard (sum of len(allocations) over all pins)",
+	}, []string{"shard"})
 )
 
 func init() {
@@ -91,6 +105,9 @@ func init() {
 		promActivePeers,
 		promWorkerPoolActive,
 		promQueueDepth,
+		promClusterPinsTotal,
+		promClusterPeersTotal,
+		promClusterAllocationsTotal,
 	)
 }
 
@@ -102,6 +119,11 @@ type ShardInfoProvider interface {
 type StorageInfoProvider interface {
 	GetStorageStatus() (int, int, []string, int) // pinned, known, cids, backoffCount
 	GetReplicationLevels() map[string]int
+}
+
+// ClusterInfoProvider supplies cluster-style metrics (pins/peers/allocations per shard).
+type ClusterInfoProvider interface {
+	GetClusterMetrics(ctx context.Context) (pinsPerShard, peersPerShard, allocationsTotalPerShard map[string]int, err error)
 }
 
 type MetricsManager struct {
@@ -145,6 +167,7 @@ type MetricsManager struct {
 	// Providers
 	shardInfo   ShardInfoProvider
 	storageInfo StorageInfoProvider
+	clusterInfo ClusterInfoProvider
 	rateLimiter *common.RateLimiter
 }
 
@@ -168,6 +191,13 @@ func (m *MetricsManager) RegisterProviders(s ShardInfoProvider, st StorageInfoPr
 	m.shardInfo = s
 	m.storageInfo = st
 	m.rateLimiter = rl
+}
+
+// RegisterClusterProvider registers the cluster metrics provider (pins/peers/allocations per shard).
+func (m *MetricsManager) RegisterClusterProvider(c ClusterInfoProvider) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.clusterInfo = c
 }
 
 func (m *MetricsManager) IncrementMessagesReceived() {
@@ -285,6 +315,22 @@ func (m *MetricsManager) UpdateGauges() {
 		_, activePeers := m.shardInfo.GetShardInfo()
 		promActivePeers.Set(float64(activePeers))
 	}
+
+	// Cluster-style metrics (pins/peers/allocations per shard)
+	if m.clusterInfo != nil {
+		pins, peers, allocs, err := m.clusterInfo.GetClusterMetrics(context.Background())
+		if err == nil {
+			for shard, count := range pins {
+				promClusterPinsTotal.WithLabelValues(shard).Set(float64(count))
+			}
+			for shard, count := range peers {
+				promClusterPeersTotal.WithLabelValues(shard).Set(float64(count))
+			}
+			for shard, count := range allocs {
+				promClusterAllocationsTotal.WithLabelValues(shard).Set(float64(count))
+			}
+		}
+	}
 }
 
 func (m *MetricsManager) ReportMetrics() {
@@ -316,8 +362,6 @@ func (m *MetricsManager) ReportMetrics() {
 		_, _, _, backoffCount = m.storageInfo.GetStorageStatus()
 		levelsMap = m.storageInfo.GetReplicationLevels()
 	}
-
-	// maxWorkers := config.ReplicationWorkers
 
 	m.mu.RUnlock() // Unlock for calculation
 
@@ -384,6 +428,15 @@ func (m *MetricsManager) ReportMetrics() {
 		// 	activeWorkers, maxWorkers, checkRate)
 		log.Printf("[Metrics] System: shard_splits=%d, current_shard=%s, rate_limited_peers=%d, files_in_backoff=%d",
 			m.shardSplits, shardID, rateLimitedPeers, backoffCount)
+		if m.clusterInfo != nil {
+			pins, peers, allocs, err := m.clusterInfo.GetClusterMetrics(context.Background())
+			if err == nil {
+				for shard := range pins {
+					log.Printf("[Metrics] Cluster shard=%s pins=%d peers=%d allocations_total=%d",
+						shard, pins[shard], peers[shard], allocs[shard])
+				}
+			}
+		}
 
 		uptime := now.Sub(m.startTime)
 		log.Printf("[Metrics] Cumulative (since startup): uptime=%v, msgs=%d (dropped=%d), checks=%d (success=%d, failures=%d), shard_splits=%d",

@@ -51,12 +51,22 @@ func (sm *StorageManager) GetNextFileToAnnounce() string {
 	return ""
 }
 
+// GetPinnedManifests returns all manifest CID strings currently pinned (for replication check).
+func (sm *StorageManager) GetPinnedManifests() []string {
+	files := sm.pinnedFiles.All()
+	out := make([]string, 0, len(files))
+	for k := range files {
+		out = append(out, k)
+	}
+	return out
+}
+
 // PinFile pins a file using its ManifestCID string.
 // It tracks the ManifestCID in our internal state and announces to DHT.
 func (sm *StorageManager) PinFile(manifestCIDStr string) bool {
 	// Check BadBits
 	if badbits.IsCIDBlocked(manifestCIDStr) {
-		log.Printf("[Storage] Refused to pin blocked CID: %s", common.TruncateCID(manifestCIDStr, 16))
+		log.Printf("[Storage] Refused to pin blocked CID: %s", manifestCIDStr)
 		return false
 	}
 
@@ -65,19 +75,11 @@ func (sm *StorageManager) PinFile(manifestCIDStr string) bool {
 		if sm.metrics != nil {
 			sm.metrics.SetPinnedFilesCount(sm.pinnedFiles.Size())
 		}
-		log.Printf("[Storage] Pinned ManifestCID: %s (total pinned: %d)", common.TruncateCID(manifestCIDStr, 16), sm.pinnedFiles.Size())
+		log.Printf("[Storage] Pinned ManifestCID: %s (total pinned: %d)", manifestCIDStr, sm.pinnedFiles.Size())
 	} else if config.VerboseLogging {
 		// File was already pinned - timestamp was updated by Add() to reflect latest pin time
-		log.Printf("[Storage] ManifestCID already pinned (timestamp updated): %s (total pinned: %d)", common.TruncateCID(manifestCIDStr, 16), sm.pinnedFiles.Size())
+		log.Printf("[Storage] ManifestCID already pinned (timestamp updated): %s (total pinned: %d)", manifestCIDStr, sm.pinnedFiles.Size())
 	}
-
-	// Also announce to DHT (provide)
-	// We do this here to ensure anything we pin is also provided
-	// go func() {
-	// 	ctx, cancel := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
-	// 	defer cancel()
-	// 	sm.ProvideFile(ctx, manifestCIDStr)
-	// }()
 
 	return true
 }
@@ -93,9 +95,9 @@ func (sm *StorageManager) UnpinFile(key string) {
 		}
 		timeSincePin := time.Since(pinTime)
 		log.Printf("[Storage] Unpinned file: %s (was pinned for %v, remaining pinned: %d)",
-			common.TruncateCID(key, 16), timeSincePin, sm.pinnedFiles.Size())
+			key, timeSincePin, sm.pinnedFiles.Size())
 	} else {
-		log.Printf("[Storage] Attempted to unpin file that wasn't pinned: %s", common.TruncateCID(key, 16))
+		log.Printf("[Storage] Attempted to unpin file that wasn't pinned: %s", key)
 	}
 }
 

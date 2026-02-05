@@ -19,6 +19,7 @@ import (
 	"dlockss/internal/badbits"
 	"dlockss/internal/common"
 	"dlockss/internal/config"
+	"dlockss/internal/discovery"
 	"dlockss/internal/fileops"
 	"dlockss/internal/managers/clusters"
 	"dlockss/internal/managers/shard"
@@ -35,6 +36,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
@@ -111,6 +113,13 @@ func main() {
 	dutil.Advertise(ctx, routingDiscovery, config.DiscoveryServiceTag)
 	log.Printf("[Config] Advertising service on DHT: %s", config.DiscoveryServiceTag)
 
+	// mDNS discovery so nodes and monitor find each other on the same LAN (same tag as monitor)
+	notifee := &discovery.DiscoveryNotifee{H: h, Ctx: ctx}
+	mdnsSvc := mdns.NewMdnsService(h, config.DiscoveryServiceTag, notifee)
+	if err := mdnsSvc.Start(); err != nil {
+		log.Printf("[Config] mDNS start failed: %v (peer/monitor discovery limited)", err)
+	}
+
 	// Find peers (e.g. monitor)
 	go func() {
 		for {
@@ -153,11 +162,25 @@ func main() {
 	storageMgr := storage.NewStorageManager(dht, metrics)
 	signer := signing.NewSigner(h, privKey, h.ID(), nonceStore, trustMgr, dht)
 
-	// Shard manager (replication set later to break cycle)
-	clusterMgr := clusters.NewClusterManager(h, ps, dht, dstore, ipfsClient, trustMgr.GetTrustedPeers())
+	// Shard manager (replication set later to break cycle).
+	// onPinSynced: when PinTracker syncs a pin from CRDT, register with storage and announce PINNED immediately so monitor sees replication right away (not only on next heartbeat batch).
+	var announcePinned func(string)
+	onPinSynced := func(cid string) {
+		storageMgr.PinFile(cid)
+		if announcePinned != nil {
+			announcePinned(cid)
+		}
+	}
+	onPinRemoved := func(cid string) {
+		storageMgr.UnpinFile(cid)
+	}
+	clusterMgr := clusters.NewClusterManager(h, ps, dht, dstore, ipfsClient, trustMgr.GetTrustedPeers(), onPinSynced, onPinRemoved)
 	shardMgr := shard.NewShardManager(ctx, h, ps, ipfsClient, storageMgr, metrics, signer, rateLimiter, clusterMgr, "")
+	clusterMgr.SetShardPeerProvider(shardMgr) // CRDT Peers() and allocations use real shard membership
+	announcePinned = shardMgr.AnnouncePinned
 
 	metrics.RegisterProviders(shardMgr, storageMgr, rateLimiter)
+	metrics.RegisterClusterProvider(clusterMgr) // cluster-style metrics: pins/peers/allocations per shard
 	metrics.SetPeerID(h.ID().String())
 
 	// Telemetry and API

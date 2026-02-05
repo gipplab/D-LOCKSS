@@ -390,63 +390,65 @@ func (fp *FileProcessor) checkBadBitsAndPin(ctx context.Context, manifestCID cid
 // trackAndAnnounceFile tracks the file and announces it to the appropriate shard.
 func (fp *FileProcessor) trackAndAnnounceFile(manifestCID cid.Cid, manifestCIDStr string, payloadCID cid.Cid) {
 	// Track in local state
-	log.Printf("[FileOps] Calling pinFile for: %s", common.TruncateCID(manifestCIDStr, 16))
+	log.Printf("[FileOps] Calling pinFile for: %s", manifestCIDStr)
 	if !fp.storageMgr.PinFile(manifestCIDStr) {
-		log.Printf("[FileOps] Warning: pinFile returned false for %s (file may be blocked or already tracked)", common.TruncateCID(manifestCIDStr, 16))
+		log.Printf("[FileOps] Warning: pinFile returned false for %s (file may be blocked or already tracked)", manifestCIDStr)
 		common.LogWarning("FileOps", "Failed to track ManifestCID", manifestCIDStr)
 		return
 	}
-	log.Printf("[FileOps] pinFile succeeded for: %s", common.TruncateCID(manifestCIDStr, 16))
+	log.Printf("[FileOps] pinFile succeeded for: %s", manifestCIDStr)
+	fp.shardMgr.AnnouncePinned(manifestCIDStr)
 
-	// Pin to Cluster (CRDT State Sync)
-	// This triggers replication to all other nodes in the shard.
-	log.Printf("[FileOps] Pinning to Cluster for: %s", common.TruncateCID(manifestCIDStr, 16))
-	if err := fp.shardMgr.PinToCluster(context.Background(), manifestCID); err != nil {
-		log.Printf("[FileOps] Error pinning to cluster: %v", err)
-		// Don't return, proceed to announce via legacy pubsub just in case
-	} else {
-		log.Printf("[FileOps] Successfully pinned to Cluster state")
+	// Determine responsibility first so we pin to the correct shard (target shard, not pinning node's shard).
+	payloadCIDStr := payloadCID.String()
+	log.Printf("[FileOps] Checking responsibility for PayloadCID: %s", payloadCIDStr)
+	isResponsible := fp.shardMgr.AmIResponsibleFor(payloadCIDStr)
+	log.Printf("[FileOps] Responsibility check for %s: responsible=%v", payloadCIDStr, isResponsible)
+
+	// Pin to Cluster in the shard that owns this file (target shard), so replication is even.
+	// Responsible: pin to current shard (current == target). Custodial: pin only in target shard (done inside announceCustodialFile).
+	if isResponsible {
+		log.Printf("[FileOps] Pinning to Cluster (current shard) for: %s", manifestCIDStr)
+		if err := fp.shardMgr.PinToCluster(context.Background(), manifestCID); err != nil {
+			log.Printf("[FileOps] Error pinning to cluster: %v", err)
+		} else {
+			log.Printf("[FileOps] Successfully pinned to Cluster state")
+		}
 	}
 
 	// Check if shardMgr is nil (shouldn't happen, but safety check)
 	if fp.shardMgr == nil {
-		log.Printf("[FileOps] ERROR: shardMgr is nil! Cannot announce file %s", common.TruncateCID(manifestCIDStr, 16))
+		log.Printf("[FileOps] ERROR: shardMgr is nil! Cannot announce file %s", manifestCIDStr)
 		return
 	}
-	log.Printf("[FileOps] shardMgr check passed, proceeding to addKnownFile for %s", common.TruncateCID(manifestCIDStr, 16))
+	log.Printf("[FileOps] shardMgr check passed, proceeding to addKnownFile for %s", manifestCIDStr)
 
 	// Add panic recovery to catch any issues
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[FileOps] PANIC in trackAndAnnounceFile after addKnownFile for %s: %v", common.TruncateCID(manifestCIDStr, 16), r)
+			log.Printf("[FileOps] PANIC in trackAndAnnounceFile after addKnownFile for %s: %v", manifestCIDStr, r)
 		}
 	}()
 
-	log.Printf("[FileOps] About to call addKnownFile for %s", common.TruncateCID(manifestCIDStr, 16))
+	log.Printf("[FileOps] About to call addKnownFile for %s", manifestCIDStr)
 	fp.storageMgr.AddKnownFile(manifestCIDStr)
-	log.Printf("[FileOps] addKnownFile completed, about to log 'Added to known files' for %s", common.TruncateCID(manifestCIDStr, 16))
-	log.Printf("[FileOps] Added to known files: %s", common.TruncateCID(manifestCIDStr, 16))
-
-	// Determine responsibility and announce
-	payloadCIDStr := payloadCID.String()
-	log.Printf("[FileOps] Checking responsibility for PayloadCID: %s", common.TruncateCID(payloadCIDStr, 16))
-	isResponsible := fp.shardMgr.AmIResponsibleFor(payloadCIDStr)
-	log.Printf("[FileOps] Responsibility check for %s: responsible=%v", common.TruncateCID(payloadCIDStr, 16), isResponsible)
+	log.Printf("[FileOps] addKnownFile completed, about to log 'Added to known files' for %s", manifestCIDStr)
+	log.Printf("[FileOps] Added to known files: %s", manifestCIDStr)
 
 	if isResponsible {
-		log.Printf("[FileOps] Calling announceResponsibleFile for %s", common.TruncateCID(manifestCIDStr, 16))
+		log.Printf("[FileOps] Calling announceResponsibleFile for %s", manifestCIDStr)
 		fp.announceResponsibleFile(manifestCID, manifestCIDStr, payloadCIDStr)
 	} else {
-		log.Printf("[FileOps] Calling announceCustodialFile for %s", common.TruncateCID(manifestCIDStr, 16))
+		log.Printf("[FileOps] Calling announceCustodialFile for %s", manifestCIDStr)
 		fp.announceCustodialFile(manifestCID, manifestCIDStr, payloadCIDStr)
 	}
-	log.Printf("[FileOps] Announcement completed for %s", common.TruncateCID(manifestCIDStr, 16))
+	log.Printf("[FileOps] Announcement completed for %s", manifestCIDStr)
 }
 
 // announceResponsibleFile announces a file when this node is responsible for it.
 func (fp *FileProcessor) announceResponsibleFile(manifestCID cid.Cid, manifestCIDStr, payloadCIDStr string) {
 	log.Printf("[Core] I am responsible for PayloadCID %s (ManifestCID %s). Announcing to Shard.",
-		common.TruncateCID(payloadCIDStr, 16), common.TruncateCID(manifestCIDStr, 16))
+		payloadCIDStr, manifestCIDStr)
 
 	// Get file size for hint (we'd need to pass this, but for now use 0)
 	currentShard, _ := fp.shardMgr.GetShardInfo()
@@ -496,7 +498,7 @@ func (fp *FileProcessor) announceResponsibleFile(manifestCID cid.Cid, manifestCI
 // It joins the target shard temporarily to announce the file.
 func (fp *FileProcessor) announceCustodialFile(manifestCID cid.Cid, manifestCIDStr, payloadCIDStr string) {
 	log.Printf("[Core] Custodial Mode: I am NOT responsible for PayloadCID %s (ManifestCID %s). Visiting target shard.",
-		common.TruncateCID(payloadCIDStr, 16), common.TruncateCID(manifestCIDStr, 16))
+		payloadCIDStr, manifestCIDStr)
 
 	// Calculate target shard
 	stableHex := common.KeyToStableHex(payloadCIDStr)
@@ -507,8 +509,17 @@ func (fp *FileProcessor) announceCustodialFile(manifestCID cid.Cid, manifestCIDS
 	}
 	targetShard := common.GetHexBinaryPrefix(stableHex, targetDepth)
 
-	// Join target shard (Tourist Mode)
+	// Join target shard (Tourist Mode): pubsub + cluster so we can pin there.
 	fp.shardMgr.JoinShard(targetShard)
+	if err := fp.shardMgr.EnsureClusterForShard(context.Background(), targetShard); err != nil {
+		log.Printf("[Core] Failed to ensure cluster for target shard %s: %v", targetShard, err)
+	}
+	// Pin to target shard's cluster so replication happens in the correct shard (not in pinning node's shard).
+	if err := fp.shardMgr.PinToShard(context.Background(), targetShard, manifestCID); err != nil {
+		log.Printf("[Core] Failed to pin to target shard %s: %v", targetShard, err)
+	} else {
+		log.Printf("[Core] Pinned to target shard %s for replication", targetShard)
+	}
 
 	// Announce IngestMessage directly to the target shard
 	im := schema.IngestMessage{

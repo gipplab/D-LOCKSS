@@ -92,14 +92,14 @@ func GetPayloadCIDForShardAssignment(ctx context.Context, client ipfs.IPFSClient
 	manifestBytes, err := client.GetBlock(ctx, manifestCID)
 	if err != nil {
 		// If we can't fetch, fallback to ManifestCID (shouldn't happen in normal operation)
-		log.Printf("[Shard] Warning: Could not fetch ResearchObject for %s, using ManifestCID for shard assignment: %v", manifestCIDStr[:min(16, len(manifestCIDStr))]+"...", err)
+		log.Printf("[Shard] Warning: Could not fetch ResearchObject for %s, using ManifestCID for shard assignment: %v", manifestCIDStr, err)
 		return manifestCIDStr
 	}
 
 	// Decode ResearchObject
 	var ro schema.ResearchObject
 	if err := ro.UnmarshalCBOR(manifestBytes); err != nil {
-		log.Printf("[Shard] Warning: Could not decode ResearchObject for %s, using ManifestCID for shard assignment: %v", manifestCIDStr[:min(16, len(manifestCIDStr))]+"...", err)
+		log.Printf("[Shard] Warning: Could not decode ResearchObject for %s, using ManifestCID for shard assignment: %v", manifestCIDStr, err)
 		return manifestCIDStr
 	}
 
@@ -107,37 +107,34 @@ func GetPayloadCIDForShardAssignment(ctx context.Context, client ipfs.IPFSClient
 	return ro.Payload.String()
 }
 
-// TruncateCID truncates a CID string to a maximum length, appending "..." if truncated.
-// This is used for consistent logging format throughout the codebase.
+// TruncateCID returns the CID string unchanged (no truncation).
+// Kept for API compatibility; callers get full CID/identifier in logs.
 func TruncateCID(cidStr string, maxLen int) string {
-	if len(cidStr) <= maxLen {
-		return cidStr
-	}
-	return cidStr[:maxLen] + "..."
+	return cidStr
 }
 
 // LogError logs an error with consistent formatting including component, operation, and identifier.
 // This standardizes error logging across the codebase.
 func LogError(component, operation, identifier string, err error) {
 	log.Printf("[Error] %s: Failed to %s %s: %v",
-		component, operation, TruncateCID(identifier, 16), err)
+		component, operation, identifier, err)
 }
 
 // LogErrorWithContext logs an error with additional context information.
 // Use this when you need to include extra details beyond the standard format.
 func LogErrorWithContext(component, operation, identifier string, context string, err error) {
 	log.Printf("[Error] %s: Failed to %s %s (%s): %v",
-		component, operation, TruncateCID(identifier, 16), context, err)
+		component, operation, identifier, context, err)
 }
 
 // LogWarning logs a warning with consistent formatting.
 func LogWarning(component, message, identifier string) {
-	log.Printf("[Warning] %s: %s %s", component, message, TruncateCID(identifier, 16))
+	log.Printf("[Warning] %s: %s %s", component, message, identifier)
 }
 
 // LogWarningWithContext logs a warning with additional context.
 func LogWarningWithContext(component, message, identifier, context string) {
-	log.Printf("[Warning] %s: %s %s (%s)", component, message, TruncateCID(identifier, 16), context)
+	log.Printf("[Warning] %s: %s %s (%s)", component, message, identifier, context)
 }
 
 func min(a, b int) int {
