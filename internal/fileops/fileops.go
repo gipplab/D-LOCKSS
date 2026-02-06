@@ -38,11 +38,13 @@ type FileProcessor struct {
 }
 
 // NewFileProcessor creates a new FileProcessor with dependencies.
+// signer should be the same Signer used by the shard manager so protocol messages use consistent nonce bounds and replay store.
 func NewFileProcessor(
 	client ipfs.IPFSClient,
 	sm *shard.ShardManager,
 	stm *storage.StorageManager,
 	key crypto.PrivKey,
+	signer *signing.Signer,
 ) *FileProcessor {
 	ctx, cancel := context.WithCancel(context.Background())
 	fp := &FileProcessor{
@@ -50,6 +52,7 @@ func NewFileProcessor(
 		shardMgr:   sm,
 		storageMgr: stm,
 		privKey:    key,
+		signer:     signer,
 		semaphore:  make(chan struct{}, config.MaxConcurrentFileProcessing),
 		jobQueue:   make(chan string, config.MaxConcurrentFileProcessing*100), // Buffer size
 		ctx:        ctx,
@@ -387,7 +390,9 @@ func (fp *FileProcessor) checkBadBitsAndPin(ctx context.Context, manifestCID cid
 	return true
 }
 
-// trackAndAnnounceFile tracks the file and announces it to the appropriate shard.
+// trackAndAnnounceFile tracks the file and announces it to the cluster that owns it by CID.
+// Invariant: each file lives in exactly one cluster (target by payload CID). We pin only there:
+// responsible => pin in current shard (current == target); custodial => inject into target shard only, never in ours.
 func (fp *FileProcessor) trackAndAnnounceFile(manifestCID cid.Cid, manifestCIDStr string, payloadCID cid.Cid) {
 	// Track in local state
 	log.Printf("[FileOps] Calling pinFile for: %s", manifestCIDStr)
@@ -399,14 +404,14 @@ func (fp *FileProcessor) trackAndAnnounceFile(manifestCID cid.Cid, manifestCIDSt
 	log.Printf("[FileOps] pinFile succeeded for: %s", manifestCIDStr)
 	fp.shardMgr.AnnouncePinned(manifestCIDStr)
 
-	// Determine responsibility first so we pin to the correct shard (target shard, not pinning node's shard).
+	// Invariant: each file lives in exactly one cluster (the target cluster by payload CID).
+	// We never pin the same file in the uploader's cluster and another cluster — only in the target.
 	payloadCIDStr := payloadCID.String()
 	log.Printf("[FileOps] Checking responsibility for PayloadCID: %s", payloadCIDStr)
 	isResponsible := fp.shardMgr.AmIResponsibleFor(payloadCIDStr)
 	log.Printf("[FileOps] Responsibility check for %s: responsible=%v", payloadCIDStr, isResponsible)
 
-	// Pin to Cluster in the shard that owns this file (target shard), so replication is even.
-	// Responsible: pin to current shard (current == target). Custodial: pin only in target shard (done inside announceCustodialFile).
+	// Pin only in the cluster that owns this file (target cluster). Never pin in our cluster when we're not responsible.
 	if isResponsible {
 		log.Printf("[FileOps] Pinning to Cluster (current shard) for: %s", manifestCIDStr)
 		if err := fp.shardMgr.PinToCluster(context.Background(), manifestCID); err != nil {
@@ -414,6 +419,9 @@ func (fp *FileProcessor) trackAndAnnounceFile(manifestCID cid.Cid, manifestCIDSt
 		} else {
 			log.Printf("[FileOps] Successfully pinned to Cluster state")
 		}
+	} else {
+		// Defensive: we must never PinToCluster when not responsible; file will be injected into target cluster only.
+		log.Printf("[FileOps] Not pinning to current cluster (custodial); file will be injected into target cluster only")
 	}
 
 	// Check if shardMgr is nil (shouldn't happen, but safety check)
@@ -494,32 +502,38 @@ func (fp *FileProcessor) announceResponsibleFile(manifestCID cid.Cid, manifestCI
 	}()
 }
 
-// announceCustodialFile announces a custodial file delegation using the "Tourist" pattern.
-// It joins the target shard temporarily to announce the file.
+// announceCustodialFile injects a file into the cluster that owns it by CID (target shard).
+// Invariant: we never pin this file in our own cluster; we only pin and announce in the target cluster.
+// The uploader is "aware" of the target cluster by deriving it from the file's payload CID (TargetShardForPayload).
 func (fp *FileProcessor) announceCustodialFile(manifestCID cid.Cid, manifestCIDStr, payloadCIDStr string) {
-	log.Printf("[Core] Custodial Mode: I am NOT responsible for PayloadCID %s (ManifestCID %s). Visiting target shard.",
+	log.Printf("[Core] Custodial Mode: I am NOT responsible for PayloadCID %s (ManifestCID %s). Injecting into target shard only.",
 		payloadCIDStr, manifestCIDStr)
 
-	// Calculate target shard
-	stableHex := common.KeyToStableHex(payloadCIDStr)
 	currentShard, _ := fp.shardMgr.GetShardInfo()
 	targetDepth := len(currentShard)
 	if targetDepth == 0 {
 		targetDepth = 1
 	}
-	targetShard := common.GetHexBinaryPrefix(stableHex, targetDepth)
+	targetShard := common.TargetShardForPayload(payloadCIDStr, targetDepth)
 
-	// Join target shard (Tourist Mode): pubsub + cluster so we can pin there.
+	// Defensive: custodial implies target != our shard (we are not responsible).
+	if targetShard == currentShard {
+		log.Printf("[Core] ERROR: Custodial path but target shard %s == current shard (invariant violation); skipping inject", targetShard)
+		return
+	}
+
+	// Join target shard (Tourist Mode): pubsub + cluster so we can inject there. We never pin in our own cluster.
 	fp.shardMgr.JoinShard(targetShard)
 	if err := fp.shardMgr.EnsureClusterForShard(context.Background(), targetShard); err != nil {
 		log.Printf("[Core] Failed to ensure cluster for target shard %s: %v", targetShard, err)
+		return
 	}
-	// Pin to target shard's cluster so replication happens in the correct shard (not in pinning node's shard).
+	// Pin only in target shard's cluster. Never in pinning node's cluster.
 	if err := fp.shardMgr.PinToShard(context.Background(), targetShard, manifestCID); err != nil {
 		log.Printf("[Core] Failed to pin to target shard %s: %v", targetShard, err)
-	} else {
-		log.Printf("[Core] Pinned to target shard %s for replication", targetShard)
+		return
 	}
+	log.Printf("[Core] Injected file into target shard %s (not in our shard %s)", targetShard, currentShard)
 
 	// Announce IngestMessage directly to the target shard
 	im := schema.IngestMessage{
@@ -731,11 +745,16 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 }
 
 // SignProtocolMessage signs a message with the node's private key.
+// Prefer using the injected Signer (same nonce bounds and semantics as verifier). Fallback uses EffectiveNonceSizeForSigning so verifier never rejects nonce length.
 func (fp *FileProcessor) SignProtocolMessage(msg interface{}) error {
-	nonce, err := common.NewNonce(config.NonceSize) // Need to export NewNonce in common/utils or similar
-	// But wait, NewNonce was in signing.go which used crypto/rand.
-	// I should duplicate NewNonce in fileops or use common if I move it.
-	// For now, I'll implement simple nonce here.
+	if fp.signer != nil {
+		return fp.signer.SignProtocolMessage(msg)
+	}
+	if msg == nil {
+		return fmt.Errorf("message is nil")
+	}
+	nonceSize := signing.EffectiveNonceSizeForSigning()
+	nonce, err := common.NewNonce(nonceSize)
 	if err != nil {
 		return err
 	}
@@ -761,7 +780,43 @@ func (fp *FileProcessor) SignProtocolMessage(msg interface{}) error {
 
 		m.Sig = sig
 		return nil
+	case *schema.ReplicationRequest:
+		m.SenderID = fp.shardMgr.GetHost().ID()
+		m.Timestamp = ts
+		m.Nonce = nonce
+		m.Sig = nil
+
+		unsigned, err := m.MarshalCBORForSigning()
+		if err != nil {
+			return err
+		}
+
+		sig, err := fp.privKey.Sign(unsigned)
+		if err != nil {
+			return err
+		}
+
+		m.Sig = sig
+		return nil
+	case *schema.UnreplicateRequest:
+		m.SenderID = fp.shardMgr.GetHost().ID()
+		m.Timestamp = ts
+		m.Nonce = nonce
+		m.Sig = nil
+
+		unsigned, err := m.MarshalCBORForSigning()
+		if err != nil {
+			return err
+		}
+
+		sig, err := fp.privKey.Sign(unsigned)
+		if err != nil {
+			return err
+		}
+
+		m.Sig = sig
+		return nil
 	default:
-		return fmt.Errorf("unsupported message type for signing")
+		return fmt.Errorf("unsupported message type for signing: %T", msg)
 	}
 }

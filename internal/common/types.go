@@ -289,14 +289,28 @@ func (tp *TrustedPeers) All() []peer.ID {
 
 // NonceStore tracks seen nonces for replay protection
 type NonceStore struct {
-	mu      sync.RWMutex
-	entries map[string]time.Time
+	mu             sync.RWMutex
+	entries        map[string]time.Time
+	cleanupCounter uint64 // run lazy cleanup only every 256 calls to avoid O(n) on every verification
 }
 
 func NewNonceStore() *NonceStore {
 	return &NonceStore{entries: make(map[string]time.Time)}
 }
 
+// nonceTTL returns the duration to keep a nonce; ensures positive TTL so replay detection is reliable.
+// Must align with effective max age used in signing (so replay window matches message validity).
+func nonceTTL() time.Duration {
+	ttl := config.SignatureMaxAge
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	return ttl
+}
+
+// SeenBefore returns true if this (sender, nonce) was already seen (replay).
+// It records the nonce only when the key is absent so that concurrent verifiers
+// cannot both see "not seen" and accept the same message (TOCTOU-safe).
 func (ns *NonceStore) SeenBefore(sender peer.ID, nonce []byte) bool {
 	key := NonceKey(sender, nonce)
 	now := time.Now()
@@ -304,17 +318,21 @@ func (ns *NonceStore) SeenBefore(sender peer.ID, nonce []byte) bool {
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
 
-	// Lazy cleanup
-	for k, exp := range ns.entries {
-		if now.After(exp) {
-			delete(ns.entries, k)
+	// Lazy cleanup every 256 calls to avoid O(n) on every verification under load
+	ns.cleanupCounter++
+	if ns.cleanupCounter&0xFF == 0 {
+		for k, exp := range ns.entries {
+			if now.After(exp) {
+				delete(ns.entries, k)
+			}
 		}
 	}
 
-	if exp, ok := ns.entries[key]; ok && now.Before(exp) {
+	// Any existing key means replay (even if expired); only insert when absent.
+	if _, exists := ns.entries[key]; exists {
 		return true
 	}
-	ns.entries[key] = now.Add(config.SignatureMaxAge)
+	ns.entries[key] = now.Add(nonceTTL())
 	return false
 }
 
@@ -322,7 +340,7 @@ func (ns *NonceStore) Record(sender peer.ID, nonce []byte) {
 	key := NonceKey(sender, nonce)
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
-	ns.entries[key] = time.Now().Add(config.SignatureMaxAge)
+	ns.entries[key] = time.Now().Add(nonceTTL())
 }
 
 // RateLimiter tracks message rates per peer

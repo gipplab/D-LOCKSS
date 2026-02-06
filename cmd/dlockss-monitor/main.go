@@ -57,6 +57,14 @@ const (
 	GeoCooldownDuration     = 5 * time.Minute
 )
 
+// shardLogLabel returns shardID for use in log lines; empty shard is shown as "root" for readability.
+func shardLogLabel(shardID string) string {
+	if shardID == "" {
+		return "root"
+	}
+	return shardID
+}
+
 // nodeCleanupTimeout: after this duration without any message (heartbeat, Ingest, etc.) a node is pruned.
 // Configurable via DLOCKSS_MONITOR_NODE_CLEANUP_TIMEOUT (e.g. "30m", "1h"). For Pi-only or remote networks
 // where connectivity can be intermittent, use a longer value so nodes are not pruned during brief gaps.
@@ -228,8 +236,7 @@ func (m *Monitor) handleIngestMessage(im *schema.IngestMessage, senderID peer.ID
 	m.setPeerShardLastSeenUnlocked(peerIDStr, shardID, now)
 
 	// Log who pins what at what time for observability (who pins what, when, which shard).
-	log.Printf("[Monitor] PIN peer=%s manifest=%s shard=%s",
-		senderID.String(), manifestCIDStr, shardID)
+	// log.Printf("[Monitor] PIN peer=%s manifest=%s shard=%s",senderID.String(), manifestCIDStr, shardID)
 
 	if m.ps != nil {
 		m.ensureShardSubscriptionUnlocked(context.Background(), shardID)
@@ -263,7 +270,7 @@ func (m *Monitor) handleHeartbeat(senderID peer.ID, shardID string, ip string, p
 
 	nodeState, exists := m.nodes[peerIDStr]
 	if !exists {
-		log.Printf("[Monitor] New node discovered via heartbeat: %s (shard: %s, pinned: %d)", peerIDStr, shardID, pinnedCount)
+		log.Printf("[Monitor] New node discovered via heartbeat: %s (shard: %s, pinned: %d)", peerIDStr, shardLogLabel(shardID), pinnedCount)
 		nodeState = &NodeState{
 			PeerID:         peerIDStr,
 			CurrentShard:   shardID,
@@ -346,9 +353,9 @@ func (m *Monitor) updateNodeShardLocked(node *NodeState, newShard string, timest
 		m.treeDirty = true
 		// Who is in what shard: log every shard change (split or discovery move).
 		log.Printf("[Monitor] SHARD_MOVE peer=%s from=%s to=%s",
-			node.PeerID, lastShard, newShard)
+			node.PeerID, shardLogLabel(lastShard), shardLogLabel(newShard))
 		if len(newShard) > len(lastShard) && strings.HasPrefix(newShard, lastShard) {
-			log.Printf("[Monitor] Detected shard split: %s -> %s (node: %s)", lastShard, newShard, node.PeerID)
+			log.Printf("[Monitor] Detected shard split: %s -> %s (node: %s)", shardLogLabel(lastShard), newShard, node.PeerID)
 			m.splitEvents = append(m.splitEvents, ShardSplitEvent{
 				ParentShard: lastShard,
 				ChildShard:  newShard,
@@ -400,7 +407,7 @@ func (m *Monitor) updateNodeShardLocked(node *NodeState, newShard string, timest
 		}
 		if removed > 0 {
 			log.Printf("[Monitor] Shard move: removed peer %s from %d manifests (now only in shard %s)",
-				peerIDStr, removed, newShard)
+				peerIDStr, removed, shardLogLabel(newShard))
 		}
 	}
 }
@@ -1130,7 +1137,7 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 					}
 					if err == nil {
 						m.handleLeaveShard(leaveID, shardID)
-						log.Printf("[Monitor] SHARD_LEAVE peer=%s shard=%s", leaveID.String(), shardID)
+						log.Printf("[Monitor] SHARD_LEAVE peer=%s shard=%s", leaveID.String(), shardLogLabel(shardID))
 					}
 				}
 				continue
@@ -1148,7 +1155,7 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 					}
 					if err == nil {
 						m.handleHeartbeat(joinID, shardID, ip, -1)
-						log.Printf("[Monitor] SHARD_JOIN peer=%s shard=%s", joinID.String(), shardID)
+						log.Printf("[Monitor] SHARD_JOIN peer=%s shard=%s", joinID.String(), shardLogLabel(shardID))
 					}
 				}
 				continue

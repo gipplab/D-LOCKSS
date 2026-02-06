@@ -74,6 +74,8 @@ export DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/5001"
 export DLOCKSS_NODE_COUNTRY="DE"
 ```
 
+**Shard tuning (small testnets):** For ~15 nodes, use `DLOCKSS_MAX_PEERS_PER_SHARD=12` and `DLOCKSS_MIN_PEERS_PER_SHARD=6` (defaults) so the network splits into a small number of shards (e.g. root → `0` and `1`) instead of many understaffed ones. If you use a lower max (e.g. 6), keep `DLOCKSS_MIN_PEERS_PER_SHARD` at least 4.
+
 See [README](README.md#configuration) for full configuration options.
 
 ## Troubleshooting

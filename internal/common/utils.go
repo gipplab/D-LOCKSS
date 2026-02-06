@@ -54,6 +54,16 @@ func KeyToStableHex(key string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// TargetShardForPayload returns the shard (cluster) that should hold a file, given its payload CID
+// and the current tree depth. Invariant: each file lives in exactly one cluster; this is the canonical
+// way to derive that cluster from content. depth 1 => "0" or "1"; depth 2 => "00","01","10","11"; etc.
+func TargetShardForPayload(payloadCIDStr string, depth int) string {
+	if depth < 1 {
+		depth = 1
+	}
+	return GetHexBinaryPrefix(KeyToStableHex(payloadCIDStr), depth)
+}
+
 func bytesToBinaryString(b []byte, length int) string {
 	var sb strings.Builder
 	for _, byteVal := range b {

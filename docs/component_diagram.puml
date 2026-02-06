@@ -7,17 +7,15 @@ package "Core Components" {
     component "FileProcessor" as FileProcessor
     component Metrics
     component "Rate Limiter" as RateLimiter
-    component "Storage Monitor" as StorageMonitor
 }
 
 ShardManager --> ClusterManager : joins/leaves shards
-ClusterManager --> StorageManager : syncs pins (via PinTracker)
+ClusterManager --> StorageManager : onPinSynced/onPinRemoved
 FileProcessor --> StorageManager : pins files, adds known
-FileProcessor --> ShardManager : checks responsibility
-ShardManager --> RateLimiter : filters messages
-RateLimiter --> StorageMonitor : checks disk usage
+FileProcessor --> ShardManager : PinToCluster, AnnouncePinned, responsibility
+ShardManager --> RateLimiter : Check(peer) before processing messages
 Metrics --> StorageManager : reads stats
-Metrics --> ClusterManager : reads cluster stats
+Metrics --> ClusterManager : GetClusterMetrics (pins/peers per shard)
 
 note right of ShardManager
     Manages shard assignment

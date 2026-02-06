@@ -193,7 +193,7 @@ func main() {
 	apiServer.Start()
 
 	// File processor and watcher
-	fp := fileops.NewFileProcessor(ipfsClient, shardMgr, storageMgr, privKey)
+	fp := fileops.NewFileProcessor(ipfsClient, shardMgr, storageMgr, privKey, signer)
 	fp.ScanExistingFiles()
 	go fp.WatchFolder(ctx)
 

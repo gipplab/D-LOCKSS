@@ -1,34 +1,36 @@
 @startuml Custodial Handoff Sequence (Tourist Pattern)
 
 participant "Custodial Node" as Custodial
-participant "Shard Manager" as ShardMgr
-participant "Cluster Manager" as ClusterMgr
-participant "CRDT" as CRDT
+participant "ShardManager" as ShardMgr
+participant "ClusterManager" as ClusterMgr
+participant "CRDT (target shard)" as CRDT
 participant "Responsible Node" as Responsible
 participant "StorageManager" as Storage
 participant "IPFS" as IPFS
+participant "PubSub" as PubSub
 
-Custodial -> Custodial: processNewFile()\nPayloadCID not in my shard
-Custodial -> IPFS: PinRecursive(ManifestCID)\n[temporary custodial hold]
-Custodial -> Storage: pinFile(ManifestCID)
+== Local ingest: we are NOT responsible ==
 
-Custodial -> ShardMgr: JoinShard(TargetShard)
-Custodial -> ClusterMgr: JoinShard(TargetShard)
-Note over Custodial: Dual-Homing / Tourist
+Custodial -> Custodial: trackAndAnnounceFile()\nAmIResponsibleFor(PayloadCID) == false
+Custodial -> IPFS: PinRecursive(ManifestCID)  ' already done in checkBadBitsAndPin
+Custodial -> Storage: PinFile(ManifestCID)
+Custodial -> ShardMgr: AnnouncePinned(ManifestCID)
 
-Custodial -> ClusterMgr: Pin(ManifestCID)
-ClusterMgr -> CRDT: LogPin(ManifestCID)
-CRDT -> Responsible: Sync State (PubSub)
+Custodial -> Custodial: announceCustodialFile()\ntargetShard = TargetShardForPayload(PayloadCID, depth)
+Custodial -> ShardMgr: JoinShard(targetShard)
+ShardMgr -> PubSub: Subscribe to dlockss-creative-commons-shard-<targetShard>
+Custodial -> ShardMgr: EnsureClusterForShard(ctx, targetShard)
+ShardMgr -> ClusterMgr: JoinShard(ctx, targetShard)
+Custodial -> ShardMgr: PinToShard(ctx, targetShard, ManifestCID)
+ShardMgr -> ClusterMgr: Pin(ctx, targetShard, cid, -1, -1)
+ClusterMgr -> CRDT: LogPin(pin)
+CRDT -> Responsible: Sync State (PubSub dlockss-shard-<targetShard>)
 
-Responsible -> CRDT: State Updated
+Responsible -> CRDT: LocalPinTracker sees new pin (we are in Allocations)
 Responsible -> IPFS: PinRecursive(ManifestCID)
-Note over Responsible: Responsible node picks up file
+Responsible -> Storage: onPinSynced(cid)
+Note over Responsible: Responsible node holds file in target cluster
 
-Custodial -> CRDT: Check State (Replication Count)
-alt Replication Sufficient
-    Custodial -> IPFS: UnpinRecursive(ManifestCID)
-    Custodial -> ClusterMgr: LeaveShard(TargetShard)
-    Custodial -> ShardMgr: LeaveShard(TargetShard)
-end
+Note over Custodial: Custodial remains in target shard as tourist.\nNo automatic unpin when replication sufficient;\nreshard/split may leave target shard later.
 
 @enduml

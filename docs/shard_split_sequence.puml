@@ -2,107 +2,71 @@
 
 participant "ShardManager" as ShardMgr
 participant "PubSub" as PubSub
+participant "ClusterManager" as ClusterMgr
 participant "StorageManager" as Storage
-participant "ReplicationManager" as ReplMgr
-participant "Old Shard Reader" as OldReader
+participant "CRDT" as CRDT
+participant "IPFS" as IPFS
 
 == Path 1: Split when current shard is overcrowded ==
 
-ShardMgr -> ShardMgr: runPeerCountChecker()\n(periodic ticker every ShardPeerCheckInterval)
-ShardMgr -> ShardMgr: getShardPeerCount()\n(topic.ListPeers() + seen peers)
+ShardMgr -> ShardMgr: runPeerCountChecker()\n(ticker: rootPeerCheckInterval at root, ShardPeerCheckInterval otherwise)
+ShardMgr -> ShardMgr: getShardPeerCount()\n(max(mesh+1, seen+1) for current shard)
 
-alt peerCount > MaxPeersPerShard\nAND estimatedPeersAfterSplit >= MinPeersPerShard
+alt peerCount > MaxPeersPerShard\nAND estimatedPeersAfterSplit >= minPerChild (MinPeersPerShard or minPeersPerChildAfterSplit)
     ShardMgr -> ShardMgr: splitShard()
-    ShardMgr -> ShardMgr: Calculate new depth\ncurrentDepth + 1
-    ShardMgr -> ShardMgr: Get peerIDHash at new depth
-    ShardMgr -> ShardMgr: Update currentShard = peerIDHash
+    ShardMgr -> ShardMgr: currentShard = GetBinaryPrefix(peerID, depth+1)
     
-    Note over ShardMgr: Entering Overlap State
+    ShardMgr -> PubSub: JoinShard(newShard)\n(topic: dlockss-creative-commons-shard-<newShard>)
     
-    ShardMgr -> PubSub: Join new shard topic
+    ShardMgr -> ClusterMgr: JoinShard(ctx, newShard, nil)
+    ClusterMgr -> CRDT: crdt.New(..., dlockss-shard-<newShard>)
+    ClusterMgr -> ClusterMgr: NewLocalPinTracker, Start, subscribe to CRDT topic for TriggerSync
     
-    Note over ShardMgr: Dual-Homing Cluster
-    ShardMgr -> ClusterMgr: JoinShard(newShard)
-    ClusterMgr -> CRDT: Initialize new consensus
-    ClusterMgr -> PinTracker: Start tracking new shard
+    ShardMgr -> ShardMgr: go: Sleep(migratePinsFlushDelay)\nMigratePins(oldShard, newShard)
+    Note right of ClusterMgr: MigratePins: ListPins(old), for each pin belonging to newShard (by PayloadCID), Pin(newShard)
     
-    ShardMgr -> ClusterMgr: MigratePins(oldShard, newShard)
-    Note right of ClusterMgr: Background migration:\nRead old CRDT -> Pin to new CRDT
+    ShardMgr -> ShardMgr: go: Sleep(ShardOverlapDuration)\nLeaveShard(oldShard)
+    ShardMgr -> PubSub: LEAVE, cancel sub, Close topic (old shard)
+    ShardMgr -> ClusterMgr: LeaveShard(oldShard)
     
-    ShardMgr -> ShardMgr: Keep old shard subscription active
-    ShardMgr -> ShardMgr: Set overlap end time
-    ShardMgr -> OldReader: Start readOldShard() goroutine
-    
-    Note over ShardMgr: Reshard Pass (Re-evaluate Responsibility)
-    ShardMgr -> Storage: Walk known files
+    ShardMgr -> ShardMgr: go: Sleep(ReshardDelay)\nRunReshardPass(oldShard, newShard)
+    ShardMgr -> Storage: GetKnownFiles().All()
     loop For each file
-        ShardMgr -> ShardMgr: Calculate new responsibility
-        alt Moved ONTO shard
-             ShardMgr -> PubSub: Publish IngestMessage (New Shard)
+        ShardMgr -> ShardMgr: targetNew = GetHexBinaryPrefix(KeyToStableHex(payloadCID), newDepth)\ntargetOld = ... oldDepth
+        alt Now responsible (targetNew == newShard) and IsPinned
+            ShardMgr -> PubSub: Publish IngestMessage (new shard)
+        else Was responsible, now not (targetNew != newShard)
+            ShardMgr -> ClusterMgr: Unpin(ctx, oldShard, manifestCID)
+            ShardMgr -> IPFS: UnpinRecursive\nStorage.UnpinFile
         end
     end
-    
-    Note over ShardMgr,OldReader: Overlap Period\n(Both subscriptions active)
-    
-    loop During Overlap Period
-        OldReader -> PubSub: Read messages from old shard
-        alt Message received
-            OldReader -> ShardMgr: Process messages
-            ShardMgr -> Storage: addKnownFile(hash)
-            Note over ShardMgr: Added to known files, picked up by ReplMgr
-        end
-    end
-    
-    alt Overlap period expired
-        ShardMgr -> PubSub: Cancel old shard subscription
-        ShardMgr -> ClusterMgr: LeaveShard(oldShard)
-        ClusterMgr -> CRDT: Shutdown old consensus
-        ShardMgr -> ShardMgr: Set inOverlap = false
-        Note over ShardMgr: Overlap complete\nOnly new shard active
-    end
-    
-    Note over ShardMgr: Responsibility changed
 end
 
-== Path 2: Discover and migrate into existing deeper shards ==
+== Path 2: Discover and migrate into existing deeper shards (root only) ==
 
-Note over ShardMgr: Late joiner in ROOT, or nodes in parent shard (e.g. "00")\nwith few peers; should discover deeper shards (e.g. "000", "001") and migrate.
+Note over ShardMgr: At root (currentShard == ""): runShardDiscovery()\nprobe deeper shards (JoinShardAsObserver), then move to deepest with peers.
 
-ShardMgr -> ShardMgr: runShardDiscovery()\n(periodic ticker every ShardDiscoveryInterval)
-ShardMgr -> ShardMgr: getShardPeerCount()
+ShardMgr -> ShardMgr: runShardDiscovery()\n(ticker: discoveryIntervalOnRoot at root, ShardDiscoveryInterval otherwise)
+ShardMgr -> ShardMgr: checkAndMergeUpIfAlone()\nthen discoverAndMoveToDeeperShard()
 
-alt peerCount <= MaxPeersPerShard\n(any shard: explore deeper)
-    ShardMgr -> ShardMgr: discoverAndMoveToDeeperShard()
-    ShardMgr -> ShardMgr: generateDeeperShards(currentShard, 3)\nfilter by peer ID prefix
-    loop For each matching deeper shard (e.g. "0", "1")
-        ShardMgr -> PubSub: probeShard(shard)\nJoin temporarily, wait probeTimeout
-        PubSub -> ShardMgr: mesh/seen peer count
-        ShardMgr -> PubSub: LeaveShard(shard)
-    end
-    alt Found deeper shard with >= 1 peer
-        ShardMgr -> ShardMgr: Update currentShard = deepestActiveShard
-        ShardMgr -> PubSub: Join new shard topic
-        ShardMgr -> ShardMgr: Keep old (ROOT) for ShardOverlapDuration
-        ShardMgr -> ShardMgr: RunReshardPass(ROOT, newShard)
-        Note over ShardMgr: Late joiner now in same shard as peers
-    end
-    else node is idle (no messages in last minute)
-    Note over ShardMgr: Also runs discovery when idle
-    ShardMgr -> ShardMgr: discoverAndMoveToDeeperShard()
+alt At root AND deeper shard has >= minRequired peers
+    ShardMgr -> ShardMgr: JoinShardAsObserver(deepestActiveShard)\nobserverProbeDuration, then JoinShard (promote to full)
+    ShardMgr -> ShardMgr: currentShard = deepestActiveShard
+    ShardMgr -> PubSub: JoinShard(newShard)
+    ShardMgr -> ClusterMgr: JoinShard(ctx, newShard, nil)
+    ShardMgr -> ShardMgr: MigratePins(oldShard, newShard)\nLeaveShard(oldShard) after ShardOverlapDuration\nRunReshardPass(oldShard, newShard)
 end
 
-== Path 3: Merge up when alone in deep shard (no siblings) ==
+== Path 3: Merge up when understaffed in deep shard ==
 
-Note over ShardMgr: One node in e.g. "011", parent "01" has 7 nodes,\nsibling "010" empty -> migrate up to "01".
+Note over ShardMgr: currentPeerCount < MinPeersPerShard\nparent has room, sibling empty or we're smaller/equal -> move to parent.
 
 ShardMgr -> ShardMgr: checkAndMergeUpIfAlone()
-alt len(currentShard) >= 2\nAND current peer count <= 1 (alone)\nAND parent peer count < MaxPeersPerShard\nAND sibling shard has 0 peers
-    ShardMgr -> ShardMgr: parentShard = currentShard[:-1]
-    ShardMgr -> PubSub: probeShard(parent)
-    ShardMgr -> PubSub: probeShard(sibling)
+alt len(currentShard) >= 2\nAND currentPeerCount < MinPeersPerShard\nAND parentPeerCount < MaxPeersPerShard\nAND (sibling empty OR we're smaller/equal)
     ShardMgr -> ShardMgr: currentShard = parentShard
-    ShardMgr -> PubSub: Join parent, Leave current after overlap
-    ShardMgr -> ShardMgr: RunReshardPass(current, parent)
+    ShardMgr -> PubSub: JoinShard(parentShard)
+    ShardMgr -> ClusterMgr: JoinShard(ctx, parentShard, nil)
+    ShardMgr -> ShardMgr: MigratePins(oldShard, parentShard)\nLeaveShard(oldShard) after ShardOverlapDuration\nRunReshardPass(oldShard, parentShard)
 end
 
 @enduml

@@ -28,13 +28,12 @@ The protocol is built on top of the **IPFS** (InterPlanetary File System) and **
 
 The network is partitioned into PubSub topics to ensure scalability:
 
-*   **Control Topic**: `dlockss-v2-creative-commons-control`
-    *   Used for cross-shard communication (e.g., Delegation).
-    *   All nodes subscribe to this.
-*   **Shard Topics**: `dlockss-v2-creative-commons-shard-<prefix>`
-    *   Examples: `...-shard-0`, `...-shard-1`, `...-shard-01`.
-    *   Nodes subscribe only to the shard topic matching their peer ID prefix.
-    *   Used for high-frequency coordination (Ingest, Replication Requests).
+*   **Shard Topics (membership + protocol)**: `dlockss-creative-commons-shard-<prefix>`
+    *   Examples: `...-shard-`, `...-shard-0`, `...-shard-1`, `...-shard-01`.
+    *   Used for: JOIN/HEARTBEAT/LEAVE, PINNED, IngestMessage, ReplicationRequest (CBOR).
+    *   Nodes subscribe to the shard topic(s) they belong to (current shard; optionally target shard as tourist).
+*   **CRDT topics (cluster consensus, internal)**: `dlockss-shard-<id>`
+    *   Used by the embedded IPFS Cluster CRDT per shard. Not subscribed to directly for application messages.
 
 ---
 
@@ -44,18 +43,16 @@ All data structures are serialized using **DAG-CBOR** (Concise Binary Object Rep
 
 ### 3.1 Research Object (The Manifest)
 
-The immutable record representing a preserved digital artifact.
+The immutable record representing a preserved digital artifact. Defined in `pkg/schema/types.go`.
 
 ```go
 type ResearchObject struct {
-    Title      string   `cbor:"title"`       // Human-readable title
-    Authors    []string `cbor:"authors"`     // List of authors
-    IngestedBy peer.ID  `cbor:"ingester_id"` // PeerID of ingesting node
-    Signature  []byte   `cbor:"sig"`         // Ed25519/RSA signature of the object
-    Timestamp  int64    `cbor:"ts"`          // Unix timestamp of creation
-    Payload    cid.Cid  `cbor:"payload"`     // CID of the raw content (UnixFS DAG root)
-    References []cid.Cid `cbor:"refs"`       // CIDs of related ResearchObjects
-    TotalSize  uint64   `cbor:"size"`        // Size of Payload in bytes
+    MetadataRef string  `cbor:"meta_ref"`    // DOI/URL or file path reference
+    IngestedBy  peer.ID `cbor:"ingester_id"` // PeerID of ingesting node
+    Signature   []byte  `cbor:"sig"`         // Signature of the object
+    Timestamp   int64   `cbor:"ts"`          // Unix timestamp of creation
+    Payload     cid.Cid `cbor:"payload"`     // CID of the raw content (UnixFS DAG root)
+    TotalSize   uint64  `cbor:"size"`        // Size of Payload in bytes
 }
 ```
 
@@ -70,9 +67,10 @@ Messages are propagated over GossipSub. All messages include a signature (`sig`)
 | Type | ID | Purpose | Topic |
 |------|----|---------|-------|
 | `Ingest` | 1 | Announce new file entry | Shard |
-| `ReplicationRequest` | 2 | Request more replicas (NEED) | Shard |
-| `Delegate` | 3 | Hand off file to responsible shard | Control |
+| `ReplicationRequest` | 2 | Request more replicas (under-replicated) | Shard |
 | `UnreplicateRequest` | 4 | Request dropping excess replicas | Shard |
+
+Custodial handoff is done by joining the target shard (pubsub + cluster) and publishing **IngestMessage** to the target shard topic; there is no separate Delegate message in the codebase.
 
 ### 4.2 IngestMessage
 
@@ -108,22 +106,6 @@ Broadcast when a node detects a file is under-replicated.
 }
 ```
 
-### 4.4 DelegateMessage
-
-Sent when a custodial node (holding a file it's not responsible for) wants to hand it off to the responsible shard.
-
-```cbor
-{
-  "type": 3,
-  "manifest_cid": <CID>,
-  "target_shard": <string>, // e.g. "10" (Target prefix)
-  "sender_id": <PeerID>,
-  "ts": <int64>,
-  "nonce": <bytes>,
-  "sig": <bytes>
-}
-```
-
 ---
 
 ## 5. Sharding Protocol
@@ -139,10 +121,10 @@ D-LOCKSS uses dynamic sharding to partition responsibility.
 ### 5.2 Dynamic Splitting
 
 When a shard becomes too large (too many peers):
-1.  **Detection**: `PeerCount > MaxPeersPerShard` (default 20).
-2.  **Split**: Node extends its `currentShard` by 1 bit (e.g., "0" -> "01").
-3.  **Overlap**: Node subscribes to BOTH old ("0") and new ("01") topics for `ShardOverlapDuration` (2m) to ensure no messages are lost during transition.
-4.  **Completion**: Old subscription is dropped.
+1.  **Detection**: `PeerCount > MaxPeersPerShard` (default 12; configurable) and estimated peers per child after split >= min per child (e.g. MinPeersPerShard or minPeersPerChildAfterSplit).
+2.  **Split**: Node sets `currentShard` to binary prefix of its PeerID at new depth (e.g., "0" -> "0" or "1" by hash).
+3.  **Overlap**: Node joins new shard (pubsub + cluster), runs MigratePins(oldShard, newShard) after a short flush delay, then keeps old shard for `ShardOverlapDuration` (default 2m).
+4.  **Completion**: After overlap, node leaves old shard (LeaveShard pubsub + ClusterManager.LeaveShard). RunReshardPass re-evaluates responsibility; files no longer in our shard are unpinned.
 
 ---
 
@@ -151,36 +133,38 @@ When a shard becomes too large (too many peers):
 ### 6.1 File Ingestion
 
 1.  **Import**: Node imports file to IPFS, getting `PayloadCID`.
-2.  **Manifest**: Node creates and signs `ResearchObject` pointing to `PayloadCID`.
-3.  **Pin**: Node pins `ManifestCID` recursively (pinning both manifest and payload).
-4.  **Check Responsibility**:
+2.  **Manifest**: Node creates and signs `ResearchObject` (meta_ref, ingester_id, payload, size) and stores it in IPFS; gets `ManifestCID`.
+3.  **Pin**: Node pins `ManifestCID` recursively (BadBits check first). Tracks via StorageManager.PinFile and announces PINNED on current shard topic.
+4.  **Check Responsibility** (AmIResponsibleFor(PayloadCID)):
     *   **If Responsible**:
-        *   Announce `IngestMessage` to **Shard Topic**.
+        *   Pin to current shard's cluster (ClusterManager.Pin).
+        *   Publish `IngestMessage` to current **Shard Topic**.
         *   Announce to DHT (`Provide`).
     *   **If Not Responsible (Custodial)**:
-        *   Do NOT announce to DHT.
-        *   Broadcast `DelegateMessage` to **Control Topic**.
+        *   Do NOT pin to current cluster. Join **target shard** (TargetShardForPayload(PayloadCID, depth)): pubsub + ClusterManager.JoinShard.
+        *   Pin to target shard's cluster (PinToShard).
+        *   Publish `IngestMessage` to **target Shard Topic**.
+        *   Do NOT announce to DHT (file lives only in target cluster).
 
 ### 6.2 Replication & Repair
 
-Replication is handled automatically by the **Cluster Manager** using CRDTs:
+Replication is handled by the **Cluster Manager** and **LocalPinTracker** per shard:
 
-1.  **Pinning**: When a responsible node ingests or accepts a file, it calls `Pin()` on the local embedded cluster.
-2.  **State Sync**: The CRDT (Merkle-DAG based) propagates this operation to all other peers in the shard via PubSub (`dlockss-shard-<id>`).
+1.  **Pinning**: When a responsible node ingests or accepts a file, it calls `ClusterManager.Pin(ctx, shardID, cid, ...)` on the shard's embedded cluster. Allocations are chosen deterministically from Peers() (shard mesh via ShardPeerProvider).
+2.  **State Sync**: The CRDT (Merkle-DAG based) propagates pin/unpin to all peers in the shard via PubSub (`dlockss-shard-<id>`).
 3.  **Local Pin Tracker**:
-    *   Each node runs a `LocalPinTracker` that watches the CRDT state.
-    *   When it sees a new CID in the state that is not pinned locally, it triggers `ipfs pin add`.
-    *   This ensures that all nodes in the shard eventually hold all files assigned to that shard.
-4.  **Repair**: If a node goes offline and comes back, the CRDT automatically syncs missing operations, and the node catches up on pinning.
+    *   Each node runs a `LocalPinTracker` per shard that polls CRDT State() (and on TriggerSync).
+    *   For each pin in state, if this node is in **Allocations** (or Allocations is empty), it pins the CID locally via IPFS and calls onPinSynced (StorageManager.PinFile, AnnouncePinned).
+    *   Pins no longer in state or no longer allocated are unpinned locally and onPinRemoved is called.
+4.  **Repair**: Under-replicated files trigger ReplicationRequest on the shard topic; peers that have the file JoinShard(targetShard), Pin, TriggerSync. CRDT sync and LocalPinTracker then replicate to allocated peers.
 
-### 6.3 Custodial Handoff
+### 6.3 Custodial Handoff (Tourist)
 
-1.  **Custodial Node** sends `DelegateMessage` (target: "10").
-2.  **Responsible Node** (in shard "10") receives message.
-3.  Responsible Node pins the file to its **Cluster State**.
-4.  The Cluster syncs, and all nodes in shard "10" begin fetching the file.
-5.  **Custodial Node** detects replication count increased (via DHT or status check).
-6.  **Custodial Node** unpins the file (freeing space).
+1.  **Custodial Node** (local ingest; not responsible): computes `targetShard = TargetShardForPayload(PayloadCID, depth)`.
+2.  **Custodial Node** joins target shard (ShardManager.JoinShard + ClusterManager.JoinShard).
+3.  **Custodial Node** pins the file to the target shard's cluster (PinToShard) and publishes **IngestMessage** to the target shard topic.
+4.  **Responsible nodes** in the target shard receive IngestMessage; if responsible they Pin to cluster and AnnouncePinned. CRDT syncs; LocalPinTracker on each allocated peer pins locally.
+5.  Custodial node remains in the target shard as a "tourist." There is no automatic unpin when replication count is sufficient; the node may leave the target shard later (e.g. reshard or shutdown).
 
 ---
 
@@ -200,5 +184,4 @@ Replication is handled automatically by the **Cluster Manager** using CRDTs:
 *   Files matching these CIDs are refused for ingestion and replication.
 
 ### 7.4 Rate Limiting
-*   Per-peer rate limits on GossipSub messages to prevent flooding.
-*   Disk usage limits reject new custodial files when storage is full (>90%).
+*   Per-peer rate limits (RateLimiter.Check) on protocol messages (Ingest, ReplicationRequest) to prevent flooding. Applied in ShardManager before processing CBOR messages.

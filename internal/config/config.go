@@ -79,11 +79,15 @@ func LogConfiguration() {
 	log.Printf("[Config] Trust Mode: %s", TrustMode)
 	log.Printf("[Config] Trust Store Path: %s", TrustStorePath)
 	log.Printf("[Config] Signature Mode: %s", SignatureMode)
+	if SignatureMode != "off" && SignatureMode != "warn" && SignatureMode != "strict" {
+		log.Printf("[Config] Warning: unknown SignatureMode %q; treating as strict (fail closed)", SignatureMode)
+	}
 	log.Printf("[Config] Signature Max Age: %v", SignatureMaxAge)
 	log.Printf("[Config] Use PubSub for Replication: %v (min shard peers: %d)", UsePubsubForReplication, MinShardPeersForPubsubOnly)
 	log.Printf("[Config] Replication Cache TTL: %v", ReplicationCacheTTL)
 	log.Printf("[Config] Auto Replication Enabled: %v", AutoReplicationEnabled)
 	log.Printf("[Config] Auto Replication Timeout: %v", AutoReplicationTimeout)
+	log.Printf("[Config] CRDT Op Timeout: %v", CRDTOpTimeout)
 
 	// File operation configuration
 	log.Printf("[Config] File Import Timeout: %v", FileImportTimeout)
@@ -150,6 +154,7 @@ var (
 	ReplicationCacheTTL            = getEnvDuration("DLOCKSS_REPLICATION_CACHE_TTL", 5*time.Minute)    // How long to cache replication counts
 	AutoReplicationEnabled         = getEnvBool("DLOCKSS_AUTO_REPLICATION_ENABLED", true)              // Enable automatic replication on ReplicationRequest
 	AutoReplicationTimeout         = getEnvDuration("DLOCKSS_AUTO_REPLICATION_TIMEOUT", 5*time.Minute) // Timeout for fetching files during replication
+	CRDTOpTimeout                  = getEnvDuration("DLOCKSS_CRDT_OP_TIMEOUT", 10*time.Minute)         // Timeout for cluster/CRDT operations (LogPin, etc.); use a longer value if "context deadline exceeded" appears in CRDT logs
 
 	// File operation timeouts and delays
 	FileImportTimeout           = getEnvDuration("DLOCKSS_FILE_IMPORT_TIMEOUT", 2*time.Minute)          // Timeout for importing files to IPFS

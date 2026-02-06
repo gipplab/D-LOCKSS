@@ -71,7 +71,7 @@ D-LOCKSS acts as a self-healing, sharded storage cluster using the IPFS/Libp2p s
 5.  **BadBits Manager:** Enforces content blocking (e.g., DMCA) based on configured country codes.
 
 ### "Networked RAID" Logic
-*   **Striping -> Sharding:** Responsibility for files is determined by a stable hash of the ManifestCID.
+*   **Striping -> Sharding:** Responsibility for files is determined by a stable hash of the **PayloadCID** (TargetShardForPayload); each file lives in exactly one cluster (shard).
 *   **Redundancy -> Cluster Consensus:** Each shard runs an embedded IPFS Cluster CRDT. When a file is ingested, it is "pinned" to the shard's cluster state. All peers in that shard sync this state and automatically pin the content locally.
 *   **Write Cache -> Custodial Mode:** Nodes temporarily hold files they don't own until they can hand them off to the responsible shard.
 

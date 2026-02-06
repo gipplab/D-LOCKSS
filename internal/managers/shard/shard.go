@@ -38,11 +38,12 @@ const rootPeerCheckInterval = 30 * time.Second
 const rootReplicationCheckInterval = 20 * time.Second
 
 type shardSubscription struct {
-	topic    *pubsub.Topic
-	sub      *pubsub.Subscription
-	refCount int
-	cancel   context.CancelFunc
-	shardID  string
+	topic        *pubsub.Topic
+	sub          *pubsub.Subscription
+	refCount     int
+	cancel       context.CancelFunc
+	shardID      string
+	observerOnly bool // true = peek only: no JOIN/HEARTBEAT/LEAVE; we don't count as a member (like monitor)
 }
 
 type ShardManager struct {
@@ -71,13 +72,18 @@ type ShardManager struct {
 	// We handle this by simply 'holding' a reference to the old shard for a duration.
 	// No special fields needed, just logic in splitShard.
 
-	msgCounter         int
-	lastPeerCheck      time.Time
-	lastDiscoveryCheck time.Time
-	lastMessageTime    time.Time // Track when we last received a message to detect idle state
+	msgCounter            int
+	lastPeerCheck         time.Time
+	lastDiscoveryCheck    time.Time
+	lastMessageTime       time.Time // Track when we last received a message to detect idle state
+	lastMoveToDeeperShard time.Time // When we last moved to a deeper shard (split or discovery); used to avoid merge-up churn
+	lastMergeUpTime       time.Time // When we last merged up to parent; skip discovery move for cooldown to reduce thrashing
 
 	// Track unique peers seen via messages (for more accurate counting)
 	seenPeers map[string]map[peer.ID]time.Time // shardID -> peerID -> last seen
+
+	// observerOnlyShards: shards we're subscribed to as observer only (peek, no JOIN/HEARTBEAT). We don't count as a member there.
+	observerOnlyShards map[string]struct{}
 }
 
 func NewShardManager(
@@ -93,20 +99,21 @@ func NewShardManager(
 	startShard string,
 ) *ShardManager {
 	sm := &ShardManager{
-		ctx:             ctx,
-		h:               h,
-		ps:              ps,
-		ipfsClient:      ipfsClient,
-		storageMgr:      stm,
-		clusterMgr:      clusterMgr,
-		metrics:         metrics,
-		signer:          signer,
-		rateLimiter:     rateLimiter,
-		reshardedFiles:  common.NewKnownFiles(),
-		currentShard:    startShard,
-		shardSubs:       make(map[string]*shardSubscription),
-		probeTopicCache: make(map[string]*pubsub.Topic),
-		seenPeers:       make(map[string]map[peer.ID]time.Time),
+		ctx:                ctx,
+		h:                  h,
+		ps:                 ps,
+		ipfsClient:         ipfsClient,
+		storageMgr:         stm,
+		clusterMgr:         clusterMgr,
+		metrics:            metrics,
+		signer:             signer,
+		rateLimiter:        rateLimiter,
+		reshardedFiles:     common.NewKnownFiles(),
+		currentShard:       startShard,
+		shardSubs:          make(map[string]*shardSubscription),
+		probeTopicCache:    make(map[string]*pubsub.Topic),
+		seenPeers:          make(map[string]map[peer.ID]time.Time),
+		observerOnlyShards: make(map[string]struct{}),
 	}
 
 	// Initialize cluster for start shard
@@ -130,12 +137,30 @@ func (sm *ShardManager) Run() {
 
 // JoinShard increments the reference count for a shard topic.
 // If the topic is not currently subscribed, it joins and starts a read loop.
+// If we're already in this shard as observer only (JoinShardAsObserver), we "promote" to full member: publish JOIN+HEARTBEAT and stop being observer.
 func (sm *ShardManager) JoinShard(shardID string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
 	sub, exists := sm.shardSubs[shardID]
 	if exists {
+		if sub.observerOnly {
+			// Promote observer to full member: we're already subscribed, just announce so we count as a member.
+			sub.observerOnly = false
+			delete(sm.observerOnlyShards, shardID)
+			sm.mu.Unlock()
+			joinMsg := []byte("JOIN:" + sm.h.ID().String())
+			_ = sub.topic.Publish(sm.ctx, joinMsg)
+			pinnedCount := 0
+			if sm.storageMgr != nil {
+				pinnedCount = sm.storageMgr.GetPinnedCount()
+			}
+			heartbeatMsg := []byte(fmt.Sprintf("HEARTBEAT:%s:%d", sm.h.ID().String(), pinnedCount))
+			_ = sub.topic.Publish(sm.ctx, heartbeatMsg)
+			log.Printf("[Sharding] Promoted observer to full member in shard %s", shardID)
+			sm.mu.Lock()
+			return
+		}
 		sub.refCount++
 		// log.Printf("[Sharding] Retained shard %s (refCount: %d)", shardID, sub.refCount)
 		return
@@ -190,6 +215,81 @@ func (sm *ShardManager) JoinShard(shardID string) {
 	go sm.readLoop(ctx, newSub)
 }
 
+// JoinShardAsObserver subscribes to a shard topic without publishing JOIN/HEARTBEAT (peek only, like the monitor).
+// We are not counted as a member in that shard (getProbePeerCount does not add 1 for self when observer).
+// Use before a full JoinShard to "peek" and verify peer count without inflating it; then promote with JoinShard or leave with LeaveShardAsObserver.
+func (sm *ShardManager) JoinShardAsObserver(shardID string) bool {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sub, exists := sm.shardSubs[shardID]
+	if exists {
+		if sub.observerOnly {
+			sub.refCount++
+			return true
+		}
+		// Already full member
+		return false
+	}
+
+	topicName := fmt.Sprintf("dlockss-creative-commons-shard-%s", shardID)
+	var t *pubsub.Topic
+	if cached := sm.probeTopicCache[shardID]; cached != nil {
+		t = cached
+		delete(sm.probeTopicCache, shardID)
+	} else {
+		var err error
+		t, err = sm.ps.Join(topicName)
+		if err != nil {
+			log.Printf("[Sharding] JoinShardAsObserver: failed to join topic %s: %v", topicName, err)
+			return false
+		}
+	}
+
+	psSub, err := t.Subscribe()
+	if err != nil {
+		log.Printf("[Sharding] JoinShardAsObserver: failed to subscribe to %s: %v", topicName, err)
+		return false
+	}
+
+	ctx, cancel := context.WithCancel(sm.ctx)
+	newSub := &shardSubscription{
+		topic:        t,
+		sub:          psSub,
+		refCount:     1,
+		cancel:       cancel,
+		shardID:      shardID,
+		observerOnly: true,
+	}
+	sm.shardSubs[shardID] = newSub
+	sm.observerOnlyShards[shardID] = struct{}{}
+
+	log.Printf("[Sharding] Joined shard %s as observer (peek only, no JOIN/HEARTBEAT)", shardID)
+	go sm.readLoop(ctx, newSub)
+	return true
+}
+
+// LeaveShardAsObserver decrements the observer reference count for a shard; if zero, unsubscribes without publishing LEAVE.
+func (sm *ShardManager) LeaveShardAsObserver(shardID string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sub, exists := sm.shardSubs[shardID]
+	if !exists || !sub.observerOnly {
+		return
+	}
+	sub.refCount--
+	if sub.refCount > 0 {
+		return
+	}
+	delete(sm.observerOnlyShards, shardID)
+	sub.cancel()
+	sub.sub.Cancel()
+	sub.topic.Close()
+	delete(sm.shardSubs, shardID)
+	log.Printf("[Sharding] Left shard %s (observer)", shardID)
+}
+
 // LeaveShard decrements the reference count for a shard topic.
 // If the count reaches zero, it unsubscribes and closes the topic.
 func (sm *ShardManager) LeaveShard(shardID string) {
@@ -205,23 +305,31 @@ func (sm *ShardManager) LeaveShard(shardID string) {
 	// log.Printf("[Sharding] Released shard %s (refCount: %d)", shardID, sub.refCount)
 
 	if sub.refCount <= 0 {
-		// Notify monitor and peers that we are leaving before closing the topic.
-		leaveMsg := []byte("LEAVE:" + sm.h.ID().String())
-		_ = sub.topic.Publish(sm.ctx, leaveMsg)
-		// Give pubsub time to flush the LEAVE message before we close the topic.
-		sm.mu.Unlock()
-		time.Sleep(150 * time.Millisecond)
-		sm.mu.Lock()
-		// Re-fetch in case refCount was bumped (e.g. JoinShard during sleep)
-		sub, exists = sm.shardSubs[shardID]
-		if !exists || sub.refCount > 0 {
-			return
+		observerOnly := sub.observerOnly
+		delete(sm.observerOnlyShards, shardID)
+		// Notify monitor and peers that we are leaving before closing the topic (only if we were a full member, not observer-only).
+		if !observerOnly {
+			leaveMsg := []byte("LEAVE:" + sm.h.ID().String())
+			_ = sub.topic.Publish(sm.ctx, leaveMsg)
+			// Give pubsub time to flush the LEAVE message before we close the topic.
+			sm.mu.Unlock()
+			time.Sleep(150 * time.Millisecond)
+			sm.mu.Lock()
+			// Re-fetch in case refCount was bumped (e.g. JoinShard during sleep)
+			sub, exists = sm.shardSubs[shardID]
+			if !exists || sub.refCount > 0 {
+				return
+			}
 		}
 		sub.cancel() // Stop read loop
 		sub.sub.Cancel()
 		sub.topic.Close()
 		delete(sm.shardSubs, shardID)
-		log.Printf("[Sharding] Left shard %s", shardID)
+		if observerOnly {
+			log.Printf("[Sharding] Left shard %s (observer)", shardID)
+		} else {
+			log.Printf("[Sharding] Left shard %s", shardID)
+		}
 	}
 }
 
@@ -338,8 +446,8 @@ func (sm *ShardManager) runReplicationChecker() {
 					continue
 				}
 				sm.PublishToShardCBOR(b, currentShard)
-				log.Printf("[Shard] ReplicationRequest sent for %s (shard %s, allocations=%d, min=%d)",
-					manifestCIDStr, currentShard, len(allocations), minRep)
+				log.Printf("[Shard] ReplicationRequest sent for %s (shard %s, allocations=%d, min=%d, peers=%d)",
+					manifestCIDStr, currentShard, len(allocations), minRep, peerCount)
 			}
 		}
 	}
@@ -515,8 +623,17 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 	}
 }
 
+// targetShardForManifest returns the shard (cluster) that should hold this file by CID.
+// Uses common.TargetShardForPayload so the one-file-one-cluster rule is canonical.
+func (sm *ShardManager) targetShardForManifest(ctx context.Context, manifestCIDStr, topicShardID string) string {
+	payloadCIDStr := common.GetPayloadCIDForShardAssignment(ctx, sm.ipfsClient, manifestCIDStr)
+	depth := len(topicShardID) + 1
+	return common.TargetShardForPayload(payloadCIDStr, depth)
+}
+
 // handleReplicationRequest processes a ReplicationRequest (under-replicated file).
-// If we already have the file, trigger sync to re-announce. If not and auto-replication is enabled, fetch from network and pin to cluster.
+// Files must be replicated in their target shard (from payload CID), not the topic/sender shard, so replication counts reflect the correct shard.
+// If we already have the file: join target shard cluster if needed, Pin there, TriggerSync(target). Else: fetch, then join target shard, Pin there, TriggerSync(target).
 func (sm *ShardManager) handleReplicationRequest(msg *pubsub.Message, rr *schema.ReplicationRequest, shardID string) {
 	if sm.signer == nil {
 		return
@@ -527,33 +644,57 @@ func (sm *ShardManager) handleReplicationRequest(msg *pubsub.Message, rr *schema
 		return
 	}
 	manifestCIDStr := rr.ManifestCID.String()
+	c := rr.ManifestCID
+
 	if sm.storageMgr.IsPinned(manifestCIDStr) {
-		sm.clusterMgr.TriggerSync(shardID)
+		// We have the file; ensure we're in the target shard's cluster and re-announce there.
+		targetShard := sm.targetShardForManifest(sm.ctx, manifestCIDStr, shardID)
+		sm.JoinShard(targetShard)
+		if err := sm.EnsureClusterForShard(sm.ctx, targetShard); err != nil {
+			log.Printf("[Shard] ReplicationRequest: failed to ensure cluster for target shard %s: %v", targetShard, err)
+			return
+		}
+		if err := sm.clusterMgr.Pin(sm.ctx, targetShard, c, config.MinReplication, config.MaxReplication); err != nil {
+			log.Printf("[Shard] ReplicationRequest: failed to pin %s to target shard %s: %v", manifestCIDStr, targetShard, err)
+			return
+		}
+		sm.clusterMgr.TriggerSync(targetShard)
 		return
 	}
 	if !config.AutoReplicationEnabled {
 		return
 	}
-	// Fetch from network and add ourselves as a replica (run in goroutine to avoid blocking message handler).
+	// Fetch from network, then pin to the file's target shard (not topic shard) so replication lands in the correct shard.
 	go func() {
-		fetchCtx, cancel := context.WithTimeout(sm.ctx, config.AutoReplicationTimeout)
-		defer cancel()
-		c := rr.ManifestCID
+		fetchCtx, cancelFetch := context.WithTimeout(sm.ctx, config.AutoReplicationTimeout)
 		if err := sm.ipfsClient.PinRecursive(fetchCtx, c); err != nil {
+			cancelFetch()
 			log.Printf("[Shard] Auto-replication: failed to fetch/pin %s: %v", manifestCIDStr, err)
 			return
 		}
-		if err := sm.clusterMgr.Pin(fetchCtx, shardID, c, config.MinReplication, config.MaxReplication); err != nil {
-			log.Printf("[Shard] Auto-replication: failed to add to cluster %s: %v", manifestCIDStr, err)
+		cancelFetch()
+		targetShard := sm.targetShardForManifest(sm.ctx, manifestCIDStr, shardID)
+		sm.JoinShard(targetShard)
+		pinCtx, cancelPin := context.WithTimeout(sm.ctx, config.CRDTOpTimeout)
+		defer cancelPin()
+		if err := sm.EnsureClusterForShard(pinCtx, targetShard); err != nil {
+			log.Printf("[Shard] Auto-replication: failed to ensure cluster for target shard %s: %v", targetShard, err)
 			return
 		}
-		log.Printf("[Shard] Auto-replication: fetched and pinned %s to shard %s", manifestCIDStr, shardID)
-		sm.clusterMgr.TriggerSync(shardID)
+		if err := sm.clusterMgr.Pin(pinCtx, targetShard, c, config.MinReplication, config.MaxReplication); err != nil {
+			log.Printf("[Shard] Auto-replication: failed to add %s to cluster %s: %v", manifestCIDStr, targetShard, err)
+			return
+		}
+		log.Printf("[Shard] Auto-replication: fetched and pinned %s to target shard %s", manifestCIDStr, targetShard)
+		sm.clusterMgr.TriggerSync(targetShard)
 	}()
 }
 
 // handleIngestMessage processes an IngestMessage.
 func (sm *ShardManager) handleIngestMessage(msg *pubsub.Message, im *schema.IngestMessage, shardID string) {
+	if sm.signer == nil {
+		return
+	}
 	logPrefix := fmt.Sprintf("IngestMessage (Shard %s)", shardID)
 	if sm.signer.VerifyAndAuthorizeMessage(msg.GetFrom(), im.SenderID, im.Timestamp, im.Nonce, im.Sig, im.MarshalCBORForSigning, logPrefix) {
 		log.Printf("[Shard] Dropped IngestMessage from %s in shard %s due to verification failure", msg.GetFrom().String(), shardID)
@@ -565,12 +706,11 @@ func (sm *ShardManager) handleIngestMessage(msg *pubsub.Message, im *schema.Inge
 	// Add to known files. If we are just a tourist, we still "know" about it.
 	sm.storageMgr.AddKnownFile(key)
 
-	// Check if we are responsible for this file
+	// Invariant: each file lives in exactly one cluster. We only pin when we're responsible (this shard owns the file by CID).
+	// We never pin a file in our cluster when it belongs to another; the message is on the target shard's topic.
 	payloadCIDStr := common.GetPayloadCIDForShardAssignment(sm.ctx, sm.ipfsClient, key)
 	if sm.AmIResponsibleFor(payloadCIDStr) {
-		// Pin to cluster
-		// This replaces the old tryReplicateFromAnnouncement logic
-		// We use -1 for replication factor to mean "Cluster Default" (which is effectively All for CRDT mode without allocator)
+		// Pin only in this shard's cluster (target cluster for this file).
 		if err := sm.clusterMgr.Pin(sm.ctx, shardID, im.ManifestCID, -1, -1); err != nil {
 			log.Printf("[Shard] Failed to pin ingested file %s to cluster: %v", key, err)
 		} else {
@@ -752,6 +892,7 @@ func (sm *ShardManager) splitShard() {
 	peerIDHash := common.GetBinaryPrefix(sm.h.ID().String(), nextDepth)
 	sm.currentShard = peerIDHash
 	sm.msgCounter = 0
+	sm.lastMoveToDeeperShard = time.Now()
 
 	// Update local state is done, unlock before calling external systems
 	sm.mu.Unlock()
@@ -1213,9 +1354,16 @@ func (sm *ShardManager) probeShardSilently(shardID string, probeTimeout time.Dur
 // ROOT nodes can see that shard "0" or "1" has peers and migrate. We return the
 // maximum of seen and mesh so probing does not undercount; probe may include
 // passive subscribers (e.g. monitor) but that is acceptable for migration decisions.
+// When we're in this shard as observer only (peek, no JOIN/HEARTBEAT), we don't add 1 for self so the count reflects real members.
 func (sm *ShardManager) getProbePeerCount(shardID string, topic interface{ ListPeers() []peer.ID }, activeWindow time.Duration) int {
 	meshPeers := topic.ListPeers()
-	meshCount := len(meshPeers) + 1
+	sm.mu.RLock()
+	_, observerOnly := sm.observerOnlyShards[shardID]
+	sm.mu.RUnlock()
+	meshCount := len(meshPeers)
+	if !observerOnly {
+		meshCount++ // +1 for self when we're a full member
+	}
 
 	sm.mu.RLock()
 	seenCount := 0
@@ -1226,7 +1374,9 @@ func (sm *ShardManager) getProbePeerCount(shardID string, topic interface{ ListP
 				seenCount++
 			}
 		}
-		seenCount++
+		if !observerOnly {
+			seenCount++ // Include self when full member
+		}
 	}
 	sm.mu.RUnlock()
 
@@ -1239,12 +1389,20 @@ func (sm *ShardManager) getProbePeerCount(shardID string, topic interface{ ListP
 
 // checkAndMergeUpIfAlone moves to the parent shard when understaffed in a leaf and (sibling empty or we're the smaller side), parent has room.
 // This consolidates tiny shards (e.g. 1 node in 00) back into the parent so we don't end up with many understaffed shards.
+// Skips merge-up for mergeUpCooldown after moving to a deeper shard to avoid wasteful down-then-up churn.
 func (sm *ShardManager) checkAndMergeUpIfAlone() {
 	sm.mu.RLock()
 	currentShard := sm.currentShard
+	lastMove := sm.lastMoveToDeeperShard
 	sm.mu.RUnlock()
 
 	if len(currentShard) < 2 {
+		return
+	}
+	if !lastMove.IsZero() && time.Since(lastMove) < mergeUpCooldown {
+		if config.VerboseLogging {
+			log.Printf("[ShardMergeUp] Skipping: moved to deeper shard %s ago (cooldown %v)", time.Since(lastMove).Round(time.Second), mergeUpCooldown)
+		}
 		return
 	}
 
@@ -1280,12 +1438,25 @@ func (sm *ShardManager) checkAndMergeUpIfAlone() {
 	oldShard := sm.currentShard
 	sm.currentShard = parentShard
 	sm.msgCounter = 0
+	sm.lastMergeUpTime = time.Now() // Skip discovery move for mergeUpCooldown to avoid thrashing (down then up then down again)
 	sm.mu.Unlock()
 
 	sm.JoinShard(parentShard)
+	if err := sm.clusterMgr.JoinShard(sm.ctx, parentShard, nil); err != nil {
+		log.Printf("[Sharding] Failed to join cluster for merge-up to %s: %v", parentShard, err)
+	}
+	go func() {
+		time.Sleep(migratePinsFlushDelay)
+		if err := sm.clusterMgr.MigratePins(sm.ctx, oldShard, parentShard); err != nil {
+			log.Printf("[Sharding] Migration on merge-up failed: %v", err)
+		}
+	}()
 	go func() {
 		time.Sleep(config.ShardOverlapDuration)
 		sm.LeaveShard(oldShard)
+		if err := sm.clusterMgr.LeaveShard(oldShard); err != nil {
+			log.Printf("[Sharding] Failed to leave cluster %s after merge-up: %v", oldShard, err)
+		}
 	}()
 	go func() {
 		time.Sleep(config.ReshardDelay)
@@ -1301,19 +1472,43 @@ const minPeersPerChildAfterSplit = 4
 // Must be at least 2 so we don't move into a shard where we'd be alone (probe counts self as 1).
 const minPeersToJoinDeeperShard = 2
 
+// mergeUpCooldown is the minimum time to wait after moving to a deeper shard (split or discovery)
+// before allowing merge-up. Prevents wasteful down-then-up churn (e.g. move to 00 then merge back to 0).
+const mergeUpCooldown = 3 * time.Minute
+
+// observerProbeDuration: how long to peek as observer before promoting to full member, so we see real peer count without inflating it.
+const observerProbeDuration = 5 * time.Second
+
 // discoverAndMoveToDeeperShard probes deeper shards in our branch and moves only when:
+// - we're on root (drain root to any active deeper shard), or
 // - current shard is over the limit (MaxPeersPerShard), or
-// - a deeper shard has strictly more peers than current.
-// We do not move when current is under the limit and the deeper shard has fewer peers
-// (e.g. 7 nodes in current must not move to a deeper shard with 2–3 nodes).
+// - a deeper shard has strictly more peers than current and the deeper shard has a sibling (so it was created by a split, not by accident).
+// When our shard is understaffed (currentPeerCount < MinPeersPerShard), we do not move—we only "tourist" (observe like the monitor); moving would fragment further and create deeper shards without siblings.
+// Skips moving for mergeUpCooldown after a merge-up so we don't immediately move down again (reduces thrashing).
 func (sm *ShardManager) discoverAndMoveToDeeperShard() {
 	sm.mu.RLock()
 	currentShard := sm.currentShard
+	lastMergeUp := sm.lastMergeUpTime
 	peerIDHash := common.GetBinaryPrefix(sm.h.ID().String(), 256)
 	sm.mu.RUnlock()
 
+	if !lastMergeUp.IsZero() && time.Since(lastMergeUp) < mergeUpCooldown {
+		if config.VerboseLogging {
+			log.Printf("[ShardDiscovery] Skipping discovery move: merged up %s ago (cooldown %v)", time.Since(lastMergeUp).Round(time.Second), mergeUpCooldown)
+		}
+		return
+	}
+
 	currentPeerCount := sm.getShardPeerCount()
 	currentOverLimit := currentPeerCount > config.MaxPeersPerShard
+
+	// When not on root and our shard is understaffed, do not move to a deeper shard (act as tourist only; don't create orphan deeper shards).
+	if currentShard != "" && currentPeerCount < config.MinPeersPerShard {
+		if config.VerboseLogging {
+			log.Printf("[ShardDiscovery] Skipping discovery move: shard %s has %d peers (understaffed, need >= %d)", currentShard, currentPeerCount, config.MinPeersPerShard)
+		}
+		return
+	}
 
 	deeperShards := sm.generateDeeperShards(currentShard, 3)
 	matchingShards := make([]string, 0)
@@ -1384,22 +1579,42 @@ func (sm *ShardManager) discoverAndMoveToDeeperShard() {
 			}
 		}
 
+		// When not on root, only move to a deeper shard that has a sibling with at least 1 peer,
+		// so the deeper shard was created by a proper split (both children exist), not by accident.
+		if currentShard != "" && len(shard) >= 1 {
+			parentShard := shard[:len(shard)-1]
+			lastBit := shard[len(shard)-1]
+			siblingShard := parentShard + string([]byte{'0' + (1 - (lastBit - '0'))})
+			siblingPeerCount := sm.probeShard(siblingShard, probeTimeout)
+			if siblingPeerCount < 1 {
+				if config.VerboseLogging {
+					log.Printf("[ShardDiscovery] Skipping deeper shard %s: sibling %s has %d peers (need >= 1, split-only)",
+						shard, siblingShard, siblingPeerCount)
+				}
+				continue
+			}
+		}
+
 		peerCount := sm.probeShard(shard, probeTimeout)
-		// When on root probing depth-1, retry once if mesh was empty so we don't stay stuck.
-		if currentShard == "" && len(shard) == 1 && peerCount == 0 {
+		// When on root, retry once if mesh was empty so we don't stay stuck (depth-1 or depth-2 may have nodes).
+		if currentShard == "" && peerCount == 0 {
 			peerCount = sm.probeShard(shard, probeTimeout)
 		}
 		minRequired := minPeersToJoinDeeperShard
-		// When on root, allow moving to depth-1 shard ("0" or "1") with >= 1 peer so we follow the first splitter.
-		if currentShard == "" && len(shard) == 1 {
+		// When on root, allow moving to any deeper shard ("0"/"1" or "00"/"01"/"10"/"11") with >= 1 peer
+		// so root drains completely even when everyone has already moved to depth-2.
+		if currentShard == "" {
 			minRequired = 1
 		}
 		// When not over limit, require deeper shard to have at least MinPeersPerShard so we don't fragment
-		// (e.g. don't move from "0" with 7 nodes to "00" with 2 nodes). Exception: when on root, allow
-		// moving to depth-1 ("0"/"1") with any count >= minRequired so root can drain and nodes don't get stuck.
+		// (e.g. don't move from "0" with 7 nodes to "00" with 2 nodes). Exceptions: (1) on root, allow
+		// moving to any deeper shard with >= minRequired so root drains (including depth-2 when 0/1 empty);
+		// (2) when in depth-1 ("0"/"1"), allow moving to direct child ("00"/"01"/"10"/"11") with >= minRequired.
 		if !currentOverLimit && peerCount < config.MinPeersPerShard {
-			if currentShard == "" && len(shard) == 1 {
-				// On root: take "0"/"1" if it has >= 1 peer so we drain root
+			if currentShard == "" {
+				// On root: take any deeper shard ("0"/"1" or "00"/"01"/"10"/"11") if it has >= 1 peer so root drains
+			} else if len(currentShard) == 1 && len(shard) == 2 && peerCount >= minRequired {
+				// Depth-1 drain: allow "0"/"1" -> "00"/"01"/"10"/"11" with >= 2 peers so we don't stay stuck in "1"
 			} else if peerCount >= minRequired && config.VerboseLogging {
 				log.Printf("[ShardDiscovery] Skipping deeper shard %s: has %d peers (need >= %d when current not over limit)",
 					shard, peerCount, config.MinPeersPerShard)
@@ -1432,6 +1647,34 @@ func (sm *ShardManager) discoverAndMoveToDeeperShard() {
 		return
 	}
 
+	// When not at root, only probe deeper shards — do not join. We only go deeper by splitting,
+	// not by "discovering" and joining. That prevents nodes in e.g. 10 from joining 101/100
+	// and then merging up again (thrashing). Root is special: we drain root by discovering and joining 0/1.
+	if currentShard != "" {
+		if config.VerboseLogging {
+			log.Printf("[ShardDiscovery] Not moving to %s: only probe when not at root (go deeper by split only)", deepestActiveShard)
+		}
+		return
+	}
+
+	// Peek as observer first so we see real peer count without being counted (reduces thrashing).
+	minRequired := minPeersToJoinDeeperShard
+	if currentShard == "" {
+		minRequired = 1
+	}
+	if sm.JoinShardAsObserver(deepestActiveShard) {
+		time.Sleep(observerProbeDuration)
+		// We're observer in that shard so getProbePeerCount won't add 1 for self.
+		stablePeerCount := sm.probeShard(deepestActiveShard, 2*time.Second)
+		if stablePeerCount < minRequired {
+			log.Printf("[ShardDiscovery] Aborting move to %s: after observer peek, peer count %d < %d",
+				deepestActiveShard, stablePeerCount, minRequired)
+			sm.LeaveShardAsObserver(deepestActiveShard)
+			return
+		}
+		// Keep observer sub; JoinShard will promote to full member (publish JOIN+HEARTBEAT).
+	}
+
 	log.Printf("[ShardDiscovery] Moving from shard %s to deeper shard %s",
 		currentShard, deepestActiveShard)
 
@@ -1439,8 +1682,10 @@ func (sm *ShardManager) discoverAndMoveToDeeperShard() {
 	oldShard := sm.currentShard
 	sm.currentShard = deepestActiveShard
 	sm.msgCounter = 0
+	sm.lastMoveToDeeperShard = time.Now()
 	sm.mu.Unlock()
 
+	// JoinShard promotes observer to full member if we just left observer; otherwise joins normally.
 	sm.JoinShard(deepestActiveShard)
 	if err := sm.clusterMgr.JoinShard(sm.ctx, deepestActiveShard, nil); err != nil {
 		log.Printf("[Sharding] Failed to join cluster for discovered shard %s: %v", deepestActiveShard, err)

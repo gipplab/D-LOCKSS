@@ -258,6 +258,7 @@ func SelectAllocations(peers []peer.ID, c cid.Cid, n int) []peer.ID {
 
 // Pin submits a pin operation to the specific shard's cluster.
 // Allocations are set deterministically from current Peers() so all nodes agree on who should replicate.
+// Callers should use a context with sufficient timeout (e.g. config.CRDTOpTimeout) so Consensus.LogPin can complete; short deadlines cause "context deadline exceeded" in go-ds-crdt (e.g. "error getting root delta priority").
 func (cm *ClusterManager) Pin(ctx context.Context, shardID string, c cid.Cid, replicationFactorMin, replicationFactorMax int) error {
 	cm.mu.RLock()
 	cluster, exists := cm.clusters[shardID]

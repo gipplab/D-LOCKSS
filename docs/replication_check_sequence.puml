@@ -1,36 +1,46 @@
 @startuml Cluster State Sync Sequence
 
 participant "ClusterManager" as ClusterMgr
-participant "CRDT Consensus" as CRDT
+participant "CRDT Consensus (per shard)" as CRDT
 participant "LocalPinTracker" as PinTracker
 participant "IPFS Daemon" as IPFS
+participant "StorageManager" as Storage
 participant "Other Peers" as Peers
 
 == Pinning (Ingest) ==
 
-ClusterMgr -> CRDT: LogPin(ManifestCID)
+ClusterMgr -> CRDT: LogPin(pin)  ' pin has Allocations from Peers()
 CRDT -> CRDT: Update local Merkle-DAG
-CRDT -> Peers: PubSub Broadcast (Heads)
+CRDT -> Peers: PubSub Broadcast (dlockss-shard-<id>)
 Peers -> CRDT: Sync State
 
-== Replication (PinTracker Loop) ==
+== Replication (LocalPinTracker syncLoop) ==
 
-PinTracker -> CRDT: State() (Poll/Watch)
-CRDT -> PinTracker: Global Pin List
+PinTracker -> CRDT: State() (poll 10s or on trigger)
+CRDT -> PinTracker: List(pins)
 
 loop For each Pin in State
-    PinTracker -> IPFS: IsPinned(CID)?
-    alt Not Pinned Locally
-        PinTracker -> IPFS: PinRecursive(CID)
-        Note over PinTracker: Content replicated locally
+    PinTracker -> PinTracker: We in Allocations? (or Allocations empty)
+    alt We are allocated for this CID
+        PinTracker -> IPFS: IsPinned(CID)?
+        alt Not Pinned Locally
+            PinTracker -> IPFS: PinRecursive(CID)
+            PinTracker -> Storage: onPinSynced(cid)  ' PinFile, AnnouncePinned
+        end
     end
 end
 
-== Unpinning (Removal) ==
+== Unpinning (no longer allocated) ==
 
-ClusterMgr -> CRDT: LogUnpin(ManifestCID)
-CRDT -> Peers: Sync State
-PinTracker -> CRDT: State()
+PinTracker -> PinTracker: CID in pinnedByUs but not in shouldHave
 PinTracker -> IPFS: UnpinRecursive(CID)
+PinTracker -> Storage: onPinRemoved(cid)
+
+== Unpin from cluster ==
+
+ClusterMgr -> CRDT: LogUnpin(pin)
+CRDT -> Peers: Sync State
+Peers -> PinTracker: State() on next sync
+PinTracker -> IPFS: UnpinRecursive (if we were holding it)
 
 @enduml

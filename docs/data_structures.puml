@@ -8,13 +8,23 @@ class ClusterManager {
     - pubsub: *pubsub.PubSub
     - dht: routing.Routing
     - datastore: datastore.Datastore
+    - trustedPeers: []peer.ID
+    - onPinSynced: func(cid string)
+    - onPinRemoved: func(cid string)
+    - peerProvider: ShardPeerProvider
     - clusters: map[string]*EmbeddedCluster
     --
-    + JoinShard(ctx, shardID, peers)
+    + JoinShard(ctx, shardID, bootstrapPeers)
     + LeaveShard(shardID)
-    + Pin(ctx, shardID, cid, ...)
+    + Pin(ctx, shardID, cid, repMin, repMax)
     + Unpin(ctx, shardID, cid)
+    + ListPins(ctx, shardID)
     + GetAllocations(ctx, shardID, cid)
+    + GetPeerCount(ctx, shardID)
+    + MigratePins(ctx, fromShard, toShard)
+    + TriggerSync(shardID)
+    + SetShardPeerProvider(provider)
+    + GetClusterMetrics(ctx)
 }
 
 class EmbeddedCluster {
@@ -26,10 +36,15 @@ class EmbeddedCluster {
 class LocalPinTracker {
     - ipfsClient: IPFSClient
     - shardID: string
+    - onPinSynced: func(cid string)
+    - onPinRemoved: func(cid string)
+    - pinnedByUs: map[string]struct{}
     --
-    + Start(consensus)
-    + syncLoop()
-    + syncState()
+    + Start(consensusClient)
+    + TriggerSync()
+    + Stop()
+    + syncLoop(consensus)
+    + syncState(consensus)  ' allocation-aware: pin only if we are in Allocations
 }
 
 ShardManager --> ClusterManager : manages
@@ -40,27 +55,34 @@ class ShardManager {
     - ctx: context.Context
     - h: host.Host
     - ps: *pubsub.PubSub
+    - ipfsClient: ipfs.IPFSClient
+    - storageMgr: *StorageManager
+    - clusterMgr: ClusterManagerInterface
+    - metrics: *telemetry.MetricsManager
+    - signer: *signing.Signer
+    - rateLimiter: *common.RateLimiter
     - mu: sync.RWMutex
     - currentShard: string
-    - clusterMgr: *ClusterManager
-    - shardTopic: *pubsub.Topic
-    - shardSub: *pubsub.Subscription
-    - oldShardName: string
-    - oldShardTopic: *pubsub.Topic
-    - oldShardSub: *pubsub.Subscription
-    - oldShardEndTime: time.Time
-    - inOverlap: bool
-    - controlTopic: *pubsub.Topic
-    - controlSub: *pubsub.Subscription
-    - msgCounter: int
+    - shardSubs: map[string]*shardSubscription
+    - probeTopicCache: map[string]*pubsub.Topic
+    - seenPeers: map[string]map[peer.ID]time.Time
+    - observerOnlyShards: map[string]struct{}
     - lastPeerCheck: time.Time
-    - shardDone: chan struct{}
+    - lastDiscoveryCheck: time.Time
+    - lastMoveToDeeperShard: time.Time
+    - lastMergeUpTime: time.Time
     --
     + NewShardManager(...): *ShardManager
     + Run()
-    + AmIResponsibleFor(key): bool  ' key is a content-based routing key (PayloadCID string)
-    + PublishToShardCBOR(bytes)
-    + PublishToControlCBOR(bytes)
+    + JoinShard(shardID)
+    + LeaveShard(shardID)
+    + JoinShardAsObserver(shardID): bool
+    + LeaveShardAsObserver(shardID)
+    + AmIResponsibleFor(key): bool  ' PayloadCID string -> shard prefix match
+    + PublishToShardCBOR(bytes, shardID)
+    + PinToCluster(ctx, cid)
+    + EnsureClusterForShard(ctx, shardID)
+    + GetPeersForShard(shardID): []peer.ID  ' ShardPeerProvider for CRDT
     + splitShard()
     + getShardPeerCount(): int
     + checkAndSplitIfNeeded()
@@ -69,18 +91,17 @@ class ShardManager {
     + checkAndMergeUpIfAlone()
     + discoverAndMoveToDeeperShard()
     + probeShard(shardID, timeout): int
-    + generateDeeperShards(currentShard, maxDepth): []string
-    + readOldShard()
-    + manageOverlap()
+    + RunReshardPass(oldShard, newShard)
+    + RunOrphanUnpinPass()
+    + AnnouncePinned(manifestCID)
     + Close()
 }
 
 note right of ShardManager
-  When current shard has few peers (<= MaxPeersPerShard),
-  runShardDiscovery runs without requiring idle.
-  Merge up: if alone in deep shard (<= 1 peer),
-  no siblings (sibling shard empty), parent has room.
-  Discover deeper: move to deeper shard if >= 1 peer.
+  PubSub topics: dlockss-creative-commons-shard-<id>.
+  One subscription per shard (refCount); observer mode for probing.
+  Merge up: understaffed in deep shard, parent has room.
+  Discovery: at root or few peers, probe deeper shards and move.
 end note
 
 class ResearchObject {
@@ -91,6 +112,10 @@ class ResearchObject {
     + Payload: cid.Cid
     + TotalSize: uint64
 }
+note right of ResearchObject
+  pkg/schema/types.go
+  No Title/Authors/References in code.
+end note
 
 class IngestMessage {
     + Type: uint8
@@ -114,26 +139,23 @@ class ReplicationRequest {
     + Sig: []byte
 }
 
-class DelegateMessage {
-    + Type: uint8
-    + ManifestCID: cid.Cid
-    + TargetShard: string
-    + SenderID: peer.ID
-    + Timestamp: int64
-    + Nonce: []byte
-    + Sig: []byte
-}
-
-class StorageState {
-    + pinnedFiles: map[string]bool  // ManifestCID strings
-    + knownFiles: map[string]bool   // ManifestCID strings
-    + fileReplicationLevels: map[string]int
-    + fileConvergenceTime: map[string]time.Time
-    + recentlyRemoved: map[string]time.Time
-    + checkingFiles: map[string]bool
-    + lastCheckTime: map[string]time.Time
-    + replicationCache: map[string]*cachedReplication
-    + pendingVerifications: map[string]*verificationPending
+class StorageManager {
+    - dht: DHTProvider
+    - pinnedFiles: *common.PinnedSet
+    - knownFiles: *common.KnownFiles
+    - recentlyRemoved: *common.RecentlyRemoved
+    - fileReplicationLevels: *common.FileReplicationLevels
+    - failedOperations: *common.BackoffTable
+    - metrics: *telemetry.MetricsManager
+    --
+    + PinFile(manifestCIDStr)
+    + UnpinFile(key)
+    + IsPinned(key): bool
+    + AddKnownFile(key)
+    + GetPinnedManifests(): []string
+    + GetKnownFiles(): *KnownFiles
+    + GetNextFileToAnnounce(): string
+    + ProvideFile(ctx, manifestCIDStr)
 }
 
 class cachedReplication {
@@ -168,8 +190,8 @@ class peerRateLimit {
     + mu: sync.Mutex
 }
 
-class BackoffManager {
-    + hashes: map[string]*operationBackoff
+class BackoffTable {
+    + m: map[string]*operationBackoff
 }
 
 class operationBackoff {
@@ -190,11 +212,21 @@ class verificationPending {
     + pinned: bool
 }
 
-ShardManager --> StorageState : reads/writes
-StorageState --> PendingVerifications : contains
-PendingVerifications --> verificationPending : contains
-StorageState --> Metrics : updates
+ShardManager --> StorageManager : GetPinnedManifests, AddKnownFile, IsPinned, GetPinTime
+StorageManager --> PinnedSet : pinnedFiles
+StorageManager --> KnownFiles : knownFiles
+StorageManager --> Metrics : updates
+
+class PinnedSet {
+    + m: map[string]time.Time
+    + Add(key), Remove(key), Has(key), GetPinTime(key), All()
+}
+
+class KnownFiles {
+    + m: map[string]bool
+    + Add(key), Remove(key), Has(key), All()
+}
 RateLimiter --> peerRateLimit : contains
-BackoffManager --> operationBackoff : contains
+BackoffTable --> operationBackoff : contains
 
 @enduml

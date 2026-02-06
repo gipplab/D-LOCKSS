@@ -54,11 +54,11 @@ shardMgr --> signingTrust : verifies messages
 shardMgr --> storage : uses (resharding)
 
 clusterMgr --> crdt : manages
-clusterMgr --> pinTracker : starts
+clusterMgr --> pinTracker : starts (LocalPinTracker per shard)
 clusterMgr --> clusterStore : persists state
 
-crdt --> pubsub : syncs state
-crdt --> dht : routing
+crdt --> pubsub : syncs state (dlockss-shard-<id>)
+crdt --> dht : routing (DHT adapter)
 pinTracker --> crdt : reads state
 pinTracker --> ipfsClient : pins content
 
@@ -73,11 +73,11 @@ storage --> ipfsClient : pin/unpin DAGs
 
 metrics --> storage : reads state
 metrics --> shardMgr : reads shard info
+metrics --> clusterMgr : GetClusterMetrics (pins/peers per shard)
 
-rateLimit --> pubsub : filters messages
-rateLimit --> storageMonitor : checks disk usage for Custodial
+shardMgr --> rateLimit : Check(peer) before processing messages
 
-storageMonitor --> dataDir : monitors disk usage
+storageMonitor --> dataDir : monitors disk usage (optional)
 
 discovery --> mdns : uses
 discovery --> host : connects peers

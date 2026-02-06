@@ -3,7 +3,7 @@
 # Configuration
 # Reduced to 15 nodes for bandwidth-limited environments
 # Each node runs its own isolated IPFS daemon
-NODE_COUNT=15
+NODE_COUNT=25
 # Make BASE_DIR absolute and relative to the script location
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 BASE_DIR="$SCRIPT_DIR/testnet_data"
