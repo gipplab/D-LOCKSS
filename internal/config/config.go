@@ -59,8 +59,9 @@ func LogConfiguration() {
 	log.Printf("[Config] Data Directory: %s", FileWatchFolder)
 	log.Printf("[Config] Replication: %d-%d", MinReplication, MaxReplication)
 	log.Printf("[Config] Check Interval: %v", CheckInterval)
-	log.Printf("[Config] Max Peers Per Shard: %d (split threshold, ensures 2x replication safety)", MaxPeersPerShard)
-	log.Printf("[Config] Min Peers Per Shard: %d (minimum, ensures replication achievable)", MinPeersPerShard)
+	log.Printf("[Config] Max Peers Per Shard: %d (do not split until this many nodes)", MaxPeersPerShard)
+	log.Printf("[Config] Min Peers Per Shard: %d (minimum per child after split)", MinPeersPerShard)
+	log.Printf("[Config] Min Peers Across Siblings: %d (join/stay only if shard+sibling >= this; else remerge)", MinPeersAcrossSiblings)
 	log.Printf("[Config] Shard Peer Check Interval: %v", ShardPeerCheckInterval)
 	log.Printf("[Config] Max Concurrent Checks: %d", MaxConcurrentReplicationChecks)
 	log.Printf("[Config] Rate Limit: %d messages per %v", MaxMessagesPerWindow, RateLimitWindow)
@@ -110,7 +111,7 @@ func LogConfiguration() {
 	if HeartbeatInterval > 0 {
 		log.Printf("[Config] Heartbeat Interval: %v", HeartbeatInterval)
 	} else {
-		log.Printf("[Config] Heartbeat Interval: auto (ShardPeerCheckInterval/3, min 30s)")
+		log.Printf("[Config] Heartbeat Interval: auto (ShardPeerCheckInterval/3, min 10s)")
 	}
 	log.Printf("[Config] Verbose Logging: %v", VerboseLogging)
 }
@@ -123,10 +124,11 @@ var (
 	MaxReplication      = getEnvInt("DLOCKSS_MAX_REPLICATION", 10)
 	CheckInterval       = getEnvDuration("DLOCKSS_CHECK_INTERVAL", 1*time.Minute)
 	// Shard splitting tied to replication requirements.
-	// With MinReplication=5, we require at least 10 nodes per shard so that the
-	// replication target remains achievable even after a split.
-	MaxPeersPerShard               = getEnvInt("DLOCKSS_MAX_PEERS_PER_SHARD", 12)                       // Split when shard exceeds this many peers (default: 12, use 6/12 for ~15-node testnet)
-	MinPeersPerShard               = getEnvInt("DLOCKSS_MIN_PEERS_PER_SHARD", 6)                        // Don't split if result would be below this many peers (default: 6)
+	// Do not split until MaxPeersPerShard (12) nodes are reached; only then may a shard split.
+	// MinPeersAcrossSiblings: only join a deeper shard (or stay split) if this shard + sibling total >= 10; otherwise remerge to guarantee replication.
+	MaxPeersPerShard               = getEnvInt("DLOCKSS_MAX_PEERS_PER_SHARD", 12)                       // Split when shard has at least this many peers (default: 12)
+	MinPeersPerShard               = getEnvInt("DLOCKSS_MIN_PEERS_PER_SHARD", 6)                        // Don't split if result would be below this many peers per child (default: 6)
+	MinPeersAcrossSiblings         = getEnvInt("DLOCKSS_MIN_PEERS_ACROSS_SIBLINGS", 10)                 // Join deeper / stay split only if shard+sibling total >= this; else remerge (default: 10)
 	ShardPeerCheckInterval         = getEnvDuration("DLOCKSS_SHARD_PEER_CHECK_INTERVAL", 2*time.Minute) // How often to check peer count
 	ShardDiscoveryInterval         = getEnvDuration("DLOCKSS_SHARD_DISCOVERY_INTERVAL", 5*time.Minute)  // How often to check for deeper shards when idle
 	MaxConcurrentReplicationChecks = getEnvInt("DLOCKSS_MAX_CONCURRENT_CHECKS", 5)
@@ -168,6 +170,9 @@ var (
 	// Reshard configuration
 	ReshardDelay = getEnvDuration("DLOCKSS_RESHARD_DELAY", 5*time.Second) // Delay after split before starting reshard pass
 
+	// PinReannounceInterval: how often to re-announce PINNED on the shard topic so the monitor (and late-joining nodes) see replication. Should be less than monitor's ReplicationAnnounceTTL (~350s).
+	PinReannounceInterval = getEnvDuration("DLOCKSS_PIN_REANNOUNCE_INTERVAL", 2*time.Minute)
+
 	// Cryptographic parameters
 	NonceSize           = getEnvInt("DLOCKSS_NONCE_SIZE", 16)                             // Size of cryptographic nonces in bytes
 	MinNonceSize        = getEnvInt("DLOCKSS_MIN_NONCE_SIZE", 8)                          // Minimum allowed nonce size
@@ -176,6 +181,6 @@ var (
 	// Telemetry
 	TelemetryInterval    = getEnvDuration("DLOCKSS_TELEMETRY_INTERVAL", 30*time.Second) // How often to send telemetry
 	TelemetryIncludeCIDs = getEnvBool("DLOCKSS_TELEMETRY_INCLUDE_CIDS", false)          // Include full CID list in telemetry (disabled by default - monitor tracks via pubsub)
-	HeartbeatInterval    = getEnvDuration("DLOCKSS_HEARTBEAT_INTERVAL", 0)              // Heartbeat interval (0 = auto-calculate from ShardPeerCheckInterval/3, min 10s)
+	HeartbeatInterval    = getEnvDuration("DLOCKSS_HEARTBEAT_INTERVAL", 10*time.Second) // Heartbeat interval (default 10s; 0 = auto from ShardPeerCheckInterval/3, min 10s)
 	VerboseLogging       = getEnvBool("DLOCKSS_VERBOSE_LOGGING", false)                 // extra debug (shard discovery, split, metrics)
 )

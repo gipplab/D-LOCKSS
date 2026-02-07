@@ -3,6 +3,8 @@ package storage
 import (
 	"context"
 	"log"
+	"sort"
+	"sync"
 	"time"
 
 	"dlockss/internal/badbits"
@@ -20,6 +22,10 @@ type StorageManager struct {
 	fileReplicationLevels *common.FileReplicationLevels
 	failedOperations      *common.BackoffTable
 	metrics               *telemetry.MetricsManager
+
+	// Round-robin pin reannouncement: index into a stable sorted list of pinned keys
+	announceMu    sync.Mutex
+	announceIndex int
 }
 
 // NewStorageManager creates a new StorageManager.
@@ -37,18 +43,28 @@ func NewStorageManager(dht common.DHTProvider, metrics *telemetry.MetricsManager
 }
 
 // GetNextFileToAnnounce returns the next file key to announce in a round-robin fashion.
-// Returns empty string if no files are pinned.
+// Returns empty string if no files are pinned. Uses a stable sorted order so all pins
+// are reannounced regularly (e.g. within ReplicationAnnounceTTL).
 func (sm *StorageManager) GetNextFileToAnnounce() string {
-	files := sm.pinnedFiles.All() // Returns map[string]time.Time
+	files := sm.pinnedFiles.All()
 	if len(files) == 0 {
 		return ""
 	}
-
-	// Just pick the first one since we removed the index
+	keys := make([]string, 0, len(files))
 	for k := range files {
-		return k
+		keys = append(keys, k)
 	}
-	return ""
+	sort.Strings(keys)
+
+	sm.announceMu.Lock()
+	idx := sm.announceIndex % len(keys)
+	key := keys[idx]
+	sm.announceIndex++
+	if sm.announceIndex < 0 {
+		sm.announceIndex = 0
+	}
+	sm.announceMu.Unlock()
+	return key
 }
 
 // GetPinnedManifests returns all manifest CID strings currently pinned (for replication check).

@@ -142,7 +142,8 @@ const dashboardHTML = `<!DOCTYPE html>
         }
         function debouncedFilter() { clearTimeout(searchTimeout); searchTimeout = setTimeout(() => { updateDashboard(); }, 300); }
         initCharts(); updateDashboard(); updateShardTree();
-        setInterval(() => { if(!document.getElementById('nodeSearch').value && currentlyEditingPeerID === null) { updateDashboard(); updateShardTree(); } }, 2000);
+        // Refresh every 1s so UI stays close to monitor state (monitor itself updates when nodes send heartbeats).
+        setInterval(() => { if(!document.getElementById('nodeSearch').value && currentlyEditingPeerID === null) { updateDashboard(); updateShardTree(); } }, 1000);
     </script>
 </body>
 </html>
