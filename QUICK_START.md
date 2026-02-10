@@ -1,7 +1,5 @@
 # D-LOCKSS Quick Start Guide
 
-Get a D-LOCKSS node running in 5 minutes!
-
 ## Prerequisites
 
 - **Go 1.21+:** [Install Go](https://go.dev/doc/install)
@@ -68,22 +66,24 @@ cp my-document.pdf ./data/
 Edit `.env` file or set environment variables:
 
 ```bash
-# Most important settings
+# Main settings
 export DLOCKSS_DATA_DIR="./data"
 export DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/5001"
 export DLOCKSS_NODE_COUNTRY="DE"
 ```
+
+**Shard tuning (small testnets):** For ~15 nodes, use `DLOCKSS_MAX_PEERS_PER_SHARD=12` and `DLOCKSS_MIN_PEERS_PER_SHARD=6` (defaults) so the network splits into a small number of shards (e.g. root → `0` and `1`) instead of many understaffed ones. If you use a lower max (e.g. 6), keep `DLOCKSS_MIN_PEERS_PER_SHARD` at least 4.
 
 See [README](README.md#configuration) for full configuration options.
 
 ## Troubleshooting
 
 **"IPFS client not initialized"**
-- Make sure `ipfs daemon` is running
-- Check IPFS API address matches: `ipfs config Addresses.API`
+- Run `ipfs daemon` and check it is up
+- Check IPFS API address: `ipfs config Addresses.API`
 
 **"Cannot connect to peers"**
-- Ensure ports 4001/tcp and 4001/udp are open
+- Open ports 4001/tcp and 4001/udp
 - Check firewall settings
 
 **Need more help?** See [README](README.md) and [docs/DLOCKSS_PROTOCOL.md](docs/DLOCKSS_PROTOCOL.md).

@@ -5,8 +5,10 @@ participant "File System" as FS
 participant "File Watcher" as Watcher
 participant "FileProcessor" as FileOps
 participant "StorageManager" as Storage
-participant "IPFS" as IPFS
 participant "ShardManager" as ShardMgr
+participant "ClusterManager" as ClusterMgr
+participant "CRDT" as CRDT
+participant "IPFS" as IPFS
 participant "DHT" as DHT
 participant "PubSub" as PubSub
 participant "Other Nodes" as Nodes
@@ -16,34 +18,44 @@ FS -> Watcher: File created event
 Watcher -> FileOps: processNewFile(path)
 
 FileOps -> IPFS: Import file (UnixFS)\nPayloadCID
-FileOps -> FileOps: Build ResearchObject (CBOR)\n{meta_ref, payload, size}
-FileOps -> IPFS: Put dag-cbor manifest block\nManifestCID
-FileOps -> FileOps: Check BadBits (ManifestCID)\n(blocked for node country?)
+FileOps -> FileOps: Build ResearchObject (CBOR)\n{meta_ref, ingester_id, payload, size}
+FileOps -> IPFS: PutDagCBOR(manifest)\nManifestCID
+FileOps -> FileOps: Check BadBits (ManifestCID)
 alt BadBits check fails
-    FileOps -> IPFS: UnpinRecursive(PayloadCID)\n(reject file)
+    FileOps -> IPFS: UnpinRecursive(ManifestCID)
     FileOps -> FileOps: Log refusal and return
 else BadBits check passes
-    FileOps -> IPFS: PinRecursive(ManifestCID)\n(recursive pin)
-    FileOps -> Storage: pinFile(ManifestCID)
+    FileOps -> IPFS: PinRecursive(ManifestCID)
 end
 
-FileOps -> Storage: addKnownFile(ManifestCID)
-
+FileOps -> FileOps: trackAndAnnounceFile(manifestCID, payloadCID)
+FileOps -> Storage: PinFile(ManifestCID)
+FileOps -> ShardMgr: AnnouncePinned(ManifestCID)\n(PINNED:<cid> on current shard topic)
 FileOps -> ShardMgr: AmIResponsibleFor(PayloadCID)
 
 alt Node is responsible
-    FileOps -> Storage: provideFile(ManifestCID)\n(via StorageManager)
-    Storage -> DHT: Provide(ManifestCID)
-    FileOps -> ShardMgr: PublishToShard(IngestMessage)
+    FileOps -> ShardMgr: PinToCluster(ManifestCID)
+    ShardMgr -> ClusterMgr: Pin(ctx, currentShard, cid, -1, -1)
+    ClusterMgr -> CRDT: LogPin(pin)
+    FileOps -> Storage: AddKnownFile(ManifestCID)
+    FileOps -> FileOps: announceResponsibleFile()
+    FileOps -> ShardMgr: PublishToShardCBOR(IngestMessage)\n(current shard topic)
     ShardMgr -> PubSub: Publish IngestMessage
-    PubSub -> Nodes: Broadcast IngestMessage
-else Node is NOT responsible (Custodial Mode)
-    Note over FileOps: Tourist Pattern
-    FileOps -> ShardMgr: JoinShard(TargetShard)
-    FileOps -> ShardMgr: PublishToShard(IngestMessage, TargetShard)
-    ShardMgr -> PubSub: Publish IngestMessage (to Target Shard)
-    PubSub -> Nodes: Broadcast IngestMessage
-    Note over FileOps: Wait for handoff (ReplicationManager checks)
+    FileOps -> Storage: ProvideFile(ManifestCID)
+    Storage -> DHT: Provide(ManifestCID)
+else Node is NOT responsible (Custodial)
+    FileOps -> Storage: AddKnownFile(ManifestCID)
+    FileOps -> FileOps: announceCustodialFile()
+    FileOps -> ShardMgr: JoinShard(targetShard)\nTargetShard = TargetShardForPayload(PayloadCID, depth)
+    FileOps -> ShardMgr: EnsureClusterForShard(ctx, targetShard)
+    ShardMgr -> ClusterMgr: JoinShard(ctx, targetShard)
+    FileOps -> ShardMgr: PinToShard(ctx, targetShard, ManifestCID)
+    ShardMgr -> ClusterMgr: Pin(ctx, targetShard, cid, -1, -1)
+    ClusterMgr -> CRDT: LogPin (target shard's CRDT)
+    FileOps -> ShardMgr: PublishToShardCBOR(IngestMessage, targetShard)
+    ShardMgr -> PubSub: Publish IngestMessage to target shard topic
+    PubSub -> Nodes: Forward (nodes in target shard)
+    Note over FileOps: No DHT Provide; file lives only in target cluster
 end
 
 @enduml

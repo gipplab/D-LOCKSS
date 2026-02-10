@@ -2,36 +2,33 @@
 
 [*] --> Discovered: File detected in ./data
 
-Discovered --> Pinned: pinFile(ManifestCID)
-Discovered --> Custodial: Not responsible\nbut holds temporarily
+Discovered --> Pinned: PinRecursive(ManifestCID)\nPinFile(ManifestCID)
 
-Pinned --> Responsible: AmIResponsibleFor(PayloadCID) == true
-Pinned --> Custodial: AmIResponsibleFor(PayloadCID) == false
+Pinned --> Responsible: AmIResponsibleFor(PayloadCID) == true\nPinToCluster(currentShard)\nPublish IngestMessage
+Pinned --> Custodial: AmIResponsibleFor(PayloadCID) == false\nJoinShard(targetShard)\nPinToShard(targetShard)\nPublish IngestMessage to target shard
 
-Custodial --> Delegated: DELEGATE message sent
-Delegated --> HandoffComplete: Replication >= MinReplication
-HandoffComplete --> [*]: unpinFile()
+Custodial --> InTargetCluster: CRDT syncs; responsible nodes\nLocalPinTracker pin locally
 
-Responsible --> Monitoring: Replication in range
-Monitoring --> UnderReplicated: count < MinReplication
-Monitoring --> OverReplicated: count > MaxReplication
+Responsible --> InCluster: Pin in CRDT; LocalPinTracker\nsyncs to self and peers (allocations)
 
-UnderReplicated --> Monitoring: Replication restored
-OverReplicated --> Monitoring: Unpinned (but still tracked)
+InCluster --> UnderReplicated: runReplicationChecker:\nallocations < MinReplication
+UnderReplicated --> InCluster: ReplicationRequest -> peers\nPin(targetShard), TriggerSync
 
-Responsible --> Removed: Shard split or discovery move\n-> Not Responsible
-Removed --> [*]
+InCluster --> Removed: RunReshardPass: we split/moved\nfile belongs to other shard
+Removed --> [*]: Unpin from cluster\nUnpinRecursive, UnpinFile
+
+InTargetCluster --> [*]: Custodial may leave target shard later\n(no automatic unpin on replication count)
 
 note right of Custodial
-    Temporary storage
-    until responsible
-    node takes over
+    Tourist: we inject file into
+    target shard's cluster only.
+    No DHT Provide.
 end note
 
-note right of Monitoring
-    Periodic checks
-    ensure replication
-    stays in range
+note right of InCluster
+    File lives in exactly one cluster
+    (shard by PayloadCID).
+    LocalPinTracker allocation-aware.
 end note
 
 @enduml

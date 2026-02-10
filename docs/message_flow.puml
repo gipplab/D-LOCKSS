@@ -4,59 +4,59 @@ participant "Node A" as A
 participant "GossipSub" as GS
 participant "Node B" as B
 participant "Node C" as C
-participant "DHT" as DHT
+participant "CRDT (shard)" as CRDT
+participant "IPFS" as IPFS
+
+== Cluster State Sync (per shard) ==
+note over A, CRDT: Each shard has its own CRDT (dlockss-shard-<id>)
+A -> CRDT: LogPin(pin) on shard's cluster
+CRDT -> B: Sync (PubSub)
+CRDT -> C: Sync (PubSub)
+B -> B: LocalPinTracker sees new CID\n(allocation-aware: pin if we are in Allocations)
+B -> IPFS: PinRecursive(ManifestCID)
+C -> C: LocalPinTracker sees new CID
+C -> IPFS: PinRecursive(ManifestCID)
 
 == File Ingestion ==
-A -> GS: IngestMessage(CBOR)\n{manifest_cid, shard_id, hint_size, ts, nonce, sig} (shard topic)
+A -> GS: IngestMessage(CBOR)\n{manifest_cid, shard_id, hint_size, sender_id, ts, nonce, sig}\n(topic: dlockss-creative-commons-shard-<id>)
 GS -> B: Forward message
 GS -> C: Forward message
-B -> B: Add to knownFiles
-C -> C: Add to knownFiles
+B -> B: Add to knownFiles\nIf AmIResponsibleFor(PayloadCID): Pin to cluster, AnnouncePinned
+C -> C: Add to knownFiles\nIf responsible: Pin to cluster, AnnouncePinned
 
 == Replication Request ==
-A -> GS: ReplicationRequest(CBOR)\n{manifest_cid, priority, deadline, ts, nonce, sig} (shard topic)
-GS -> B: Forward message (same shard only)
-GS -> C: Forward message (same shard only)
-B -> B: Check if responsible\n(AmIResponsibleFor(PayloadCID))
-C -> C: Check if responsible\n(AmIResponsibleFor(PayloadCID))
-alt B is responsible
-    B -> DHT: Check if I have file
-    alt File not pinned
-        B -> IPFS: Fetch and pin file
-        B -> DHT: provideFile(manifest_cid)\n(only responsible nodes announce)
-    end
-else B not responsible
-    B -> B: Ignore (not in responsible shard)
+A -> GS: ReplicationRequest(CBOR)\n{manifest_cid, priority, deadline, sender_id, ts, nonce, sig} (shard topic)
+GS -> B: Forward message
+GS -> C: Forward message
+B -> B: targetShard = targetShardForManifest(manifest, topicShard)
+B -> B: If we have file: JoinShard(targetShard), EnsureClusterForShard,\nPin(targetShard), TriggerSync(targetShard)
+alt B has file
+    B -> CRDT: Pin(targetShard) via ClusterManager
+    B -> B: TriggerSync(targetShard)
+else B does not have file
+    B -> IPFS: Fetch PinRecursive(manifestCID)
+    B -> CRDT: Pin(targetShard)
+    B -> B: TriggerSync(targetShard)
 end
-alt C is responsible
-    C -> DHT: Check if I have file
-    alt File not pinned
-        C -> IPFS: Fetch and pin file
-        C -> DHT: provideFile(manifest_cid)\n(only responsible nodes announce)
-    end
-else C not responsible
-    C -> C: Ignore (not in responsible shard)
-end
+C -> C: Same logic (target shard = file's shard by PayloadCID)
 
-== Tourist Pattern (Handoff) ==
-note over A: Node A holds file but is not responsible.\nCalculates Target Shard (e.g. "10").
-A -> GS: JoinShard("10")
-A -> GS: IngestMessage(CBOR)\n{manifest_cid, shard_id="10", ...} (Topic: ...-shard-10)
-GS -> C: Forward message (Node C is in Shard 10)
-C -> C: Accept ingest
-C -> DHT: provideFile(manifest_cid)
-note over A: A monitors DHT for replicas.\nWhen replication >= Target, A unpins.
-A -> GS: LeaveShard("10")
+== Custodial (Tourist) ==
+note over A: Local ingest; we are NOT responsible.\nTarget shard = TargetShardForPayload(PayloadCID, depth)
+A -> GS: JoinShard(targetShard)
+A -> CRDT: EnsureClusterForShard, Pin(targetShard)
+A -> GS: IngestMessage(CBOR) to target shard topic
+GS -> C: Forward (nodes in target shard)
+C -> C: If responsible: Pin to cluster, AnnouncePinned
+note over A: We remain in target shard as tourist.\nReshard pass later may unpin if we leave.
 
 == Rate Limiting ==
 A -> GS: Message
 GS -> B: Forward
-B -> B: checkRateLimit(A)
+B -> B: rateLimiter.Check(peer)
 alt Rate limit OK
     B -> B: Process message
 else Rate limit exceeded
-    B -> B: Drop message
-    B -> B: Increment messagesDropped
+    B -> B: Drop message, Increment messagesDropped
 end
 
 @enduml

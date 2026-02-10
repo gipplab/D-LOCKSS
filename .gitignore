@@ -31,3 +31,4 @@ shard_test.go
 # Binaries
 main
 testnet/dlockss-monitor
+

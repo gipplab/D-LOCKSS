@@ -1,21 +1,30 @@
 @startuml
-title Custodial Delegation (Tourist Pattern)
+title Custodial / Tourist Pattern (Join target shard to inject file)
 
-participant "NewNode" as NN
-participant "TargetShard" as TS
-participant "Discovery" as DISC
+participant "Custodial Node" as NN
+participant "ShardManager" as ShardMgr
+participant "ClusterManager" as ClusterMgr
 participant "PubSub" as PS
+participant "Target Shard Peers" as TS
 
-NN -> DISC: Find peers for target shard
-DISC --> NN: Peer list
+note over NN: We have file but AmIResponsibleFor(PayloadCID) == false\ntargetShard = TargetShardForPayload(PayloadCID, depth)
 
-NN -> TS: Connect to peers
-note right: Node connects to peers in the swarm
-
-NN -> PS: Join PubSub topic for Shard
-note right: Implicit delegation via "Tourist Pattern"\nNode joins topic and begins participating
+NN -> ShardMgr: JoinShard(targetShard)
+ShardMgr -> PS: Subscribe to dlockss-creative-commons-shard-<targetShard>
+ShardMgr -> ShardMgr: Publish JOIN, HEARTBEAT (full member)
 PS --> NN: Subscribed
 
-NN -> TS: Begin replication checks
-NN -> TS: Participate in consensus/storage
+NN -> ShardMgr: EnsureClusterForShard(ctx, targetShard)
+ShardMgr -> ClusterMgr: JoinShard(ctx, targetShard)
+ClusterMgr -> ClusterMgr: CRDT + LocalPinTracker for target shard
+
+NN -> ShardMgr: PinToShard(ctx, targetShard, ManifestCID)
+ShardMgr -> ClusterMgr: Pin(ctx, targetShard, cid, -1, -1)
+ClusterMgr -> TS: CRDT sync (PubSub dlockss-shard-<id>)
+
+NN -> ShardMgr: PublishToShardCBOR(IngestMessage, targetShard)
+ShardMgr -> PS: Publish IngestMessage
+PS -> TS: Forward
+
+note over NN: Tourist: we participate in target shard\nuntil we leave. No separate Delegate message.
 @enduml

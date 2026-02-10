@@ -2,44 +2,38 @@
 
 package "Core Components" {
     component "ShardManager" as ShardManager
+    component "ClusterManager" as ClusterManager
     component "StorageManager" as StorageManager
-    component "ReplicationManager" as ReplicationManager
     component "FileProcessor" as FileProcessor
     component Metrics
     component "Rate Limiter" as RateLimiter
-    component "Storage Monitor" as StorageMonitor
 }
 
-ShardManager --> StorageManager : updates state (reshard)
-ReplicationManager --> StorageManager : pins/unpins, check state
-ReplicationManager --> ShardManager : uses for responsibility check
+ShardManager --> ClusterManager : joins/leaves shards
+ClusterManager --> StorageManager : onPinSynced/onPinRemoved
 FileProcessor --> StorageManager : pins files, adds known
-FileProcessor --> ShardManager : checks responsibility
-ShardManager --> RateLimiter : filters messages
-RateLimiter --> StorageMonitor : checks disk usage
+FileProcessor --> ShardManager : PinToCluster, AnnouncePinned, responsibility
+ShardManager --> RateLimiter : Check(peer) before processing messages
 Metrics --> StorageManager : reads stats
-Metrics --> ReplicationManager : reads stats
+Metrics --> ClusterManager : GetClusterMetrics (pins/peers per shard)
 
 note right of ShardManager
     Manages shard assignment
     and PubSub topics.
-    Splits when overcrowded;
-    late joiners in ROOT
-    discover and join deeper shards.
+    Splits when overcrowded.
+end note
+
+note right of ClusterManager
+    Manages embedded IPFS Clusters
+    (CRDT Consensus).
+    Syncs state between peers
+    and drives local pinning.
 end note
 
 note right of StorageManager
     Owns local state:
     - PinnedFiles
     - KnownFiles
-    - BackoffTable
-end note
-
-note right of ReplicationManager
-    Owns pipeline:
-    - Scheduler
-    - Prober
-    - Reconciler
 end note
 
 note right of FileProcessor

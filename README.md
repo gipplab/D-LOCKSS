@@ -6,7 +6,7 @@
 
 ## 1. Summary & Vision
 
-**D-LOCKSS** is a decentralized storage network designed to ensure the long-term preservation and authenticity of research data.
+**D-LOCKSS** is a decentralized storage network for long-term preservation and authenticity of research data.
 
 *   **Core Philosophy:** "Networked RAID." Just as RAID protects data across multiple hard drives, D-LOCKSS protects data across a distributed network of peers.
 *   **Authenticity:** Relies on Content Addressing (CIDs) to guarantee data integrity.
@@ -64,15 +64,15 @@ See [docs/DLOCKSS_PROTOCOL.md](docs/DLOCKSS_PROTOCOL.md) for protocol details.
 D-LOCKSS acts as a self-healing, sharded storage cluster using the IPFS/Libp2p stack.
 
 ### Key Components
-1.  **Shard Manager:** Dynamically splits responsibilities based on peer count to maintain scalability. Nodes that join late (in ROOT with few peers after others have split) periodically explore deeper shards and join the branch that matches their peer ID so they catch up instead of staying stuck in ROOT.
-2.  **File Watcher:** Monitors the data directory to automatically ingest content.
-3.  **Replication Checker:** Periodically verifies replication levels (default: every 1 min). Uses dual-query hysteresis to prevent false alarms.
+1.  **Shard Manager:** Dynamically splits responsibilities based on peer count to maintain scalability.
+2.  **Cluster Manager:** Manages embedded **IPFS Cluster** instances (one per shard) using **CRDTs** for state consensus; nodes in a shard sync and pin content assigned to that shard.
+3.  **File Watcher:** Monitors the data directory to automatically ingest content.
 4.  **Storage Monitor:** Protects nodes from disk exhaustion by rejecting custodial requests when full.
 5.  **BadBits Manager:** Enforces content blocking (e.g., DMCA) based on configured country codes.
 
 ### "Networked RAID" Logic
-*   **Striping -> Sharding:** Responsibility for files is determined by a stable hash of the ManifestCID.
-*   **Redundancy -> Replication:** Enforces `MinReplication` (5) and `MaxReplication` (10).
+*   **Striping -> Sharding:** Responsibility for files is determined by a stable hash of the **PayloadCID** (TargetShardForPayload); each file lives in exactly one cluster (shard).
+*   **Redundancy -> Cluster Consensus:** Each shard runs an embedded IPFS Cluster CRDT. When a file is ingested, it is "pinned" to the shard's cluster state. All peers in that shard sync this state and automatically pin the content locally.
 *   **Write Cache -> Custodial Mode:** Nodes temporarily hold files they don't own until they can hand them off to the responsible shard.
 
 Documentation:

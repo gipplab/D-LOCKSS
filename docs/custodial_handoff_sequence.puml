@@ -1,52 +1,36 @@
 @startuml Custodial Handoff Sequence (Tourist Pattern)
 
 participant "Custodial Node" as Custodial
-participant "Shard Manager" as ShardMgr
-participant "PubSub Target" as PubSub
+participant "ShardManager" as ShardMgr
+participant "ClusterManager" as ClusterMgr
+participant "CRDT (target shard)" as CRDT
 participant "Responsible Node" as Responsible
 participant "StorageManager" as Storage
-participant "ReplicationManager" as ReplMgr
 participant "IPFS" as IPFS
-participant "DHT" as DHT
+participant "PubSub" as PubSub
 
-Custodial -> Custodial: processNewFile()\nPayloadCID not in my shard
-Custodial -> IPFS: PinRecursive(ManifestCID)\n[temporary custodial hold]
-Custodial -> Storage: pinFile(ManifestCID)
-Note over Custodial: Do NOT announce to DHT
+== Local ingest: we are NOT responsible ==
 
-Custodial -> ShardMgr: JoinShard(TargetShard)
-Custodial -> PubSub: PublishToShard(IngestMessage)
-Note over Custodial: Temporary "Tourist" subscription
+Custodial -> Custodial: trackAndAnnounceFile()\nAmIResponsibleFor(PayloadCID) == false
+Custodial -> IPFS: PinRecursive(ManifestCID)  ' already done in checkBadBitsAndPin
+Custodial -> Storage: PinFile(ManifestCID)
+Custodial -> ShardMgr: AnnouncePinned(ManifestCID)
 
-PubSub -> Responsible: Broadcast IngestMessage
-Responsible -> Responsible: Check if responsible for PayloadCID
+Custodial -> Custodial: announceCustodialFile()\ntargetShard = TargetShardForPayload(PayloadCID, depth)
+Custodial -> ShardMgr: JoinShard(targetShard)
+ShardMgr -> PubSub: Subscribe to dlockss-creative-commons-shard-<targetShard>
+Custodial -> ShardMgr: EnsureClusterForShard(ctx, targetShard)
+ShardMgr -> ClusterMgr: JoinShard(ctx, targetShard)
+Custodial -> ShardMgr: PinToShard(ctx, targetShard, ManifestCID)
+ShardMgr -> ClusterMgr: Pin(ctx, targetShard, cid, -1, -1)
+ClusterMgr -> CRDT: LogPin(pin)
+CRDT -> Responsible: Sync State (PubSub dlockss-shard-<targetShard>)
 
-alt Responsible
-    Responsible -> Storage: addKnownFile(ManifestCID)
-    Note over Responsible: Added to known files, picked up by ReplManager
-    Responsible -> ReplMgr: runScheduler() -> runProber()
-    ReplMgr -> DHT: FindProvidersAsync(ManifestCID)
-    DHT -> ReplMgr: Provider count
-    
-    alt count < MinReplication (in Reconciler)
-        ReplMgr -> IPFS: PinRecursive(ManifestCID)
-        ReplMgr -> Storage: pinFile(ManifestCID) (Provides)
-        ReplMgr -> DHT: Provide(ManifestCID)
-    end
-    
-    Note over Responsible: File now properly replicated
-    
-    alt Replication reaches MinReplication
-        Custodial -> ReplMgr: runProber(ManifestCID)
-        Custodial -> DHT: FindProvidersAsync(ManifestCID)
-        DHT -> Custodial: count >= MinReplication
-        Custodial -> IPFS: UnpinRecursive(ManifestCID)
-        Custodial -> Storage: unpinFile(ManifestCID)
-        Custodial -> ShardMgr: LeaveShard(TargetShard)
-        Note over Custodial: Custodial handoff complete, left ephemeral shard
-    end
-else Not Responsible
-    Responsible -> Responsible: Ignore message
-end
+Responsible -> CRDT: LocalPinTracker sees new pin (we are in Allocations)
+Responsible -> IPFS: PinRecursive(ManifestCID)
+Responsible -> Storage: onPinSynced(cid)
+Note over Responsible: Responsible node holds file in target cluster
+
+Note over Custodial: Custodial remains in target shard as tourist.\nNo automatic unpin when replication sufficient;\nreshard/split may leave target shard later.
 
 @enduml

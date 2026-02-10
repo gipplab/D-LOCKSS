@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"os/signal"
+	"path/filepath"
+	"sync"
 	"syscall"
+	"time"
 
 	"dlockss/internal/api"
 	"dlockss/internal/badbits"
@@ -19,7 +21,7 @@ import (
 	"dlockss/internal/config"
 	"dlockss/internal/discovery"
 	"dlockss/internal/fileops"
-	"dlockss/internal/managers/replication"
+	"dlockss/internal/managers/clusters"
 	"dlockss/internal/managers/shard"
 	"dlockss/internal/managers/storage"
 	"dlockss/internal/signing"
@@ -27,11 +29,17 @@ import (
 	"dlockss/internal/trust"
 	"dlockss/pkg/ipfs"
 
+	leveldb "github.com/ipfs/go-ds-leveldb"
 	"github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
-	"github.com/libp2p/go-libp2p/p2p/security/noise"
+	kaddht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
+	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
+	"github.com/libp2p/go-libp2p/p2p/security/noise"
 )
 
 func main() {
@@ -75,6 +83,34 @@ func main() {
 		log.Fatalf("[Fatal] Failed to create pubsub: %v", err)
 	}
 
+	// DHT for discovery (separate from IPFS daemon; used for dlockss-prod rendezvous).
+	kademliaDHT, err := kaddht.New(ctx, h)
+	if err != nil {
+		log.Fatalf("[Fatal] Failed to create DHT: %v", err)
+	}
+	if err = kademliaDHT.Bootstrap(ctx); err != nil {
+		log.Fatalf("[Fatal] Failed to bootstrap DHT: %v", err)
+	}
+
+	// Connect to default bootstrap peers
+	var wg sync.WaitGroup
+	for _, peerAddr := range kaddht.DefaultBootstrapPeers {
+		peerinfo, _ := peer.AddrInfoFromP2pAddr(peerAddr)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := h.Connect(ctx, *peerinfo); err != nil {
+				// log.Printf("Bootstrap warning: %s", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Setup Routing Discovery
+	routingDiscovery := routing.NewRoutingDiscovery(kademliaDHT)
+	dutil.Advertise(ctx, routingDiscovery, config.DiscoveryServiceTag)
+	log.Printf("[Config] Advertising service on DHT: %s", config.DiscoveryServiceTag)
+
 	// mDNS discovery so nodes and monitor find each other on the same LAN (same tag as monitor)
 	notifee := &discovery.DiscoveryNotifee{H: h, Ctx: ctx}
 	mdnsSvc := mdns.NewMdnsService(h, config.DiscoveryServiceTag, notifee)
@@ -82,11 +118,41 @@ func main() {
 		log.Printf("[Config] mDNS start failed: %v (peer/monitor discovery limited)", err)
 	}
 
+	// Find peers (e.g. monitor)
+	go func() {
+		for {
+			peerChan, err := routingDiscovery.FindPeers(ctx, config.DiscoveryServiceTag)
+			if err != nil {
+				log.Printf("[Discovery] FindPeers error: %v", err)
+				time.Sleep(10 * time.Second)
+				continue
+			}
+			for peer := range peerChan {
+				if peer.ID == h.ID() {
+					continue
+				}
+				if h.Network().Connectedness(peer.ID) != network.Connected {
+					h.Connect(ctx, peer)
+				}
+			}
+			time.Sleep(30 * time.Second)
+		}
+	}()
+
 	// Trust (optional: load peers if file exists)
 	trustMgr := trust.NewTrustManager(config.TrustMode)
 	if err := trustMgr.LoadTrustedPeers(config.TrustStorePath); err != nil && !os.IsNotExist(err) {
 		log.Printf("[Config] Trust store load failed: %v", err)
 	}
+
+	// Initialize persistent datastore for cluster state
+	// We place this OUTSIDE the FileWatchFolder (ingest dir) to avoid the node trying to ingest its own database files.
+	dsPath := "cluster_store"
+	dstore, err := leveldb.NewDatastore(dsPath, nil)
+	if err != nil {
+		log.Fatalf("[Fatal] Failed to create datastore at %s: %v", dsPath, err)
+	}
+	defer dstore.Close()
 
 	nonceStore := common.NewNonceStore()
 	rateLimiter := common.NewRateLimiter()
@@ -94,12 +160,25 @@ func main() {
 	storageMgr := storage.NewStorageManager(dht, metrics)
 	signer := signing.NewSigner(h, privKey, h.ID(), nonceStore, trustMgr, dht)
 
-	// Shard manager (replication set later to break cycle)
-	shardMgr := shard.NewShardManager(ctx, h, ps, ipfsClient, storageMgr, metrics, signer, rateLimiter, "")
-	repMgr := replication.NewReplicationManager(ipfsClient, shardMgr, storageMgr, metrics, signer, dht)
-	shardMgr.SetReplicationManager(repMgr)
+	// Shard manager (replication set later to break cycle).
+	// onPinSynced: when PinTracker syncs a pin from CRDT, register with storage and announce PINNED immediately so monitor sees replication right away (not only on next heartbeat batch).
+	var announcePinned func(string)
+	onPinSynced := func(cid string) {
+		storageMgr.PinFile(cid)
+		if announcePinned != nil {
+			announcePinned(cid)
+		}
+	}
+	onPinRemoved := func(cid string) {
+		storageMgr.UnpinFile(cid)
+	}
+	clusterMgr := clusters.NewClusterManager(h, ps, dht, dstore, ipfsClient, trustMgr.GetTrustedPeers(), onPinSynced, onPinRemoved)
+	shardMgr := shard.NewShardManager(ctx, h, ps, ipfsClient, storageMgr, metrics, signer, rateLimiter, clusterMgr, "")
+	clusterMgr.SetShardPeerProvider(shardMgr) // CRDT Peers() and allocations use real shard membership
+	announcePinned = shardMgr.AnnouncePinned
 
-	metrics.RegisterProviders(shardMgr, storageMgr, repMgr, rateLimiter)
+	metrics.RegisterProviders(shardMgr, storageMgr, rateLimiter)
+	metrics.RegisterClusterProvider(clusterMgr) // cluster-style metrics: pins/peers/allocations per shard
 	metrics.SetPeerID(h.ID().String())
 
 	// Telemetry and API
@@ -112,13 +191,12 @@ func main() {
 	apiServer.Start()
 
 	// File processor and watcher
-	fp := fileops.NewFileProcessor(ipfsClient, shardMgr, storageMgr, privKey)
+	fp := fileops.NewFileProcessor(ipfsClient, shardMgr, storageMgr, privKey, signer)
 	fp.ScanExistingFiles()
 	go fp.WatchFolder(ctx)
 
 	// Run managers
 	shardMgr.Run()
-	repMgr.StartReplicationPipeline(ctx)
 
 	// Graceful shutdown
 	sigCh := make(chan os.Signal, 1)

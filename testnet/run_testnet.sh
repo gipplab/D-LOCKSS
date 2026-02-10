@@ -3,10 +3,10 @@
 # Configuration
 # Reduced to 15 nodes for bandwidth-limited environments
 # Each node runs its own isolated IPFS daemon
-NODE_COUNT=15
-# Make BASE_DIR absolute to avoid path resolution issues
-BASE_DIR_REL="testnet_data"
-BASE_DIR=$(cd "$BASE_DIR_REL" 2>/dev/null && pwd || echo "$(pwd)/$BASE_DIR_REL")
+NODE_COUNT=25
+# Make BASE_DIR absolute and relative to the script location
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+BASE_DIR="$SCRIPT_DIR/testnet_data"
 BINARY_NAME="dlockss-node"
 PID_FILE="active_nodes.pids"
 IPFS_PID_FILE="active_ipfs.pids"
@@ -142,17 +142,21 @@ if [ ! -f "$IPFS_REPO/config" ]; then
         (export IPFS_PATH="$IPFS_REPO" && ipfs init -e --profile=lowpower >/dev/null 2>&1)
 
         # 2. Connection Limits (Bandwidth Protection)
-        #    Increased to allow full mesh in root shard (25 nodes) and facilitate discovery
-        (export IPFS_PATH="$IPFS_REPO" && ipfs config Swarm.ConnMgr.LowWater --json 30)
-        (export IPFS_PATH="$IPFS_REPO" && ipfs config Swarm.ConnMgr.HighWater --json 60)
+        #    Reduced for local testnet efficiency
+        (export IPFS_PATH="$IPFS_REPO" && ipfs config Swarm.ConnMgr.LowWater --json 10)
+        (export IPFS_PATH="$IPFS_REPO" && ipfs config Swarm.ConnMgr.HighWater --json 20)
         
-        # 3. Enable DHT Server Mode
-        #    CRITICAL: In a closed testnet, nodes must act as DHT servers to find each other/content.
-        (export IPFS_PATH="$IPFS_REPO" && ipfs config Routing.Type "dhtserver")
+        # 3. Hybrid DHT Mode (Balance Bandwidth vs Availability)
+        #    Nodes 1-3 act as DHT Servers (Backbone) to maintain the network.
+        #    Nodes 4-15 act as DHT Clients (Leaf) to save bandwidth but still publish content.
+        if [ $i -le 3 ]; then
+            (export IPFS_PATH="$IPFS_REPO" && ipfs config Routing.Type "dhtserver")
+        else
+            (export IPFS_PATH="$IPFS_REPO" && ipfs config Routing.Type "dhtclient")
+        fi
 
-        # 4. ENABLE MDNS (Automatic Discovery)
-        #    Since you have CPU power, this allows nodes to find each other 
-        #    automatically on localhost without manual wiring.
+        # 4. ENABLE MDNS (Required for Local Discovery)
+        #    We need this so IPFS daemons find each other since we disabled the DHT server.
         (export IPFS_PATH="$IPFS_REPO" && ipfs config Discovery.MDNS.Enabled --json true)
 
         # 5. Disable AutoNAT
@@ -190,6 +194,7 @@ if [ ! -f "$IPFS_REPO/config" ]; then
 
     # 2. Run the node in background with testnet-optimized settings
     # See docs/TIMEOUTS_AND_DELAYS_ANALYSIS.md for rationale
+    # Shard 12/6 avoids over-splitting for ~15 nodes (code enforces min 4 per child, merge-up when understaffed)
     # Export IPFS_PATH so D-LOCKSS can load IPFS identity (use absolute path)
     IPFS_PATH="$IPFS_REPO_ABS" \
     DLOCKSS_METRICS_EXPORT="metrics.csv" \

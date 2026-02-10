@@ -5,8 +5,8 @@
 package "D-LOCKSS Node" {
     [Main] as main
     [ShardManager] as shardMgr
+    [ClusterManager] as clusterMgr
     [FileProcessor] as fileOps
-    [ReplicationManager] as replMgr
     [StorageManager] as storage
     [Storage Monitor] as storageMonitor
     [Metrics Reporter] as metrics
@@ -14,6 +14,11 @@ package "D-LOCKSS Node" {
     [Discovery Service] as discovery
     [IPFS Client] as ipfsClient
     [Signing & Trust] as signingTrust
+
+    package "Embedded Cluster" {
+        [CRDT Consensus] as crdt
+        [PinTracker] as pinTracker
+    }
 }
 
 package "libp2p Stack" {
@@ -26,6 +31,7 @@ package "libp2p Stack" {
 package "File System" {
     [./data Directory] as dataDir
     [File Watcher] as watcher
+    [Cluster Store] as clusterStore
 }
 
 package "External" {
@@ -35,17 +41,26 @@ package "External" {
 
 main --> shardMgr : manages
 main --> fileOps : orchestrates
-main --> replMgr : starts
 main --> storage : uses
 main --> metrics : collects
 main --> rateLimit : uses
 main --> discovery : initializes
 main --> signingTrust : initializes
 
+shardMgr --> clusterMgr : manages clusters
 shardMgr --> pubsub : subscribes/publishes
 shardMgr --> host : uses
 shardMgr --> signingTrust : verifies messages
 shardMgr --> storage : uses (resharding)
+
+clusterMgr --> crdt : manages
+clusterMgr --> pinTracker : starts (LocalPinTracker per shard)
+clusterMgr --> clusterStore : persists state
+
+crdt --> pubsub : syncs state (dlockss-shard-<id>)
+crdt --> dht : routing (DHT adapter)
+pinTracker --> crdt : reads state
+pinTracker --> ipfsClient : pins content
 
 fileOps --> storage : pins/unpins (via mgr)
 fileOps --> shardMgr : checks responsibility
@@ -53,23 +68,16 @@ fileOps --> watcher : triggered by
 fileOps --> ipfsClient : imports/pins
 fileOps --> signingTrust : signs manifests/messages
 
-replMgr --> dht : queries providers
-replMgr --> shardMgr : publishes NEED
-replMgr --> storage : manages pins, check backoff
-replMgr --> ipfsClient : verifies DAG
-replMgr --> signingTrust : verifies manifests
-
 storage --> dht : provides files
 storage --> ipfsClient : pin/unpin DAGs
 
 metrics --> storage : reads state
-metrics --> replMgr : tracks stats
 metrics --> shardMgr : reads shard info
+metrics --> clusterMgr : GetClusterMetrics (pins/peers per shard)
 
-rateLimit --> pubsub : filters messages
-rateLimit --> storageMonitor : checks disk usage for Custodial
+shardMgr --> rateLimit : Check(peer) before processing messages
 
-storageMonitor --> dataDir : monitors disk usage
+storageMonitor --> dataDir : monitors disk usage (optional)
 
 discovery --> mdns : uses
 discovery --> host : connects peers
