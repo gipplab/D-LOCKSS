@@ -36,9 +36,7 @@ type ClusterManagerInterface interface {
 	TriggerSync(shardID string)
 }
 
-// ShardPeerProvider returns the list of peers in a shard (e.g. from pubsub mesh).
-// When set on ClusterManager, CRDT Peers() and GetPeerCount() use it so allocations
-// and replication are distributed across real shard members instead of just self.
+// ShardPeerProvider supplies peers for a shard (e.g. pubsub mesh). Used by CRDT for allocations.
 type ShardPeerProvider interface {
 	GetPeersForShard(shardID string) []peer.ID
 }
@@ -95,8 +93,7 @@ func NewClusterManager(h host.Host, ps *pubsub.PubSub, dht routing.Routing, ds d
 	}
 }
 
-// SetShardPeerProvider sets the provider used to resolve shard peers for CRDT Peers().
-// Call after ShardManager is created (e.g. in main) so allocations use real shard membership.
+// SetShardPeerProvider sets the provider for CRDT Peers(). Set before using clusters.
 func (cm *ClusterManager) SetShardPeerProvider(provider ShardPeerProvider) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -131,14 +128,13 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string, bootstr
 		TrustedPeers:        cm.trustedPeers,
 		Batching: crdt.BatchingConfig{
 			MaxBatchSize: 50,
-			MaxBatchAge:  200 * time.Millisecond, // shorter so last pin in a burst propagates sooner (avoids "single file" stuck at replication 1)
+			MaxBatchAge:  200 * time.Millisecond,
 			MaxQueueSize: 100,
 		},
 	}
 
 	// Initialize CRDT Consensus
-	// Note: We pass nil for PinTracker for now as we just want state consensus first.
-	// We will wire up storageMgr later or use a custom listener.
+	// PinTracker nil for now; state consensus only. storageMgr wired later or custom listener.
 	consensus, err := crdt.New(cm.host, cm.dht, cm.pubsub, cfg, shardDS)
 	if err != nil {
 		return fmt.Errorf("failed to initialize CRDT for shard %s: %w", shardID, err)
@@ -272,9 +268,7 @@ func SelectAllocations(peers []peer.ID, c cid.Cid, n int) []peer.ID {
 	return out
 }
 
-// Pin submits a pin operation to the specific shard's cluster.
-// Allocations are set deterministically from current Peers() so all nodes agree on who should replicate.
-// Callers should use a context with sufficient timeout (e.g. config.CRDTOpTimeout) so Consensus.LogPin can complete; short deadlines cause "context deadline exceeded" in go-ds-crdt (e.g. "error getting root delta priority").
+// Pin submits a pin to the shard's cluster. Use context with long timeout (e.g. CRDTOpTimeout).
 func (cm *ClusterManager) Pin(ctx context.Context, shardID string, c cid.Cid, replicationFactorMin, replicationFactorMax int) error {
 	cm.mu.RLock()
 	cluster, exists := cm.clusters[shardID]
@@ -300,7 +294,7 @@ func (cm *ClusterManager) Pin(ctx context.Context, shardID string, c cid.Cid, re
 		peers, err := cluster.Consensus.Peers(ctx)
 		if err != nil {
 			log.Printf("[Cluster] Warning: failed to get peers for shard %s: %v (using full replication)", shardID, err)
-			// Fall through with nil peers → empty allocations → full replication (safe fallback)
+			// nil peers → full replication
 		}
 		// Cap replication at shard size: a shard with 4 nodes can only replicate 4x.
 		peerCount := len(peers)
@@ -442,7 +436,7 @@ func (cm *ClusterManager) GetPeerCount(ctx context.Context, shardID string) (int
 	return len(peers), nil
 }
 
-// TriggerSync triggers an immediate sync of the PinTracker for the given shard (e.g. after ReplicationRequest).
+// TriggerSync syncs PinTracker for the shard.
 func (cm *ClusterManager) TriggerSync(shardID string) {
 	cm.mu.RLock()
 	cluster, exists := cm.clusters[shardID]

@@ -8,8 +8,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-// getShardPeerCount returns peer count for the CURRENT shard.
-// It may use seenPeers (recent heartbeats) to avoid undercounting when mesh is slow to update.
 func (sm *ShardManager) getShardPeerCount() int {
 	sm.mu.RLock()
 	currentShard := sm.currentShard
@@ -48,10 +46,7 @@ func (sm *ShardManager) getShardPeerCount() int {
 	return 0
 }
 
-// getShardPeerCountForSplit returns the current mesh size only (peers actually in the topic now).
-// Used for split decisions so we never split on stale counts: seenPeers can include nodes that
-// have already left the shard (up to 350s), which would otherwise make e.g. 11 report 12 and
-// split when only 2–3 nodes remain.
+// getShardPeerCountForSplit returns mesh size only (split uses this to avoid stale counts).
 func (sm *ShardManager) getShardPeerCountForSplit() int {
 	sm.mu.RLock()
 	currentShard := sm.currentShard
@@ -71,7 +66,6 @@ func (sm *ShardManager) getShardPeerCountForSplit() int {
 	return 0
 }
 
-// GetShardInfo returns current shard ID and peer count.
 func (sm *ShardManager) GetShardInfo() (string, int) {
 	sm.mu.RLock()
 	currentShard := sm.currentShard
@@ -83,7 +77,6 @@ func (sm *ShardManager) GetHost() host.Host {
 	return sm.h
 }
 
-// GetShardPeers returns the list of peers in the current shard (mesh peers from pubsub).
 func (sm *ShardManager) GetShardPeers() []peer.ID {
 	sm.mu.RLock()
 	currentShard := sm.currentShard
@@ -96,9 +89,6 @@ func (sm *ShardManager) GetShardPeers() []peer.ID {
 	return sub.topic.ListPeers()
 }
 
-// GetPeersForShard returns the list of peers in the given shard (mesh + heartbeat-seen peers).
-// This is used by the CRDT PeerMonitor stub so allocations reflect the full shard membership,
-// not just the gossipsub mesh (which is typically a small subset of the topic subscribers).
 func (sm *ShardManager) GetPeersForShard(shardID string) []peer.ID {
 	sm.mu.RLock()
 	sub, exists := sm.shardSubs[shardID]
@@ -132,7 +122,6 @@ func (sm *ShardManager) GetPeersForShard(shardID string) []peer.ID {
 	return all
 }
 
-// GetShardPeerCount returns the total peer count for a specific shard (including self when we are in that shard).
 func (sm *ShardManager) GetShardPeerCount(shardID string) int {
 	sm.mu.RLock()
 	currentShard := sm.currentShard
@@ -150,8 +139,6 @@ func (sm *ShardManager) GetShardPeerCount(shardID string) int {
 	return n
 }
 
-// getSiblingShard returns the sibling shard ID (same parent, other branch). E.g. "0"→"1", "010"→"011".
-// Empty shard has no sibling; returns "".
 func getSiblingShard(shardID string) string {
 	if shardID == "" {
 		return ""
@@ -162,7 +149,6 @@ func getSiblingShard(shardID string) string {
 	return parent + string(byte(otherBit))
 }
 
-// generateDeeperShards generates all possible deeper shards in the branch starting from the current shard.
 func (sm *ShardManager) generateDeeperShards(currentShard string, maxDepth int) []string {
 	if maxDepth <= 0 {
 		return nil
@@ -190,7 +176,6 @@ func (sm *ShardManager) generateDeeperShards(currentShard string, maxDepth int) 
 	return shards
 }
 
-// probeShard checks how many peers are in a shard without becoming a member.
 func (sm *ShardManager) probeShard(shardID string, probeTimeout time.Duration) int {
 	sm.mu.RLock()
 	sub, alreadyJoined := sm.shardSubs[shardID]
@@ -202,10 +187,7 @@ func (sm *ShardManager) probeShard(shardID string, probeTimeout time.Duration) i
 	return sm.probeShardSilently(shardID, probeTimeout)
 }
 
-// probeShardSilently subscribes to a shard topic to observe the mesh, then unsubscribes.
-// Reuses a cached topic handle if available (ps.Join returns "topic already exists" for open topics).
 func (sm *ShardManager) probeShardSilently(shardID string, probeTimeout time.Duration) int {
-	// Reuse cached topic handle; ps.Join fails with "topic already exists" if the topic is still open.
 	sm.mu.Lock()
 	t, fromCache := sm.probeTopicCache[shardID]
 	if fromCache {
@@ -268,7 +250,6 @@ func (sm *ShardManager) probeShardSilently(shardID string, probeTimeout time.Dur
 	return n
 }
 
-// getProbePeerCount returns peer count for a shard when probing (observer or mesh).
 func (sm *ShardManager) getProbePeerCount(shardID string, topic interface{ ListPeers() []peer.ID }, activeWindow time.Duration) int {
 	meshPeers := topic.ListPeers()
 	sm.mu.RLock()

@@ -40,7 +40,6 @@ type IPFSDHTAdapter struct {
 	intervalMu      sync.RWMutex
 }
 
-// Ensure IPFSDHTAdapter implements routing.Routing
 var _ routing.Routing = (*IPFSDHTAdapter)(nil)
 
 // NewIPFSDHTAdapter creates a new DHT adapter that uses IPFS's DHT
@@ -203,7 +202,6 @@ func (a *IPFSDHTAdapter) FindProvidersAsync(ctx context.Context, key cid.Cid, co
 	return ch
 }
 
-// isTransientError checks if an error is transient and should be retried
 func (a *IPFSDHTAdapter) isTransientError(err error) bool {
 	if err == nil {
 		return false
@@ -365,7 +363,7 @@ func (a *IPFSDHTAdapter) FindPeer(ctx context.Context, id peer.ID) (peer.AddrInf
 // PutValue implements routing.ValueStore.
 func (a *IPFSDHTAdapter) PutValue(ctx context.Context, key string, val []byte, opts ...routing.Option) error {
 	// IPFS API dht/put
-	// Note: We ignore opts for now
+	// opts ignored for now
 	return a.api.Request("dht/put", key).Body(strings.NewReader(string(val))).Exec(ctx, nil)
 }
 
@@ -385,11 +383,8 @@ func (a *IPFSDHTAdapter) GetValue(ctx context.Context, key string, opts ...routi
 	return result.Values[0], nil
 }
 
-// SearchValue implements routing.ValueStore.
+// SearchValue implements routing.ValueStore. Wraps GetValue in a channel for compatibility.
 func (a *IPFSDHTAdapter) SearchValue(ctx context.Context, key string, opts ...routing.Option) (<-chan []byte, error) {
-	// IPFS API doesn't easily expose streaming search values via HTTP client in this way,
-	// but GetValue (dht/get) returns the best value.
-	// We'll just return a channel with the result of GetValue for compatibility.
 	out := make(chan []byte, 1)
 	go func() {
 		defer close(out)
@@ -404,8 +399,7 @@ func (a *IPFSDHTAdapter) SearchValue(ctx context.Context, key string, opts ...ro
 	return out, nil
 }
 
-// Bootstrap implements routing.Routing.
+// Bootstrap implements routing.Routing. IPFS daemon bootstraps itself.
 func (a *IPFSDHTAdapter) Bootstrap(ctx context.Context) error {
-	// IPFS daemon handles its own bootstrap. We can just return nil.
 	return nil
 }

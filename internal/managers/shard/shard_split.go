@@ -14,7 +14,6 @@ import (
 	"dlockss/internal/config"
 )
 
-// calculateXORDistance computes the XOR distance between a peer ID and a CID.
 func calculateXORDistance(peerID peer.ID, contentCID cid.Cid) (*big.Int, error) {
 	peerIDBytes := []byte(peerID)
 	var peerHash []byte
@@ -49,13 +48,9 @@ func calculateXORDistance(peerID peer.ID, contentCID cid.Cid) (*big.Int, error) 
 	return new(big.Int).SetBytes(xorResult), nil
 }
 
-// probeTimeoutForSplitChild is used when probing the target child shard before splitting.
 const probeTimeoutForSplitChild = 6 * time.Second
 
-// checkAndSplitIfNeeded implements "split only at the limit" (see docs/SHARDING_ALGORITHM.md).
-// Split when current shard peer count >= MaxPeersPerShard. New child shards are created only
-// by splitting: we move to the child only if (1) the child already has >= 1 peer (join existing)
-// or (2) the child is empty and the parent has >= 2*MinPeersPerShard (create child by splitting).
+// checkAndSplitIfNeeded splits when peer count >= MaxPeersPerShard; move to child if join existing or parent >= 2*MinPeersPerShard.
 func (sm *ShardManager) checkAndSplitIfNeeded() {
 	sm.mu.Lock()
 	now := time.Now()
@@ -71,14 +66,11 @@ func (sm *ShardManager) checkAndSplitIfNeeded() {
 	sm.lastPeerCheck = now
 	sm.mu.Unlock()
 
-	// Use mesh count only for split: getShardPeerCount() can overcount (seenPeers includes
-	// nodes that left the shard for up to 350s), which would split e.g. 11 with 3 nodes.
 	peerCount := sm.getShardPeerCountForSplit()
 	if peerCount < config.MaxPeersPerShard {
 		return
 	}
 
-	// Only at the limit: consider splitting.
 	estimatedPerChild := peerCount / 2
 	if estimatedPerChild < config.MinPeersPerShard {
 		if config.VerboseLogging {
@@ -88,14 +80,10 @@ func (sm *ShardManager) checkAndSplitIfNeeded() {
 		return
 	}
 
-	// Parent is at limit; after everyone splits, the two children will have total = peerCount >= MinPeersAcrossSiblings.
-	// We do NOT require (child+1)+sibling >= MinPeersAcrossSiblings here: that would deadlock (first mover needs sibling to have 9, but sibling needs us to have 9).
-	// Merge is prevented when sibling has 0 (split in progress) and by merge cooldown after we move.
 	nextDepth := len(currentShard) + 1
 	targetChild := common.GetBinaryPrefix(sm.h.ID().String(), nextDepth)
 	childPeerCount := sm.probeShard(targetChild, probeTimeoutForSplitChild)
 
-	// Create new child only through splitting: either join existing branch or parent can spare.
 	canJoinExisting := childPeerCount >= 1
 	minParentToCreate := 2 * config.MinPeersPerShard
 	canCreateChild := childPeerCount == 0 && peerCount >= minParentToCreate
@@ -113,10 +101,7 @@ func (sm *ShardManager) checkAndSplitIfNeeded() {
 	sm.moveToShard(currentShard, targetChild, false)
 }
 
-// announceSplit publishes a SPLIT announcement on the parent shard topic so that
-// other nodes in the parent know child shards exist. Without this, discovery uses
-// probeShardSilently which causes "phantom peer" false positives when multiple nodes
-// simultaneously subscribe to a child topic to probe it.
+// announceSplit publishes SPLIT:child0:child1 on the parent topic.
 func (sm *ShardManager) announceSplit(parentShard string, targetChild string) {
 	sibling := getSiblingShard(targetChild)
 	sm.mu.RLock()
@@ -130,8 +115,7 @@ func (sm *ShardManager) announceSplit(parentShard string, targetChild string) {
 	log.Printf("[Sharding] Announced split on shard %s: children %s, %s", parentShard, targetChild, sibling)
 }
 
-// splitShard is used when the current shard is at the split limit; it moves this node to its target child.
-// Callers must have already decided to split (checkAndSplitIfNeeded). Exposed for tests.
+// splitShard moves this node to its target child. For tests; normal path uses checkAndSplitIfNeeded.
 func (sm *ShardManager) splitShard() {
 	sm.mu.RLock()
 	currentShard := sm.currentShard

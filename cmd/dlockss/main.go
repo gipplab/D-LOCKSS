@@ -83,9 +83,7 @@ func main() {
 		log.Fatalf("[Fatal] Failed to create pubsub: %v", err)
 	}
 
-	// Initialize DHT for discovery (replacing mDNS)
-	// Note: This DHT is separate from the IPFS daemon's DHT. It is used solely for
-	// finding other D-LOCKSS nodes/monitors via the "dlockss-prod" rendezvous tag.
+	// DHT for discovery (separate from IPFS daemon; used for dlockss-prod rendezvous).
 	kademliaDHT, err := kaddht.New(ctx, h)
 	if err != nil {
 		log.Fatalf("[Fatal] Failed to create DHT: %v", err)

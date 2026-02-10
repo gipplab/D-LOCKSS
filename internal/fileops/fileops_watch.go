@@ -206,7 +206,7 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 							fileCount++
 
 							if !fp.TryEnqueue(path) {
-								log.Printf("[FileWatcher] Dropped file %s due to backpressure", path)
+								log.Printf("[FileWatcher] Dropped %s (backpressure)", path)
 							}
 							return nil
 						})
@@ -234,7 +234,7 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 
 				if shouldProcessFileEvent(path) {
 					if !fp.TryEnqueue(path) {
-						log.Printf("[FileWatcher] Dropped file %s due to backpressure", path)
+						log.Printf("[FileWatcher] Dropped %s (backpressure)", path)
 					}
 				}
 			}

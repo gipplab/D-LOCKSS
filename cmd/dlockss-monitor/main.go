@@ -30,7 +30,7 @@ func main() {
 	monitor := NewMonitor()
 	h, err := startLibP2P(ctx, monitor)
 	if err != nil {
-		log.Fatalf("Critical P2P Error: %v", err)
+		log.Fatalf("P2P error: %v", err)
 	}
 	defer h.Close()
 

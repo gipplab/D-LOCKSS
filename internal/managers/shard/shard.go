@@ -61,8 +61,7 @@ type ShardManager struct {
 	seenPeers          map[string]map[peer.ID]time.Time
 	observerOnlyShards map[string]struct{}
 	knownChildShards   map[string]time.Time
-	// orphanHandoffSent tracks when we sent a ReplicationRequest to a child shard for a file we're about to orphan-unpin, so we extend grace before actually unpinning.
-	orphanHandoffSent map[string]map[string]time.Time
+	orphanHandoffSent  map[string]map[string]time.Time
 }
 
 func NewShardManager(
@@ -132,8 +131,7 @@ func (sm *ShardManager) Close() {
 	sm.probeTopicCache = make(map[string]*pubsub.Topic)
 }
 
-// moveToShard atomically switches from one shard to another: join new, migrate pins, leave old.
-// Used by split (parent→child), discovery (parent→existing child), and merge (child→parent).
+// moveToShard switches shard: join new, migrate pins, leave old. Used by split, discovery, merge.
 func (sm *ShardManager) moveToShard(fromShard, toShard string, isMergeUp bool) {
 	sm.mu.Lock()
 	if sm.currentShard != fromShard {
@@ -143,7 +141,7 @@ func (sm *ShardManager) moveToShard(fromShard, toShard string, isMergeUp bool) {
 	sm.currentShard = toShard
 	sm.msgCounter = 0
 	sm.knownChildShards = make(map[string]time.Time)
-	sm.lastPeerCheck = time.Now() // reset so ShardPeerCheckInterval cooldown starts fresh (prevents premature splits from probe-inflated mesh)
+	sm.lastPeerCheck = time.Now()
 	if isMergeUp {
 		sm.lastMergeUpTime = time.Now()
 	} else {
@@ -165,10 +163,6 @@ func (sm *ShardManager) moveToShard(fromShard, toShard string, isMergeUp bool) {
 		current := sm.currentShard
 		sm.mu.RUnlock()
 		if current != toShard {
-			// Another transition happened. If the current shard is a child of
-			// toShard (e.g., we moved 1→00→01 and current is now "01" while
-			// toShard is "00"), migrate directly from fromShard to current so
-			// pins aren't lost.
 			if strings.HasPrefix(current, toShard) {
 				log.Printf("[Sharding] Migration redirect: %s → %s (current shard moved past %s)", fromShard, current, toShard)
 				if err := sm.clusterMgr.MigratePins(sm.ctx, fromShard, current); err != nil {

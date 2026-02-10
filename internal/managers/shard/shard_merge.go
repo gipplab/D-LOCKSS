@@ -8,22 +8,17 @@ import (
 )
 
 const (
-	// mergeUpCooldown: after moving deeper (split or discovery), wait this long before considering merge.
-	// Must be long enough for other nodes in the parent to split (e.g. ShardPeerCheckInterval * (MaxPeersPerShard/2)).
 	mergeUpCooldown   = 15 * time.Minute
 	probeTimeoutMerge = 3 * time.Second
 )
 
-// checkAndMergeUpIfAlone implements "merge only at the limit" (see docs/SHARDING_ALGORITHM.md).
-// When (my shard + sibling) < MinPeersAcrossSiblings, merge up to the parent. Applies at any
-// depth including "0"/"1" → root (root is a normal parent).
+// checkAndMergeUpIfAlone merges to parent when (my shard + sibling) < MinPeersAcrossSiblings.
 func (sm *ShardManager) checkAndMergeUpIfAlone() {
 	sm.mu.RLock()
 	currentShard := sm.currentShard
 	lastMove := sm.lastMoveToDeeperShard
 	sm.mu.RUnlock()
 
-	// At root there is no parent to merge into.
 	if currentShard == "" {
 		return
 	}
@@ -46,7 +41,6 @@ func (sm *ShardManager) checkAndMergeUpIfAlone() {
 	siblingPeerCount := sm.probeShard(siblingShard, probeTimeoutMerge)
 	siblingsTotal := currentPeerCount + siblingPeerCount
 
-	// Never merge when sibling has 0 nodes: split is in progress; more nodes will move to the sibling.
 	if siblingPeerCount == 0 {
 		if config.VerboseLogging {
 			log.Printf("[ShardMergeUp] Shard %s has %d peers, sibling %s has 0 (split in progress), not merging",
@@ -55,7 +49,6 @@ func (sm *ShardManager) checkAndMergeUpIfAlone() {
 		return
 	}
 
-	// Merge only at the limit: when sibling pair is below threshold.
 	if siblingsTotal >= config.MinPeersAcrossSiblings {
 		if config.VerboseLogging {
 			log.Printf("[ShardMergeUp] Shard %s has %d peers, sibling %s has %d (total %d >= %d), not merging",

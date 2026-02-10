@@ -14,34 +14,25 @@ import (
 	"github.com/multiformats/go-multihash"
 )
 
-// ResearchObject is the fundamental unit of storage in the D-LOCKSS network.
-// It wraps content in a structured format with metadata references and validation hints.
-// Pinning a ResearchObject (ManifestCID) recursively pins the underlying PayloadCID.
+// ResearchObject is the unit of storage: metadata, payload link, and validation hints.
 type ResearchObject struct {
-	// --- Metadata (Context) ---
 	MetadataRef string  `cbor:"meta_ref"`    // DOI or URL to external metadata
 	IngestedBy  peer.ID `cbor:"ingester_id"` // PeerID of the node that ingested this
 	Signature   []byte  `cbor:"sig"`         // Cryptographic signature
 	Timestamp   int64   `cbor:"ts"`          // Unix timestamp of ingestion
 
-	// --- The Content (Redundancy Target) ---
-	// Pinning 'ResearchObject' recursively pins this CID.
-	Payload cid.Cid `cbor:"payload"` // Link to the raw UnixFS DAG containing the actual file data
+	Payload cid.Cid `cbor:"payload"` // Link to raw UnixFS DAG (file data)
 
-	// --- Validation Hints ---
-	TotalSize uint64 `cbor:"size"` // Total size in bytes (used for rate limiting and liar detection)
+	TotalSize uint64 `cbor:"size"` // Total size in bytes
 }
 
-// ManifestCID returns the CID of this ResearchObject when serialized.
-// This is the "root" CID that should be pinned recursively.
+// ManifestCID returns the root CID to pin recursively.
 func (ro *ResearchObject) ManifestCID() (cid.Cid, error) {
 	// Serialize to CBOR
 	data, err := ro.MarshalCBOR()
 	if err != nil {
 		return cid.Cid{}, err
 	}
-
-	// Create CID from CBOR bytes
 	hash := sha256.Sum256(data)
 	mh, err := multihash.Sum(hash[:], multihash.SHA2_256, -1)
 	if err != nil {
@@ -56,8 +47,7 @@ func (ro *ResearchObject) MarshalCBOR() ([]byte, error) {
 	return ro.marshalCBOR(true)
 }
 
-// MarshalCBORForSigning serializes the ResearchObject to CBOR without the signature field.
-// This is the canonical byte representation that should be signed and verified.
+// MarshalCBORForSigning returns CBOR without the signature (canonical bytes for signing).
 func (ro *ResearchObject) MarshalCBORForSigning() ([]byte, error) {
 	return ro.marshalCBOR(false)
 }

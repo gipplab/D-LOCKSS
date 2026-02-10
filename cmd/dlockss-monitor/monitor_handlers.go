@@ -60,11 +60,7 @@ func (m *Monitor) handleIngestMessage(im *schema.IngestMessage, senderID peer.ID
 		m.manifestReplication[manifestCIDStr] = make(map[string]time.Time)
 	}
 	m.manifestReplication[manifestCIDStr][peerIDStr] = now
-	// Track observed shard for this manifest; prefer deeper shards only within the
-	// SAME subtree (child of the current observed shard). This prevents stale
-	// announcements from sibling subtrees (e.g. a node in shard 10 that hasn't
-	// resharded yet announcing a file that belongs to shard 0) from corrupting the
-	// shard assignment and making the monitor count replicas in the wrong shard.
+	// Prefer deeper shard in same subtree; ignore sibling-shard announcements.
 	if existing, ok := m.manifestShard[manifestCIDStr]; !ok || (len(shardID) > len(existing) && strings.HasPrefix(shardID, existing)) {
 		m.manifestShard[manifestCIDStr] = shardID
 	}

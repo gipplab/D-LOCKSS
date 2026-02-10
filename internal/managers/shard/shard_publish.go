@@ -11,7 +11,6 @@ import (
 	"dlockss/internal/common"
 )
 
-// AnnouncePinned publishes PINNED:<manifestCID> to the current shard topic immediately.
 func (sm *ShardManager) AnnouncePinned(manifestCID string) {
 	if manifestCID == "" {
 		return
@@ -27,7 +26,6 @@ func (sm *ShardManager) AnnouncePinned(manifestCID string) {
 	_ = sub.topic.Publish(sm.ctx, msg)
 }
 
-// PublishToShard publishes a message to a specific shard topic.
 func (sm *ShardManager) PublishToShard(shardID, msg string) {
 	sm.mu.RLock()
 	sub, exists := sm.shardSubs[shardID]
@@ -48,9 +46,7 @@ func (sm *ShardManager) PublishToShardCBOR(data []byte, shardID string) {
 	}
 }
 
-// PublishIngestMessageToCurrentAndChildIfSplit publishes the given CBOR-encoded IngestMessage to the
-// current shard and, if the current shard has active children (split in progress), also to the child
-// topic that matches the payload's target shard at depth+1, so nodes that already moved still see it.
+// PublishIngestMessageToCurrentAndChildIfSplit publishes to current shard and to target child if split in progress.
 func (sm *ShardManager) PublishIngestMessageToCurrentAndChildIfSplit(data []byte, currentShard string, payloadCIDStr string) {
 	sm.PublishToShardCBOR(data, currentShard)
 
@@ -78,9 +74,7 @@ func (sm *ShardManager) PublishIngestMessageToCurrentAndChildIfSplit(data []byte
 	}
 }
 
-// ResolveTargetShardForCustodial returns the shard to use for custodial injection. If the nominal
-// target (a parent shard) has active children (split in progress), returns the child shard that
-// matches the payload at depth+1; otherwise returns the given nominalTargetShard.
+// ResolveTargetShardForCustodial returns child shard if parent has active children, else nominalTargetShard.
 func (sm *ShardManager) ResolveTargetShardForCustodial(nominalTargetShard string, payloadCIDStr string) string {
 	child0 := nominalTargetShard + "0"
 	child1 := nominalTargetShard + "1"
@@ -110,7 +104,6 @@ func (sm *ShardManager) AmIResponsibleFor(key string) bool {
 	return prefix == sm.currentShard
 }
 
-// PinToCluster pins a CID to the current shard's cluster state.
 func (sm *ShardManager) PinToCluster(ctx context.Context, c cid.Cid) error {
 	sm.mu.RLock()
 	currentShard := sm.currentShard
@@ -118,12 +111,10 @@ func (sm *ShardManager) PinToCluster(ctx context.Context, c cid.Cid) error {
 	return sm.clusterMgr.Pin(ctx, currentShard, c, -1, -1)
 }
 
-// EnsureClusterForShard ensures the embedded cluster for the given shard exists.
 func (sm *ShardManager) EnsureClusterForShard(ctx context.Context, shardID string) error {
 	return sm.clusterMgr.JoinShard(ctx, shardID, nil)
 }
 
-// PinToShard pins a CID to a specific shard's cluster state.
 func (sm *ShardManager) PinToShard(ctx context.Context, shardID string, c cid.Cid) error {
 	return sm.clusterMgr.Pin(ctx, shardID, c, -1, -1)
 }

@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-D-LOCKSS (Distributed Lots of Copies Keep Stuff Safe) is a decentralized preservation network that ensures long-term data durability through cooperative replication. It functions as a "Networked RAID", where independent nodes collaboratively maintain a target replication level for datasets.
+D-LOCKSS (Distributed Lots of Copies Keep Stuff Safe) is a decentralized preservation network for long-term data durability through cooperative replication. It functions as a "Networked RAID", where independent nodes collaboratively maintain a target replication level for datasets.
 
 The protocol is built on top of the **IPFS** (InterPlanetary File System) and **libp2p** stack, utilizing content-addressing, peer-to-peer messaging (GossipSub), distributed hash tables (DHT), and **IPFS Cluster CRDTs** for state consensus.
 
@@ -26,7 +26,7 @@ The protocol is built on top of the **IPFS** (InterPlanetary File System) and **
 
 ### 2.1 Topic Naming
 
-The network is partitioned into PubSub topics to ensure scalability:
+The network is partitioned into PubSub topics for scalability:
 
 *   **Shard Topics (membership + protocol)**: `dlockss-creative-commons-shard-<prefix>`
     *   Examples: `...-shard-`, `...-shard-0`, `...-shard-1`, `...-shard-01`.

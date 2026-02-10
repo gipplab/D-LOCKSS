@@ -1,6 +1,6 @@
 // Package clusters: embedded RPC stubs so ipfs-cluster CRDT consensus can run
 // without a full cluster daemon. The CRDT uses gorpc to call PinTracker and
-// PeerMonitor; we provide no-op/local stubs and set the client on the consensus.
+// PeerMonitor; no-op stubs, client set on consensus.
 package clusters
 
 import (
@@ -92,10 +92,7 @@ func newEmbeddedRPCClient(h host.Host, shardID string, getPeers func(shardID str
 	return rpc.NewClientWithServer(h, version.RPCProtocol, srv, rpc.WithMultiStreamBufferSize(rpcStreamBufferSize))
 }
 
-// setConsensusRPCClient sets the gorpc client on the CRDT consensus so
-// PutHook, DeleteHook, and Peers() do not use a nil client. Pass the result
-// of crdt.New(), the same host, shardID, optional getPeers for shard-aware PeerMonitor,
-// and optional onTrack to trigger PinTracker sync on Track/Untrack.
+// setConsensusRPCClient wires the gorpc client to CRDT. getPeers and onTrack are optional.
 func setConsensusRPCClient(consensus interface{ SetClient(*rpc.Client) }, h host.Host, shardID string, getPeers func(string) []peer.ID, onTrack func(string)) {
 	client := newEmbeddedRPCClient(h, shardID, getPeers, onTrack)
 	consensus.SetClient(client)

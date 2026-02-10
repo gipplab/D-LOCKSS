@@ -10,9 +10,7 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 )
 
-// JoinShard increments the reference count for a shard topic.
-// If the topic is not currently subscribed, it joins and starts a read loop.
-// If we're already in this shard as observer only (JoinShardAsObserver), we "promote" to full member: publish JOIN+HEARTBEAT and stop being observer.
+// JoinShard subscribes to the shard topic (or increments refcount). Promotes observer to full member if already subscribed.
 func (sm *ShardManager) JoinShard(shardID string) {
 	sm.mu.Lock()
 
@@ -22,8 +20,6 @@ func (sm *ShardManager) JoinShard(shardID string) {
 			// Promote observer to full member: we're already subscribed, just announce so we count as a member.
 			sub.observerOnly = false
 			delete(sm.observerOnlyShards, shardID)
-			// Capture topic reference before releasing lock so we can safely publish
-			// even if a concurrent LeaveShard removes the subscription.
 			topic := sub.topic
 			sm.mu.Unlock()
 			joinMsg := []byte("JOIN:" + sm.h.ID().String())
@@ -168,8 +164,7 @@ func (sm *ShardManager) LeaveShardAsObserver(shardID string) {
 	log.Printf("[Sharding] Left shard %s (observer)", shardID)
 }
 
-// LeaveShard decrements the reference count for a shard topic.
-// If the count reaches zero, it unsubscribes and closes the topic.
+// LeaveShard decrements refcount; unsubscribes and closes topic when zero.
 func (sm *ShardManager) LeaveShard(shardID string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()

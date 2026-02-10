@@ -81,7 +81,7 @@ func LogConfiguration() {
 	log.Printf("[Config] Trust Store Path: %s", TrustStorePath)
 	log.Printf("[Config] Signature Mode: %s", SignatureMode)
 	if SignatureMode != "off" && SignatureMode != "warn" && SignatureMode != "strict" {
-		log.Printf("[Config] Warning: unknown SignatureMode %q; treating as strict (fail closed)", SignatureMode)
+		log.Printf("[Config] Unknown SignatureMode %q; using strict", SignatureMode)
 	}
 	log.Printf("[Config] Signature Max Age: %v", SignatureMaxAge)
 	log.Printf("[Config] Use PubSub for Replication: %v (min shard peers: %d)", UsePubsubForReplication, MinShardPeersForPubsubOnly)
@@ -117,20 +117,16 @@ func LogConfiguration() {
 }
 
 var (
-	// ControlTopicName removed in favor of Tourist Pattern (ephemeral shard joining)
-	DiscoveryServiceTag = getEnvString("DLOCKSS_DISCOVERY_TAG", "dlockss-prod")
-	FileWatchFolder     = getEnvString("DLOCKSS_DATA_DIR", "./data")
-	MinReplication      = getEnvInt("DLOCKSS_MIN_REPLICATION", 5)
-	MaxReplication      = getEnvInt("DLOCKSS_MAX_REPLICATION", 10)
-	CheckInterval       = getEnvDuration("DLOCKSS_CHECK_INTERVAL", 1*time.Minute)
-	// Shard splitting tied to replication requirements.
-	// Do not split until MaxPeersPerShard (12) nodes are reached; only then may a shard split.
-	// MinPeersAcrossSiblings: only join a deeper shard (or stay split) if this shard + sibling total >= 10; otherwise remerge to guarantee replication.
-	MaxPeersPerShard               = getEnvInt("DLOCKSS_MAX_PEERS_PER_SHARD", 12)                       // Split when shard has at least this many peers (default: 12)
-	MinPeersPerShard               = getEnvInt("DLOCKSS_MIN_PEERS_PER_SHARD", 6)                        // Don't split if result would be below this many peers per child (default: 6)
-	MinPeersAcrossSiblings         = getEnvInt("DLOCKSS_MIN_PEERS_ACROSS_SIBLINGS", 10)                 // Join deeper / stay split only if shard+sibling total >= this; else remerge (default: 10)
-	ShardPeerCheckInterval         = getEnvDuration("DLOCKSS_SHARD_PEER_CHECK_INTERVAL", 2*time.Minute) // How often to check peer count
-	ShardDiscoveryInterval         = getEnvDuration("DLOCKSS_SHARD_DISCOVERY_INTERVAL", 5*time.Minute)  // How often to check for deeper shards when idle
+	DiscoveryServiceTag            = getEnvString("DLOCKSS_DISCOVERY_TAG", "dlockss-prod")
+	FileWatchFolder                = getEnvString("DLOCKSS_DATA_DIR", "./data")
+	MinReplication                 = getEnvInt("DLOCKSS_MIN_REPLICATION", 5)
+	MaxReplication                 = getEnvInt("DLOCKSS_MAX_REPLICATION", 10)
+	CheckInterval                  = getEnvDuration("DLOCKSS_CHECK_INTERVAL", 1*time.Minute)
+	MaxPeersPerShard               = getEnvInt("DLOCKSS_MAX_PEERS_PER_SHARD", 12)
+	MinPeersPerShard               = getEnvInt("DLOCKSS_MIN_PEERS_PER_SHARD", 6)
+	MinPeersAcrossSiblings         = getEnvInt("DLOCKSS_MIN_PEERS_ACROSS_SIBLINGS", 10)
+	ShardPeerCheckInterval         = getEnvDuration("DLOCKSS_SHARD_PEER_CHECK_INTERVAL", 2*time.Minute)
+	ShardDiscoveryInterval         = getEnvDuration("DLOCKSS_SHARD_DISCOVERY_INTERVAL", 5*time.Minute)
 	MaxConcurrentReplicationChecks = getEnvInt("DLOCKSS_MAX_CONCURRENT_CHECKS", 5)
 	RateLimitWindow                = getEnvDuration("DLOCKSS_RATE_LIMIT_WINDOW", 1*time.Minute)
 	MaxMessagesPerWindow           = getEnvInt("DLOCKSS_MAX_MESSAGES_PER_WINDOW", 100)
@@ -143,44 +139,38 @@ var (
 	MetricsExportPath              = getEnvString("DLOCKSS_METRICS_EXPORT", "")
 	BadBitsPath                    = getEnvString("DLOCKSS_BADBITS_PATH", "badBits.csv")
 	ShardOverlapDuration           = getEnvDuration("DLOCKSS_SHARD_OVERLAP_DURATION", 2*time.Minute)
-	ReplicationVerificationDelay   = getEnvDuration("DLOCKSS_REPLICATION_VERIFICATION_DELAY", 2*time.Minute) // Grace period before verifying newly pinned files
+	ReplicationVerificationDelay   = getEnvDuration("DLOCKSS_REPLICATION_VERIFICATION_DELAY", 2*time.Minute)
 	DiskUsageHighWaterMark         = getEnvFloat("DLOCKSS_DISK_USAGE_HIGH_WATER_MARK", 90.0)
 	IPFSNodeAddress                = getEnvString("DLOCKSS_IPFS_NODE", "/ip4/127.0.0.1/tcp/5001")
-	APIPort                        = getEnvInt("DLOCKSS_API_PORT", 5050)        // observability /metrics and /status
-	TrustMode                      = getEnvString("DLOCKSS_TRUST_MODE", "open") // open | allowlist
+	APIPort                        = getEnvInt("DLOCKSS_API_PORT", 5050) // observability /metrics and /status
+	TrustMode                      = getEnvString("DLOCKSS_TRUST_MODE", "open")
 	TrustStorePath                 = getEnvString("DLOCKSS_TRUST_STORE", "trusted_peers.json")
-	SignatureMode                  = getEnvString("DLOCKSS_SIGNATURE_MODE", "warn") // off | warn | strict
+	SignatureMode                  = getEnvString("DLOCKSS_SIGNATURE_MODE", "warn")
 	SignatureMaxAge                = getEnvDuration("DLOCKSS_SIGNATURE_MAX_AGE", 10*time.Minute)
-	UsePubsubForReplication        = getEnvBool("DLOCKSS_USE_PUBSUB_FOR_REPLICATION", true)            // Use pubsub peers first, DHT as fallback (avoids expensive DHT queries since nodes already know each other)
-	MinShardPeersForPubsubOnly     = getEnvInt("DLOCKSS_MIN_SHARD_PEERS_PUBSUB_ONLY", 5)               // Only use pubsub-only if shard has at least this many peers (otherwise query DHT for additional providers)
-	ReplicationCacheTTL            = getEnvDuration("DLOCKSS_REPLICATION_CACHE_TTL", 5*time.Minute)    // How long to cache replication counts
-	AutoReplicationEnabled         = getEnvBool("DLOCKSS_AUTO_REPLICATION_ENABLED", true)              // Enable automatic replication on ReplicationRequest
-	AutoReplicationTimeout         = getEnvDuration("DLOCKSS_AUTO_REPLICATION_TIMEOUT", 5*time.Minute) // Timeout for fetching files during replication
-	CRDTOpTimeout                  = getEnvDuration("DLOCKSS_CRDT_OP_TIMEOUT", 10*time.Minute)         // Timeout for cluster/CRDT operations (LogPin, etc.); use a longer value if "context deadline exceeded" appears in CRDT logs
+	UsePubsubForReplication        = getEnvBool("DLOCKSS_USE_PUBSUB_FOR_REPLICATION", true)
+	MinShardPeersForPubsubOnly     = getEnvInt("DLOCKSS_MIN_SHARD_PEERS_PUBSUB_ONLY", 5)
+	ReplicationCacheTTL            = getEnvDuration("DLOCKSS_REPLICATION_CACHE_TTL", 5*time.Minute)
+	AutoReplicationEnabled         = getEnvBool("DLOCKSS_AUTO_REPLICATION_ENABLED", true)
+	AutoReplicationTimeout         = getEnvDuration("DLOCKSS_AUTO_REPLICATION_TIMEOUT", 5*time.Minute)
+	CRDTOpTimeout                  = getEnvDuration("DLOCKSS_CRDT_OP_TIMEOUT", 10*time.Minute)
 
-	// File operation timeouts and delays
-	FileImportTimeout           = getEnvDuration("DLOCKSS_FILE_IMPORT_TIMEOUT", 2*time.Minute)          // Timeout for importing files to IPFS
-	DHTProvideTimeout           = getEnvDuration("DLOCKSS_DHT_PROVIDE_TIMEOUT", 60*time.Second)         // Timeout for providing files to DHT (increased to account for retries)
-	FileProcessingDelay         = getEnvDuration("DLOCKSS_FILE_PROCESSING_DELAY", 100*time.Millisecond) // Delay before processing new files
-	MaxConcurrentFileProcessing = getEnvInt("DLOCKSS_MAX_CONCURRENT_FILE_PROCESSING", 5)                // Maximum number of files processed concurrently
+	FileImportTimeout           = getEnvDuration("DLOCKSS_FILE_IMPORT_TIMEOUT", 2*time.Minute)
+	DHTProvideTimeout           = getEnvDuration("DLOCKSS_DHT_PROVIDE_TIMEOUT", 60*time.Second)
+	FileProcessingDelay         = getEnvDuration("DLOCKSS_FILE_PROCESSING_DELAY", 100*time.Millisecond)
+	MaxConcurrentFileProcessing = getEnvInt("DLOCKSS_MAX_CONCURRENT_FILE_PROCESSING", 5)
 
-	// Replication timeouts
-	DHTQueryTimeout = getEnvDuration("DLOCKSS_DHT_QUERY_TIMEOUT", 2*time.Minute) // Timeout for DHT queries during replication checks
+	DHTQueryTimeout = getEnvDuration("DLOCKSS_DHT_QUERY_TIMEOUT", 2*time.Minute)
 
-	// Reshard configuration
-	ReshardDelay = getEnvDuration("DLOCKSS_RESHARD_DELAY", 5*time.Second) // Delay after split before starting reshard pass
+	ReshardDelay = getEnvDuration("DLOCKSS_RESHARD_DELAY", 5*time.Second)
 
-	// PinReannounceInterval: how often to re-announce PINNED on the shard topic so the monitor (and late-joining nodes) see replication. Should be less than monitor's ReplicationAnnounceTTL (~350s).
 	PinReannounceInterval = getEnvDuration("DLOCKSS_PIN_REANNOUNCE_INTERVAL", 2*time.Minute)
 
-	// Cryptographic parameters
-	NonceSize           = getEnvInt("DLOCKSS_NONCE_SIZE", 16)                             // Size of cryptographic nonces in bytes
-	MinNonceSize        = getEnvInt("DLOCKSS_MIN_NONCE_SIZE", 8)                          // Minimum allowed nonce size
-	FutureSkewTolerance = getEnvDuration("DLOCKSS_FUTURE_SKEW_TOLERANCE", 30*time.Second) // Tolerance for future timestamps in signature verification
+	NonceSize           = getEnvInt("DLOCKSS_NONCE_SIZE", 16)
+	MinNonceSize        = getEnvInt("DLOCKSS_MIN_NONCE_SIZE", 8)
+	FutureSkewTolerance = getEnvDuration("DLOCKSS_FUTURE_SKEW_TOLERANCE", 30*time.Second)
 
-	// Telemetry
-	TelemetryInterval    = getEnvDuration("DLOCKSS_TELEMETRY_INTERVAL", 30*time.Second) // How often to send telemetry
-	TelemetryIncludeCIDs = getEnvBool("DLOCKSS_TELEMETRY_INCLUDE_CIDS", false)          // Include full CID list in telemetry (disabled by default - monitor tracks via pubsub)
-	HeartbeatInterval    = getEnvDuration("DLOCKSS_HEARTBEAT_INTERVAL", 10*time.Second) // Heartbeat interval (default 10s; 0 = auto from ShardPeerCheckInterval/3, min 10s)
-	VerboseLogging       = getEnvBool("DLOCKSS_VERBOSE_LOGGING", false)                 // extra debug (shard discovery, split, metrics)
+	TelemetryInterval    = getEnvDuration("DLOCKSS_TELEMETRY_INTERVAL", 30*time.Second)
+	TelemetryIncludeCIDs = getEnvBool("DLOCKSS_TELEMETRY_INCLUDE_CIDS", false)
+	HeartbeatInterval    = getEnvDuration("DLOCKSS_HEARTBEAT_INTERVAL", 10*time.Second)
+	VerboseLogging       = getEnvBool("DLOCKSS_VERBOSE_LOGGING", false)
 )

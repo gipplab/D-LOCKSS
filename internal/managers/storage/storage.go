@@ -42,9 +42,7 @@ func NewStorageManager(dht common.DHTProvider, metrics *telemetry.MetricsManager
 	}
 }
 
-// GetNextFileToAnnounce returns the next file key to announce in a round-robin fashion.
-// Returns empty string if no files are pinned. Uses a stable sorted order so all pins
-// are reannounced regularly (e.g. within ReplicationAnnounceTTL).
+// GetNextFileToAnnounce returns next file key for round-robin PINNED announcements.
 func (sm *StorageManager) GetNextFileToAnnounce() string {
 	files := sm.pinnedFiles.All()
 	if len(files) == 0 {

@@ -6,7 +6,7 @@
 
 ## 1. Summary & Vision
 
-**D-LOCKSS** is a decentralized storage network designed to ensure the long-term preservation and authenticity of research data.
+**D-LOCKSS** is a decentralized storage network for long-term preservation and authenticity of research data.
 
 *   **Core Philosophy:** "Networked RAID." Just as RAID protects data across multiple hard drives, D-LOCKSS protects data across a distributed network of peers.
 *   **Authenticity:** Relies on Content Addressing (CIDs) to guarantee data integrity.
@@ -65,7 +65,7 @@ D-LOCKSS acts as a self-healing, sharded storage cluster using the IPFS/Libp2p s
 
 ### Key Components
 1.  **Shard Manager:** Dynamically splits responsibilities based on peer count to maintain scalability.
-2.  **Cluster Manager:** Manages embedded **IPFS Cluster** instances (one per shard) using **CRDTs** for state consensus. This ensures that all nodes in a shard automatically sync and pin the content assigned to that shard.
+2.  **Cluster Manager:** Manages embedded **IPFS Cluster** instances (one per shard) using **CRDTs** for state consensus; nodes in a shard sync and pin content assigned to that shard.
 3.  **File Watcher:** Monitors the data directory to automatically ingest content.
 4.  **Storage Monitor:** Protects nodes from disk exhaustion by rejecting custodial requests when full.
 5.  **BadBits Manager:** Enforces content blocking (e.g., DMCA) based on configured country codes.

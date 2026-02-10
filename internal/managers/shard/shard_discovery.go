@@ -13,15 +13,8 @@ const (
 	probeTimeoutDiscovery   = 6 * time.Second
 )
 
-// discoverAndMoveToDeeperShard discovers existing child shards that have nodes and joins the one
-// that matches this node's hash. New child shards are never created here—only by splitting.
-// We only join if after we move the sibling pair (child + sibling) would be >= MinPeersAcrossSiblings,
-// so we never trigger an immediate merge (no faulty split / faulty shard creation).
-//
-// To prevent phantom peers (multiple nodes simultaneously probing a child topic see each other
-// as real members), we only use the projected pair total (including parent peers) when children
-// were announced via a SPLIT message. Without SPLIT knowledge, we require the strict pair total
-// to meet the threshold, which prevents phantom-peer false positives.
+// discoverAndMoveToDeeperShard joins an existing child shard that matches this node's hash (children created only by split).
+// Join only if (child + sibling) would be >= MinPeersAcrossSiblings. Use projected pair total only when SPLIT was announced.
 func (sm *ShardManager) discoverAndMoveToDeeperShard() {
 	sm.mu.RLock()
 	currentShard := sm.currentShard
@@ -31,9 +24,6 @@ func (sm *ShardManager) discoverAndMoveToDeeperShard() {
 	targetChild := common.GetBinaryPrefix(sm.h.ID().String(), nextDepth)
 	siblingShard := getSiblingShard(targetChild)
 
-	// Check if children were announced via a SPLIT message (proof that a real split happened).
-	// This determines whether we can use the optimistic projected pair total or must rely
-	// on strict observed counts only.
 	sm.mu.RLock()
 	_, targetKnown := sm.knownChildShards[targetChild]
 	_, siblingKnown := sm.knownChildShards[siblingShard]
