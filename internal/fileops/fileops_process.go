@@ -59,7 +59,7 @@ func (fp *FileProcessor) processNewFile(path string) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), config.FileImportTimeout)
+	ctx, cancel := context.WithTimeout(fp.ctx, config.FileImportTimeout)
 	defer cancel()
 
 	log.Printf("[FileOps] Importing file to IPFS: %s", path)
@@ -250,6 +250,7 @@ func (fp *FileProcessor) announceResponsibleFile(manifestCID cid.Cid, manifestCI
 
 	if err := fp.SignProtocolMessage(&im); err != nil {
 		common.LogError("FileOps", "sign IngestMessage", manifestCIDStr, err)
+		return
 	}
 
 	b, err := im.MarshalCBOR()
@@ -258,7 +259,7 @@ func (fp *FileProcessor) announceResponsibleFile(manifestCID cid.Cid, manifestCI
 		return
 	}
 
-	fp.shardMgr.PublishToShardCBOR(b, currentShard)
+	fp.shardMgr.PublishIngestMessageToCurrentAndChildIfSplit(b, currentShard, payloadCIDStr)
 
 	provideCtx, provideCancel := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
 	go func() {
@@ -276,7 +277,8 @@ func (fp *FileProcessor) announceCustodialFile(manifestCID cid.Cid, manifestCIDS
 	if targetDepth == 0 {
 		targetDepth = 1
 	}
-	targetShard := common.TargetShardForPayload(payloadCIDStr, targetDepth)
+	nominalTarget := common.TargetShardForPayload(payloadCIDStr, targetDepth)
+	targetShard := fp.shardMgr.ResolveTargetShardForCustodial(nominalTarget, payloadCIDStr)
 
 	if targetShard == currentShard {
 		log.Printf("[Core] ERROR: Custodial path but target shard %s == current shard (invariant violation); skipping inject", targetShard)

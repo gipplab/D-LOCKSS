@@ -3,6 +3,7 @@ package shard
 import (
 	"context"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -59,6 +60,9 @@ type ShardManager struct {
 
 	seenPeers          map[string]map[peer.ID]time.Time
 	observerOnlyShards map[string]struct{}
+	knownChildShards   map[string]time.Time
+	// orphanHandoffSent tracks when we sent a ReplicationRequest to a child shard for a file we're about to orphan-unpin, so we extend grace before actually unpinning.
+	orphanHandoffSent map[string]map[string]time.Time
 }
 
 func NewShardManager(
@@ -89,6 +93,8 @@ func NewShardManager(
 		probeTopicCache:    make(map[string]*pubsub.Topic),
 		seenPeers:          make(map[string]map[peer.ID]time.Time),
 		observerOnlyShards: make(map[string]struct{}),
+		knownChildShards:   make(map[string]time.Time),
+		orphanHandoffSent:  make(map[string]map[string]time.Time),
 	}
 
 	if err := sm.clusterMgr.JoinShard(ctx, startShard, nil); err != nil {
@@ -116,7 +122,14 @@ func (sm *ShardManager) Close() {
 	for _, sub := range sm.shardSubs {
 		sub.cancel()
 		sub.sub.Cancel()
+		_ = sub.topic.Close()
 	}
+	sm.shardSubs = make(map[string]*shardSubscription)
+
+	for _, t := range sm.probeTopicCache {
+		_ = t.Close()
+	}
+	sm.probeTopicCache = make(map[string]*pubsub.Topic)
 }
 
 // moveToShard atomically switches from one shard to another: join new, migrate pins, leave old.
@@ -129,6 +142,8 @@ func (sm *ShardManager) moveToShard(fromShard, toShard string, isMergeUp bool) {
 	}
 	sm.currentShard = toShard
 	sm.msgCounter = 0
+	sm.knownChildShards = make(map[string]time.Time)
+	sm.lastPeerCheck = time.Now() // reset so ShardPeerCheckInterval cooldown starts fresh (prevents premature splits from probe-inflated mesh)
 	if isMergeUp {
 		sm.lastMergeUpTime = time.Now()
 	} else {
@@ -141,20 +156,60 @@ func (sm *ShardManager) moveToShard(fromShard, toShard string, isMergeUp bool) {
 		log.Printf("[Sharding] Failed to join cluster for shard %s: %v", toShard, err)
 	}
 	go func() {
-		time.Sleep(migratePinsFlushDelay)
+		select {
+		case <-sm.ctx.Done():
+			return
+		case <-time.After(migratePinsFlushDelay):
+		}
+		sm.mu.RLock()
+		current := sm.currentShard
+		sm.mu.RUnlock()
+		if current != toShard {
+			// Another transition happened. If the current shard is a child of
+			// toShard (e.g., we moved 1→00→01 and current is now "01" while
+			// toShard is "00"), migrate directly from fromShard to current so
+			// pins aren't lost.
+			if strings.HasPrefix(current, toShard) {
+				log.Printf("[Sharding] Migration redirect: %s → %s (current shard moved past %s)", fromShard, current, toShard)
+				if err := sm.clusterMgr.MigratePins(sm.ctx, fromShard, current); err != nil {
+					log.Printf("[Sharding] Migration failed %s → %s: %v", fromShard, current, err)
+				}
+			}
+			return
+		}
 		if err := sm.clusterMgr.MigratePins(sm.ctx, fromShard, toShard); err != nil {
 			log.Printf("[Sharding] Migration failed %s → %s: %v", fromShard, toShard, err)
 		}
 	}()
 	go func() {
-		time.Sleep(config.ShardOverlapDuration)
+		select {
+		case <-sm.ctx.Done():
+			return
+		case <-time.After(config.ShardOverlapDuration):
+		}
+		sm.mu.RLock()
+		current := sm.currentShard
+		sm.mu.RUnlock()
+		if current == fromShard {
+			return // we moved back to fromShard, don't leave it
+		}
 		sm.LeaveShard(fromShard)
 		if err := sm.clusterMgr.LeaveShard(fromShard); err != nil {
 			log.Printf("[Sharding] Failed to leave cluster %s: %v", fromShard, err)
 		}
 	}()
 	go func() {
-		time.Sleep(config.ReshardDelay)
+		select {
+		case <-sm.ctx.Done():
+			return
+		case <-time.After(config.ReshardDelay):
+		}
+		sm.mu.RLock()
+		current := sm.currentShard
+		sm.mu.RUnlock()
+		if current != toShard {
+			return // another transition happened, skip stale reshard
+		}
 		sm.RunReshardPass(fromShard, toShard)
 	}()
 }

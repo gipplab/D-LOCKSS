@@ -107,6 +107,7 @@ type Monitor struct {
 	nodeFiles           map[string]map[string]time.Time
 	manifestReplication map[string]map[string]time.Time
 	peerShardLastSeen   map[string]map[string]time.Time
+	manifestShard       map[string]string // manifest CID → observed shard (from PINNED/IngestMessage announcements)
 }
 
 type geoRequest struct {
@@ -133,6 +134,7 @@ func NewMonitor() *Monitor {
 		nodeFiles:           make(map[string]map[string]time.Time),
 		manifestReplication: make(map[string]map[string]time.Time),
 		peerShardLastSeen:   make(map[string]map[string]time.Time),
+		manifestShard:       make(map[string]string),
 	}
 	go m.geoWorker()
 	go m.runReplicationCleanup()

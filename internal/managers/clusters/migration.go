@@ -2,6 +2,7 @@ package clusters
 
 import (
 	"context"
+	"fmt"
 	"log"
 
 	"dlockss/internal/common"
@@ -17,8 +18,7 @@ func (cm *ClusterManager) MigratePins(ctx context.Context, sourceShardID, destSh
 	// 1. Get all pins from the source cluster (CRDT state)
 	pins, err := cm.ListPins(ctx, sourceShardID)
 	if err != nil {
-		log.Printf("[ClusterMigration] Source shard %s not found or error: %v", sourceShardID, err)
-		return nil
+		return fmt.Errorf("source shard %s not found or error: %w", sourceShardID, err)
 	}
 
 	allocations := make([]cid.Cid, 0, len(pins))
@@ -51,9 +51,11 @@ func (cm *ClusterManager) MigratePins(ctx context.Context, sourceShardID, destSh
 			continue
 		}
 
-		// 3. Pin to the new cluster
-		// We use default replication factors for now (-1).
-		if err := cm.Pin(ctx, destShardID, c, -1, -1); err != nil {
+		// 3. Pin to the new cluster with full replication (0,0 = no allocations).
+		// During migration, the shard is forming and has few peers. Using full
+		// replication ensures all nodes pin the file. The replication checker
+		// will add proper allocations once the shard stabilizes.
+		if err := cm.Pin(ctx, destShardID, c, 0, 0); err != nil {
 			log.Printf("[ClusterMigration] Failed to migrate pin %s: %v", c, err)
 			continue
 		}

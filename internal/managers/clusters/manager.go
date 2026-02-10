@@ -66,6 +66,7 @@ type ConsensusClient interface {
 	LogUnpin(ctx context.Context, pin api.Pin) error
 	State(ctx context.Context) (state.ReadOnly, error)
 	Peers(ctx context.Context) ([]peer.ID, error)
+	Shutdown(ctx context.Context) error
 }
 
 // EmbeddedCluster represents a single shard's consensus state (CRDT).
@@ -144,18 +145,16 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string, bootstr
 	}
 	// CRDT uses gorpc for PutHook/DeleteHook (PinTracker) and Peers() (PeerMonitor).
 	// Set an embedded RPC client with stub handlers so it never uses a nil client.
-	// When peerProvider is set, PeerMonitor returns real shard peers so allocations and GetPeerCount use shard membership.
-	var getPeers func(string) []peer.ID
-	if cm.peerProvider != nil {
-		getPeers = func(s string) []peer.ID {
-			cm.mu.RLock()
-			p := cm.peerProvider
-			cm.mu.RUnlock()
-			if p == nil {
-				return nil
-			}
-			return p.GetPeersForShard(s)
+	// getPeers reads cm.peerProvider at call time (not creation time) so clusters
+	// created before SetShardPeerProvider still get real shard peers for allocations.
+	getPeers := func(s string) []peer.ID {
+		cm.mu.RLock()
+		p := cm.peerProvider
+		cm.mu.RUnlock()
+		if p == nil {
+			return nil
 		}
+		return p.GetPeersForShard(s)
 	}
 	// On Track/Untrack (CRDT PutHook/DeleteHook), trigger immediate PinTracker sync for this shard.
 	onTrack := func(s string) { cm.TriggerSync(s) }
@@ -193,6 +192,7 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string, bootstr
 				}
 			}()
 		} else {
+			_ = topic.Close()
 			log.Printf("[Cluster] Warning: Failed to subscribe to signal topic %s: %v", topicName, err)
 		}
 	} else {
@@ -213,21 +213,41 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string, bootstr
 // LeaveShard gracefully shuts down the cluster for the given shard.
 func (cm *ClusterManager) LeaveShard(shardID string) error {
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
 	cluster, exists := cm.clusters[shardID]
 	if !exists {
+		cm.mu.Unlock()
 		return nil
 	}
+	delete(cm.clusters, shardID)
+	cm.mu.Unlock()
 
 	log.Printf("[Cluster] Shutting down embedded cluster for shard %s...", shardID)
 	if cluster.PinTracker != nil {
 		cluster.PinTracker.Stop()
 	}
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer shutCancel()
+	if err := cluster.Consensus.Shutdown(shutCtx); err != nil {
+		log.Printf("[Cluster] Error shutting down consensus for shard %s: %v", shardID, err)
+	}
 	cluster.cancel()
-	// Wait for shutdown...
-	delete(cm.clusters, shardID)
 	return nil
+}
+
+// Shutdown gracefully shuts down all embedded clusters.
+func (cm *ClusterManager) Shutdown() {
+	cm.mu.Lock()
+	shards := make([]string, 0, len(cm.clusters))
+	for shardID := range cm.clusters {
+		shards = append(shards, shardID)
+	}
+	cm.mu.Unlock()
+
+	for _, shardID := range shards {
+		if err := cm.LeaveShard(shardID); err != nil {
+			log.Printf("[Cluster] Error leaving shard %s during shutdown: %v", shardID, err)
+		}
+	}
 }
 
 // SelectAllocations deterministically chooses n peers from sorted list for the given CID (same CID → same set on all nodes).
@@ -244,11 +264,7 @@ func SelectAllocations(peers []peer.ID, c cid.Cid, n int) []peer.ID {
 	}
 	// Hash CID to get a stable start index so the same CID gets the same replicas everywhere.
 	h := sha256.Sum256(c.Bytes())
-	start := int(h[0])<<8 | int(h[1])
-	if start < 0 {
-		start = -start
-	}
-	start = start % len(sorted)
+	start := (int(h[0])<<8 | int(h[1])) % len(sorted)
 	out := make([]peer.ID, 0, n)
 	for i := 0; i < n; i++ {
 		out = append(out, sorted[(start+i)%len(sorted)])
@@ -269,6 +285,7 @@ func (cm *ClusterManager) Pin(ctx context.Context, shardID string, c cid.Cid, re
 	}
 
 	// Use config defaults when -1 (cluster default / "all").
+	// Use 0,0 for full replication (no allocations computed - all nodes pin).
 	repMin := replicationFactorMin
 	repMax := replicationFactorMax
 	if repMin < 0 {
@@ -278,23 +295,32 @@ func (cm *ClusterManager) Pin(ctx context.Context, shardID string, c cid.Cid, re
 		repMax = config.MaxReplication
 	}
 
-	peers, err := cluster.Consensus.Peers(ctx)
-	if err != nil {
-		log.Printf("[Cluster] Failed to get peers for allocation: %v", err)
-	}
-	// Cap replication at shard size: a shard with 4 nodes can only replicate 4x.
-	peerCount := len(peers)
-	if peerCount > 0 {
-		if repMax > peerCount {
-			repMax = peerCount
+	var allocations []peer.ID
+	if repMin > 0 || repMax > 0 {
+		peers, err := cluster.Consensus.Peers(ctx)
+		if err != nil {
+			log.Printf("[Cluster] Warning: failed to get peers for shard %s: %v (using full replication)", shardID, err)
+			// Fall through with nil peers → empty allocations → full replication (safe fallback)
 		}
-		if repMin > peerCount {
-			repMin = peerCount
+		// Cap replication at shard size: a shard with 4 nodes can only replicate 4x.
+		peerCount := len(peers)
+		if peerCount > 0 {
+			if repMax > peerCount {
+				repMax = peerCount
+			}
+			if repMin > peerCount {
+				repMin = peerCount
+			}
 		}
-	}
-	allocations := SelectAllocations(peers, c, repMax)
-	if len(allocations) == 0 && len(peers) > 0 {
-		allocations = SelectAllocations(peers, c, repMin)
+		allocations = SelectAllocations(peers, c, repMax)
+		if len(allocations) == 0 && len(peers) > 0 {
+			allocations = SelectAllocations(peers, c, repMin)
+		}
+	} else {
+		// repMin=0 && repMax=0: full replication mode (used during migration).
+		// Store config defaults as metadata but leave Allocations empty so all nodes pin.
+		repMin = config.MinReplication
+		repMax = config.MaxReplication
 	}
 
 	pin := api.Pin{
@@ -310,7 +336,7 @@ func (cm *ClusterManager) Pin(ctx context.Context, shardID string, c cid.Cid, re
 		return fmt.Errorf("failed to log pin to CRDT: %w", err)
 	}
 
-	log.Printf("[Cluster] Pinning %s to shard %s (Rep: %d-%d)", c, shardID, replicationFactorMin, replicationFactorMax)
+	log.Printf("[Cluster] Pinning %s to shard %s (Rep: %d-%d, Alloc: %d)", c, shardID, repMin, repMax, len(allocations))
 	return nil
 }
 
@@ -352,15 +378,19 @@ func (cm *ClusterManager) GetAllocations(ctx context.Context, shardID string, c 
 		return nil, err
 	}
 
-	// List streams pins to a channel. state.List closes out when done; do not close it here (double-close causes panic).
+	// List streams pins to a channel. Use a cancellable context so the List
+	// goroutine exits promptly when we find our CID and stop reading.
+	listCtx, listCancel := context.WithCancel(ctx)
+	defer listCancel()
+
 	out := make(chan api.Pin)
 	go func() {
-		_ = st.List(ctx, out)
+		_ = st.List(listCtx, out)
 	}()
 
 	for pin := range out {
 		if pin.Cid.Equals(api.NewCid(c)) {
-			return pin.Allocations, nil
+			return pin.Allocations, nil // listCancel fires via defer, unblocking the List goroutine
 		}
 	}
 	return nil, fmt.Errorf("pin not found in state")

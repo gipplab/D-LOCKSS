@@ -60,6 +60,14 @@ func (m *Monitor) handleIngestMessage(im *schema.IngestMessage, senderID peer.ID
 		m.manifestReplication[manifestCIDStr] = make(map[string]time.Time)
 	}
 	m.manifestReplication[manifestCIDStr][peerIDStr] = now
+	// Track observed shard for this manifest; prefer deeper shards only within the
+	// SAME subtree (child of the current observed shard). This prevents stale
+	// announcements from sibling subtrees (e.g. a node in shard 10 that hasn't
+	// resharded yet announcing a file that belongs to shard 0) from corrupting the
+	// shard assignment and making the monitor count replicas in the wrong shard.
+	if existing, ok := m.manifestShard[manifestCIDStr]; !ok || (len(shardID) > len(existing) && strings.HasPrefix(shardID, existing)) {
+		m.manifestShard[manifestCIDStr] = shardID
+	}
 	m.setPeerShardLastSeenUnlocked(peerIDStr, shardID, now)
 
 	if m.ps != nil {
@@ -125,6 +133,14 @@ func (m *Monitor) handleHeartbeat(senderID peer.ID, shardID string, ip string, p
 				if removedFromManifests > 0 {
 					log.Printf("[Monitor] UNPIN_ALL peer=%s shard=%s (pinned=0, removed from %d manifests)",
 						peerIDStr, shardID, removedFromManifests)
+				}
+			} else {
+				// Peer is alive and pinning: refresh manifestReplication timestamps
+				// so entries don't expire between PINNED re-announcements.
+				for _, peers := range m.manifestReplication {
+					if _, ok := peers[peerIDStr]; ok {
+						peers[peerIDStr] = now
+					}
 				}
 			}
 		}
@@ -199,22 +215,19 @@ func (m *Monitor) updateNodeShardLocked(node *NodeState, newShard string, timest
 		node.ShardHistory = append(node.ShardHistory, ShardHistoryEntry{ShardID: newShard, FirstSeen: timestamp})
 
 		peerIDStr := node.PeerID
-		depth := 0
-		for _, n := range m.nodes {
-			shard := n.CurrentShard
-			if shard == "" && len(n.ShardHistory) > 0 {
-				shard = n.ShardHistory[len(n.ShardHistory)-1].ShardID
-			}
-			if len(shard) > depth {
-				depth = len(shard)
-			}
-		}
 		removed := 0
 		for manifest, peers := range m.manifestReplication {
 			if _, had := peers[peerIDStr]; !had {
 				continue
 			}
-			if targetShardForManifest(manifest, depth) != newShard {
+			// Use the observed shard from PINNED announcements (set by nodes using PayloadCID-based
+			// shard assignment). Only remove if the manifest's observed shard is incompatible with
+			// the peer's new shard (neither is a prefix of the other).
+			observedShard := m.manifestShard[manifest]
+			compatible := observedShard == newShard ||
+				strings.HasPrefix(newShard, observedShard) ||
+				strings.HasPrefix(observedShard, newShard)
+			if !compatible {
 				delete(peers, peerIDStr)
 				removed++
 				if len(peers) == 0 {
@@ -232,7 +245,6 @@ func (m *Monitor) updateNodeShardLocked(node *NodeState, newShard string, timest
 func (m *Monitor) getPinnedInShardForNode(peerIDStr string, nodeShard string) int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	depth := m.replicationNetworkDepthUnlocked()
 	cutoff := time.Now().Add(-ReplicationAnnounceTTL)
 	if m.peerShardLastSeen[peerIDStr] != nil {
 		if last := m.peerShardLastSeen[peerIDStr][nodeShard]; last.Before(cutoff) {
@@ -244,7 +256,9 @@ func (m *Monitor) getPinnedInShardForNode(peerIDStr string, nodeShard string) in
 		if _, ok := peers[peerIDStr]; !ok {
 			continue
 		}
-		if targetShardForManifest(manifest, depth) != nodeShard {
+		// Use observed shard from PINNED announcements.
+		targetShard := m.manifestShard[manifest]
+		if targetShard != nodeShard {
 			continue
 		}
 		count++

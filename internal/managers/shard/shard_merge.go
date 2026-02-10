@@ -42,8 +42,7 @@ func (sm *ShardManager) checkAndMergeUpIfAlone() {
 		return
 	}
 
-	lastBit := currentShard[len(currentShard)-1]
-	siblingShard := parentShard + string([]byte{'0' + (1 - (lastBit - '0'))})
+	siblingShard := getSiblingShard(currentShard)
 	siblingPeerCount := sm.probeShard(siblingShard, probeTimeoutMerge)
 	siblingsTotal := currentPeerCount + siblingPeerCount
 

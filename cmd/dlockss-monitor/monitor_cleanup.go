@@ -16,6 +16,16 @@ func (m *Monitor) PruneStaleNodes() {
 	for id, node := range m.nodes {
 		if now.Sub(node.LastSeen) > nodeCleanupTimeout {
 			delete(m.nodes, id)
+			delete(m.nodeFiles, id)
+			delete(m.peerShardLastSeen, id)
+			// Remove this peer from manifestReplication maps.
+			for manifest, peers := range m.manifestReplication {
+				delete(peers, id)
+				if len(peers) == 0 {
+					delete(m.manifestReplication, manifest)
+					delete(m.manifestShard, manifest)
+				}
+			}
 			changed = true
 			prunedCount++
 		}

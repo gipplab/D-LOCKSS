@@ -15,7 +15,6 @@ import (
 // If we're already in this shard as observer only (JoinShardAsObserver), we "promote" to full member: publish JOIN+HEARTBEAT and stop being observer.
 func (sm *ShardManager) JoinShard(shardID string) {
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
 
 	sub, exists := sm.shardSubs[shardID]
 	if exists {
@@ -23,20 +22,23 @@ func (sm *ShardManager) JoinShard(shardID string) {
 			// Promote observer to full member: we're already subscribed, just announce so we count as a member.
 			sub.observerOnly = false
 			delete(sm.observerOnlyShards, shardID)
+			// Capture topic reference before releasing lock so we can safely publish
+			// even if a concurrent LeaveShard removes the subscription.
+			topic := sub.topic
 			sm.mu.Unlock()
 			joinMsg := []byte("JOIN:" + sm.h.ID().String())
-			_ = sub.topic.Publish(sm.ctx, joinMsg)
+			_ = topic.Publish(sm.ctx, joinMsg)
 			pinnedCount := 0
 			if sm.storageMgr != nil {
 				pinnedCount = sm.storageMgr.GetPinnedCount()
 			}
 			heartbeatMsg := []byte(fmt.Sprintf("HEARTBEAT:%s:%d", sm.h.ID().String(), pinnedCount))
-			_ = sub.topic.Publish(sm.ctx, heartbeatMsg)
+			_ = topic.Publish(sm.ctx, heartbeatMsg)
 			log.Printf("[Sharding] Promoted observer to full member in shard %s", shardID)
-			sm.mu.Lock()
 			return
 		}
 		sub.refCount++
+		sm.mu.Unlock()
 		return
 	}
 
@@ -52,9 +54,11 @@ func (sm *ShardManager) JoinShard(shardID string) {
 			if strings.Contains(err.Error(), "topic already exists") {
 				if sub, exists := sm.shardSubs[shardID]; exists {
 					sub.refCount++
+					sm.mu.Unlock()
 					return
 				}
 			}
+			sm.mu.Unlock()
 			log.Printf("[Error] Failed to join shard topic %s: %v", topicName, err)
 			return
 		}
@@ -62,6 +66,7 @@ func (sm *ShardManager) JoinShard(shardID string) {
 
 	psSub, err := t.Subscribe()
 	if err != nil {
+		sm.mu.Unlock()
 		log.Printf("[Error] Failed to subscribe to shard topic %s: %v", topicName, err)
 		return
 	}
@@ -75,6 +80,7 @@ func (sm *ShardManager) JoinShard(shardID string) {
 		shardID:  shardID,
 	}
 	sm.shardSubs[shardID] = newSub
+	sm.mu.Unlock()
 
 	log.Printf("[Sharding] Joined shard %s (Topic: %s)", shardID, topicName)
 
@@ -178,15 +184,32 @@ func (sm *ShardManager) LeaveShard(shardID string) {
 	if sub.refCount <= 0 {
 		observerOnly := sub.observerOnly
 		delete(sm.observerOnlyShards, shardID)
+		originalSub := sub // save pointer to detect replacement during sleep
 		if !observerOnly {
 			leaveMsg := []byte("LEAVE:" + sm.h.ID().String())
 			_ = sub.topic.Publish(sm.ctx, leaveMsg)
 			sm.mu.Unlock()
 			time.Sleep(150 * time.Millisecond)
 			sm.mu.Lock()
-			sub, exists = sm.shardSubs[shardID]
-			if !exists || sub.refCount > 0 {
+			currentSub, stillExists := sm.shardSubs[shardID]
+			if !stillExists {
+				// Subscription was removed by someone else; clean up our original.
+				originalSub.cancel()
+				originalSub.sub.Cancel()
+				_ = originalSub.topic.Close()
+				log.Printf("[Sharding] Left shard %s (cleaned up after concurrent removal)", shardID)
 				return
+			}
+			if currentSub != originalSub {
+				// A new subscription replaced ours; clean up original without touching the map.
+				originalSub.cancel()
+				originalSub.sub.Cancel()
+				_ = originalSub.topic.Close()
+				log.Printf("[Sharding] Left shard %s (cleaned up replaced subscription)", shardID)
+				return
+			}
+			if currentSub.refCount > 0 {
+				return // re-joined during sleep
 			}
 		}
 		sub.cancel()

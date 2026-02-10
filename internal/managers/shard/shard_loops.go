@@ -12,7 +12,6 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/peer"
 
-	"dlockss/internal/common"
 	"dlockss/internal/config"
 	"dlockss/pkg/schema"
 )
@@ -28,6 +27,24 @@ func (sm *ShardManager) runPeerCountChecker() {
 			return
 		case <-ticker.C:
 			sm.checkAndSplitIfNeeded()
+			sm.pruneStaleSeenPeers()
+		}
+	}
+}
+
+// pruneStaleSeenPeers removes entries from seenPeers that haven't been seen recently.
+func (sm *ShardManager) pruneStaleSeenPeers() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	cutoff := time.Now().Add(-600 * time.Second)
+	for shardID, peers := range sm.seenPeers {
+		for peerID, lastSeen := range peers {
+			if lastSeen.Before(cutoff) {
+				delete(peers, peerID)
+			}
+		}
+		if len(peers) == 0 {
+			delete(sm.seenPeers, shardID)
 		}
 	}
 }
@@ -65,25 +82,49 @@ func (sm *ShardManager) runReplicationChecker() {
 			}
 
 			for _, manifestCIDStr := range manifests {
-				payloadCIDStr := common.GetPayloadCIDForShardAssignment(sm.ctx, sm.ipfsClient, manifestCIDStr)
-				if !sm.AmIResponsibleFor(payloadCIDStr) {
-					continue
-				}
+				// Allow both responsible nodes and "stray" holders (we have the file but hash target is another shard)
+				// to send ReplicationRequest to our current shard so replication can recover when all copies are in the wrong shard.
 				c, err := cid.Decode(manifestCIDStr)
 				if err != nil {
 					continue
 				}
 				allocations, err := sm.clusterMgr.GetAllocations(sm.ctx, currentShard, c)
 				if err != nil {
-					continue
+					// Pin not found in CRDT — the file is pinned locally but has no
+					// CRDT entry (e.g. CRDT gossip didn't propagate the migration
+					// entry to this node). Write a full-replication pin so the
+					// PinTracker keeps the file and other nodes discover it via CRDT
+					// gossip. Proceed with 0 allocations to send a ReplicationRequest.
+					_ = sm.clusterMgr.Pin(sm.ctx, currentShard, c, 0, 0)
+					allocations = nil
 				}
 				peerCount := sm.getShardPeerCount()
-				minRep := config.MinReplication
-				if peerCount > 0 && minRep > peerCount {
-					minRep = peerCount
+				// Target replication: up to MaxReplication, capped by peer count (can't replicate more than peers in shard).
+				targetRep := config.MaxReplication
+				if peerCount > 0 && targetRep > peerCount {
+					targetRep = peerCount
 				}
-				if len(allocations) >= minRep {
-					continue
+				// Filter allocations to only count peers currently in this shard.
+				// Stale peer IDs from pre-split configurations inflate len(allocations)
+				// and fool the checker into thinking replication is sufficient.
+				currentPeers := sm.GetPeersForShard(currentShard)
+				currentSet := make(map[peer.ID]struct{}, len(currentPeers)+1)
+				currentSet[sm.h.ID()] = struct{}{} // include self
+				for _, p := range currentPeers {
+					currentSet[p] = struct{}{}
+				}
+				activeAllocations := 0
+				for _, a := range allocations {
+					if _, ok := currentSet[a]; ok {
+						activeAllocations++
+					}
+				}
+				if activeAllocations >= targetRep {
+					const replicationGracePeriod = 3 * time.Minute
+					pinTime := sm.storageMgr.GetPinTime(manifestCIDStr)
+					if pinTime.IsZero() || time.Since(pinTime) >= replicationGracePeriod {
+						continue
+					}
 				}
 				if sm.signer == nil {
 					continue
@@ -103,8 +144,8 @@ func (sm *ShardManager) runReplicationChecker() {
 					continue
 				}
 				sm.PublishToShardCBOR(b, currentShard)
-				log.Printf("[Shard] ReplicationRequest sent for %s (shard %s, allocations=%d, min=%d, peers=%d)",
-					manifestCIDStr, currentShard, len(allocations), minRep, peerCount)
+				log.Printf("[Shard] ReplicationRequest sent for %s (shard %s, active_alloc=%d, total_alloc=%d, target=%d, peers=%d)",
+					manifestCIDStr, currentShard, activeAllocations, len(allocations), targetRep, peerCount)
 			}
 		}
 	}
@@ -123,6 +164,7 @@ func (sm *ShardManager) runHeartbeat() {
 	}
 	const backoffWhenPeers = 2
 	const backoffInterval = 5 * time.Minute
+	baseInterval := heartbeatInterval
 
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
@@ -135,9 +177,13 @@ func (sm *ShardManager) runHeartbeat() {
 			return
 		case <-ticker.C:
 			sm.sendHeartbeat()
-			if n := sm.getShardPeerCount(); n >= backoffWhenPeers && heartbeatInterval < backoffInterval {
+			n := sm.getShardPeerCount()
+			if n >= backoffWhenPeers && heartbeatInterval < backoffInterval {
 				ticker.Reset(backoffInterval)
 				heartbeatInterval = backoffInterval
+			} else if n < backoffWhenPeers && heartbeatInterval > baseInterval {
+				ticker.Reset(baseInterval)
+				heartbeatInterval = baseInterval
 			}
 		}
 	}
@@ -213,6 +259,10 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 		if len(msg.Data) >= 5 && (string(msg.Data[:5]) == "JOIN:" || (len(msg.Data) >= 6 && string(msg.Data[:6]) == "LEAVE:")) {
 			return
 		}
+		if len(msg.Data) > 6 && string(msg.Data[:6]) == "SPLIT:" {
+			sm.handleSplitAnnouncement(string(msg.Data[6:]))
+			return
+		}
 	}
 
 	if sm.rateLimiter != nil && !sm.rateLimiter.Check(msg.GetFrom()) {
@@ -246,6 +296,29 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 		}
 		sm.handleReplicationRequest(msg, &rr, shardID)
 	}
+}
+
+// handleSplitAnnouncement records child shards from a SPLIT:child0:child1 message.
+func (sm *ShardManager) handleSplitAnnouncement(payload string) {
+	// Find separator between child0 and child1.
+	sep := -1
+	for i := 0; i < len(payload); i++ {
+		if payload[i] == ':' {
+			sep = i
+			break
+		}
+	}
+	if sep < 1 || sep >= len(payload)-1 {
+		return
+	}
+	child0 := payload[:sep]
+	child1 := payload[sep+1:]
+	now := time.Now()
+	sm.mu.Lock()
+	sm.knownChildShards[child0] = now
+	sm.knownChildShards[child1] = now
+	sm.mu.Unlock()
+	log.Printf("[Shard] Received split announcement: children %s and %s", child0, child1)
 }
 
 func decodeCBORMessageType(data []byte) (schema.MessageType, error) {

@@ -96,7 +96,9 @@ func (sm *ShardManager) GetShardPeers() []peer.ID {
 	return sub.topic.ListPeers()
 }
 
-// GetPeersForShard returns the list of peers in the given shard (mesh peers from pubsub).
+// GetPeersForShard returns the list of peers in the given shard (mesh + heartbeat-seen peers).
+// This is used by the CRDT PeerMonitor stub so allocations reflect the full shard membership,
+// not just the gossipsub mesh (which is typically a small subset of the topic subscribers).
 func (sm *ShardManager) GetPeersForShard(shardID string) []peer.ID {
 	sm.mu.RLock()
 	sub, exists := sm.shardSubs[shardID]
@@ -105,19 +107,47 @@ func (sm *ShardManager) GetPeersForShard(shardID string) []peer.ID {
 	if !exists || sub.topic == nil {
 		return nil
 	}
-	return sub.topic.ListPeers()
+
+	meshPeers := sub.topic.ListPeers()
+	seen := make(map[peer.ID]struct{}, len(meshPeers))
+	for _, p := range meshPeers {
+		seen[p] = struct{}{}
+	}
+
+	sm.mu.RLock()
+	if seenMap, ok := sm.seenPeers[shardID]; ok {
+		cutoff := time.Now().Add(-350 * time.Second)
+		for p, lastSeen := range seenMap {
+			if lastSeen.After(cutoff) {
+				seen[p] = struct{}{}
+			}
+		}
+	}
+	sm.mu.RUnlock()
+
+	all := make([]peer.ID, 0, len(seen))
+	for p := range seen {
+		all = append(all, p)
+	}
+	return all
 }
 
-// GetShardPeerCount returns the peer count for a specific shard.
+// GetShardPeerCount returns the total peer count for a specific shard (including self when we are in that shard).
 func (sm *ShardManager) GetShardPeerCount(shardID string) int {
 	sm.mu.RLock()
+	currentShard := sm.currentShard
 	sub, exists := sm.shardSubs[shardID]
 	sm.mu.RUnlock()
 
 	if !exists || sub.topic == nil {
 		return 0
 	}
-	return len(sub.topic.ListPeers())
+	meshPeers := sub.topic.ListPeers()
+	n := len(meshPeers)
+	if shardID == currentShard {
+		n++ // include self
+	}
+	return n
 }
 
 // getSiblingShard returns the sibling shard ID (same parent, other branch). E.g. "0"→"1", "010"→"011".
@@ -173,25 +203,48 @@ func (sm *ShardManager) probeShard(shardID string, probeTimeout time.Duration) i
 }
 
 // probeShardSilently subscribes to a shard topic to observe the mesh, then unsubscribes.
+// Reuses a cached topic handle if available (ps.Join returns "topic already exists" for open topics).
 func (sm *ShardManager) probeShardSilently(shardID string, probeTimeout time.Duration) int {
-	topicName := fmt.Sprintf("dlockss-creative-commons-shard-%s", shardID)
-	t, err := sm.ps.Join(topicName)
-	if err != nil {
-		return 0
+	// Reuse cached topic handle; ps.Join fails with "topic already exists" if the topic is still open.
+	sm.mu.Lock()
+	t, fromCache := sm.probeTopicCache[shardID]
+	if fromCache {
+		delete(sm.probeTopicCache, shardID)
 	}
+	sm.mu.Unlock()
+
+	if !fromCache {
+		topicName := fmt.Sprintf("dlockss-creative-commons-shard-%s", shardID)
+		var err error
+		t, err = sm.ps.Join(topicName)
+		if err != nil {
+			return 0
+		}
+	}
+
 	psSub, err := t.Subscribe()
 	if err != nil {
-		_ = t.Close()
+		if !fromCache {
+			_ = t.Close()
+		}
 		return 0
 	}
 	defer psSub.Cancel()
 
-	time.Sleep(probeTimeout)
+	select {
+	case <-sm.ctx.Done():
+		return 0
+	case <-time.After(probeTimeout):
+	}
 
 	meshPeers := t.ListPeers()
 	n := len(meshPeers)
 	if n == 0 {
-		time.Sleep(2 * time.Second)
+		select {
+		case <-sm.ctx.Done():
+			return 0
+		case <-time.After(2 * time.Second):
+		}
 		meshPeers = t.ListPeers()
 		if len(meshPeers) > n {
 			n = len(meshPeers)
@@ -199,7 +252,7 @@ func (sm *ShardManager) probeShardSilently(shardID string, probeTimeout time.Dur
 	}
 
 	sm.mu.Lock()
-	if old := sm.probeTopicCache[shardID]; old != nil {
+	if old := sm.probeTopicCache[shardID]; old != nil && old != t {
 		_ = old.Close()
 	}
 	const maxProbeCache = 4

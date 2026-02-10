@@ -165,7 +165,11 @@ func (pt *LocalPinTracker) syncState(consensus ConsensusClient) {
 			continue
 		}
 
-		isPinned, _ := pt.ipfsClient.IsPinned(pt.ctx, c)
+		isPinned, err := pt.ipfsClient.IsPinned(pt.ctx, c)
+		if err != nil {
+			log.Printf("[PinTracker:%s] Error checking pin status for %s: %v", pt.shardID, c, err)
+			continue
+		}
 		if !isPinned {
 			log.Printf("[PinTracker:%s] Syncing pin %s to local IPFS", pt.shardID, c)
 			if err := pt.ipfsClient.PinRecursive(pt.ctx, c); err != nil {
@@ -174,27 +178,35 @@ func (pt *LocalPinTracker) syncState(consensus ConsensusClient) {
 			}
 		}
 		pt.mu.Lock()
+		_, alreadyTracked := pt.pinnedByUs[cStr]
 		pt.pinnedByUs[cStr] = struct{}{}
 		pt.mu.Unlock()
-		// Notify so storage can register this CID and we announce PINNED on pubsub;
-		// the monitor then sees this node has the file and can show replication > 1.
-		if pt.onPinSynced != nil {
+		// Only notify on first sync so we don't spam announcements every 10s.
+		if !alreadyTracked && pt.onPinSynced != nil {
 			pt.onPinSynced(cStr)
 		}
 	}
 
 	// Unpin CIDs we previously pinned from this shard but are no longer allocated for.
-	pt.mu.Lock()
+	// Collect the list under the lock, then process outside to avoid data race
+	// from unlocking/relocking mid-iteration.
+	pt.mu.RLock()
+	var toUnpin []string
 	for cidStr := range pt.pinnedByUs {
-		if _, ok := shouldHave[cidStr]; ok {
-			continue
+		if _, ok := shouldHave[cidStr]; !ok {
+			toUnpin = append(toUnpin, cidStr)
 		}
+	}
+	pt.mu.RUnlock()
+
+	for _, cidStr := range toUnpin {
 		c, err := cid.Decode(cidStr)
 		if err != nil {
+			pt.mu.Lock()
 			delete(pt.pinnedByUs, cidStr)
+			pt.mu.Unlock()
 			continue
 		}
-		pt.mu.Unlock()
 		log.Printf("[PinTracker:%s] Unpinning %s (no longer allocated)", pt.shardID, cidStr)
 		_ = pt.ipfsClient.UnpinRecursive(pt.ctx, c)
 		if pt.onPinRemoved != nil {
@@ -202,8 +214,8 @@ func (pt *LocalPinTracker) syncState(consensus ConsensusClient) {
 		}
 		pt.mu.Lock()
 		delete(pt.pinnedByUs, cidStr)
+		pt.mu.Unlock()
 	}
-	pt.mu.Unlock()
 }
 
 func min(a, b int) int {

@@ -17,26 +17,13 @@ import (
 // calculateXORDistance computes the XOR distance between a peer ID and a CID.
 func calculateXORDistance(peerID peer.ID, contentCID cid.Cid) (*big.Int, error) {
 	peerIDBytes := []byte(peerID)
+	var peerHash []byte
 	peerMh, err := multihash.Decode(peerIDBytes)
 	if err != nil {
-		peerHash := peerIDBytes
-		cidMh := contentCID.Hash()
-		cidMhDecoded, err := multihash.Decode(cidMh)
-		if err != nil {
-			return nil, fmt.Errorf("decode CID multihash: %w", err)
-		}
-		contentHash := cidMhDecoded.Digest
-		minLen := len(peerHash)
-		if len(contentHash) < minLen {
-			minLen = len(contentHash)
-		}
-		xorResult := make([]byte, minLen)
-		for i := 0; i < minLen; i++ {
-			xorResult[i] = peerHash[i] ^ contentHash[i]
-		}
-		return new(big.Int).SetBytes(xorResult), nil
+		peerHash = peerIDBytes
+	} else {
+		peerHash = peerMh.Digest
 	}
-	peerHash := peerMh.Digest
 
 	cidMh := contentCID.Hash()
 	cidMhDecoded, err := multihash.Decode(cidMh)
@@ -122,7 +109,25 @@ func (sm *ShardManager) checkAndSplitIfNeeded() {
 
 	log.Printf("[Sharding] Shard %s at limit (%d peers), child %s has %d → splitting", currentShard, peerCount, targetChild, childPeerCount)
 	sm.metrics.IncrementShardSplits()
+	sm.announceSplit(currentShard, targetChild)
 	sm.moveToShard(currentShard, targetChild, false)
+}
+
+// announceSplit publishes a SPLIT announcement on the parent shard topic so that
+// other nodes in the parent know child shards exist. Without this, discovery uses
+// probeShardSilently which causes "phantom peer" false positives when multiple nodes
+// simultaneously subscribe to a child topic to probe it.
+func (sm *ShardManager) announceSplit(parentShard string, targetChild string) {
+	sibling := getSiblingShard(targetChild)
+	sm.mu.RLock()
+	sub, exists := sm.shardSubs[parentShard]
+	sm.mu.RUnlock()
+	if !exists || sub.topic == nil {
+		return
+	}
+	msg := []byte(fmt.Sprintf("SPLIT:%s:%s", targetChild, sibling))
+	_ = sub.topic.Publish(sm.ctx, msg)
+	log.Printf("[Sharding] Announced split on shard %s: children %s, %s", parentShard, targetChild, sibling)
 }
 
 // splitShard is used when the current shard is at the split limit; it moves this node to its target child.

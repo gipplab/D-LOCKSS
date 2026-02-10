@@ -51,6 +51,7 @@ func (m *mockConsensus) State(ctx context.Context) (state.ReadOnly, error) {
 func (m *mockConsensus) Peers(ctx context.Context) ([]peer.ID, error) {
 	return nil, nil
 }
+func (m *mockConsensus) Shutdown(ctx context.Context) error { return nil }
 
 // mockIPFSForTracker implements IPFSClient and records Pin/Unpin calls.
 type mockIPFSForTracker struct {
