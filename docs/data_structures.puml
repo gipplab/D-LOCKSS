@@ -101,7 +101,8 @@ note right of ShardManager
   PubSub topics: dlockss-creative-commons-shard-<id>.
   One subscription per shard (refCount); observer mode for probing.
   Merge up: understaffed in deep shard, parent has room.
-  Discovery: at root or few peers, probe deeper shards and move.
+  Discovery: all shards; 10s root, 2m default, 45s when SPLIT known.
+  Split rebroadcast: nodes in children rebroadcast SPLIT to ancestors (60s).
 end note
 
 class ResearchObject {

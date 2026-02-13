@@ -1,6 +1,7 @@
 package shard
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -17,26 +18,13 @@ func (sm *ShardManager) getShardPeerCount() int {
 	sm.mu.RUnlock()
 
 	if exists && sub.topic != nil {
+		activeCount := sm.countActivePeers(currentShard, true, config.SeenPeersWindow)
+		if activeCount > 0 {
+			return activeCount
+		}
+		// Fallback: no role data yet, use mesh as lower bound (may overcount PASSIVE/PROBE)
 		meshPeers := sub.topic.ListPeers()
-		meshCount := len(meshPeers) + 1
-
-		sm.mu.RLock()
-		seenCount := 0
-		if seenMap, ok := sm.seenPeers[currentShard]; ok {
-			cutoff := time.Now().Add(-config.SeenPeersWindow)
-			for _, lastSeen := range seenMap {
-				if lastSeen.After(cutoff) {
-					seenCount++
-				}
-			}
-			seenCount++
-		}
-		sm.mu.RUnlock()
-
-		if seenCount > meshCount {
-			return seenCount
-		}
-		return meshCount
+		return len(meshPeers) + 1
 	}
 
 	if sm.clusterMgr != nil {
@@ -48,7 +36,10 @@ func (sm *ShardManager) getShardPeerCount() int {
 	return 0
 }
 
-// getShardPeerCountForSplit returns mesh size only (split uses this to avoid stale counts).
+// getShardPeerCountForSplit returns ACTIVE peer count for split decisions.
+// Uses only role-based counts (HEARTBEAT/JOIN); avoids mesh fallback because the mesh
+// can include the monitor and other non-ACTIVE subscribers, which would overcount
+// and trigger premature splits (e.g. 9 real nodes + monitor = 10, split when we shouldn't).
 func (sm *ShardManager) getShardPeerCountForSplit() int {
 	sm.mu.RLock()
 	currentShard := sm.currentShard
@@ -56,8 +47,13 @@ func (sm *ShardManager) getShardPeerCountForSplit() int {
 	sm.mu.RUnlock()
 
 	if exists && sub.topic != nil {
-		meshPeers := sub.topic.ListPeers()
-		return len(meshPeers) + 1
+		activeCount := sm.countActivePeers(currentShard, true, config.SeenPeersWindow)
+		if activeCount > 0 {
+			return activeCount
+		}
+		// No role data yet: return 0 to avoid splitting on phantom peers (monitor in mesh).
+		// Split will proceed once HEARTBEATs establish accurate ACTIVE counts.
+		return 0
 	}
 	if sm.clusterMgr != nil {
 		count, err := sm.clusterMgr.GetPeerCount(sm.ctx, currentShard)
@@ -100,15 +96,32 @@ func (sm *ShardManager) GetPeersForShard(shardID string) []peer.ID {
 		return nil
 	}
 
+	// Return only ACTIVE peers (exclude PASSIVE and PROBE for replication)
+	sm.mu.RLock()
+	roles, ok := sm.seenPeerRoles[shardID]
+	cutoff := time.Now().Add(-350 * time.Second)
+	sm.mu.RUnlock()
+
+	if ok {
+		var active []peer.ID
+		sm.mu.RLock()
+		for p, info := range roles {
+			if info.Role == RoleActive && info.LastSeen.After(cutoff) && p != sm.h.ID() {
+				active = append(active, p)
+			}
+		}
+		sm.mu.RUnlock()
+		return active
+	}
+
+	// Fallback: no role data, use mesh+seen (may include PASSIVE/PROBE)
 	meshPeers := sub.topic.ListPeers()
 	seen := make(map[peer.ID]struct{}, len(meshPeers))
 	for _, p := range meshPeers {
 		seen[p] = struct{}{}
 	}
-
 	sm.mu.RLock()
 	if seenMap, ok := sm.seenPeers[shardID]; ok {
-		cutoff := time.Now().Add(-350 * time.Second)
 		for p, lastSeen := range seenMap {
 			if lastSeen.After(cutoff) {
 				seen[p] = struct{}{}
@@ -116,10 +129,11 @@ func (sm *ShardManager) GetPeersForShard(shardID string) []peer.ID {
 		}
 	}
 	sm.mu.RUnlock()
-
 	all := make([]peer.ID, 0, len(seen))
 	for p := range seen {
-		all = append(all, p)
+		if p != sm.h.ID() {
+			all = append(all, p)
+		}
 	}
 	return all
 }
@@ -133,10 +147,15 @@ func (sm *ShardManager) GetShardPeerCount(shardID string) int {
 	if !exists || sub.topic == nil {
 		return 0
 	}
+	includeSelf := (shardID == currentShard)
+	activeCount := sm.countActivePeers(shardID, includeSelf, 350*time.Second)
+	if activeCount > 0 {
+		return activeCount
+	}
 	meshPeers := sub.topic.ListPeers()
 	n := len(meshPeers)
-	if shardID == currentShard {
-		n++ // include self
+	if includeSelf {
+		n++
 	}
 	return n
 }
@@ -215,26 +234,50 @@ func (sm *ShardManager) probeShardSilently(shardID string, probeTimeout time.Dur
 	}
 	defer psSub.Cancel()
 
-	select {
-	case <-sm.ctx.Done():
-		return 0
-	case <-time.After(probeTimeout):
+	// Publish PROBE so others know we're a prober (not counted)
+	probeMsg := []byte("PROBE:" + sm.h.ID().String())
+	_ = t.Publish(sm.ctx, probeMsg)
+
+	// Process incoming messages to collect HEARTBEAT/JOIN/PROBE role info
+	deadline := time.Now().Add(probeTimeout)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(sm.ctx, 500*time.Millisecond)
+		msg, err := psSub.Next(ctx)
+		cancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				break
+			}
+			continue
+		}
+		if msg.GetFrom() == sm.h.ID() {
+			continue
+		}
+		sm.processTextProtocolForProbe(msg, shardID)
 	}
 
-	meshPeers := t.ListPeers()
-	n := len(meshPeers)
-	if n == 0 {
-		select {
-		case <-sm.ctx.Done():
-			return 0
-		case <-time.After(2 * time.Second):
+	activeCount := sm.countActivePeers(shardID, false, 350*time.Second)
+	if activeCount > 0 {
+		sm.mu.Lock()
+		if old := sm.probeTopicCache[shardID]; old != nil && old != t {
+			_ = old.Close()
 		}
-		meshPeers = t.ListPeers()
-		if len(meshPeers) > n {
-			n = len(meshPeers)
+		const maxProbeCache = 4
+		if len(sm.probeTopicCache) >= maxProbeCache && sm.probeTopicCache[shardID] == nil {
+			for k, v := range sm.probeTopicCache {
+				_ = v.Close()
+				delete(sm.probeTopicCache, k)
+				break
+			}
 		}
+		sm.probeTopicCache[shardID] = t
+		sm.mu.Unlock()
+		return activeCount
 	}
 
+	// No ACTIVE peers: return 0 instead of mesh count. The mesh can include the monitor
+	// or other non-ACTIVE subscribers; trusting it would allow phantom "join existing"
+	// when the child is empty, bypassing the create threshold (14).
 	sm.mu.Lock()
 	if old := sm.probeTopicCache[shardID]; old != nil && old != t {
 		_ = old.Close()
@@ -249,36 +292,18 @@ func (sm *ShardManager) probeShardSilently(shardID string, probeTimeout time.Dur
 	}
 	sm.probeTopicCache[shardID] = t
 	sm.mu.Unlock()
-	return n
+	return 0
 }
 
 func (sm *ShardManager) getProbePeerCount(shardID string, topic interface{ ListPeers() []peer.ID }, activeWindow time.Duration) int {
-	meshPeers := topic.ListPeers()
 	sm.mu.RLock()
 	_, observerOnly := sm.observerOnlyShards[shardID]
 	sm.mu.RUnlock()
-	meshCount := len(meshPeers)
-	if !observerOnly {
-		meshCount++
+	activeCount := sm.countActivePeers(shardID, !observerOnly, activeWindow)
+	if activeCount > 0 {
+		return activeCount
 	}
-
-	sm.mu.RLock()
-	seenCount := 0
-	if seenMap, exists := sm.seenPeers[shardID]; exists {
-		cutoff := time.Now().Add(-activeWindow)
-		for _, lastSeen := range seenMap {
-			if lastSeen.After(cutoff) {
-				seenCount++
-			}
-		}
-		if !observerOnly {
-			seenCount++
-		}
-	}
-	sm.mu.RUnlock()
-
-	if seenCount > meshCount {
-		return seenCount
-	}
-	return meshCount
+	// No ACTIVE peers: return 0 instead of mesh count. The mesh can include the monitor
+	// or other non-ACTIVE subscribers; trusting it would allow phantom "join existing".
+	return 0
 }

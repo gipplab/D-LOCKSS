@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -16,6 +17,24 @@ import (
 	"dlockss/internal/config"
 	"dlockss/pkg/schema"
 )
+
+// runSplitRebroadcast periodically re-broadcasts SPLIT to all ancestor shards so late-joining
+// nodes (e.g. in root or parent) can discover existing children. Each node in a child shard
+// publishes to its ancestors; no central coordinator needed.
+func (sm *ShardManager) runSplitRebroadcast() {
+	jitterRange := config.ShardSplitRebroadcastInterval / 2
+	if jitterRange < time.Second {
+		jitterRange = time.Second
+	}
+	for {
+		select {
+		case <-sm.ctx.Done():
+			return
+		case <-time.After(config.ShardSplitRebroadcastInterval + time.Duration(rand.Int63n(int64(jitterRange)))):
+			sm.rebroadcastSplitToAncestors()
+		}
+	}
+}
 
 // runPeerCountChecker checks peer count in the current shard and triggers splits when at limit.
 func (sm *ShardManager) runPeerCountChecker() {
@@ -46,6 +65,16 @@ func (sm *ShardManager) pruneStaleSeenPeers() {
 		}
 		if len(peers) == 0 {
 			delete(sm.seenPeers, shardID)
+		}
+	}
+	for shardID, roles := range sm.seenPeerRoles {
+		for peerID, info := range roles {
+			if info.LastSeen.Before(cutoff) {
+				delete(roles, peerID)
+			}
+		}
+		if len(roles) == 0 {
+			delete(sm.seenPeerRoles, shardID)
 		}
 	}
 }
@@ -209,7 +238,8 @@ func (sm *ShardManager) sendHeartbeat() {
 	}
 
 	pinnedCount := sm.storageMgr.GetPinnedCount()
-	heartbeatMsg := []byte(fmt.Sprintf("HEARTBEAT:%s:%d", sm.h.ID().String(), pinnedCount))
+	role := sm.getOurRole()
+	heartbeatMsg := []byte(fmt.Sprintf("HEARTBEAT:%s:%d:%s", sm.h.ID().String(), pinnedCount, role))
 	if err := sub.topic.Publish(sm.ctx, heartbeatMsg); err != nil {
 		return
 	}
@@ -237,19 +267,28 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 		return
 	}
 
+	from := msg.GetFrom()
+	now := time.Now()
 	sm.mu.Lock()
 	if sm.seenPeers[shardID] == nil {
 		sm.seenPeers[shardID] = make(map[peer.ID]time.Time)
 	}
-	sm.seenPeers[shardID][msg.GetFrom()] = time.Now()
-	sm.lastMessageTime = time.Now()
+	sm.seenPeers[shardID][from] = now
+	sm.lastMessageTime = now
 	sm.mu.Unlock()
 
 	if len(msg.Data) > 0 {
 		if msg.Data[0] == '{' {
 			return
 		}
-		if string(msg.Data[:min(10, len(msg.Data))]) == "HEARTBEAT:" {
+		if len(msg.Data) >= 10 && string(msg.Data[:10]) == "HEARTBEAT:" {
+			role := parseHeartbeatRole(msg.Data)
+			sm.mu.Lock()
+			if sm.seenPeerRoles[shardID] == nil {
+				sm.seenPeerRoles[shardID] = make(map[peer.ID]PeerRoleInfo)
+			}
+			sm.seenPeerRoles[shardID][from] = PeerRoleInfo{Role: role, LastSeen: now}
+			sm.mu.Unlock()
 			return
 		}
 		if len(msg.Data) > 7 && string(msg.Data[:7]) == "PINNED:" {
@@ -257,7 +296,31 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 			sm.storageMgr.AddKnownFile(key)
 			return
 		}
-		if len(msg.Data) >= 5 && (string(msg.Data[:5]) == "JOIN:" || (len(msg.Data) >= 6 && string(msg.Data[:6]) == "LEAVE:")) {
+		if len(msg.Data) >= 5 && string(msg.Data[:5]) == "JOIN:" {
+			role := parseJoinRole(msg.Data)
+			sm.mu.Lock()
+			if sm.seenPeerRoles[shardID] == nil {
+				sm.seenPeerRoles[shardID] = make(map[peer.ID]PeerRoleInfo)
+			}
+			sm.seenPeerRoles[shardID][from] = PeerRoleInfo{Role: role, LastSeen: now}
+			sm.mu.Unlock()
+			return
+		}
+		if len(msg.Data) >= 6 && string(msg.Data[:6]) == "LEAVE:" {
+			sm.mu.Lock()
+			if sm.seenPeerRoles[shardID] != nil {
+				delete(sm.seenPeerRoles[shardID], from)
+			}
+			sm.mu.Unlock()
+			return
+		}
+		if len(msg.Data) >= 6 && string(msg.Data[:6]) == "PROBE:" {
+			sm.mu.Lock()
+			if sm.seenPeerRoles[shardID] == nil {
+				sm.seenPeerRoles[shardID] = make(map[peer.ID]PeerRoleInfo)
+			}
+			sm.seenPeerRoles[shardID][from] = PeerRoleInfo{Role: RoleProbe, LastSeen: now}
+			sm.mu.Unlock()
 			return
 		}
 		if len(msg.Data) > 6 && string(msg.Data[:6]) == "SPLIT:" {

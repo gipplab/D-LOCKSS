@@ -58,10 +58,12 @@ type ShardManager struct {
 	lastMoveToDeeperShard time.Time
 	lastMergeUpTime       time.Time
 
-	seenPeers          map[string]map[peer.ID]time.Time
-	observerOnlyShards map[string]struct{}
-	knownChildShards   map[string]time.Time
-	orphanHandoffSent  map[string]map[string]*orphanHandoffInfo
+	seenPeers                map[string]map[peer.ID]time.Time
+	seenPeerRoles            map[string]map[peer.ID]PeerRoleInfo
+	observerOnlyShards       map[string]struct{}
+	splitAboveThresholdCount int // consecutive checks where peerCount >= MaxPeersPerShard
+	knownChildShards         map[string]time.Time
+	orphanHandoffSent        map[string]map[string]*orphanHandoffInfo
 }
 
 type orphanHandoffInfo struct {
@@ -96,6 +98,7 @@ func NewShardManager(
 		shardSubs:          make(map[string]*shardSubscription),
 		probeTopicCache:    make(map[string]*pubsub.Topic),
 		seenPeers:          make(map[string]map[peer.ID]time.Time),
+		seenPeerRoles:      make(map[string]map[peer.ID]PeerRoleInfo),
 		observerOnlyShards: make(map[string]struct{}),
 		knownChildShards:   make(map[string]time.Time),
 		orphanHandoffSent:  make(map[string]map[string]*orphanHandoffInfo),
@@ -114,6 +117,7 @@ func NewShardManager(
 func (sm *ShardManager) Run() {
 	go sm.runPeerCountChecker()
 	go sm.runHeartbeat()
+	go sm.runSplitRebroadcast()
 	go sm.runShardDiscovery()
 	go sm.runOrphanUnpinLoop()
 	go sm.runReplicationChecker()
@@ -150,6 +154,7 @@ func (sm *ShardManager) moveToShard(fromShard, toShard string, isMergeUp bool) {
 	sm.msgCounter = 0
 	sm.knownChildShards = make(map[string]time.Time)
 	sm.lastPeerCheck = time.Now()
+	sm.splitAboveThresholdCount = 0
 	if isMergeUp {
 		sm.lastMergeUpTime = time.Now()
 	} else {

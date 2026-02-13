@@ -22,6 +22,10 @@ func (m *Monitor) geoWorker() {
 		m.mu.RLock()
 		if !m.geoCooldownUntil.IsZero() && time.Now().Before(m.geoCooldownUntil) {
 			m.mu.RUnlock()
+			select {
+			case m.geoQueue <- req:
+			default:
+			}
 			continue
 		}
 		cached, found := m.geoCache[req.ip]
@@ -95,10 +99,41 @@ func (m *Monitor) fetchGeoLocation(client *http.Client, ip string) (*GeoLocation
 	if err := json.NewDecoder(resp.Body).Decode(&geo); err != nil {
 		return nil, err
 	}
-	if geo.Country == "" {
+	if geo.Status != "success" || geo.Country == "" {
 		return nil, nil
 	}
 	return &geo, nil
+}
+
+func (m *Monitor) runGeoRetrySweep() {
+	ticker := time.NewTicker(GeoRetrySweepInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		m.mu.RLock()
+		now := time.Now()
+		var toRetry []geoRequest
+		for id, node := range m.nodes {
+			if node.Region != "" || node.IPAddress == "" {
+				continue
+			}
+			if !node.lastGeoAttempt.IsZero() && now.Sub(node.lastGeoAttempt) < GeoRetryInterval {
+				continue
+			}
+			toRetry = append(toRetry, geoRequest{ip: node.IPAddress, peerID: id})
+		}
+		m.mu.RUnlock()
+		for _, req := range toRetry {
+			select {
+			case m.geoQueue <- req:
+				m.mu.Lock()
+				if node, ok := m.nodes[req.peerID]; ok && node.Region == "" {
+					node.lastGeoAttempt = now
+				}
+				m.mu.Unlock()
+			default:
+			}
+		}
+	}
 }
 
 func (m *Monitor) updateNodeRegion(peerID string, geo *GeoLocation) {

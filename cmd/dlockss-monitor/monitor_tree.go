@@ -15,21 +15,26 @@ func (m *Monitor) GetShardTree() *ShardTreeNode {
 
 	rawShardIDs := make(map[string]bool)
 	rawShardIDs[""] = true
-	for _, e := range m.splitEvents {
-		rawShardIDs[e.ParentShard] = true
-		rawShardIDs[e.ChildShard] = true
-	}
+	maxDepth := MaxShardDepthForTreeDisplay
 	shardCounts := make(map[string]int)
-	for _, n := range m.nodes {
-		if len(n.ShardHistory) > 0 {
-			sid := n.ShardHistory[len(n.ShardHistory)-1].ShardID
-			shardCounts[sid]++
-			rawShardIDs[sid] = true
-		} else if n.CurrentShard != "" {
-			sid := n.CurrentShard
-			shardCounts[sid]++
-			rawShardIDs[sid] = true
+	for id, n := range m.nodes {
+		if !m.isDisplayableNodeUnlocked(id, n) {
+			continue
 		}
+		var sid string
+		if len(n.ShardHistory) > 0 {
+			sid = n.ShardHistory[len(n.ShardHistory)-1].ShardID
+		} else if n.CurrentShard != "" {
+			sid = n.CurrentShard
+		} else {
+			continue
+		}
+		// Collapse deep shards into their prefix for display
+		if len(sid) > maxDepth {
+			sid = sid[:maxDepth]
+		}
+		shardCounts[sid]++
+		rawShardIDs[sid] = true
 	}
 	allShardIDs := make(map[string]bool)
 	for id := range rawShardIDs {

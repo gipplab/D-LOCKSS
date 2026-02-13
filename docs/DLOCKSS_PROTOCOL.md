@@ -121,10 +121,17 @@ D-LOCKSS uses dynamic sharding to partition responsibility.
 ### 5.2 Dynamic Splitting
 
 When a shard becomes too large (too many peers):
-1.  **Detection**: `PeerCount > MaxPeersPerShard` (default 12; configurable) and estimated peers per child after split >= min per child (e.g. MinPeersPerShard or minPeersPerChildAfterSplit).
-2.  **Split**: Node sets `currentShard` to binary prefix of its PeerID at new depth (e.g., "0" -> "0" or "1" by hash).
+1.  **Detection**: `PeerCount >= MaxPeersPerShard` (default 12; configurable) for 2 consecutive checks, estimated peers per child >= MinPeersPerShard, and (child has ≥1 peer OR parent ≥14 to create). Uses ACTIVE peers only (HEARTBEAT/JOIN), not mesh count.
+2.  **Split**: Node announces SPLIT on parent topic, sets `currentShard` to binary prefix of its PeerID at new depth (e.g., "0" -> "00" or "01" by hash).
 3.  **Overlap**: Node joins new shard (pubsub + cluster), runs MigratePins(oldShard, newShard) after a short flush delay, then keeps old shard for `ShardOverlapDuration` (default 2m).
 4.  **Completion**: After overlap, node leaves old shard (LeaveShard pubsub + ClusterManager.LeaveShard). RunReshardPass re-evaluates responsibility; files no longer in our shard are unpinned.
+
+### 5.3 Discovery and Late Joiners
+
+Nodes in any shard (not just root) periodically run discovery to join existing deeper child shards:
+- **Intervals**: 10s at root, 2m default (`ShardDiscoveryInterval`), or 45s when SPLIT was received for target/sibling.
+- **Requirement**: SPLIT must be announced (avoids phantom joins). Probe timeout 12s.
+- **Split rebroadcast**: Nodes in child shards (e.g. 00, 01) periodically rebroadcast SPLIT to ancestor topics (0, root) so late joiners in the parent receive the announcement. Interval: 60s (`ShardSplitRebroadcastInterval`).
 
 ---
 

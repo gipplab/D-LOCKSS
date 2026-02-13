@@ -55,6 +55,9 @@ func (m *Monitor) runReplicationCleanup() {
 		}
 		log.Printf("[Monitor] SNAPSHOT total_nodes=%d total_manifests=%d total_at_target=%d avg_replication=%.2f |%s",
 			totalNodes, totalFiles, filesAtTarget, avgLevel, strings.TrimSpace(b.String()))
+		if filesAtTarget == 0 && totalFiles > 0 && totalNodes > 0 {
+			log.Printf("[Monitor] Hint: total_at_target=0 with manifests — may be transient during shard churn, cutoff filtering (ReplicationAnnounceTTL=%v), or target/replica mismatch", ReplicationAnnounceTTL)
+		}
 		if totalFiles == 0 && totalNodes > 0 {
 			m.mu.RLock()
 			knownManifests := len(m.manifestReplication)
@@ -127,7 +130,10 @@ func (m *Monitor) replicationNetworkDepth() int {
 // replicationNetworkDepthUnlocked returns max shard depth; caller must hold m.mu (at least RLock).
 func (m *Monitor) replicationNetworkDepthUnlocked() int {
 	maxLen := 0
-	for _, node := range m.nodes {
+	for id, node := range m.nodes {
+		if !m.isDisplayableNodeUnlocked(id, node) {
+			continue
+		}
 		shard := node.CurrentShard
 		if shard == "" && len(node.ShardHistory) > 0 {
 			shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
@@ -144,7 +150,10 @@ func (m *Monitor) getReplicationStats() (distribution [11]int, avgLevel float64,
 	defer m.mu.RUnlock()
 
 	shardPeerCount := make(map[string]int)
-	for _, node := range m.nodes {
+	for id, node := range m.nodes {
+		if !m.isDisplayableNodeUnlocked(id, node) {
+			continue
+		}
 		shard := node.CurrentShard
 		if shard == "" && len(node.ShardHistory) > 0 {
 			shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
@@ -153,7 +162,10 @@ func (m *Monitor) getReplicationStats() (distribution [11]int, avgLevel float64,
 	}
 
 	depth := 0
-	for _, n := range m.nodes {
+	for id, n := range m.nodes {
+		if !m.isDisplayableNodeUnlocked(id, n) {
+			continue
+		}
 		shard := n.CurrentShard
 		if shard == "" && len(n.ShardHistory) > 0 {
 			shard = n.ShardHistory[len(n.ShardHistory)-1].ShardID
@@ -181,7 +193,7 @@ func (m *Monitor) getReplicationStats() (distribution [11]int, avgLevel float64,
 		manifestShardCounts := make(map[string]int)
 		for peerID := range peers {
 			node, ok := m.nodes[peerID]
-			if !ok {
+			if !ok || !m.isDisplayableNodeUnlocked(peerID, node) {
 				continue
 			}
 			shard := node.CurrentShard
@@ -263,12 +275,27 @@ func (m *Monitor) getReplicationStats() (distribution [11]int, avgLevel float64,
 	return distribution, avgLevel, filesAtTarget
 }
 
-func (m *Monitor) getReplicationByShard() map[string]int {
+// ReplicationCIDEntry holds a manifest CID and its replication metadata for the replication-cids API.
+type ReplicationCIDEntry struct {
+	CID      string `json:"cid"`
+	Shard    string `json:"shard"`
+	Replicas int    `json:"replicas"`
+}
+
+// getReplicationCIDsByLevel returns CIDs at the given replication level (0–10).
+// Level 0–9 = exactly that many replicas; level 10 = 10+ replicas.
+func (m *Monitor) getReplicationCIDsByLevel(level int) []ReplicationCIDEntry {
+	if level < 0 || level > 10 {
+		return nil
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	shardPeerCount := make(map[string]int)
-	for _, node := range m.nodes {
+	for id, node := range m.nodes {
+		if !m.isDisplayableNodeUnlocked(id, node) {
+			continue
+		}
 		shard := node.CurrentShard
 		if shard == "" && len(node.ShardHistory) > 0 {
 			shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
@@ -277,7 +304,125 @@ func (m *Monitor) getReplicationByShard() map[string]int {
 	}
 
 	depth := 0
-	for _, n := range m.nodes {
+	for id, n := range m.nodes {
+		if !m.isDisplayableNodeUnlocked(id, n) {
+			continue
+		}
+		shard := n.CurrentShard
+		if shard == "" && len(n.ShardHistory) > 0 {
+			shard = n.ShardHistory[len(n.ShardHistory)-1].ShardID
+		}
+		if len(shard) > depth {
+			depth = len(shard)
+		}
+	}
+	cutoff := time.Now().Add(-ReplicationAnnounceTTL)
+
+	var result []ReplicationCIDEntry
+	for manifest, peers := range m.manifestReplication {
+		if len(peers) == 0 {
+			continue
+		}
+		targetShard := m.manifestShard[manifest]
+		if targetShard == "" || shardPeerCount[targetShard] == 0 {
+			targetShard, _ = effectiveTargetShardForManifest(manifest, depth, shardPeerCount)
+		}
+		manifestShardCounts := make(map[string]int)
+		for peerID := range peers {
+			node, ok := m.nodes[peerID]
+			if !ok || !m.isDisplayableNodeUnlocked(peerID, node) {
+				continue
+			}
+			shard := node.CurrentShard
+			if shard == "" && len(node.ShardHistory) > 0 {
+				shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
+			}
+			if m.peerShardLastSeen[peerID] != nil {
+				if last := m.peerShardLastSeen[peerID][shard]; last.Before(cutoff) {
+					continue
+				}
+			}
+			manifestShardCounts[shard]++
+		}
+		count := manifestShardCounts[targetShard]
+		maxRep := shardPeerCount[targetShard]
+		if maxRep == 0 && len(targetShard) > 0 {
+			descReplicas, descNodes := sumDescendantReplicasAndNodes(manifestShardCounts, shardPeerCount, targetShard)
+			if descReplicas > 0 {
+				count = descReplicas
+				maxRep = descNodes
+			}
+		}
+		if count > 0 && len(targetShard) >= 1 {
+			minRep := MonitorMinReplication
+			if maxRep > 0 && minRep > maxRep {
+				minRep = maxRep
+			}
+			if count < minRep {
+				parent := targetShard[:len(targetShard)-1]
+				if shardPeerCount[parent] == 0 {
+					descReplicas, descNodes := sumDescendantReplicasAndNodes(manifestShardCounts, shardPeerCount, parent)
+					if descReplicas > count {
+						count = descReplicas
+						maxRep = descNodes
+					}
+				}
+			}
+		}
+		if count == 0 {
+			targetShard = shardWithMostReplicas(manifestShardCounts, shardPeerCount)
+			if targetShard == "" {
+				continue
+			}
+			count = manifestShardCounts[targetShard]
+			maxRep = shardPeerCount[targetShard]
+		}
+		if maxRep == 0 {
+			maxRep = len(peers)
+		}
+		if count == 0 {
+			continue
+		}
+		// Check if this manifest belongs to the requested level bucket.
+		var matches bool
+		if level == 10 {
+			matches = count >= 10
+		} else {
+			matches = count == level
+		}
+		if matches {
+			shardLabel := m.manifestShard[manifest]
+			if shardLabel == "" {
+				shardLabel = "root"
+			}
+			result = append(result, ReplicationCIDEntry{CID: manifest, Shard: shardLabel, Replicas: count})
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].CID < result[j].CID })
+	return result
+}
+
+func (m *Monitor) getReplicationByShard() map[string]int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	shardPeerCount := make(map[string]int)
+	for id, node := range m.nodes {
+		if !m.isDisplayableNodeUnlocked(id, node) {
+			continue
+		}
+		shard := node.CurrentShard
+		if shard == "" && len(node.ShardHistory) > 0 {
+			shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
+		}
+		shardPeerCount[shard]++
+	}
+
+	depth := 0
+	for id, n := range m.nodes {
+		if !m.isDisplayableNodeUnlocked(id, n) {
+			continue
+		}
 		shard := n.CurrentShard
 		if shard == "" && len(n.ShardHistory) > 0 {
 			shard = n.ShardHistory[len(n.ShardHistory)-1].ShardID
@@ -296,7 +441,7 @@ func (m *Monitor) getReplicationByShard() map[string]int {
 		perManifestPerShard[manifest] = make(map[string]int)
 		for peerID := range peers {
 			node, ok := m.nodes[peerID]
-			if !ok {
+			if !ok || !m.isDisplayableNodeUnlocked(peerID, node) {
 				continue
 			}
 			shard := node.CurrentShard
