@@ -95,6 +95,8 @@ func (sm *ShardManager) JoinShard(shardID string) {
 }
 
 // JoinShardAsObserver subscribes to a shard topic without publishing JOIN/HEARTBEAT (peek only, like the monitor).
+// When ps.Join returns "topic already exists" (race with probeShardSilently), use Subscribe to obtain the
+// existing topic's subscription.
 func (sm *ShardManager) JoinShardAsObserver(shardID string) bool {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -110,22 +112,40 @@ func (sm *ShardManager) JoinShardAsObserver(shardID string) bool {
 
 	topicName := fmt.Sprintf("%s-creative-commons-shard-%s", config.PubsubTopicPrefix, shardID)
 	var t *pubsub.Topic
+	var psSub *pubsub.Subscription
 	if cached := sm.probeTopicCache[shardID]; cached != nil {
 		t = cached
 		delete(sm.probeTopicCache, shardID)
+		var err error
+		psSub, err = t.Subscribe()
+		if err != nil {
+			log.Printf("[Sharding] JoinShardAsObserver: failed to subscribe to %s: %v", topicName, err)
+			return false
+		}
 	} else {
 		var err error
 		t, err = sm.ps.Join(topicName)
 		if err != nil {
-			log.Printf("[Sharding] JoinShardAsObserver: failed to join topic %s: %v", topicName, err)
-			return false
+			if strings.Contains(err.Error(), "topic already exists") {
+				// Race: probeShardSilently has the topic but hasn't cached it yet. Subscribe uses
+				// tryJoin and returns the existing topic's subscription.
+				psSub, err = sm.ps.Subscribe(topicName)
+				if err != nil {
+					log.Printf("[Sharding] JoinShardAsObserver: failed to subscribe to %s (after topic exists): %v", topicName, err)
+					return false
+				}
+				t = nil // no topic handle; use ps.Publish for publishing
+			} else {
+				log.Printf("[Sharding] JoinShardAsObserver: failed to join topic %s: %v", topicName, err)
+				return false
+			}
+		} else {
+			psSub, err = t.Subscribe()
+			if err != nil {
+				log.Printf("[Sharding] JoinShardAsObserver: failed to subscribe to %s: %v", topicName, err)
+				return false
+			}
 		}
-	}
-
-	psSub, err := t.Subscribe()
-	if err != nil {
-		log.Printf("[Sharding] JoinShardAsObserver: failed to subscribe to %s: %v", topicName, err)
-		return false
 	}
 
 	ctx, cancel := context.WithCancel(sm.ctx)
@@ -161,7 +181,9 @@ func (sm *ShardManager) LeaveShardAsObserver(shardID string) {
 	delete(sm.observerOnlyShards, shardID)
 	sub.cancel()
 	sub.sub.Cancel()
-	sub.topic.Close()
+	if sub.topic != nil {
+		sub.topic.Close()
+	}
 	delete(sm.shardSubs, shardID)
 	log.Printf("[Sharding] Left shard %s (observer)", shardID)
 }

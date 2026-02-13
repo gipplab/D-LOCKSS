@@ -9,6 +9,7 @@ import (
 	"github.com/ipfs/go-cid"
 
 	"dlockss/internal/common"
+	"dlockss/internal/config"
 )
 
 func (sm *ShardManager) AnnouncePinned(manifestCID string) {
@@ -31,8 +32,14 @@ func (sm *ShardManager) PublishToShard(shardID, msg string) {
 	sub, exists := sm.shardSubs[shardID]
 	sm.mu.RUnlock()
 
-	if exists && sub.topic != nil {
-		sub.topic.Publish(sm.ctx, []byte(msg))
+	if !exists {
+		return
+	}
+	if sub.topic != nil {
+		_ = sub.topic.Publish(sm.ctx, []byte(msg))
+	} else {
+		topicName := fmt.Sprintf("%s-creative-commons-shard-%s", config.PubsubTopicPrefix, shardID)
+		_ = sm.ps.Publish(topicName, []byte(msg))
 	}
 }
 
@@ -41,8 +48,14 @@ func (sm *ShardManager) PublishToShardCBOR(data []byte, shardID string) {
 	sub, exists := sm.shardSubs[shardID]
 	sm.mu.RUnlock()
 
-	if exists && sub.topic != nil {
-		sub.topic.Publish(sm.ctx, data)
+	if !exists {
+		return
+	}
+	if sub.topic != nil {
+		_ = sub.topic.Publish(sm.ctx, data)
+	} else {
+		topicName := fmt.Sprintf("%s-creative-commons-shard-%s", config.PubsubTopicPrefix, shardID)
+		_ = sm.ps.Publish(topicName, data)
 	}
 }
 
