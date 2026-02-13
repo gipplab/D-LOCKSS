@@ -7,6 +7,8 @@ import (
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
+
+	"dlockss/internal/config"
 )
 
 const (
@@ -92,6 +94,7 @@ type GeoLocation struct {
 
 type Monitor struct {
 	mu                  sync.RWMutex
+	topicPrefixOverride string // if set, overrides config.PubsubTopicPrefix for subscriptions
 	nodes               map[string]*NodeState
 	splitEvents         []ShardSplitEvent
 	geoCache            map[string]*GeoLocation
@@ -122,6 +125,21 @@ func shardLogLabel(shardID string) string {
 		return "root"
 	}
 	return shardID
+}
+
+// getTopicPrefix returns the effective topic prefix (override or config).
+func (m *Monitor) getTopicPrefix() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.getTopicPrefixUnlocked()
+}
+
+// getTopicPrefixUnlocked returns the effective topic prefix. Call only when holding m.mu.
+func (m *Monitor) getTopicPrefixUnlocked() string {
+	if m.topicPrefixOverride != "" {
+		return m.topicPrefixOverride
+	}
+	return config.PubsubTopicPrefix
 }
 
 func NewMonitor() *Monitor {

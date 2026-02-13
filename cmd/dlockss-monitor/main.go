@@ -131,6 +131,25 @@ func main() {
 		json.NewEncoder(w).Encode(tree)
 	})
 
+	mux.HandleFunc("/api/root-topic", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			var body struct {
+				TopicPrefix string `json:"topic_prefix"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, `{"error":"invalid JSON, expected {\"topic_prefix\":\"...\"}"}`, http.StatusBadRequest)
+				return
+			}
+			monitor.SwitchTopicPrefix(ctx, body.TopicPrefix)
+			rootTopic := fmt.Sprintf("%s-creative-commons-shard-", monitor.getTopicPrefix())
+			json.NewEncoder(w).Encode(map[string]string{"root_topic": rootTopic, "topic_prefix": monitor.getTopicPrefix()})
+			return
+		}
+		rootTopic := fmt.Sprintf("%s-creative-commons-shard-", monitor.getTopicPrefix())
+		json.NewEncoder(w).Encode(map[string]string{"root_topic": rootTopic, "topic_prefix": monitor.getTopicPrefix()})
+	})
+
 	mux.HandleFunc("/api/unique-cids", func(w http.ResponseWriter, r *http.Request) {
 		monitor.mu.RLock()
 		count := len(monitor.uniqueCIDs)

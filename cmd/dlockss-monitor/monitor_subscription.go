@@ -60,7 +60,7 @@ func (m *Monitor) ensureShardSubscriptionUnlocked(ctx context.Context, shardID s
 	if _, exists := m.shardTopics[shardID]; exists {
 		return
 	}
-	topicName := fmt.Sprintf("%s-creative-commons-shard-%s", config.PubsubTopicPrefix, shardID)
+	topicName := fmt.Sprintf("%s-creative-commons-shard-%s", m.getTopicPrefixUnlocked(), shardID)
 	topic, err := m.ps.Join(topicName)
 	if err != nil {
 		log.Printf("[Monitor] Failed to join shard topic %s: %v", topicName, err)
@@ -257,4 +257,38 @@ func (m *Monitor) subscribeToActiveShardsPass(ctx context.Context) {
 			m.ensureShardSubscription(ctx, shardID)
 		}
 	}
+}
+
+// SwitchTopicPrefix changes the topic prefix and re-subscribes to the new network.
+// Use this to investigate different D-LOCKSS versions without restarting the monitor.
+// Pass "" to reset to the config default (DLOCKSS_PUBSUB_TOPIC_PREFIX).
+func (m *Monitor) SwitchTopicPrefix(ctx context.Context, newPrefix string) {
+	effectivePrefix := newPrefix
+	if effectivePrefix == "" {
+		effectivePrefix = config.PubsubTopicPrefix
+	}
+	m.mu.Lock()
+	// Close all current topic subscriptions
+	for shardID, topic := range m.shardTopics {
+		_ = topic.Close()
+		delete(m.shardTopics, shardID)
+	}
+	m.topicPrefixOverride = newPrefix // "" clears override, effectivePrefix used for subscribe
+	// Clear state from old network
+	m.nodes = make(map[string]*NodeState)
+	m.splitEvents = m.splitEvents[:0]
+	m.uniqueCIDs = make(map[string]time.Time)
+	m.manifestReplication = make(map[string]map[string]time.Time)
+	m.manifestShard = make(map[string]string)
+	m.nodeFiles = make(map[string]map[string]time.Time)
+	m.peerShardLastSeen = make(map[string]map[string]time.Time)
+	m.treeCache = nil
+	m.treeDirty = true
+	m.mu.Unlock()
+
+	// Re-subscribe to bootstrap shards with new prefix
+	for _, shardID := range shardIDsUpToDepth(bootstrapShardDepth) {
+		m.ensureShardSubscription(ctx, shardID)
+	}
+	log.Printf("[Monitor] Switched to topic prefix %q, subscribed to %d shards", effectivePrefix, 1<<(bootstrapShardDepth+1)-1)
 }

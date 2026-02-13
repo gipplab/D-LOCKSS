@@ -48,7 +48,18 @@ const dashboardHTML = `<!DOCTYPE html>
     <div class="container">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 20px;">
             <h1>D-LOCKSS Monitor</h1>
-            <div style="font-size: 0.9em;">SYSTEM STATUS: <span class="status-text status-online">[ONLINE]</span></div>
+            <div style="font-size: 0.9em; text-align: right;">
+                <div>SYSTEM STATUS: <span class="status-text status-online">[ONLINE]</span></div>
+                <div id="root-topic-row" style="font-size: 0.75em; color: #666; margin-top: 4px; word-break: break-all;">
+                    Root topic: <span id="root-topic-value">--</span>
+                    <button class="btn-text" id="root-topic-edit-btn" style="margin-left: 6px; font-size: 0.9em;">EDIT</button>
+                </div>
+                <div id="root-topic-edit-row" style="display: none; margin-top: 4px;">
+                    <input type="text" id="root-topic-input" placeholder="e.g. dlockss-v0.0.2" style="padding: 4px; font-family: inherit; font-size: 0.85em; width: 160px; border: 1px solid #333;" title="Topic prefix (full topic: {prefix}-creative-commons-shard-)">
+                    <button class="btn-text btn-save" id="root-topic-save-btn">SAVE</button>
+                    <button class="btn-text btn-cancel" id="root-topic-cancel-btn">CANCEL</button>
+                </div>
+            </div>
         </div>
         <div class="stats">
             <div class="stat-card"><div class="stat-value" id="total-nodes">--</div><div class="stat-label">Total Nodes</div></div>
@@ -141,7 +152,21 @@ const dashboardHTML = `<!DOCTYPE html>
             });
         }
         function debouncedFilter() { clearTimeout(searchTimeout); searchTimeout = setTimeout(() => { updateDashboard(); }, 300); }
-        initCharts(); updateDashboard(); updateShardTree();
+        function loadRootTopic() { fetch('/api/root-topic').then(r=>r.json()).then(d => { const el = document.getElementById('root-topic-value'); if (el && d.root_topic) el.textContent = d.root_topic; if (d.topic_prefix) window._currentTopicPrefix = d.topic_prefix; }).catch(() => {}); }
+        function showTopicEdit() { document.getElementById('root-topic-row').style.display = 'none'; document.getElementById('root-topic-edit-row').style.display = 'block'; document.getElementById('root-topic-input').value = window._currentTopicPrefix || ''; document.getElementById('root-topic-input').focus(); }
+        function hideTopicEdit() { document.getElementById('root-topic-edit-row').style.display = 'none'; document.getElementById('root-topic-row').style.display = ''; }
+        function saveTopicPrefix() {
+            const prefix = document.getElementById('root-topic-input').value.trim();
+            fetch('/api/root-topic', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ topic_prefix: prefix || undefined }) })
+                .then(r => { if (!r.ok) throw new Error(r.statusText); return r.json(); })
+                .then(d => { window._currentTopicPrefix = d.topic_prefix; document.getElementById('root-topic-value').textContent = d.root_topic; hideTopicEdit(); updateDashboard(); updateShardTree(); })
+                .catch(e => alert('Failed to switch topic: ' + e.message));
+        }
+        document.getElementById('root-topic-edit-btn').onclick = showTopicEdit;
+        document.getElementById('root-topic-save-btn').onclick = saveTopicPrefix;
+        document.getElementById('root-topic-cancel-btn').onclick = hideTopicEdit;
+        document.getElementById('root-topic-input').onkeydown = function(e) { if (e.key === 'Enter') saveTopicPrefix(); else if (e.key === 'Escape') hideTopicEdit(); };
+        initCharts(); updateDashboard(); updateShardTree(); loadRootTopic();
         // Refresh every 1s so UI stays close to monitor state (monitor itself updates when nodes send heartbeats).
         setInterval(() => { if(!document.getElementById('nodeSearch').value && currentlyEditingPeerID === null) { updateDashboard(); updateShardTree(); } }, 1000);
     </script>
