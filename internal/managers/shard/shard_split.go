@@ -68,6 +68,21 @@ func (sm *ShardManager) checkAndSplitIfNeeded() {
 
 	peerCount := sm.getShardPeerCountForSplit()
 	if peerCount < config.MaxPeersPerShard {
+		sm.mu.Lock()
+		sm.splitAboveThresholdCount = 0
+		sm.mu.Unlock()
+		return
+	}
+
+	// Hysteresis: require 2 consecutive checks above threshold to avoid splitting on transient spikes
+	sm.mu.Lock()
+	sm.splitAboveThresholdCount++
+	count := sm.splitAboveThresholdCount
+	sm.mu.Unlock()
+	if count < 2 {
+		if config.VerboseLogging {
+			log.Printf("[Sharding] Shard %s at %d peers (≥%d) but waiting for 2nd consecutive check before split", currentShard, peerCount, config.MaxPeersPerShard)
+		}
 		return
 	}
 
@@ -86,11 +101,14 @@ func (sm *ShardManager) checkAndSplitIfNeeded() {
 
 	canJoinExisting := childPeerCount >= 1
 	minParentToCreate := 2 * config.MinPeersPerShard
-	canCreateChild := childPeerCount == 0 && peerCount >= minParentToCreate
+	// When creating a new child (child empty), require +2 buffer so we have 14+ in parent.
+	// First mover creates 13+1; more peers will join before merge timeout, reducing 1-node windows.
+	minParentToCreateNew := minParentToCreate + 2
+	canCreateChild := childPeerCount == 0 && peerCount >= minParentToCreateNew
 	if !canJoinExisting && !canCreateChild {
 		if config.VerboseLogging {
 			log.Printf("[Sharding] Shard %s at limit (%d peers) but not splitting: child %s has %d (need ≥1 to join or parent ≥%d to create)",
-				currentShard, peerCount, targetChild, childPeerCount, minParentToCreate)
+				currentShard, peerCount, targetChild, childPeerCount, minParentToCreateNew)
 		}
 		return
 	}
@@ -113,6 +131,52 @@ func (sm *ShardManager) announceSplit(parentShard string, targetChild string) {
 	msg := []byte(fmt.Sprintf("SPLIT:%s:%s", targetChild, sibling))
 	_ = sub.topic.Publish(sm.ctx, msg)
 	log.Printf("[Sharding] Announced split on shard %s: children %s, %s", parentShard, targetChild, sibling)
+}
+
+// publishSplitToAncestor joins the ancestor shard as observer, publishes SPLIT:child0:child1, then leaves.
+// This lets late-joining nodes in the ancestor discover existing children.
+func (sm *ShardManager) publishSplitToAncestor(ancestorShard string) {
+	child0 := ancestorShard + "0"
+	child1 := ancestorShard + "1"
+	if ancestorShard == "" {
+		child0 = "0"
+		child1 = "1"
+	}
+	if !sm.JoinShardAsObserver(ancestorShard) {
+		return // already full member (we're in this shard) or failed to join
+	}
+	defer sm.LeaveShardAsObserver(ancestorShard)
+
+	msg := []byte(fmt.Sprintf("SPLIT:%s:%s", child0, child1))
+	sm.mu.RLock()
+	sub, exists := sm.shardSubs[ancestorShard]
+	sm.mu.RUnlock()
+	if exists && sub.topic != nil {
+		_ = sub.topic.Publish(sm.ctx, msg)
+	} else {
+		// Fallback when topic is nil (e.g. "topic already exists" path in JoinShardAsObserver)
+		topicName := fmt.Sprintf("%s-creative-commons-shard-%s", config.PubsubTopicPrefix, ancestorShard)
+		_ = sm.ps.Publish(topicName, msg)
+	}
+	log.Printf("[Sharding] Re-broadcast SPLIT to ancestor %q: children %s, %s", ancestorShard, child0, child1)
+}
+
+// rebroadcastSplitToAncestors publishes SPLIT to each ancestor shard (parent, grandparent, ..., root).
+// Late joiners in any ancestor will receive the announcement and can discover existing children.
+func (sm *ShardManager) rebroadcastSplitToAncestors() {
+	sm.mu.RLock()
+	currentShard := sm.currentShard
+	sm.mu.RUnlock()
+	if currentShard == "" {
+		return // root has no ancestors
+	}
+	for ancestor := currentShard[:len(currentShard)-1]; ; {
+		sm.publishSplitToAncestor(ancestor)
+		if ancestor == "" {
+			break
+		}
+		ancestor = ancestor[:len(ancestor)-1]
+	}
 }
 
 // splitShard moves this node to its target child. For tests; normal path uses checkAndSplitIfNeeded.

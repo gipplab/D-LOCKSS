@@ -6,15 +6,29 @@ import (
 	"time"
 )
 
+// SplitGracePeriod: after a split, don't prune nodes for this duration to allow
+// gossip-sub mesh formation on new shards (avoids dropping nodes during active splits).
+const splitGracePeriod = 5 * time.Minute
+
 func (m *Monitor) PruneStaleNodes() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	now := time.Now()
+	// Skip pruning during grace period after a split (mesh may still be forming on new shards).
+	if !m.lastSplitTime.IsZero() && now.Sub(m.lastSplitTime) < splitGracePeriod {
+		return
+	}
 	changed := false
 	prunedCount := 0
 	for id, node := range m.nodes {
-		if now.Sub(node.LastSeen) > nodeCleanupTimeout {
+		timeout := nodeCleanupTimeout
+		// Nodes in transition (CurrentShard == "" after LEAVE) get 2x grace: JOIN on new shard
+		// can be delayed by discovery, gossip-sub mesh formation, or slow networks.
+		if node.CurrentShard == "" {
+			timeout = nodeCleanupTimeout * 2
+		}
+		if now.Sub(node.LastSeen) > timeout {
 			delete(m.nodes, id)
 			delete(m.nodeFiles, id)
 			delete(m.peerShardLastSeen, id)

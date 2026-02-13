@@ -9,8 +9,9 @@ import (
 )
 
 const (
-	discoveryIntervalOnRoot = 10 * time.Second
-	probeTimeoutDiscovery   = 6 * time.Second
+	discoveryIntervalOnRoot       = 10 * time.Second
+	probeTimeoutDiscovery         = 12 * time.Second // allow mesh formation before counting peers
+	discoveryIntervalWithChildren = 45 * time.Second // when SPLIT known, retry more often
 )
 
 // discoverAndMoveToDeeperShard joins an existing child shard that matches this node's hash (children created only by split).
@@ -90,6 +91,18 @@ func (sm *ShardManager) runShardDiscovery() {
 		interval := config.ShardDiscoveryInterval
 		if currentShard == "" {
 			interval = discoveryIntervalOnRoot
+		} else {
+			// When we know children exist (SPLIT received), retry discovery more often so we migrate promptly
+			nextDepth := len(currentShard) + 1
+			targetChild := common.GetBinaryPrefix(sm.h.ID().String(), nextDepth)
+			siblingShard := getSiblingShard(targetChild)
+			sm.mu.RLock()
+			_, targetKnown := sm.knownChildShards[targetChild]
+			_, siblingKnown := sm.knownChildShards[siblingShard]
+			sm.mu.RUnlock()
+			if targetKnown || siblingKnown {
+				interval = discoveryIntervalWithChildren
+			}
 		}
 
 		select {
@@ -106,7 +119,16 @@ func (sm *ShardManager) runShardDiscovery() {
 		peerCount := sm.getShardPeerCountForSplit() // mesh-only: stale seenPeers mustn't block discovery
 		fewPeersInShard := peerCount <= config.MaxPeersPerShard
 		onRoot := currentShard == ""
-		if !isIdle && !fewPeersInShard && !onRoot {
+		// When we know children exist (SPLIT received), always run discovery so we migrate promptly
+		nextDepth := len(currentShard) + 1
+		targetChild := common.GetBinaryPrefix(sm.h.ID().String(), nextDepth)
+		siblingShard := getSiblingShard(targetChild)
+		sm.mu.RLock()
+		_, targetKnown := sm.knownChildShards[targetChild]
+		_, siblingKnown := sm.knownChildShards[siblingShard]
+		sm.mu.RUnlock()
+		hasKnownChildren := targetKnown || siblingKnown
+		if !hasKnownChildren && !isIdle && !fewPeersInShard && !onRoot {
 			continue
 		}
 

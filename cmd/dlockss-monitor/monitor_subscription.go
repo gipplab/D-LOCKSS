@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -57,12 +58,18 @@ func (m *Monitor) ensureShardSubscriptionUnlocked(ctx context.Context, shardID s
 	if m.ps == nil {
 		return
 	}
+	if len(shardID) > MaxShardDepthForSubscription {
+		return // Avoid subscribing to very deep shards (e.g. 16-bit IDs)
+	}
 	if _, exists := m.shardTopics[shardID]; exists {
 		return
 	}
 	topicName := fmt.Sprintf("%s-creative-commons-shard-%s", m.getTopicPrefixUnlocked(), shardID)
 	topic, err := m.ps.Join(topicName)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "context canceled") {
+			return // Normal during shutdown; don't log
+		}
 		log.Printf("[Monitor] Failed to join shard topic %s: %v", topicName, err)
 		return
 	}
@@ -72,8 +79,13 @@ func (m *Monitor) ensureShardSubscriptionUnlocked(ctx context.Context, shardID s
 		return
 	}
 	m.shardTopics[shardID] = topic
+	// Publish PROBE so D-LOCKSS nodes know we're an observer (don't count us for split/replication)
+	if m.host != nil {
+		probeMsg := []byte("PROBE:" + m.host.ID().String())
+		_ = topic.Publish(ctx, probeMsg)
+	}
 	go m.handleShardMessages(ctx, sub, shardID)
-	log.Printf("[Monitor] Subscribed to shard topic: %s", shardID)
+	log.Printf("[Monitor] Subscribed to shard topic: %s", shardLogLabel(shardID))
 }
 
 func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscription, shardID string) {
@@ -106,6 +118,15 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 
 			if len(msg.Data) > 0 && len(msg.Data) < 500 && string(msg.Data[:min(10, len(msg.Data))]) == "HEARTBEAT:" {
 				parts := strings.SplitN(string(msg.Data), ":", 4)
+				role := "ACTIVE"
+				if len(parts) >= 4 {
+					switch strings.ToUpper(parts[3]) {
+					case "PASSIVE":
+						role = "PASSIVE"
+					case "PROBE":
+						role = "PROBE"
+					}
+				}
 				if len(parts) >= 2 && parts[1] != "" {
 					authorID, err := peer.Decode(parts[1])
 					if err != nil {
@@ -116,19 +137,27 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 							authorID = senderID
 						}
 					}
-					pinnedCount := 0
+					pinnedCount := -1
 					if len(parts) >= 3 {
-						fmt.Sscanf(parts[2], "%d", &pinnedCount)
+						var n int
+						if _, err := fmt.Sscanf(parts[2], "%d", &n); err == nil {
+							pinnedCount = n
+						}
 					}
 					if shardID != "" {
-						log.Printf("[Monitor] HEARTBEAT shard=%s author=%s pinned=%d", shardID, authorID.String(), pinnedCount)
+						log.Printf("[Monitor] HEARTBEAT shard=%s author=%s pinned=%d role=%s", shardID, authorID.String(), pinnedCount, role)
 					}
-					m.handleHeartbeat(authorID, shardID, ip, -1)
-					m.handleHeartbeat(authorID, shardID, ip, pinnedCount)
+					m.handleHeartbeatWithRole(authorID, shardID, ip, pinnedCount, role)
 				} else {
-					// HEARTBEAT prefix but no valid author (malformed or old format): count sender so we don't miss nodes.
 					m.handleHeartbeat(senderID, shardID, ip, -1)
 				}
+				continue
+			}
+
+			if len(msg.Data) >= 6 && string(msg.Data[:6]) == "PROBE:" {
+				// PROBE means "I'm observing this shard", not "I'm a member". Don't update
+				// node state: that would incorrectly move nodes to the probed shard and hide
+				// them (Role=PROBE). Node membership is tracked via HEARTBEAT and JOIN only.
 				continue
 			}
 
@@ -150,7 +179,12 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 			}
 
 			if len(msg.Data) > 5 && string(msg.Data[:5]) == "JOIN:" {
-				peerIDStr := strings.TrimSpace(string(msg.Data[5:]))
+				parts := strings.SplitN(string(msg.Data[5:]), ":", 2)
+				peerIDStr := strings.TrimSpace(parts[0])
+				role := "ACTIVE"
+				if len(parts) >= 2 && strings.ToUpper(parts[1]) == "PASSIVE" {
+					role = "PASSIVE"
+				}
 				if peerIDStr != "" {
 					joinID, err := peer.Decode(peerIDStr)
 					if err != nil {
@@ -159,8 +193,9 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 						}
 					}
 					if err == nil {
-						m.handleHeartbeat(joinID, shardID, ip, -1)
-						log.Printf("[Monitor] SHARD_JOIN peer=%s shard=%s", joinID.String(), shardLogLabel(shardID))
+						if m.handleHeartbeatWithRole(joinID, shardID, ip, -1, role) {
+							log.Printf("[Monitor] SHARD_JOIN peer=%s shard=%s role=%s", joinID.String(), shardLogLabel(shardID), role)
+						}
 					}
 				}
 				continue
@@ -200,7 +235,7 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 }
 
 func (m *Monitor) subscribeToActiveShards(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	// Run subscription pass once immediately so we don't wait 5s for first subscription update.
 	m.subscribeToActiveShardsPass(ctx)
@@ -248,12 +283,12 @@ func (m *Monitor) subscribeToActiveShardsPass(ctx context.Context) {
 	}
 	m.mu.RUnlock()
 	for shardID := range activeShards {
-		if m.ps != nil {
+		if len(shardID) <= MaxShardDepthForSubscription && m.ps != nil {
 			m.ensureShardSubscription(ctx, shardID)
 		}
 	}
 	for shardID := range potentialChildren {
-		if m.ps != nil {
+		if len(shardID) <= MaxShardDepthForSubscription && m.ps != nil {
 			m.ensureShardSubscription(ctx, shardID)
 		}
 	}

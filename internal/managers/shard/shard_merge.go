@@ -8,8 +8,9 @@ import (
 )
 
 const (
-	mergeUpCooldown   = 15 * time.Minute
-	probeTimeoutMerge = 3 * time.Second
+	mergeUpCooldown        = 15 * time.Minute
+	probeTimeoutMerge      = 3 * time.Second
+	siblingEmptyMergeAfter = 5 * time.Minute // if sibling has 0 for this long, merge (not "split in progress")
 )
 
 // checkAndMergeUpIfAlone merges to parent when (my shard + sibling) < MinPeersAcrossSiblings.
@@ -42,10 +43,19 @@ func (sm *ShardManager) checkAndMergeUpIfAlone() {
 	siblingsTotal := currentPeerCount + siblingPeerCount
 
 	if siblingPeerCount == 0 {
-		if config.VerboseLogging {
-			log.Printf("[ShardMergeUp] Shard %s has %d peers, sibling %s has 0 (split in progress), not merging",
-				currentShard, currentPeerCount, siblingShard)
+		// Normally we don't merge when sibling has 0 (split in progress). But if we've been
+		// in this shard for a long time, sibling empty means no one joined it (e.g. 110 has 1,
+		// 111 has 0) — we should merge up to avoid understaffed leaf shards.
+		if lastMove.IsZero() || time.Since(lastMove) < siblingEmptyMergeAfter {
+			if config.VerboseLogging {
+				log.Printf("[ShardMergeUp] Shard %s has %d peers, sibling %s has 0 (split in progress?), not merging",
+					currentShard, currentPeerCount, siblingShard)
+			}
+			return
 		}
+		log.Printf("[ShardMergeUp] Shard %s has %d peers, sibling %s has 0 for >%v → merging to %s",
+			currentShard, currentPeerCount, siblingShard, siblingEmptyMergeAfter, parentShard)
+		sm.moveToShard(currentShard, parentShard, true)
 		return
 	}
 

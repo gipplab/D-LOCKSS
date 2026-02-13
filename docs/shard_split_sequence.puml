@@ -10,11 +10,11 @@ participant "IPFS" as IPFS
 == Path 1: Split when current shard is overcrowded ==
 
 ShardMgr -> ShardMgr: runPeerCountChecker()\n(ticker: rootPeerCheckInterval at root, ShardPeerCheckInterval otherwise)
-ShardMgr -> ShardMgr: getShardPeerCount()\n(max(mesh+1, seen+1) for current shard)
+ShardMgr -> ShardMgr: getShardPeerCountForSplit()\n(ACTIVE peers only from HEARTBEAT/JOIN; no mesh fallback)
 
-alt peerCount > MaxPeersPerShard\nAND estimatedPeersAfterSplit >= minPerChild (MinPeersPerShard or minPeersPerChildAfterSplit)
-    ShardMgr -> ShardMgr: splitShard()
-    ShardMgr -> ShardMgr: currentShard = GetBinaryPrefix(peerID, depth+1)
+alt peerCount >= MaxPeersPerShard (2 consecutive checks)\nAND estimatedPerChild >= MinPeersPerShard\nAND (child has >=1 peer OR parent >= 14 to create)
+    ShardMgr -> ShardMgr: announceSplit(parentShard, targetChild)\nPublish SPLIT:child0:child1 on parent topic
+    ShardMgr -> ShardMgr: moveToShard(currentShard, targetChild)\ncurrentShard = GetBinaryPrefix(peerID, depth+1)
     
     ShardMgr -> PubSub: JoinShard(newShard)\n(topic: dlockss-creative-commons-shard-<newShard>)
     
@@ -42,20 +42,29 @@ alt peerCount > MaxPeersPerShard\nAND estimatedPeersAfterSplit >= minPerChild (M
     end
 end
 
-== Path 2: Discover and migrate into existing deeper shards (root only) ==
+== Path 2: Discover and migrate into existing deeper shards ==
 
-Note over ShardMgr: At root (currentShard == ""): runShardDiscovery()\nprobe deeper shards (JoinShardAsObserver), then move to deepest with peers.
+Note over ShardMgr: runShardDiscovery() runs for ALL shards (root and non-root).\nRequires SPLIT announcement (knownChildShards); probe timeout 12s.\nInterval: 10s at root, 2m default, 45s when SPLIT known.
 
-ShardMgr -> ShardMgr: runShardDiscovery()\n(ticker: discoveryIntervalOnRoot at root, ShardDiscoveryInterval otherwise)
-ShardMgr -> ShardMgr: checkAndMergeUpIfAlone()\nthen discoverAndMoveToDeeperShard()
+ShardMgr -> ShardMgr: runShardDiscovery()\n(ticker: 10s at root, 2m otherwise, 45s when knownChildShards)
+ShardMgr -> ShardMgr: discoverAndMoveToDeeperShard()\nprobeShard(targetChild, 12s) + probeShard(sibling)
+ShardMgr -> ShardMgr: checkAndMergeUpIfAlone()
 
-alt At root AND deeper shard has >= minRequired peers
-    ShardMgr -> ShardMgr: JoinShardAsObserver(deepestActiveShard)\nobserverProbeDuration, then JoinShard (promote to full)
-    ShardMgr -> ShardMgr: currentShard = deepestActiveShard
+alt SPLIT announced AND (child+sibling >= MinPeersAcrossSiblings OR projected >= threshold)
+    ShardMgr -> ShardMgr: moveToShard(currentShard, targetChild)
     ShardMgr -> PubSub: JoinShard(newShard)
     ShardMgr -> ClusterMgr: JoinShard(ctx, newShard, nil)
     ShardMgr -> ShardMgr: MigratePins(oldShard, newShard)\nLeaveShard(oldShard) after ShardOverlapDuration\nRunReshardPass(oldShard, newShard)
 end
+
+== Path 2b: Split rebroadcast (late joiners) ==
+
+Note over ShardMgr: Nodes in child shards periodically rebroadcast SPLIT to ancestors.
+
+ShardMgr -> ShardMgr: runSplitRebroadcast()\n(ticker: ShardSplitRebroadcastInterval, default 60s)
+ShardMgr -> ShardMgr: rebroadcastSplitToAncestors()\nfor each ancestor: publishSplitToAncestor()
+ShardMgr -> ShardMgr: JoinShardAsObserver(ancestor), Publish SPLIT:child0:child1, LeaveShardAsObserver
+ShardMgr -> PubSub: SPLIT:child0:child1 on ancestor topic
 
 == Path 3: Merge up when understaffed in deep shard ==
 

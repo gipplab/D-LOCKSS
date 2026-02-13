@@ -20,7 +20,9 @@ Metrics --> ClusterManager : GetClusterMetrics (pins/peers per shard)
 note right of ShardManager
     Manages shard assignment
     and PubSub topics.
-    Splits when overcrowded.
+    Splits when overcrowded (≥12 peers).
+    Discovery: join existing deeper shards.
+    Rebroadcast SPLIT to ancestors for late joiners.
 end note
 
 note right of ClusterManager

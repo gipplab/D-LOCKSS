@@ -222,7 +222,8 @@ if [ ! -f "$IPFS_REPO/config" ]; then
 fi
 
 printf '%bStarting IPFS daemon...%b\n' "$YELLOW" "$NC"
-(export IPFS_PATH="$IPFS_REPO" && "$IPFS_CMD" daemon --enable-gc >> "$LOG_IPFS" 2>&1 & echo $! > "$IPFS_PID_FILE")
+# Filter reprovider "block not found locally" errors (harmless; occurs when D-LOCKSS unpins after shard moves)
+(export IPFS_PATH="$IPFS_REPO" && "$IPFS_CMD" daemon --enable-gc 2>&1 | grep -v 'reproviding failed both routing/provide' >> "$LOG_IPFS" & echo $! > "$IPFS_PID_FILE")
 
 i=1
 while [ "$i" -le 120 ]; do
