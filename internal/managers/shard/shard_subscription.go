@@ -8,6 +8,8 @@ import (
 	"time"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+
+	"dlockss/internal/config"
 )
 
 // JoinShard subscribes to the shard topic (or increments refcount). Promotes observer to full member if already subscribed.
@@ -38,7 +40,7 @@ func (sm *ShardManager) JoinShard(shardID string) {
 		return
 	}
 
-	topicName := fmt.Sprintf("dlockss-creative-commons-shard-%s", shardID)
+	topicName := fmt.Sprintf("%s-creative-commons-shard-%s", config.PubsubTopicPrefix, shardID)
 	var t *pubsub.Topic
 	if cached := sm.probeTopicCache[shardID]; cached != nil {
 		t = cached
@@ -106,7 +108,7 @@ func (sm *ShardManager) JoinShardAsObserver(shardID string) bool {
 		return false
 	}
 
-	topicName := fmt.Sprintf("dlockss-creative-commons-shard-%s", shardID)
+	topicName := fmt.Sprintf("%s-creative-commons-shard-%s", config.PubsubTopicPrefix, shardID)
 	var t *pubsub.Topic
 	if cached := sm.probeTopicCache[shardID]; cached != nil {
 		t = cached

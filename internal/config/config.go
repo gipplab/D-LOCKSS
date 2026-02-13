@@ -3,9 +3,14 @@ package config
 import (
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 )
+
+// DefaultPubsubVersion is the protocol version used for pubsub topic names.
+// Bump when releasing to avoid cross-talk with older nodes. Keep in sync with releases.
+const DefaultPubsubVersion = "dlockss-v0.0.2"
 
 func getEnvString(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
@@ -54,15 +59,27 @@ func getEnvBool(key string, defaultValue bool) bool {
 	return defaultValue
 }
 
+func getClusterStorePath() string {
+	if p := os.Getenv("DLOCKSS_CLUSTER_STORE"); p != "" {
+		return p
+	}
+	return filepath.Join(filepath.Dir(FileWatchFolder), "cluster_store")
+}
+
 func LogConfiguration() {
 	log.Printf("[Config] Discovery Tag: %s", DiscoveryServiceTag)
+	log.Printf("[Config] Pubsub Topic Prefix: %s", PubsubTopicPrefix)
 	log.Printf("[Config] Data Directory: %s", FileWatchFolder)
+	log.Printf("[Config] Cluster Store: %s", ClusterStorePath)
 	log.Printf("[Config] Replication: %d-%d", MinReplication, MaxReplication)
 	log.Printf("[Config] Check Interval: %v", CheckInterval)
 	log.Printf("[Config] Max Peers Per Shard: %d (do not split until this many nodes)", MaxPeersPerShard)
 	log.Printf("[Config] Min Peers Per Shard: %d (minimum per child after split)", MinPeersPerShard)
 	log.Printf("[Config] Min Peers Across Siblings: %d (join/stay only if shard+sibling >= this; else remerge)", MinPeersAcrossSiblings)
 	log.Printf("[Config] Shard Peer Check Interval: %v", ShardPeerCheckInterval)
+	log.Printf("[Config] Bootstrap Timeout: %v", BootstrapTimeout)
+	log.Printf("[Config] Seen Peers Window: %v", SeenPeersWindow)
+	log.Printf("[Config] Prune Stale Peers Interval: %v", PruneStalePeersInterval)
 	log.Printf("[Config] Max Concurrent Checks: %d", MaxConcurrentReplicationChecks)
 	log.Printf("[Config] Rate Limit: %d messages per %v", MaxMessagesPerWindow, RateLimitWindow)
 	log.Printf("[Config] Backoff: %v - %v (multiplier: %.1f)", InitialBackoffDelay, MaxBackoffDelay, BackoffMultiplier)
@@ -74,6 +91,7 @@ func LogConfiguration() {
 	log.Printf("[Config] Removed File Cooldown: %v", RemovedFileCooldown)
 	log.Printf("[Config] BadBits Path: %s", BadBitsPath)
 	log.Printf("[Config] Shard Overlap Duration: %v", ShardOverlapDuration)
+	log.Printf("[Config] Orphan Unpin Grace: %v, Handoff Grace: %v, Min Handoff Count: %d", OrphanUnpinGracePeriod, OrphanHandoffGrace, OrphanUnpinMinHandoffCount)
 	log.Printf("[Config] Replication Verification Delay: %v", ReplicationVerificationDelay)
 	log.Printf("[Config] Disk Usage High Water Mark: %.1f%%", DiskUsageHighWaterMark)
 	log.Printf("[Config] IPFS Node Address: %s", IPFSNodeAddress)
@@ -106,6 +124,7 @@ func LogConfiguration() {
 
 	// Reshard configuration
 	log.Printf("[Config] Reshard Delay After Split: %v", ReshardDelay)
+	log.Printf("[Config] Reshard Handoff Delay: %v", ReshardHandoffDelay)
 	log.Printf("[Config] Telemetry Interval: %v", TelemetryInterval)
 	log.Printf("[Config] Telemetry Include CIDs: %v", TelemetryIncludeCIDs)
 	if HeartbeatInterval > 0 {
@@ -118,7 +137,9 @@ func LogConfiguration() {
 
 var (
 	DiscoveryServiceTag            = getEnvString("DLOCKSS_DISCOVERY_TAG", "dlockss-prod")
+	PubsubTopicPrefix              = getEnvString("DLOCKSS_PUBSUB_TOPIC_PREFIX", DefaultPubsubVersion)
 	FileWatchFolder                = getEnvString("DLOCKSS_DATA_DIR", "./data")
+	ClusterStorePath               = getClusterStorePath()
 	MinReplication                 = getEnvInt("DLOCKSS_MIN_REPLICATION", 5)
 	MaxReplication                 = getEnvInt("DLOCKSS_MAX_REPLICATION", 10)
 	CheckInterval                  = getEnvDuration("DLOCKSS_CHECK_INTERVAL", 1*time.Minute)
@@ -127,6 +148,9 @@ var (
 	MinPeersAcrossSiblings         = getEnvInt("DLOCKSS_MIN_PEERS_ACROSS_SIBLINGS", 10)
 	ShardPeerCheckInterval         = getEnvDuration("DLOCKSS_SHARD_PEER_CHECK_INTERVAL", 2*time.Minute)
 	ShardDiscoveryInterval         = getEnvDuration("DLOCKSS_SHARD_DISCOVERY_INTERVAL", 5*time.Minute)
+	BootstrapTimeout               = getEnvDuration("DLOCKSS_BOOTSTRAP_TIMEOUT", 15*time.Second)
+	SeenPeersWindow                = getEnvDuration("DLOCKSS_SEEN_PEERS_WINDOW", 350*time.Second)
+	PruneStalePeersInterval        = getEnvDuration("DLOCKSS_PRUNE_STALE_PEERS_INTERVAL", 10*time.Minute)
 	MaxConcurrentReplicationChecks = getEnvInt("DLOCKSS_MAX_CONCURRENT_CHECKS", 5)
 	RateLimitWindow                = getEnvDuration("DLOCKSS_RATE_LIMIT_WINDOW", 1*time.Minute)
 	MaxMessagesPerWindow           = getEnvInt("DLOCKSS_MAX_MESSAGES_PER_WINDOW", 100)
@@ -139,6 +163,9 @@ var (
 	MetricsExportPath              = getEnvString("DLOCKSS_METRICS_EXPORT", "")
 	BadBitsPath                    = getEnvString("DLOCKSS_BADBITS_PATH", "badBits.csv")
 	ShardOverlapDuration           = getEnvDuration("DLOCKSS_SHARD_OVERLAP_DURATION", 2*time.Minute)
+	OrphanUnpinGracePeriod         = getEnvDuration("DLOCKSS_ORPHAN_UNPIN_GRACE", 6*time.Minute)
+	OrphanHandoffGrace             = getEnvDuration("DLOCKSS_ORPHAN_HANDOFF_GRACE", 6*time.Minute)
+	OrphanUnpinMinHandoffCount     = getEnvInt("DLOCKSS_ORPHAN_MIN_HANDOFF_COUNT", 2)
 	ReplicationVerificationDelay   = getEnvDuration("DLOCKSS_REPLICATION_VERIFICATION_DELAY", 2*time.Minute)
 	DiskUsageHighWaterMark         = getEnvFloat("DLOCKSS_DISK_USAGE_HIGH_WATER_MARK", 90.0)
 	IPFSNodeAddress                = getEnvString("DLOCKSS_IPFS_NODE", "/ip4/127.0.0.1/tcp/5001")
@@ -161,7 +188,8 @@ var (
 
 	DHTQueryTimeout = getEnvDuration("DLOCKSS_DHT_QUERY_TIMEOUT", 2*time.Minute)
 
-	ReshardDelay = getEnvDuration("DLOCKSS_RESHARD_DELAY", 5*time.Second)
+	ReshardDelay        = getEnvDuration("DLOCKSS_RESHARD_DELAY", 5*time.Second)
+	ReshardHandoffDelay = getEnvDuration("DLOCKSS_RESHARD_HANDOFF_DELAY", 3*time.Second)
 
 	PinReannounceInterval = getEnvDuration("DLOCKSS_PIN_REANNOUNCE_INTERVAL", 2*time.Minute)
 

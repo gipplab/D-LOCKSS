@@ -120,7 +120,7 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string, bootstr
 	}
 
 	cfg := &crdt.Config{
-		ClusterName:         "dlockss-shard-" + shardID,
+		ClusterName:         config.PubsubTopicPrefix + "-shard-" + shardID,
 		PeersetMetric:       "ping",
 		RebroadcastInterval: 5 * time.Minute,
 		DatastoreNamespace:  datastore.NewKey("consensus").String(),

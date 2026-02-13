@@ -304,8 +304,8 @@ func (s *Signer) handleSignatureError(logContext string, err error) bool {
 	return false
 }
 
-// VerifyAndAuthorizeMessage returns true to drop (auth/signature failed), false to accept.
-func (s *Signer) VerifyAndAuthorizeMessage(receivedFrom peer.ID, senderID peer.ID, timestamp int64, nonce []byte, sig []byte, marshalForSigning func() ([]byte, error), logContext string) bool {
+// ShouldDropMessage returns true if the message should be dropped (auth/signature failed).
+func (s *Signer) ShouldDropMessage(receivedFrom peer.ID, senderID peer.ID, timestamp int64, nonce []byte, sig []byte, marshalForSigning func() ([]byte, error), logContext string) bool {
 	if s.trustMgr == nil {
 		log.Printf("[Trust] Dropped %s: trust manager missing", logContext)
 		return true
@@ -332,4 +332,10 @@ func (s *Signer) VerifyAndAuthorizeMessage(receivedFrom peer.ID, senderID peer.I
 	}
 
 	return false
+}
+
+// VerifyAndAuthorizeMessage returns true to drop (auth/signature failed), false to accept.
+// Deprecated: use ShouldDropMessage for clearer semantics.
+func (s *Signer) VerifyAndAuthorizeMessage(receivedFrom peer.ID, senderID peer.ID, timestamp int64, nonce []byte, sig []byte, marshalForSigning func() ([]byte, error), logContext string) bool {
+	return s.ShouldDropMessage(receivedFrom, senderID, timestamp, nonce, sig, marshalForSigning, logContext)
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/ipfs/go-cid"
@@ -32,11 +33,11 @@ func (sm *ShardManager) runPeerCountChecker() {
 	}
 }
 
-// pruneStaleSeenPeers drops peers not seen in 10 minutes.
+// pruneStaleSeenPeers drops peers not seen within PruneStalePeersInterval.
 func (sm *ShardManager) pruneStaleSeenPeers() {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	cutoff := time.Now().Add(-600 * time.Second)
+	cutoff := time.Now().Add(-config.PruneStalePeersInterval)
 	for shardID, peers := range sm.seenPeers {
 		for peerID, lastSeen := range peers {
 			if lastSeen.Before(cutoff) {
@@ -81,61 +82,79 @@ func (sm *ShardManager) runReplicationChecker() {
 				continue
 			}
 
-			for _, manifestCIDStr := range manifests {
-				c, err := cid.Decode(manifestCIDStr)
-				if err != nil {
-					continue
-				}
-				allocations, err := sm.clusterMgr.GetAllocations(sm.ctx, currentShard, c)
-				if err != nil {
-					_ = sm.clusterMgr.Pin(sm.ctx, currentShard, c, 0, 0)
-					allocations = nil
-				}
-				peerCount := sm.getShardPeerCount()
-				targetRep := config.MaxReplication
-				if peerCount > 0 && targetRep > peerCount {
-					targetRep = peerCount
-				}
-				currentPeers := sm.GetPeersForShard(currentShard)
-				currentSet := make(map[peer.ID]struct{}, len(currentPeers)+1)
-				currentSet[sm.h.ID()] = struct{}{}
-				for _, p := range currentPeers {
-					currentSet[p] = struct{}{}
-				}
-				activeAllocations := 0
-				for _, a := range allocations {
-					if _, ok := currentSet[a]; ok {
-						activeAllocations++
-					}
-				}
-				if activeAllocations >= targetRep {
-					const replicationGracePeriod = 3 * time.Minute
-					pinTime := sm.storageMgr.GetPinTime(manifestCIDStr)
-					if pinTime.IsZero() || time.Since(pinTime) >= replicationGracePeriod {
-						continue
-					}
-				}
-				if sm.signer == nil {
-					continue
-				}
-				rr := &schema.ReplicationRequest{
-					Type:        schema.MessageTypeReplicationRequest,
-					ManifestCID: c,
-					Priority:    0,
-					Deadline:    0,
-				}
-				if err := sm.signer.SignProtocolMessage(rr); err != nil {
-					log.Printf("[Shard] Failed to sign ReplicationRequest for %s: %v", manifestCIDStr, err)
-					continue
-				}
-				b, err := rr.MarshalCBOR()
-				if err != nil {
-					continue
-				}
-				sm.PublishToShardCBOR(b, currentShard)
-				log.Printf("[Shard] ReplicationRequest sent for %s (shard %s, active_alloc=%d, total_alloc=%d, target=%d, peers=%d)",
-					manifestCIDStr, currentShard, activeAllocations, len(allocations), targetRep, peerCount)
+			maxConc := config.MaxConcurrentReplicationChecks
+			if maxConc < 1 {
+				maxConc = 1
 			}
+			sem := make(chan struct{}, maxConc)
+			var wg sync.WaitGroup
+			for _, manifestCIDStr := range manifests {
+				select {
+				case <-sm.ctx.Done():
+					wg.Wait()
+					return
+				case sem <- struct{}{}:
+				}
+				wg.Add(1)
+				go func(manifestCIDStr string) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					c, err := cid.Decode(manifestCIDStr)
+					if err != nil {
+						return
+					}
+					allocations, err := sm.clusterMgr.GetAllocations(sm.ctx, currentShard, c)
+					if err != nil {
+						_ = sm.clusterMgr.Pin(sm.ctx, currentShard, c, 0, 0)
+						allocations = nil
+					}
+					peerCount := sm.getShardPeerCount()
+					targetRep := config.MaxReplication
+					if peerCount > 0 && targetRep > peerCount {
+						targetRep = peerCount
+					}
+					currentPeers := sm.GetPeersForShard(currentShard)
+					currentSet := make(map[peer.ID]struct{}, len(currentPeers)+1)
+					currentSet[sm.h.ID()] = struct{}{}
+					for _, p := range currentPeers {
+						currentSet[p] = struct{}{}
+					}
+					activeAllocations := 0
+					for _, a := range allocations {
+						if _, ok := currentSet[a]; ok {
+							activeAllocations++
+						}
+					}
+					if activeAllocations >= targetRep {
+						const replicationGracePeriod = 3 * time.Minute
+						pinTime := sm.storageMgr.GetPinTime(manifestCIDStr)
+						if pinTime.IsZero() || time.Since(pinTime) >= replicationGracePeriod {
+							return
+						}
+					}
+					if sm.signer == nil {
+						return
+					}
+					rr := &schema.ReplicationRequest{
+						Type:        schema.MessageTypeReplicationRequest,
+						ManifestCID: c,
+						Priority:    0,
+						Deadline:    0,
+					}
+					if err := sm.signer.SignProtocolMessage(rr); err != nil {
+						log.Printf("[Shard] Failed to sign ReplicationRequest for %s: %v", manifestCIDStr, err)
+						return
+					}
+					b, err := rr.MarshalCBOR()
+					if err != nil {
+						return
+					}
+					sm.PublishToShardCBOR(b, currentShard)
+					log.Printf("[Shard] ReplicationRequest sent for %s (shard %s, active_alloc=%d, total_alloc=%d, target=%d, peers=%d)",
+						manifestCIDStr, currentShard, activeAllocations, len(allocations), targetRep, peerCount)
+				}(manifestCIDStr)
+			}
+			wg.Wait()
 		}
 	}
 }

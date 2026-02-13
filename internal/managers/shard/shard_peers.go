@@ -6,6 +6,8 @@ import (
 
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+
+	"dlockss/internal/config"
 )
 
 func (sm *ShardManager) getShardPeerCount() int {
@@ -21,7 +23,7 @@ func (sm *ShardManager) getShardPeerCount() int {
 		sm.mu.RLock()
 		seenCount := 0
 		if seenMap, ok := sm.seenPeers[currentShard]; ok {
-			cutoff := time.Now().Add(-350 * time.Second)
+			cutoff := time.Now().Add(-config.SeenPeersWindow)
 			for _, lastSeen := range seenMap {
 				if lastSeen.After(cutoff) {
 					seenCount++
@@ -196,7 +198,7 @@ func (sm *ShardManager) probeShardSilently(shardID string, probeTimeout time.Dur
 	sm.mu.Unlock()
 
 	if !fromCache {
-		topicName := fmt.Sprintf("dlockss-creative-commons-shard-%s", shardID)
+		topicName := fmt.Sprintf("%s-creative-commons-shard-%s", config.PubsubTopicPrefix, shardID)
 		var err error
 		t, err = sm.ps.Join(topicName)
 		if err != nil {

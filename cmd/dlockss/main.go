@@ -92,7 +92,7 @@ func main() {
 		log.Fatalf("[Fatal] Failed to bootstrap DHT: %v", err)
 	}
 
-	// Connect to default bootstrap peers
+	// Connect to default bootstrap peers (non-blocking: proceed after timeout if some fail)
 	var wg sync.WaitGroup
 	for _, peerAddr := range kaddht.DefaultBootstrapPeers {
 		peerinfo, _ := peer.AddrInfoFromP2pAddr(peerAddr)
@@ -104,7 +104,17 @@ func main() {
 			}
 		}()
 	}
-	wg.Wait()
+	// Proceed after BootstrapTimeout or when all connects finish (whichever first)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(config.BootstrapTimeout):
+		log.Printf("[Config] Bootstrap timeout after %v, proceeding (some peers may not be connected)", config.BootstrapTimeout)
+	}
 
 	// Setup Routing Discovery
 	routingDiscovery := routing.NewRoutingDiscovery(kademliaDHT)
@@ -147,10 +157,10 @@ func main() {
 
 	// Initialize persistent datastore for cluster state
 	// We place this OUTSIDE the FileWatchFolder (ingest dir) to avoid the node trying to ingest its own database files.
-	dsPath := "cluster_store"
-	dstore, err := leveldb.NewDatastore(dsPath, nil)
+	// Path is configurable via DLOCKSS_CLUSTER_STORE; otherwise derived from FileWatchFolder (instance-specific when data dirs differ).
+	dstore, err := leveldb.NewDatastore(config.ClusterStorePath, nil)
 	if err != nil {
-		log.Fatalf("[Fatal] Failed to create datastore at %s: %v", dsPath, err)
+		log.Fatalf("[Fatal] Failed to create datastore at %s: %v", config.ClusterStorePath, err)
 	}
 	defer dstore.Close()
 
@@ -204,6 +214,7 @@ func main() {
 	<-sigCh
 	log.Printf("[System] Shutting down...")
 	cancel()
+	shardMgr.Close()
 	_ = apiServer.Shutdown(context.Background())
 }
 

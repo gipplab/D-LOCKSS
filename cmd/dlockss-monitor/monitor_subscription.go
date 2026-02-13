@@ -13,8 +13,36 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 	mh "github.com/multiformats/go-multihash"
 
+	"dlockss/internal/config"
 	"dlockss/pkg/schema"
 )
+
+// shardIDsUpToDepth returns all shard IDs in the binary tree up to the given depth.
+// Depth 0: [""]. Depth 1: ["", "0", "1"]. Depth 2: ["", "0", "1", "00", "01", "10", "11"]. etc.
+// This allows the monitor to bootstrap-subscribe to all potentially populated shards
+// even when joining late (when nodes have already moved to deeper shards).
+func shardIDsUpToDepth(depth int) []string {
+	if depth < 0 {
+		return nil
+	}
+	n := 1<<(depth+1) - 1
+	out := make([]string, 0, n)
+	out = append(out, "")
+	for level := 1; level <= depth; level++ {
+		for i := 0; i < 1<<level; i++ {
+			var sb strings.Builder
+			for b := level - 1; b >= 0; b-- {
+				if (i>>b)&1 == 1 {
+					sb.WriteByte('1')
+				} else {
+					sb.WriteByte('0')
+				}
+			}
+			out = append(out, sb.String())
+		}
+	}
+	return out
+}
 
 func (m *Monitor) ensureShardSubscription(ctx context.Context, shardID string) {
 	if m.ps == nil {
@@ -32,7 +60,7 @@ func (m *Monitor) ensureShardSubscriptionUnlocked(ctx context.Context, shardID s
 	if _, exists := m.shardTopics[shardID]; exists {
 		return
 	}
-	topicName := fmt.Sprintf("dlockss-creative-commons-shard-%s", shardID)
+	topicName := fmt.Sprintf("%s-creative-commons-shard-%s", config.PubsubTopicPrefix, shardID)
 	topic, err := m.ps.Join(topicName)
 	if err != nil {
 		log.Printf("[Monitor] Failed to join shard topic %s: %v", topicName, err)

@@ -61,7 +61,12 @@ type ShardManager struct {
 	seenPeers          map[string]map[peer.ID]time.Time
 	observerOnlyShards map[string]struct{}
 	knownChildShards   map[string]time.Time
-	orphanHandoffSent  map[string]map[string]time.Time
+	orphanHandoffSent  map[string]map[string]*orphanHandoffInfo
+}
+
+type orphanHandoffInfo struct {
+	lastSent time.Time
+	count    int
 }
 
 func NewShardManager(
@@ -93,7 +98,7 @@ func NewShardManager(
 		seenPeers:          make(map[string]map[peer.ID]time.Time),
 		observerOnlyShards: make(map[string]struct{}),
 		knownChildShards:   make(map[string]time.Time),
-		orphanHandoffSent:  make(map[string]map[string]time.Time),
+		orphanHandoffSent:  make(map[string]map[string]*orphanHandoffInfo),
 	}
 
 	if err := sm.clusterMgr.JoinShard(ctx, startShard, nil); err != nil {
@@ -101,6 +106,7 @@ func NewShardManager(
 	}
 
 	sm.JoinShard(startShard)
+	sm.loadReshardedFiles()
 
 	return sm
 }
@@ -112,9 +118,11 @@ func (sm *ShardManager) Run() {
 	go sm.runOrphanUnpinLoop()
 	go sm.runReplicationChecker()
 	go sm.runReannouncePinsLoop()
+	go sm.runReshardedFilesSaveLoop()
 }
 
 func (sm *ShardManager) Close() {
+	sm.saveReshardedFiles()
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 

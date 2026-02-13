@@ -110,6 +110,8 @@ jobs:
           images: ghcr.io/gipplab/dlockss-single-node
           tags: |
             type=ref,event=pr
+            type=ref,event=branch
+            type=sha,prefix=
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable={{is_default_branch}}
@@ -156,6 +158,8 @@ jobs:
           images: ghcr.io/gipplab/dlockss-monitor
           tags: |
             type=ref,event=pr
+            type=ref,event=branch
+            type=sha,prefix=
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable={{is_default_branch}}

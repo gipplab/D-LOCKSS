@@ -19,7 +19,7 @@ func (sm *ShardManager) handleReplicationRequest(msg *pubsub.Message, rr *schema
 		return
 	}
 	logPrefix := fmt.Sprintf("ReplicationRequest (Shard %s)", shardID)
-	if sm.signer.VerifyAndAuthorizeMessage(msg.GetFrom(), rr.SenderID, rr.Timestamp, rr.Nonce, rr.Sig, rr.MarshalCBORForSigning, logPrefix) {
+	if sm.signer.ShouldDropMessage(msg.GetFrom(), rr.SenderID, rr.Timestamp, rr.Nonce, rr.Sig, rr.MarshalCBORForSigning, logPrefix) {
 		log.Printf("[Shard] ReplicationRequest rejected %s from %s (shard %s)", rr.ManifestCID.String(), msg.GetFrom().String(), shardID)
 		return
 	}
@@ -63,7 +63,7 @@ func (sm *ShardManager) handleIngestMessage(msg *pubsub.Message, im *schema.Inge
 		return
 	}
 	logPrefix := fmt.Sprintf("IngestMessage (Shard %s)", shardID)
-	if sm.signer.VerifyAndAuthorizeMessage(msg.GetFrom(), im.SenderID, im.Timestamp, im.Nonce, im.Sig, im.MarshalCBORForSigning, logPrefix) {
+	if sm.signer.ShouldDropMessage(msg.GetFrom(), im.SenderID, im.Timestamp, im.Nonce, im.Sig, im.MarshalCBORForSigning, logPrefix) {
 		log.Printf("[Shard] IngestMessage rejected from %s (shard %s)", msg.GetFrom().String(), shardID)
 		return
 	}
@@ -162,7 +162,7 @@ func (sm *ShardManager) RunReshardPass(oldShard, newShard string) {
 							log.Printf("[Reshard] ReplicationRequest sent to shard %s before unpinning %s", targetNew, key)
 							select {
 							case <-sm.ctx.Done():
-							case <-time.After(reshardHandoffDelay):
+							case <-time.After(config.ReshardHandoffDelay):
 							}
 						}
 					}
@@ -182,9 +182,6 @@ func (sm *ShardManager) RunReshardPass(oldShard, newShard string) {
 }
 
 const orphanUnpinInterval = 2 * time.Minute
-const orphanUnpinGracePeriod = 6 * time.Minute
-const orphanHandoffGrace = 6 * time.Minute
-const reshardHandoffDelay = 3 * time.Second
 
 // RunOrphanUnpinPass unpins files that belong to active child shards (we are still in parent).
 func (sm *ShardManager) RunOrphanUnpinPass() {
@@ -223,7 +220,7 @@ func (sm *ShardManager) RunOrphanUnpinPass() {
 		if !sm.storageMgr.IsPinned(key) {
 			continue
 		}
-		if pinTime := sm.storageMgr.GetPinTime(key); !pinTime.IsZero() && time.Since(pinTime) < orphanUnpinGracePeriod {
+		if pinTime := sm.storageMgr.GetPinTime(key); !pinTime.IsZero() && time.Since(pinTime) < config.OrphanUnpinGracePeriod {
 			continue
 		}
 		payloadCIDStr := common.GetPayloadCIDForShardAssignment(sm.ctx, sm.ipfsClient, key)
@@ -237,36 +234,50 @@ func (sm *ShardManager) RunOrphanUnpinPass() {
 			continue
 		}
 		sm.mu.Lock()
-		lastSent := time.Time{}
+		var info *orphanHandoffInfo
 		if sm.orphanHandoffSent[key] != nil {
-			lastSent = sm.orphanHandoffSent[key][targetChild]
+			info = sm.orphanHandoffSent[key][targetChild]
 		}
 		sm.mu.Unlock()
-		if !lastSent.IsZero() && time.Since(lastSent) < orphanHandoffGrace {
+		if info != nil && time.Since(info.lastSent) < config.OrphanHandoffGrace {
 			continue
 		}
-		if lastSent.IsZero() && sm.signer != nil {
-			rr := &schema.ReplicationRequest{
-				Type:        schema.MessageTypeReplicationRequest,
-				ManifestCID: manifestCID,
-				Priority:    0,
-				Deadline:    0,
-			}
-			if err := sm.signer.SignProtocolMessage(rr); err == nil {
-				if b, err := rr.MarshalCBOR(); err == nil && sm.JoinShardAsObserver(targetChild) {
-					sm.PublishToShardCBOR(b, targetChild)
-					sm.LeaveShardAsObserver(targetChild)
-					sm.mu.Lock()
-					if sm.orphanHandoffSent[key] == nil {
-						sm.orphanHandoffSent[key] = make(map[string]time.Time)
+		minCount := config.OrphanUnpinMinHandoffCount
+		if minCount < 1 {
+			minCount = 1
+		}
+		if info != nil && info.count >= minCount && time.Since(info.lastSent) >= config.OrphanHandoffGrace {
+			// Proceed to unpin
+		} else if info == nil || info.count < minCount {
+			if sm.signer != nil {
+				rr := &schema.ReplicationRequest{
+					Type:        schema.MessageTypeReplicationRequest,
+					ManifestCID: manifestCID,
+					Priority:    0,
+					Deadline:    0,
+				}
+				if err := sm.signer.SignProtocolMessage(rr); err == nil {
+					if b, err := rr.MarshalCBOR(); err == nil && sm.JoinShardAsObserver(targetChild) {
+						sm.PublishToShardCBOR(b, targetChild)
+						sm.LeaveShardAsObserver(targetChild)
+						sm.mu.Lock()
+						if sm.orphanHandoffSent[key] == nil {
+							sm.orphanHandoffSent[key] = make(map[string]*orphanHandoffInfo)
+						}
+						if sm.orphanHandoffSent[key][targetChild] == nil {
+							sm.orphanHandoffSent[key][targetChild] = &orphanHandoffInfo{}
+						}
+						ho := sm.orphanHandoffSent[key][targetChild]
+						ho.lastSent = time.Now()
+						ho.count++
+						sm.mu.Unlock()
+						log.Printf("[Reshard] Orphan handoff: sent ReplicationRequest to child %s for %s (count=%d)", targetChild, key, ho.count)
+						time.Sleep(10 * time.Millisecond)
+						continue
 					}
-					sm.orphanHandoffSent[key][targetChild] = time.Now()
-					sm.mu.Unlock()
-					log.Printf("[Reshard] Orphan handoff: sent ReplicationRequest to child %s for %s", targetChild, key)
-					time.Sleep(10 * time.Millisecond)
-					continue
 				}
 			}
+			continue
 		}
 
 		log.Printf("[Reshard] Orphan unpin: %s (belongs to child %s)", key, targetChild)

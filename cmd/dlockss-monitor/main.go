@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -24,6 +25,12 @@ func main() {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			nodeCleanupTimeout = d
 			log.Printf("[Monitor] Node cleanup timeout: %s (from env)", nodeCleanupTimeout)
+		}
+	}
+	if v := os.Getenv("DLOCKSS_MONITOR_BOOTSTRAP_SHARD_DEPTH"); v != "" {
+		if d, err := strconv.Atoi(v); err == nil && d >= 0 && d <= 12 {
+			bootstrapShardDepth = d
+			log.Printf("[Monitor] Bootstrap shard depth: %d (from env)", bootstrapShardDepth)
 		}
 	}
 

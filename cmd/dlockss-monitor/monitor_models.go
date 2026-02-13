@@ -10,21 +10,23 @@ import (
 )
 
 const (
-	DiscoveryServiceTag       = "dlockss-prod"
-	WebUIPort                 = 8080
-	DefaultNodeCleanupTimeout = 350 * time.Second
-	ReplicationAnnounceTTL    = 350 * time.Second
-	MonitorMinReplication     = 5
-	MonitorMaxReplication     = 10
-	ReplicationCleanupEvery   = 1 * time.Minute
-	GeoIPCacheDuration        = 24 * time.Hour
-	MaxGeoQueueSize           = 1000
-	MonitorIdentityFile       = "monitor_identity.key"
-	GeoFailureThreshold       = 5
-	GeoCooldownDuration       = 5 * time.Minute
+	DiscoveryServiceTag        = "dlockss-prod"
+	WebUIPort                  = 8080
+	DefaultBootstrapShardDepth = 5 // Depth of shard tree to subscribe to on startup (covers late-join case)
+	DefaultNodeCleanupTimeout  = 350 * time.Second
+	ReplicationAnnounceTTL     = 350 * time.Second
+	MonitorMinReplication      = 5
+	MonitorMaxReplication      = 10
+	ReplicationCleanupEvery    = 1 * time.Minute
+	GeoIPCacheDuration         = 24 * time.Hour
+	MaxGeoQueueSize            = 1000
+	MonitorIdentityFile        = "monitor_identity.key"
+	GeoFailureThreshold        = 5
+	GeoCooldownDuration        = 5 * time.Minute
 )
 
 var nodeCleanupTimeout = DefaultNodeCleanupTimeout
+var bootstrapShardDepth = DefaultBootstrapShardDepth
 
 type StatusResponse struct {
 	PeerID        string            `json:"peer_id"`

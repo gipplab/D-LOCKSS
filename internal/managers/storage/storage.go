@@ -23,9 +23,11 @@ type StorageManager struct {
 	failedOperations      *common.BackoffTable
 	metrics               *telemetry.MetricsManager
 
-	// Round-robin pin reannouncement: index into a stable sorted list of pinned keys
-	announceMu    sync.Mutex
-	announceIndex int
+	// Round-robin pin reannouncement: cached sorted list, rebuilt when pins change
+	announceMu        sync.Mutex
+	announceIndex     int
+	announceKeys      []string
+	announceKeysDirty bool
 }
 
 // NewStorageManager creates a new StorageManager.
@@ -44,25 +46,42 @@ func NewStorageManager(dht common.DHTProvider, metrics *telemetry.MetricsManager
 
 // GetNextFileToAnnounce returns next file key for round-robin PINNED announcements.
 func (sm *StorageManager) GetNextFileToAnnounce() string {
+	sm.announceMu.Lock()
+	defer sm.announceMu.Unlock()
+
+	if sm.announceKeysDirty {
+		sm.rebuildAnnounceKeys()
+	}
+	if len(sm.announceKeys) == 0 {
+		return ""
+	}
+	idx := sm.announceIndex % len(sm.announceKeys)
+	key := sm.announceKeys[idx]
+	sm.announceIndex++
+	if sm.announceIndex < 0 {
+		sm.announceIndex = 0
+	}
+	return key
+}
+
+func (sm *StorageManager) rebuildAnnounceKeys() {
 	files := sm.pinnedFiles.All()
 	if len(files) == 0 {
-		return ""
+		sm.announceKeys = nil
+		sm.announceKeysDirty = false
+		return
 	}
 	keys := make([]string, 0, len(files))
 	for k := range files {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-
-	sm.announceMu.Lock()
-	idx := sm.announceIndex % len(keys)
-	key := keys[idx]
-	sm.announceIndex++
+	sm.announceKeys = keys
+	sm.announceKeysDirty = false
+	sm.announceIndex = sm.announceIndex % len(keys)
 	if sm.announceIndex < 0 {
 		sm.announceIndex = 0
 	}
-	sm.announceMu.Unlock()
-	return key
 }
 
 // GetPinnedManifests returns all manifest CID strings currently pinned (for replication check).
@@ -86,6 +105,9 @@ func (sm *StorageManager) PinFile(manifestCIDStr string) bool {
 
 	wasNew := sm.pinnedFiles.Add(manifestCIDStr)
 	if wasNew {
+		sm.announceMu.Lock()
+		sm.announceKeysDirty = true
+		sm.announceMu.Unlock()
 		if sm.metrics != nil {
 			sm.metrics.SetPinnedFilesCount(sm.pinnedFiles.Size())
 		}
@@ -101,6 +123,9 @@ func (sm *StorageManager) PinFile(manifestCIDStr string) bool {
 // UnpinFile removes a file/manifest from the pinned set.
 func (sm *StorageManager) UnpinFile(key string) {
 	if sm.pinnedFiles.Has(key) {
+		sm.announceMu.Lock()
+		sm.announceKeysDirty = true
+		sm.announceMu.Unlock()
 		// Get pin time before removing to log how long it was pinned
 		pinTime := sm.pinnedFiles.GetPinTime(key)
 		sm.pinnedFiles.Remove(key)

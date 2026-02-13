@@ -205,9 +205,7 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 							}
 							fileCount++
 
-							if !fp.TryEnqueue(path) {
-								log.Printf("[FileWatcher] Dropped %s (backpressure)", path)
-							}
+							_ = fp.EnqueueOrRetry(path)
 							return nil
 						})
 						if err != nil {
@@ -233,9 +231,7 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 				}
 
 				if shouldProcessFileEvent(path) {
-					if !fp.TryEnqueue(path) {
-						log.Printf("[FileWatcher] Dropped %s (backpressure)", path)
-					}
+					_ = fp.EnqueueOrRetry(path)
 				}
 			}
 		case err, ok := <-watcher.Errors:

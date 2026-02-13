@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -19,6 +20,9 @@ import (
 	"dlockss/pkg/schema"
 )
 
+const maxRetryQueueSize = 1000
+const retryDrainInterval = 10 * time.Second
+
 // FileProcessor handles file ingestion and processing.
 type FileProcessor struct {
 	ipfsClient ipfs.IPFSClient
@@ -30,6 +34,9 @@ type FileProcessor struct {
 	signer     *signing.Signer
 	ctx        context.Context
 	cancel     context.CancelFunc
+
+	retryQueue []string
+	retryMu    sync.Mutex
 }
 
 // NewFileProcessor creates a new FileProcessor with dependencies.
@@ -53,6 +60,7 @@ func NewFileProcessor(
 		cancel:     cancel,
 	}
 	fp.startWorkers()
+	go fp.retryLoop()
 	return fp
 }
 
@@ -78,6 +86,47 @@ func (fp *FileProcessor) Stop() {
 	fp.cancel()
 }
 
+// retryLoop periodically drains the retry queue and re-attempts enqueue.
+func (fp *FileProcessor) retryLoop() {
+	ticker := time.NewTicker(retryDrainInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-fp.ctx.Done():
+			return
+		case <-ticker.C:
+			fp.drainRetryQueue()
+		}
+	}
+}
+
+func (fp *FileProcessor) drainRetryQueue() {
+	fp.retryMu.Lock()
+	toRetry := fp.retryQueue
+	fp.retryQueue = nil
+	fp.retryMu.Unlock()
+
+	var stillPending []string
+	for _, path := range toRetry {
+		if fp.TryEnqueue(path) {
+			// success
+		} else {
+			stillPending = append(stillPending, path)
+		}
+	}
+	if len(stillPending) > 0 {
+		fp.retryMu.Lock()
+		space := maxRetryQueueSize - len(fp.retryQueue)
+		add := len(stillPending)
+		if add > space {
+			add = space
+			log.Printf("[FileOps] Retry queue full, dropping %d paths", len(stillPending)-space)
+		}
+		fp.retryQueue = append(fp.retryQueue, stillPending[:add]...)
+		fp.retryMu.Unlock()
+	}
+}
+
 // ScanExistingFiles walks the data directory and processes any existing files.
 func (fp *FileProcessor) ScanExistingFiles() {
 	var fileCount int
@@ -89,7 +138,7 @@ func (fp *FileProcessor) ScanExistingFiles() {
 		if info.IsDir() {
 			return nil
 		}
-		fp.TryEnqueue(path)
+		fp.EnqueueOrRetry(path)
 		fileCount++
 		return nil
 	})
@@ -106,9 +155,25 @@ func (fp *FileProcessor) TryEnqueue(path string) bool {
 	case fp.jobQueue <- path:
 		return true
 	default:
-		log.Printf("[FileOps] Queue full, dropping file: %s", path)
 		return false
 	}
+}
+
+// EnqueueOrRetry tries to enqueue; on backpressure, adds to retry queue for later.
+func (fp *FileProcessor) EnqueueOrRetry(path string) bool {
+	if fp.TryEnqueue(path) {
+		return true
+	}
+	fp.retryMu.Lock()
+	if len(fp.retryQueue) < maxRetryQueueSize {
+		fp.retryQueue = append(fp.retryQueue, path)
+		fp.retryMu.Unlock()
+		log.Printf("[FileOps] Queue full, queued for retry: %s", path)
+		return true
+	}
+	fp.retryMu.Unlock()
+	log.Printf("[FileOps] Queue and retry full, dropping file: %s", path)
+	return false
 }
 
 // SignProtocolMessage signs a message with the node's private key.
