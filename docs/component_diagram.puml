@@ -23,6 +23,11 @@ note right of ShardManager
     Splits when overcrowded (≥12 peers).
     Discovery: join existing deeper shards.
     Rebroadcast SPLIT to ancestors for late joiners.
+    Stability (v0.0.3):
+    - Move cooldown (30s) after any transition
+    - Jittered discovery timers
+    - PROBE response rate limiting (5s)
+    - Immediate LEAVE on departure
 end note
 
 note right of ClusterManager

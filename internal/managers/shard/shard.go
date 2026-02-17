@@ -23,6 +23,8 @@ import (
 const migratePinsFlushDelay = 250 * time.Millisecond
 const rootPeerCheckInterval = 30 * time.Second
 const rootReplicationCheckInterval = 20 * time.Second
+const replicationRequestCooldownDuration = 5 * time.Minute
+const maxReplicationRequestsPerCycle = 50
 
 type shardSubscription struct {
 	topic        *pubsub.Topic
@@ -57,6 +59,8 @@ type ShardManager struct {
 	lastMessageTime       time.Time
 	lastMoveToDeeperShard time.Time
 	lastMergeUpTime       time.Time
+	lastShardMove         time.Time // set on ANY shard transition (split, merge, discovery)
+	lastProbeResponseTime time.Time // rate-limits heartbeat responses to PROBE messages
 
 	seenPeers                map[string]map[peer.ID]time.Time
 	seenPeerRoles            map[string]map[peer.ID]PeerRoleInfo
@@ -64,6 +68,11 @@ type ShardManager struct {
 	splitAboveThresholdCount int // consecutive checks where peerCount >= MaxPeersPerShard
 	knownChildShards         map[string]time.Time
 	orphanHandoffSent        map[string]map[string]*orphanHandoffInfo
+
+	replicationRequestMu       sync.Mutex
+	replicationRequestLastSent map[string]time.Time
+
+	autoReplicationSem chan struct{} // bounds concurrent auto-replication fetches
 }
 
 type orphanHandoffInfo struct {
@@ -84,24 +93,26 @@ func NewShardManager(
 	startShard string,
 ) *ShardManager {
 	sm := &ShardManager{
-		ctx:                ctx,
-		h:                  h,
-		ps:                 ps,
-		ipfsClient:         ipfsClient,
-		storageMgr:         stm,
-		clusterMgr:         clusterMgr,
-		metrics:            metrics,
-		signer:             signer,
-		rateLimiter:        rateLimiter,
-		reshardedFiles:     common.NewKnownFiles(),
-		currentShard:       startShard,
-		shardSubs:          make(map[string]*shardSubscription),
-		probeTopicCache:    make(map[string]*pubsub.Topic),
-		seenPeers:          make(map[string]map[peer.ID]time.Time),
-		seenPeerRoles:      make(map[string]map[peer.ID]PeerRoleInfo),
-		observerOnlyShards: make(map[string]struct{}),
-		knownChildShards:   make(map[string]time.Time),
-		orphanHandoffSent:  make(map[string]map[string]*orphanHandoffInfo),
+		ctx:                        ctx,
+		h:                          h,
+		ps:                         ps,
+		ipfsClient:                 ipfsClient,
+		storageMgr:                 stm,
+		clusterMgr:                 clusterMgr,
+		metrics:                    metrics,
+		signer:                     signer,
+		rateLimiter:                rateLimiter,
+		reshardedFiles:             common.NewKnownFiles(),
+		currentShard:               startShard,
+		shardSubs:                  make(map[string]*shardSubscription),
+		probeTopicCache:            make(map[string]*pubsub.Topic),
+		seenPeers:                  make(map[string]map[peer.ID]time.Time),
+		seenPeerRoles:              make(map[string]map[peer.ID]PeerRoleInfo),
+		observerOnlyShards:         make(map[string]struct{}),
+		knownChildShards:           make(map[string]time.Time),
+		orphanHandoffSent:          make(map[string]map[string]*orphanHandoffInfo),
+		replicationRequestLastSent: make(map[string]time.Time),
+		autoReplicationSem:         make(chan struct{}, config.MaxConcurrentReplicationChecks),
 	}
 
 	if err := sm.clusterMgr.JoinShard(ctx, startShard, nil); err != nil {
@@ -133,7 +144,9 @@ func (sm *ShardManager) Close() {
 	for _, sub := range sm.shardSubs {
 		sub.cancel()
 		sub.sub.Cancel()
-		_ = sub.topic.Close()
+		if sub.topic != nil {
+			_ = sub.topic.Close()
+		}
 	}
 	sm.shardSubs = make(map[string]*shardSubscription)
 
@@ -155,12 +168,28 @@ func (sm *ShardManager) moveToShard(fromShard, toShard string, isMergeUp bool) {
 	sm.knownChildShards = make(map[string]time.Time)
 	sm.lastPeerCheck = time.Now()
 	sm.splitAboveThresholdCount = 0
+	sm.reshardedFiles = common.NewKnownFiles()
+	sm.lastShardMove = time.Now()
 	if isMergeUp {
-		sm.lastMergeUpTime = time.Now()
+		sm.lastMergeUpTime = sm.lastShardMove
 	} else {
-		sm.lastMoveToDeeperShard = time.Now()
+		sm.lastMoveToDeeperShard = sm.lastShardMove
 	}
 	sm.mu.Unlock()
+
+	// Immediately announce departure from the old shard so other peers stop
+	// counting us as ACTIVE.  The actual topic unsubscription happens later
+	// (after ShardOverlapDuration) to allow continued message reception for
+	// data migration, but other nodes need to drop us from their peer counts
+	// now — otherwise stale entries inflate getShardPeerCountForSplit() and
+	// can trigger premature splits.
+	sm.mu.RLock()
+	fromSub, fromSubExists := sm.shardSubs[fromShard]
+	sm.mu.RUnlock()
+	if fromSubExists && fromSub.topic != nil && !fromSub.observerOnly {
+		leaveMsg := []byte("LEAVE:" + sm.h.ID().String())
+		_ = fromSub.topic.Publish(sm.ctx, leaveMsg)
+	}
 
 	sm.JoinShard(toShard)
 	if err := sm.clusterMgr.JoinShard(sm.ctx, toShard, nil); err != nil {

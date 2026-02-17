@@ -10,7 +10,7 @@ import (
 
 // DefaultPubsubVersion is the protocol version used for pubsub topic names.
 // Bump when releasing to avoid cross-talk with older nodes. Keep in sync with releases.
-const DefaultPubsubVersion = "dlockss-v0.0.2"
+const DefaultPubsubVersion = "dlockss-v0.0.3"
 
 func getEnvString(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
@@ -101,7 +101,32 @@ func LogConfiguration() {
 	log.Printf("[Config] Trust Store Path: %s", TrustStorePath)
 	log.Printf("[Config] Signature Mode: %s", SignatureMode)
 	if SignatureMode != "off" && SignatureMode != "warn" && SignatureMode != "strict" {
-		log.Printf("[Config] Unknown SignatureMode %q; using strict", SignatureMode)
+		log.Printf("[Config] Unknown SignatureMode %q; defaulting to strict", SignatureMode)
+		SignatureMode = "strict"
+	}
+	if MaxConcurrentFileProcessing < 1 {
+		log.Printf("[Config] MaxConcurrentFileProcessing=%d is invalid; defaulting to 5", MaxConcurrentFileProcessing)
+		MaxConcurrentFileProcessing = 5
+	}
+	if NonceSize < 1 {
+		log.Printf("[Config] NonceSize=%d is invalid; defaulting to 16", NonceSize)
+		NonceSize = 16
+	}
+	if MinNonceSize < 1 {
+		log.Printf("[Config] MinNonceSize=%d is invalid; defaulting to 8", MinNonceSize)
+		MinNonceSize = 8
+	}
+	if MinReplication > MaxReplication {
+		log.Printf("[Config] MinReplication (%d) > MaxReplication (%d); swapping", MinReplication, MaxReplication)
+		MinReplication, MaxReplication = MaxReplication, MinReplication
+	}
+	if MaxConcurrentReplicationChecks < 1 {
+		log.Printf("[Config] MaxConcurrentReplicationChecks=%d is invalid; defaulting to 5", MaxConcurrentReplicationChecks)
+		MaxConcurrentReplicationChecks = 5
+	}
+	if DiskUsageHighWaterMark <= 0 || DiskUsageHighWaterMark > 100 {
+		log.Printf("[Config] DiskUsageHighWaterMark=%.1f is out of range (0,100]; defaulting to 90.0", DiskUsageHighWaterMark)
+		DiskUsageHighWaterMark = 90.0
 	}
 	log.Printf("[Config] Signature Max Age: %v", SignatureMaxAge)
 	log.Printf("[Config] Use PubSub for Replication: %v (min shard peers: %d)", UsePubsubForReplication, MinShardPeersForPubsubOnly)
@@ -114,6 +139,7 @@ func LogConfiguration() {
 	log.Printf("[Config] File Import Timeout: %v", FileImportTimeout)
 	log.Printf("[Config] DHT Provide Timeout: %v", DHTProvideTimeout)
 	log.Printf("[Config] File Processing Delay: %v", FileProcessingDelay)
+	log.Printf("[Config] File Stability Delay: %v (wait for file size to settle before ingest)", FileStabilityDelay)
 	log.Printf("[Config] Max Concurrent File Processing: %d", MaxConcurrentFileProcessing)
 
 	// Replication timeouts
@@ -135,6 +161,10 @@ func LogConfiguration() {
 		log.Printf("[Config] Heartbeat Interval: auto (ShardPeerCheckInterval/3, min 10s)")
 	}
 	log.Printf("[Config] Verbose Logging: %v", VerboseLogging)
+	log.Printf("[Config] Merge Up Cooldown: %v", MergeUpCooldown)
+	log.Printf("[Config] Probe Timeout Merge: %v", ProbeTimeoutMerge)
+	log.Printf("[Config] Sibling Empty Merge After: %v", SiblingEmptyMergeAfter)
+	log.Printf("[Config] Shard Move Cooldown: %v", ShardMoveCooldown)
 }
 
 var (
@@ -175,7 +205,7 @@ var (
 	APIPort                        = getEnvInt("DLOCKSS_API_PORT", 5050) // observability /metrics and /status
 	TrustMode                      = getEnvString("DLOCKSS_TRUST_MODE", "open")
 	TrustStorePath                 = getEnvString("DLOCKSS_TRUST_STORE", "trusted_peers.json")
-	SignatureMode                  = getEnvString("DLOCKSS_SIGNATURE_MODE", "warn")
+	SignatureMode                  = getEnvString("DLOCKSS_SIGNATURE_MODE", "strict")
 	SignatureMaxAge                = getEnvDuration("DLOCKSS_SIGNATURE_MAX_AGE", 10*time.Minute)
 	UsePubsubForReplication        = getEnvBool("DLOCKSS_USE_PUBSUB_FOR_REPLICATION", true)
 	MinShardPeersForPubsubOnly     = getEnvInt("DLOCKSS_MIN_SHARD_PEERS_PUBSUB_ONLY", 5)
@@ -187,6 +217,7 @@ var (
 	FileImportTimeout           = getEnvDuration("DLOCKSS_FILE_IMPORT_TIMEOUT", 2*time.Minute)
 	DHTProvideTimeout           = getEnvDuration("DLOCKSS_DHT_PROVIDE_TIMEOUT", 60*time.Second)
 	FileProcessingDelay         = getEnvDuration("DLOCKSS_FILE_PROCESSING_DELAY", 100*time.Millisecond)
+	FileStabilityDelay          = getEnvDuration("DLOCKSS_FILE_STABILITY_DELAY", 3*time.Second)
 	MaxConcurrentFileProcessing = getEnvInt("DLOCKSS_MAX_CONCURRENT_FILE_PROCESSING", 5)
 
 	DHTQueryTimeout = getEnvDuration("DLOCKSS_DHT_QUERY_TIMEOUT", 2*time.Minute)
@@ -204,4 +235,9 @@ var (
 	TelemetryIncludeCIDs = getEnvBool("DLOCKSS_TELEMETRY_INCLUDE_CIDS", false)
 	HeartbeatInterval    = getEnvDuration("DLOCKSS_HEARTBEAT_INTERVAL", 10*time.Second)
 	VerboseLogging       = getEnvBool("DLOCKSS_VERBOSE_LOGGING", false)
+
+	MergeUpCooldown        = getEnvDuration("DLOCKSS_MERGE_UP_COOLDOWN", 2*time.Minute)
+	ProbeTimeoutMerge      = getEnvDuration("DLOCKSS_PROBE_TIMEOUT_MERGE", 6*time.Second)
+	SiblingEmptyMergeAfter = getEnvDuration("DLOCKSS_SIBLING_EMPTY_MERGE_AFTER", 5*time.Minute)
+	ShardMoveCooldown      = getEnvDuration("DLOCKSS_SHARD_MOVE_COOLDOWN", 30*time.Second)
 )

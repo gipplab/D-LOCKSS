@@ -23,13 +23,14 @@ import (
 const maxRetryQueueSize = 1000
 const retryDrainInterval = 10 * time.Second
 
+const recentIngestTTL = 30 * time.Second
+
 // FileProcessor handles file ingestion and processing.
 type FileProcessor struct {
 	ipfsClient ipfs.IPFSClient
 	shardMgr   *shard.ShardManager
 	storageMgr *storage.StorageManager
 	privKey    crypto.PrivKey
-	semaphore  chan struct{}
 	jobQueue   chan string
 	signer     *signing.Signer
 	ctx        context.Context
@@ -37,6 +38,9 @@ type FileProcessor struct {
 
 	retryQueue []string
 	retryMu    sync.Mutex
+
+	recentIngestMu sync.Mutex
+	recentIngests  map[string]time.Time // PayloadCID → last ingest time
 }
 
 // NewFileProcessor creates a new FileProcessor with dependencies.
@@ -49,15 +53,15 @@ func NewFileProcessor(
 ) *FileProcessor {
 	ctx, cancel := context.WithCancel(context.Background())
 	fp := &FileProcessor{
-		ipfsClient: client,
-		shardMgr:   sm,
-		storageMgr: stm,
-		privKey:    key,
-		signer:     signer,
-		semaphore:  make(chan struct{}, config.MaxConcurrentFileProcessing),
-		jobQueue:   make(chan string, config.MaxConcurrentFileProcessing*100),
-		ctx:        ctx,
-		cancel:     cancel,
+		ipfsClient:    client,
+		shardMgr:      sm,
+		storageMgr:    stm,
+		privKey:       key,
+		signer:        signer,
+		jobQueue:      make(chan string, config.MaxConcurrentFileProcessing*100),
+		ctx:           ctx,
+		cancel:        cancel,
+		recentIngests: make(map[string]time.Time),
 	}
 	fp.startWorkers()
 	go fp.retryLoop()

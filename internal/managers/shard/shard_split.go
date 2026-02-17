@@ -55,6 +55,15 @@ func (sm *ShardManager) checkAndSplitIfNeeded() {
 	sm.mu.Lock()
 	now := time.Now()
 	currentShard := sm.currentShard
+
+	// General move cooldown: don't evaluate splits right after any shard transition.
+	// This prevents cascading splits during the overlap period when peer counts
+	// are inflated by nodes that are still migrating.
+	if !sm.lastShardMove.IsZero() && now.Sub(sm.lastShardMove) < config.ShardMoveCooldown {
+		sm.mu.Unlock()
+		return
+	}
+
 	interval := config.ShardPeerCheckInterval
 	if currentShard == "" {
 		interval = rootPeerCheckInterval

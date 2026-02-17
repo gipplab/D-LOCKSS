@@ -8,11 +8,9 @@ import (
 	"time"
 
 	"dlockss/internal/badbits"
-	// "dlockss/internal/config"
 
 	"github.com/ipfs-cluster/ipfs-cluster/api"
 	"github.com/ipfs/go-cid"
-	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 // IPFSClient defines the subset of ipfs.IPFSClient needed for pinning
@@ -125,36 +123,14 @@ func (pt *LocalPinTracker) syncState(consensus ConsensusClient) {
 		_ = state.List(pt.ctx, out)
 	}()
 
-	// Resolve our peer ID once per sync (for allocation check).
-	ourPeerIDStr, err := pt.ipfsClient.GetPeerID(pt.ctx)
-	if err != nil {
-		log.Printf("[PinTracker:%s] Failed to get our peer ID: %v", pt.shardID, err)
-		return
-	}
-	ourPeerID, err := peer.Decode(ourPeerIDStr)
-	if err != nil {
-		log.Printf("[PinTracker:%s] Invalid peer ID %s: %v", pt.shardID, ourPeerIDStr, err)
-		return
-	}
-
-	// CIDs we should have pinned (we are allocated for these, or Allocations is empty).
+	// CIDs we should have pinned — all nodes on a shard pin everything in
+	// the shard's CRDT.  Allocations are informational only (for monitoring
+	// target replication).  We ignore them here so that pins propagated
+	// via PinIfAbsent (with -1,-1 "pin everywhere" allocations) or via
+	// the ingesting node (with specific allocations) are treated equally.
 	shouldHave := make(map[string]struct{})
 
 	for pin := range out {
-		// Allocation-aware: only pin if we are in Allocations, or if Allocations is empty (full replication).
-		if len(pin.Allocations) > 0 {
-			weAreAllocated := false
-			for _, p := range pin.Allocations {
-				if p == ourPeerID {
-					weAreAllocated = true
-					break
-				}
-			}
-			if !weAreAllocated {
-				continue
-			}
-		}
-
 		c := pin.Cid.Cid
 		cStr := c.String()
 		shouldHave[cStr] = struct{}{}
@@ -187,9 +163,13 @@ func (pt *LocalPinTracker) syncState(consensus ConsensusClient) {
 		}
 	}
 
-	// Unpin CIDs we previously pinned from this shard but are no longer allocated for.
-	// Collect the list under the lock, then process outside to avoid data race
-	// from unlocking/relocking mid-iteration.
+	// Remove CIDs we previously pinned from this shard but are no longer allocated for.
+	// We intentionally do NOT call ipfsClient.UnpinRecursive here because during a
+	// shard split/migration, the same CID may be migrated to a child shard on this
+	// same node.  If we unpinned from IPFS, the child shard's PinTracker would
+	// have to re-fetch the data (unnecessary churn, risk of loss during GC window).
+	// Actual IPFS-level unpins are handled by the reshard pass (shard_replication.go)
+	// which is migration-aware and calls ipfsClient.UnpinRecursive directly.
 	pt.mu.RLock()
 	var toUnpin []string
 	for cidStr := range pt.pinnedByUs {
@@ -200,15 +180,7 @@ func (pt *LocalPinTracker) syncState(consensus ConsensusClient) {
 	pt.mu.RUnlock()
 
 	for _, cidStr := range toUnpin {
-		c, err := cid.Decode(cidStr)
-		if err != nil {
-			pt.mu.Lock()
-			delete(pt.pinnedByUs, cidStr)
-			pt.mu.Unlock()
-			continue
-		}
-		log.Printf("[PinTracker:%s] Unpinning %s (no longer allocated)", pt.shardID, cidStr)
-		_ = pt.ipfsClient.UnpinRecursive(pt.ctx, c)
+		log.Printf("[PinTracker:%s] Releasing tracking for %s (no longer in CRDT)", pt.shardID, cidStr)
 		if pt.onPinRemoved != nil {
 			pt.onPinRemoved(cidStr)
 		}
@@ -216,11 +188,4 @@ func (pt *LocalPinTracker) syncState(consensus ConsensusClient) {
 		delete(pt.pinnedByUs, cidStr)
 		pt.mu.Unlock()
 	}
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

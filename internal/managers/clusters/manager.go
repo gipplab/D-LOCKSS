@@ -29,6 +29,7 @@ type ClusterManagerInterface interface {
 	JoinShard(ctx context.Context, shardID string, bootstrapPeers []multiaddr.Multiaddr) error
 	LeaveShard(shardID string) error
 	Pin(ctx context.Context, shardID string, c cid.Cid, replicationFactorMin, replicationFactorMax int) error
+	PinIfAbsent(ctx context.Context, shardID string, c cid.Cid, replicationFactorMin, replicationFactorMax int) error
 	Unpin(ctx context.Context, shardID string, c cid.Cid) error
 	GetAllocations(ctx context.Context, shardID string, c cid.Cid) ([]peer.ID, error)
 	GetPeerCount(ctx context.Context, shardID string) (int, error)
@@ -122,7 +123,7 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string, bootstr
 	cfg := &crdt.Config{
 		ClusterName:         config.PubsubTopicPrefix + "-shard-" + shardID,
 		PeersetMetric:       "ping",
-		RebroadcastInterval: 5 * time.Minute,
+		RebroadcastInterval: 30 * time.Second,
 		DatastoreNamespace:  datastore.NewKey("consensus").String(),
 		TrustAll:            trustAll,
 		TrustedPeers:        cm.trustedPeers,
@@ -332,6 +333,17 @@ func (cm *ClusterManager) Pin(ctx context.Context, shardID string, c cid.Cid, re
 
 	log.Printf("[Cluster] Pinning %s to shard %s (Rep: %d-%d, Alloc: %d)", c, shardID, repMin, repMax, len(allocations))
 	return nil
+}
+
+// PinIfAbsent writes a pin to the CRDT only if the CID is not already tracked.
+// This prevents overwriting allocations computed by the ingesting node when
+// multiple nodes handle the same IngestMessage or ReplicationRequest.
+func (cm *ClusterManager) PinIfAbsent(ctx context.Context, shardID string, c cid.Cid, replicationFactorMin, replicationFactorMax int) error {
+	_, err := cm.GetAllocations(ctx, shardID, c)
+	if err == nil {
+		return nil // Pin already exists in CRDT — don't overwrite
+	}
+	return cm.Pin(ctx, shardID, c, replicationFactorMin, replicationFactorMax)
 }
 
 // Unpin submits an unpin operation to the specific shard's cluster.

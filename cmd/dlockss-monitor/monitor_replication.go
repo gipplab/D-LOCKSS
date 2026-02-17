@@ -13,7 +13,12 @@ import (
 func (m *Monitor) runReplicationCleanup() {
 	ticker := time.NewTicker(ReplicationCleanupEvery)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		select {
+		case <-m.done:
+			return
+		case <-ticker.C:
+		}
 		m.mu.Lock()
 		cutoff := time.Now().Add(-ReplicationAnnounceTTL)
 		for manifest, peers := range m.manifestReplication {

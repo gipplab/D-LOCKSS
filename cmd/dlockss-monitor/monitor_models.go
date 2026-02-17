@@ -2,11 +2,13 @@
 package main
 
 import (
+	"log"
 	"sync"
 	"time"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/oschwald/geoip2-golang"
 
 	"dlockss/internal/config"
 )
@@ -22,13 +24,7 @@ const (
 	MonitorMinReplication        = 5
 	MonitorMaxReplication        = 10
 	ReplicationCleanupEvery      = 1 * time.Minute
-	GeoIPCacheDuration           = 24 * time.Hour
-	GeoRetryInterval             = 5 * time.Minute // min time between retry attempts per node
-	GeoRetrySweepInterval        = 2 * time.Minute // how often to sweep for nodes needing retry
-	MaxGeoQueueSize              = 1000
 	MonitorIdentityFile          = "monitor_identity.key"
-	GeoFailureThreshold          = 5
-	GeoCooldownDuration          = 5 * time.Minute
 	siblingMoveCooldown          = 90 * time.Second // ignore sibling moves within this window (reduces 00↔01, 10↔11 oscillation; gossip-sub can delay 20–30s)
 	unpinGracePeriod             = 30 * time.Second // don't act on pinned=0 until this long after first discovery (avoids stale heartbeats)
 )
@@ -71,7 +67,6 @@ type NodeState struct {
 	ShardHistory   []ShardHistoryEntry `json:"shard_history"`
 	IPAddress      string              `json:"ip_address"`
 	Region         string              `json:"region"`
-	lastGeoAttempt time.Time           // when we last enqueued a geo lookup for this node
 	announcedFiles map[string]time.Time
 }
 
@@ -93,27 +88,17 @@ type ShardTreeNode struct {
 	NodeCount int              `json:"node_count"`
 }
 
-type GeoLocation struct {
-	Status      string `json:"status"` // "success" or "fail" from ip-api.com
-	Country     string `json:"country"`
-	RegionName  string `json:"regionName"`
-	City        string `json:"city"`
-	CountryCode string `json:"countryCode"`
-}
-
 type Monitor struct {
 	mu                  sync.RWMutex
 	topicPrefixOverride string // if set, overrides config.PubsubTopicPrefix for subscriptions
 	nodes               map[string]*NodeState
 	splitEvents         []ShardSplitEvent
-	geoCache            map[string]*GeoLocation
-	geoCacheTime        map[string]time.Time
-	geoFailures         int
-	geoCooldownUntil    time.Time
+	geoDB               *geoip2.Reader // local GeoIP database; nil if not configured
+	geoCache            sync.Map       // IP → region string; permanent cache for API lookups
+	geoQueue            chan string    // IPs pending API geo lookup
 	treeCache           *ShardTreeNode
 	treeCacheTime       time.Time
 	treeDirty           bool
-	geoQueue            chan geoRequest
 	uniqueCIDs          map[string]time.Time
 	shardTopics         map[string]*pubsub.Topic
 	ps                  *pubsub.PubSub
@@ -124,6 +109,7 @@ type Monitor struct {
 	manifestShard       map[string]string // manifest CID → observed shard (from PINNED/IngestMessage announcements)
 	lastSplitTime       time.Time         // when we last detected a split; used to avoid pruning during mesh formation
 	peerLastSiblingMove map[string]siblingMoveRecord
+	done                chan struct{} // closed on shutdown to stop background goroutines
 }
 
 // siblingMoveRecord tracks the last sibling shard move for cooldown (reduces 0↔1 oscillation from stale messages).
@@ -131,11 +117,6 @@ type siblingMoveRecord struct {
 	from string
 	to   string
 	when time.Time
-}
-
-type geoRequest struct {
-	ip     string
-	peerID string
 }
 
 func shardLogLabel(shardID string) string {
@@ -172,13 +153,12 @@ func (m *Monitor) getTopicPrefixUnlocked() string {
 	return config.PubsubTopicPrefix
 }
 
-func NewMonitor() *Monitor {
+func NewMonitor(geoDBPath string) *Monitor {
 	m := &Monitor{
 		nodes:               make(map[string]*NodeState),
 		splitEvents:         make([]ShardSplitEvent, 0, 100),
-		geoCache:            make(map[string]*GeoLocation),
-		geoCacheTime:        make(map[string]time.Time),
-		geoQueue:            make(chan geoRequest, MaxGeoQueueSize),
+		geoDB:               openGeoIPDB(geoDBPath),
+		geoQueue:            make(chan string, geoMaxQueueSize),
 		uniqueCIDs:          make(map[string]time.Time),
 		shardTopics:         make(map[string]*pubsub.Topic),
 		nodeFiles:           make(map[string]map[string]time.Time),
@@ -186,9 +166,14 @@ func NewMonitor() *Monitor {
 		peerShardLastSeen:   make(map[string]map[string]time.Time),
 		manifestShard:       make(map[string]string),
 		peerLastSiblingMove: make(map[string]siblingMoveRecord),
+		done:                make(chan struct{}),
 	}
-	go m.geoWorker()
-	go m.runGeoRetrySweep()
+	if m.geoDB != nil {
+		log.Println("[Monitor] GeoIP: using local database (instant lookups)")
+	} else {
+		log.Println("[Monitor] GeoIP: using ip-api.com API (async batch lookups)")
+		go m.geoAPIWorker()
+	}
 	go m.runReplicationCleanup()
 	return m
 }

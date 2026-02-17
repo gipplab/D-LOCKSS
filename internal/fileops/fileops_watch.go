@@ -28,6 +28,16 @@ var fileEventDeduper = struct {
 	info: make(map[string]fileEventInfo),
 }
 
+// pendingStability tracks files waiting for size to settle before ingest.
+var pendingStability = struct {
+	mu    sync.Mutex
+	path  map[string]int64
+	timer map[string]*time.Timer
+}{
+	path:  make(map[string]int64),
+	timer: make(map[string]*time.Timer),
+}
+
 func shouldProcessFileEvent(path string) bool {
 	const window = 2 * time.Second
 	now := time.Now()
@@ -68,6 +78,52 @@ func shouldProcessFileEvent(path string) bool {
 	}
 
 	return true
+}
+
+// enqueueWithStabilityCheck enqueues path for processing. If FileStabilityDelay > 0,
+// waits for the file size to be unchanged for that duration before enqueueing,
+// to avoid ingesting files still being written (e.g. downloads).
+func (fp *FileProcessor) enqueueWithStabilityCheck(path string) {
+	if config.FileStabilityDelay <= 0 {
+		_ = fp.EnqueueOrRetry(path)
+		return
+	}
+
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return
+	}
+	currentSize := info.Size()
+
+	pendingStability.mu.Lock()
+	if t, ok := pendingStability.timer[path]; ok {
+		t.Stop()
+	}
+	pendingStability.path[path] = currentSize
+	pendingStability.timer[path] = time.AfterFunc(config.FileStabilityDelay, func() {
+		if fp.ctx.Err() != nil {
+			return
+		}
+
+		pendingStability.mu.Lock()
+		expectedSize := pendingStability.path[path]
+		delete(pendingStability.path, path)
+		delete(pendingStability.timer, path)
+		pendingStability.mu.Unlock()
+
+		info2, err2 := os.Stat(path)
+		if err2 != nil || info2.IsDir() {
+			return
+		}
+		if info2.Size() == expectedSize {
+			_ = fp.EnqueueOrRetry(path)
+		} else {
+			log.Printf("[FileWatcher] File still changing size (was %d, now %d), re-scheduling stability check: %s",
+				expectedSize, info2.Size(), path)
+			fp.enqueueWithStabilityCheck(path)
+		}
+	})
+	pendingStability.mu.Unlock()
 }
 
 // WatchFolder watches the data directory for new files.
@@ -205,7 +261,7 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 							}
 							fileCount++
 
-							_ = fp.EnqueueOrRetry(path)
+							fp.enqueueWithStabilityCheck(path)
 							return nil
 						})
 						if err != nil {
@@ -231,7 +287,7 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 				}
 
 				if shouldProcessFileEvent(path) {
-					_ = fp.EnqueueOrRetry(path)
+					fp.enqueueWithStabilityCheck(path)
 				}
 			}
 		case err, ok := <-watcher.Errors:

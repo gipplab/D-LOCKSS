@@ -28,7 +28,8 @@ The protocol is built on top of the **IPFS** (InterPlanetary File System) and **
 
 The network is partitioned into PubSub topics for scalability:
 
-*   **Shard Topics (membership + protocol)**: `dlockss-creative-commons-shard-<prefix>`
+*   **Shard Topics (membership + protocol)**: `<version>-creative-commons-shard-<prefix>`
+    *   Version prefix: `DefaultPubsubVersion` (currently `dlockss-v0.0.3`). Bumped on breaking changes to isolate versions.
     *   Examples: `...-shard-`, `...-shard-0`, `...-shard-1`, `...-shard-01`.
     *   Used for: JOIN/HEARTBEAT/LEAVE, PINNED, IngestMessage, ReplicationRequest (CBOR).
     *   Nodes subscribe to the shard topic(s) they belong to (current shard; optionally target shard as tourist).

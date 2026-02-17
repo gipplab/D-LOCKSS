@@ -80,7 +80,17 @@ func (rr *RecentlyRemoved) WasRemoved(key string) (time.Time, bool) {
 func (rr *RecentlyRemoved) Record(key string) {
 	rr.mu.Lock()
 	defer rr.mu.Unlock()
-	rr.m[key] = time.Now()
+	now := time.Now()
+	rr.m[key] = now
+	// Prune entries older than 10 minutes every 64 records
+	if len(rr.m)&0x3F == 0 {
+		cutoff := now.Add(-10 * time.Minute)
+		for k, t := range rr.m {
+			if t.Before(cutoff) {
+				delete(rr.m, k)
+			}
+		}
+	}
 }
 
 func (rr *RecentlyRemoved) Remove(key string) {

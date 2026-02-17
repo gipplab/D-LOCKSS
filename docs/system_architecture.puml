@@ -34,9 +34,18 @@ package "File System" {
     [Cluster Store] as clusterStore
 }
 
+package "D-LOCKSS Monitor" {
+    [Dashboard Server] as dashboard
+    [Subscription Manager] as subMgr
+    [GeoIP Resolver] as geoIP
+    [Replication Tracker] as repTracker
+}
+
 package "External" {
     [Other D-LOCKSS Nodes] as peers
     [IPFS Network] as ipfsNet
+    [ip-api.com Batch API] as geoAPI
+    [Local GeoIP DB (.mmdb)] as geoDB
 }
 
 main --> shardMgr : manages
@@ -91,5 +100,13 @@ pubsub --> peers : broadcasts messages
 mdns --> peers : discovers locally
 
 watcher --> dataDir : monitors
+
+subMgr --> pubsub : subscribes to all shard topics
+subMgr --> dashboard : feeds node/shard state
+subMgr --> repTracker : tracks manifest replication
+geoIP --> geoDB : local lookup (preferred)
+geoIP --> geoAPI : batch API fallback (if no local DB)
+geoIP --> dashboard : region display
+dashboard --> repTracker : replication data
 
 @enduml

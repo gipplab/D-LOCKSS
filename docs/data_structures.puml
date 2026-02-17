@@ -71,6 +71,8 @@ class ShardManager {
     - lastDiscoveryCheck: time.Time
     - lastMoveToDeeperShard: time.Time
     - lastMergeUpTime: time.Time
+    - lastShardMove: time.Time
+    - lastProbeResponseTime: time.Time
     --
     + NewShardManager(...): *ShardManager
     + Run()
@@ -103,6 +105,11 @@ note right of ShardManager
   Merge up: understaffed in deep shard, parent has room.
   Discovery: all shards; 10s root, 2m default, 45s when SPLIT known.
   Split rebroadcast: nodes in children rebroadcast SPLIT to ancestors (60s).
+  Stability (v0.0.3):
+  - lastShardMove: general cooldown (30s) after ANY transition
+  - lastProbeResponseTime: rate-limits PROBE heartbeat responses (5s)
+  - Jittered discovery timers (0-25% random)
+  - Immediate LEAVE on departure
 end note
 
 class ResearchObject {
