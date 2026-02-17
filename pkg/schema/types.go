@@ -2,44 +2,26 @@ package schema
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"fmt"
-	"time"
 
 	"github.com/ipfs/go-cid"
 	"github.com/ipld/go-ipld-prime/codec/dagcbor"
 	"github.com/ipld/go-ipld-prime/datamodel"
 	"github.com/ipld/go-ipld-prime/node/basicnode"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/multiformats/go-multihash"
 )
 
 // ResearchObject is the unit of storage: metadata, payload link, and validation hints.
+// The manifest is content-addressed: same content + same ingester = same ManifestCID.
+// No timestamp is included to ensure deterministic CIDs for deduplication.
 type ResearchObject struct {
 	MetadataRef string  `cbor:"meta_ref"`    // DOI or URL to external metadata
 	IngestedBy  peer.ID `cbor:"ingester_id"` // PeerID of the node that ingested this
 	Signature   []byte  `cbor:"sig"`         // Cryptographic signature
-	Timestamp   int64   `cbor:"ts"`          // Unix timestamp of ingestion
 
 	Payload cid.Cid `cbor:"payload"` // Link to raw UnixFS DAG (file data)
 
 	TotalSize uint64 `cbor:"size"` // Total size in bytes
-}
-
-// ManifestCID returns the root CID to pin recursively.
-func (ro *ResearchObject) ManifestCID() (cid.Cid, error) {
-	// Serialize to CBOR
-	data, err := ro.MarshalCBOR()
-	if err != nil {
-		return cid.Cid{}, err
-	}
-	hash := sha256.Sum256(data)
-	mh, err := multihash.Sum(hash[:], multihash.SHA2_256, -1)
-	if err != nil {
-		return cid.Cid{}, err
-	}
-
-	return cid.NewCidV1(cid.DagCBOR, mh), nil
 }
 
 // MarshalCBOR serializes the ResearchObject to CBOR format.
@@ -54,9 +36,9 @@ func (ro *ResearchObject) MarshalCBORForSigning() ([]byte, error) {
 
 func (ro *ResearchObject) marshalCBOR(includeSig bool) ([]byte, error) {
 	nb := basicnode.Prototype.Map.NewBuilder()
-	fieldCount := int64(5)
+	fieldCount := int64(4)
 	if includeSig {
-		fieldCount = 6
+		fieldCount = 5
 	}
 	ma, err := nb.BeginMap(fieldCount)
 	if err != nil {
@@ -91,15 +73,6 @@ func (ro *ResearchObject) marshalCBOR(includeSig bool) ([]byte, error) {
 		if err := ma.AssembleValue().AssignNode(sigNode); err != nil {
 			return nil, fmt.Errorf("failed to assign sig value: %w", err)
 		}
-	}
-
-	// Timestamp
-	tsNode := basicnode.NewInt(ro.Timestamp)
-	if err := ma.AssembleKey().AssignString("ts"); err != nil {
-		return nil, fmt.Errorf("failed to assign ts key: %w", err)
-	}
-	if err := ma.AssembleValue().AssignNode(tsNode); err != nil {
-		return nil, fmt.Errorf("failed to assign ts value: %w", err)
 	}
 
 	// Payload (CID as string)
@@ -184,16 +157,9 @@ func (ro *ResearchObject) UnmarshalCBOR(data []byte) error {
 		return fmt.Errorf("failed to get sig bytes: %w", err)
 	}
 
-	// Timestamp
-	tsNode, err := node.LookupByString("ts")
-	if err != nil {
-		return fmt.Errorf("failed to get ts: %w", err)
-	}
-	tsInt, err := tsNode.AsInt()
-	if err != nil {
-		return fmt.Errorf("failed to get ts int: %w", err)
-	}
-	ro.Timestamp = tsInt
+	// Timestamp (optional, for backward compatibility with old manifests)
+	// Ignored — no longer stored in the struct.
+	_, _ = node.LookupByString("ts")
 
 	// Payload
 	payloadNode, err := node.LookupByString("payload")
@@ -224,11 +190,11 @@ func (ro *ResearchObject) UnmarshalCBOR(data []byte) error {
 }
 
 // NewResearchObject creates a new ResearchObject with the given parameters.
+// The manifest is deterministic: same (metadataRef, ingesterID, payloadCID, totalSize) → same ManifestCID.
 func NewResearchObject(metadataRef string, ingesterID peer.ID, payloadCID cid.Cid, totalSize uint64) *ResearchObject {
 	return &ResearchObject{
 		MetadataRef: metadataRef,
 		IngestedBy:  ingesterID,
-		Timestamp:   time.Now().Unix(),
 		Payload:     payloadCID,
 		TotalSize:   totalSize,
 	}

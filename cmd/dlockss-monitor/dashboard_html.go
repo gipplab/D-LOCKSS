@@ -70,7 +70,7 @@ const dashboardHTML = `<!DOCTYPE html>
                     <button class="btn-text" id="root-topic-edit-btn" style="margin-left: 6px; font-size: 0.9em;">EDIT</button>
                 </div>
                 <div id="root-topic-edit-row" style="display: none; margin-top: 4px;">
-                    <input type="text" id="root-topic-input" placeholder="e.g. dlockss-v0.0.2" style="padding: 4px; font-family: inherit; font-size: 0.85em; width: 160px; border: 1px solid #333;" title="Topic prefix (full topic: {prefix}-creative-commons-shard-)">
+                    <input type="text" id="root-topic-input" placeholder="e.g. dlockss-v0.0.3" style="padding: 4px; font-family: inherit; font-size: 0.85em; width: 160px; border: 1px solid #333;" title="Topic prefix (full topic: {prefix}-creative-commons-shard-)">
                     <button class="btn-text btn-save" id="root-topic-save-btn">SAVE</button>
                     <button class="btn-text btn-cancel" id="root-topic-cancel-btn">CANCEL</button>
                 </div>

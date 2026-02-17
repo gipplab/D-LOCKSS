@@ -90,10 +90,6 @@ func GetPayloadCIDForShardAssignment(ctx context.Context, client ipfs.IPFSClient
 	return ro.Payload.String()
 }
 
-func TruncateCID(cidStr string, maxLen int) string {
-	return cidStr
-}
-
 func LogError(component, operation, identifier string, err error) {
 	log.Printf("[Error] %s: Failed to %s %s: %v", component, operation, identifier, err)
 }
@@ -108,11 +104,4 @@ func LogWarning(component, message, identifier string) {
 
 func LogWarningWithContext(component, message, identifier, context string) {
 	log.Printf("[Warning] %s: %s %s (%s)", component, message, identifier, context)
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

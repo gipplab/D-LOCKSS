@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ipfs/go-cid"
@@ -18,6 +19,8 @@ import (
 	"dlockss/pkg/schema"
 )
 
+const probeResponseCooldown = 5 * time.Second
+
 // runSplitRebroadcast periodically re-broadcasts SPLIT to all ancestor shards so late-joining
 // nodes (e.g. in root or parent) can discover existing children. Each node in a child shard
 // publishes to its ancestors; no central coordinator needed.
@@ -27,10 +30,13 @@ func (sm *ShardManager) runSplitRebroadcast() {
 		jitterRange = time.Second
 	}
 	for {
+		delay := config.ShardSplitRebroadcastInterval + time.Duration(rand.Int63n(int64(jitterRange)))
+		t := time.NewTimer(delay)
 		select {
 		case <-sm.ctx.Done():
+			t.Stop()
 			return
-		case <-time.After(config.ShardSplitRebroadcastInterval + time.Duration(rand.Int63n(int64(jitterRange)))):
+		case <-t.C:
 			sm.rebroadcastSplitToAncestors()
 		}
 	}
@@ -79,6 +85,18 @@ func (sm *ShardManager) pruneStaleSeenPeers() {
 	}
 }
 
+// pruneReplicationRequestCooldown removes stale entries from the cooldown map.
+func (sm *ShardManager) pruneReplicationRequestCooldown() {
+	sm.replicationRequestMu.Lock()
+	defer sm.replicationRequestMu.Unlock()
+	cutoff := time.Now().Add(-2 * replicationRequestCooldownDuration)
+	for cidStr, lastSent := range sm.replicationRequestLastSent {
+		if lastSent.Before(cutoff) {
+			delete(sm.replicationRequestLastSent, cidStr)
+		}
+	}
+}
+
 // runReplicationChecker sends ReplicationRequest for pinned files below target replication.
 func (sm *ShardManager) runReplicationChecker() {
 	if config.CheckInterval <= 0 {
@@ -111,18 +129,25 @@ func (sm *ShardManager) runReplicationChecker() {
 				continue
 			}
 
+			sm.pruneReplicationRequestCooldown()
+
 			maxConc := config.MaxConcurrentReplicationChecks
 			if maxConc < 1 {
 				maxConc = 1
 			}
 			sem := make(chan struct{}, maxConc)
 			var wg sync.WaitGroup
+			var sentThisCycle int32
 			for _, manifestCIDStr := range manifests {
 				select {
 				case <-sm.ctx.Done():
 					wg.Wait()
 					return
 				case sem <- struct{}{}:
+				}
+				if atomic.LoadInt32(&sentThisCycle) >= maxReplicationRequestsPerCycle {
+					<-sem
+					continue
 				}
 				wg.Add(1)
 				go func(manifestCIDStr string) {
@@ -134,7 +159,7 @@ func (sm *ShardManager) runReplicationChecker() {
 					}
 					allocations, err := sm.clusterMgr.GetAllocations(sm.ctx, currentShard, c)
 					if err != nil {
-						_ = sm.clusterMgr.Pin(sm.ctx, currentShard, c, 0, 0)
+						_ = sm.clusterMgr.Pin(sm.ctx, currentShard, c, -1, -1)
 						allocations = nil
 					}
 					peerCount := sm.getShardPeerCount()
@@ -155,12 +180,19 @@ func (sm *ShardManager) runReplicationChecker() {
 						}
 					}
 					if activeAllocations >= targetRep {
-						const replicationGracePeriod = 3 * time.Minute
-						pinTime := sm.storageMgr.GetPinTime(manifestCIDStr)
-						if pinTime.IsZero() || time.Since(pinTime) >= replicationGracePeriod {
-							return
-						}
+						return
 					}
+					if atomic.LoadInt32(&sentThisCycle) >= maxReplicationRequestsPerCycle {
+						return
+					}
+					sm.replicationRequestMu.Lock()
+					lastSent := sm.replicationRequestLastSent[manifestCIDStr]
+					if time.Since(lastSent) < replicationRequestCooldownDuration {
+						sm.replicationRequestMu.Unlock()
+						return
+					}
+					sm.replicationRequestLastSent[manifestCIDStr] = time.Now()
+					sm.replicationRequestMu.Unlock()
 					if sm.signer == nil {
 						return
 					}
@@ -179,8 +211,11 @@ func (sm *ShardManager) runReplicationChecker() {
 						return
 					}
 					sm.PublishToShardCBOR(b, currentShard)
-					log.Printf("[Shard] ReplicationRequest sent for %s (shard %s, active_alloc=%d, total_alloc=%d, target=%d, peers=%d)",
-						manifestCIDStr, currentShard, activeAllocations, len(allocations), targetRep, peerCount)
+					atomic.AddInt32(&sentThisCycle, 1)
+					if config.VerboseLogging {
+						log.Printf("[Shard] ReplicationRequest sent for %s (shard %s, active_alloc=%d, total_alloc=%d, target=%d, peers=%d)",
+							manifestCIDStr, currentShard, activeAllocations, len(allocations), targetRep, peerCount)
+					}
 				}(manifestCIDStr)
 			}
 			wg.Wait()
@@ -199,9 +234,6 @@ func (sm *ShardManager) runHeartbeat() {
 			heartbeatInterval = 10 * time.Second
 		}
 	}
-	const backoffWhenPeers = 2
-	const backoffInterval = 5 * time.Minute
-	baseInterval := heartbeatInterval
 
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
@@ -214,14 +246,6 @@ func (sm *ShardManager) runHeartbeat() {
 			return
 		case <-ticker.C:
 			sm.sendHeartbeat()
-			n := sm.getShardPeerCount()
-			if n >= backoffWhenPeers && heartbeatInterval < backoffInterval {
-				ticker.Reset(backoffInterval)
-				heartbeatInterval = backoffInterval
-			} else if n < backoffWhenPeers && heartbeatInterval > baseInterval {
-				ticker.Reset(baseInterval)
-				heartbeatInterval = baseInterval
-			}
 		}
 	}
 }
@@ -320,7 +344,37 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 				sm.seenPeerRoles[shardID] = make(map[peer.ID]PeerRoleInfo)
 			}
 			sm.seenPeerRoles[shardID][from] = PeerRoleInfo{Role: RoleProbe, LastSeen: now}
+
+			// Rate-limit heartbeat responses to PROBEs.  When multiple nodes
+			// probe at once (e.g. after synchronized MergeUpCooldown expiry),
+			// every probe triggers an immediate heartbeat from every peer.
+			// With N probers and M responders this creates N*M messages in a
+			// short window — a "heartbeat storm".  Limit responses to at most
+			// one per probeResponseCooldown (5 s) to keep traffic bounded.
+			probeRateLimited := !sm.lastProbeResponseTime.IsZero() && now.Sub(sm.lastProbeResponseTime) < probeResponseCooldown
+			if !probeRateLimited {
+				sm.lastProbeResponseTime = now
+			}
 			sm.mu.Unlock()
+
+			if probeRateLimited {
+				return
+			}
+
+			// Respond with an immediate heartbeat if this is our current shard.
+			sm.mu.RLock()
+			cs := sm.currentShard
+			probeSub, probeSubExists := sm.shardSubs[shardID]
+			sm.mu.RUnlock()
+			if shardID == cs && probeSubExists && probeSub.topic != nil && !probeSub.observerOnly {
+				pinnedCount := 0
+				if sm.storageMgr != nil {
+					pinnedCount = sm.storageMgr.GetPinnedCount()
+				}
+				role := sm.getOurRole()
+				hb := []byte(fmt.Sprintf("HEARTBEAT:%s:%d:%s", sm.h.ID().String(), pinnedCount, role))
+				_ = probeSub.topic.Publish(sm.ctx, hb)
+			}
 			return
 		}
 		if len(msg.Data) > 6 && string(msg.Data[:6]) == "SPLIT:" {
@@ -399,11 +453,4 @@ func decodeCBORMessageType(data []byte) (schema.MessageType, error) {
 		return 0, err
 	}
 	return schema.MessageType(ti), nil
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

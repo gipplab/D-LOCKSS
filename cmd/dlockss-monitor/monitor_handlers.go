@@ -72,11 +72,8 @@ func (m *Monitor) handleIngestMessage(im *schema.IngestMessage, senderID peer.ID
 
 	if ip != "" && ip != nodeState.IPAddress {
 		nodeState.IPAddress = ip
-		nodeState.Region = ""
-		select {
-		case m.geoQueue <- geoRequest{ip: ip, peerID: peerIDStr}:
-			nodeState.lastGeoAttempt = now
-		default:
+		if region := m.lookupGeoIP(ip); region != "" {
+			nodeState.Region = region
 		}
 	}
 }
@@ -179,14 +176,12 @@ func (m *Monitor) handleHeartbeatWithRole(senderID peer.ID, shardID string, ip s
 	}
 	if ip != "" && ip != nodeState.IPAddress {
 		nodeState.IPAddress = ip
-		nodeState.Region = ""
-	}
-
-	if ip != "" && nodeState.Region == "" {
-		select {
-		case m.geoQueue <- geoRequest{ip: ip, peerID: peerIDStr}:
-			nodeState.lastGeoAttempt = now
-		default:
+		if region := m.lookupGeoIP(ip); region != "" {
+			nodeState.Region = region
+		}
+	} else if ip != "" && nodeState.Region == "" {
+		if region := m.lookupGeoIP(ip); region != "" {
+			nodeState.Region = region
 		}
 	}
 	return shardUpdated

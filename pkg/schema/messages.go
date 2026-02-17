@@ -22,41 +22,41 @@ const (
 // IngestMessage replaces the old "NEW:<hash>" string format.
 // It contains metadata about a new ResearchObject being announced.
 type IngestMessage struct {
-	Type       MessageType `cbor:"type"`        // Always MessageTypeIngest
-	ManifestCID cid.Cid   `cbor:"manifest_cid"` // The CID of the ResearchObject (root of graph)
-	ShardID    string     `cbor:"shard_id"`     // Target shard prefix
-	HintSize   uint64     `cbor:"hint_size"`    // Total size in bytes (for immediate disk-usage checks)
-	SenderID   peer.ID    `cbor:"sender_id"`    // PeerID of the sender
-	Timestamp  int64      `cbor:"ts"`           // Unix timestamp
-	Nonce      []byte     `cbor:"nonce"`        // Random nonce for replay protection
-	Sig        []byte     `cbor:"sig"`          // Signature over canonical CBOR (excluding sig)
+	Type        MessageType `cbor:"type"`         // Always MessageTypeIngest
+	ManifestCID cid.Cid     `cbor:"manifest_cid"` // The CID of the ResearchObject (root of graph)
+	ShardID     string      `cbor:"shard_id"`     // Target shard prefix
+	HintSize    uint64      `cbor:"hint_size"`    // Total size in bytes (for immediate disk-usage checks)
+	SenderID    peer.ID     `cbor:"sender_id"`    // PeerID of the sender
+	Timestamp   int64       `cbor:"ts"`           // Unix timestamp
+	Nonce       []byte      `cbor:"nonce"`        // Random nonce for replay protection
+	Sig         []byte      `cbor:"sig"`          // Signature over canonical CBOR (excluding sig)
 }
 
 // ReplicationRequest replaces the old "NEED:<hash>" string format.
 // It requests replication of a ResearchObject.
 type ReplicationRequest struct {
-	Type       MessageType `cbor:"type"`        // Always MessageTypeReplicationRequest
-	ManifestCID cid.Cid   `cbor:"manifest_cid"` // The CID of the ResearchObject to replicate
-	Priority   uint8       `cbor:"priority"`    // 0=Low, 1=High
-	Deadline   int64       `cbor:"deadline"`     // Unix timestamp deadline (0 = no deadline)
-	SenderID   peer.ID     `cbor:"sender_id"`    // PeerID of the sender
-	Timestamp  int64       `cbor:"ts"`           // Unix timestamp
-	Nonce      []byte      `cbor:"nonce"`        // Random nonce for replay protection
-	Sig        []byte      `cbor:"sig"`          // Signature over canonical CBOR (excluding sig)
+	Type        MessageType `cbor:"type"`         // Always MessageTypeReplicationRequest
+	ManifestCID cid.Cid     `cbor:"manifest_cid"` // The CID of the ResearchObject to replicate
+	Priority    uint8       `cbor:"priority"`     // 0=Low, 1=High
+	Deadline    int64       `cbor:"deadline"`     // Unix timestamp deadline (0 = no deadline)
+	SenderID    peer.ID     `cbor:"sender_id"`    // PeerID of the sender
+	Timestamp   int64       `cbor:"ts"`           // Unix timestamp
+	Nonce       []byte      `cbor:"nonce"`        // Random nonce for replay protection
+	Sig         []byte      `cbor:"sig"`          // Signature over canonical CBOR (excluding sig)
 }
 
 // UnreplicateRequest requests peers to drop over-replicated files.
 // Peers use deterministic selection (hash of ManifestCID + PeerID) to decide
 // if they should drop the file, ensuring distributed consensus without coordination.
 type UnreplicateRequest struct {
-	Type        MessageType `cbor:"type"`         // Always MessageTypeUnreplicateRequest
-	ManifestCID cid.Cid     `cbor:"manifest_cid"` // The CID of the ResearchObject to drop
-	ExcessCount int         `cbor:"excess_count"` // How many replicas need to be dropped (count - MaxReplication)
-	CurrentCount int        `cbor:"current_count"` // Current replication count (for verification)
-	SenderID    peer.ID     `cbor:"sender_id"`    // PeerID of the sender
-	Timestamp   int64       `cbor:"ts"`          // Unix timestamp
-	Nonce       []byte      `cbor:"nonce"`        // Random nonce for replay protection
-	Sig         []byte      `cbor:"sig"`          // Signature over canonical CBOR (excluding sig)
+	Type         MessageType `cbor:"type"`          // Always MessageTypeUnreplicateRequest
+	ManifestCID  cid.Cid     `cbor:"manifest_cid"`  // The CID of the ResearchObject to drop
+	ExcessCount  int         `cbor:"excess_count"`  // How many replicas need to be dropped (count - MaxReplication)
+	CurrentCount int         `cbor:"current_count"` // Current replication count (for verification)
+	SenderID     peer.ID     `cbor:"sender_id"`     // PeerID of the sender
+	Timestamp    int64       `cbor:"ts"`            // Unix timestamp
+	Nonce        []byte      `cbor:"nonce"`         // Random nonce for replay protection
+	Sig          []byte      `cbor:"sig"`           // Signature over canonical CBOR (excluding sig)
 }
 
 // MarshalCBOR serializes an IngestMessage to CBOR format.
@@ -71,9 +71,9 @@ func (m *IngestMessage) MarshalCBORForSigning() ([]byte, error) {
 
 func (m *IngestMessage) marshalCBOR(includeSig bool) ([]byte, error) {
 	nb := basicnode.Prototype.Map.NewBuilder()
-	fieldCount := int64(8)
+	fieldCount := int64(7)
 	if includeSig {
-		fieldCount = 9
+		fieldCount = 8
 	}
 	ma, err := nb.BeginMap(fieldCount)
 	if err != nil {

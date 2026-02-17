@@ -12,9 +12,10 @@ participant "IPFS" as IPFS
 ShardMgr -> ShardMgr: runPeerCountChecker()\n(ticker: rootPeerCheckInterval at root, ShardPeerCheckInterval otherwise)
 ShardMgr -> ShardMgr: getShardPeerCountForSplit()\n(ACTIVE peers only from HEARTBEAT/JOIN; no mesh fallback)
 
-alt peerCount >= MaxPeersPerShard (2 consecutive checks)\nAND estimatedPerChild >= MinPeersPerShard\nAND (child has >=1 peer OR parent >= 14 to create)
+alt peerCount >= MaxPeersPerShard (2 consecutive checks)\nAND estimatedPerChild >= MinPeersPerShard\nAND (child has >=1 peer OR parent >= 14 to create)\nAND time.Since(lastShardMove) >= ShardMoveCooldown (30s)
     ShardMgr -> ShardMgr: announceSplit(parentShard, targetChild)\nPublish SPLIT:child0:child1 on parent topic
     ShardMgr -> ShardMgr: moveToShard(currentShard, targetChild)\ncurrentShard = GetBinaryPrefix(peerID, depth+1)
+    ShardMgr -> ShardMgr: lastShardMove = now\nPublish LEAVE on old shard (immediate)
     
     ShardMgr -> PubSub: JoinShard(newShard)\n(topic: dlockss-creative-commons-shard-<newShard>)
     
@@ -44,14 +45,14 @@ end
 
 == Path 2: Discover and migrate into existing deeper shards ==
 
-Note over ShardMgr: runShardDiscovery() runs for ALL shards (root and non-root).\nRequires SPLIT announcement (knownChildShards); probe timeout 12s.\nInterval: 10s at root, 2m default, 45s when SPLIT known.
+Note over ShardMgr: runShardDiscovery() runs for ALL shards (root and non-root).\nRequires SPLIT announcement (knownChildShards); probe timeout 12s.\nInterval: 10s at root, 2m default, 45s when SPLIT known.\nJitter: 0-25% random added to interval to prevent synchronized moves.\nBlocked if time.Since(lastShardMove) < ShardMoveCooldown (30s).
 
-ShardMgr -> ShardMgr: runShardDiscovery()\n(ticker: 10s at root, 2m otherwise, 45s when knownChildShards)
+ShardMgr -> ShardMgr: runShardDiscovery()\n(ticker: interval + rand(0..interval/4) jitter)
 ShardMgr -> ShardMgr: discoverAndMoveToDeeperShard()\nprobeShard(targetChild, 12s) + probeShard(sibling)
 ShardMgr -> ShardMgr: checkAndMergeUpIfAlone()
 
-alt SPLIT announced AND (child+sibling >= MinPeersAcrossSiblings OR projected >= threshold)
-    ShardMgr -> ShardMgr: moveToShard(currentShard, targetChild)
+alt SPLIT announced AND (child+sibling >= MinPeersAcrossSiblings OR projected >= threshold)\nAND time.Since(lastShardMove) >= ShardMoveCooldown (30s)
+    ShardMgr -> ShardMgr: moveToShard(currentShard, targetChild)\nlastShardMove = now\nPublish LEAVE on old shard (immediate)
     ShardMgr -> PubSub: JoinShard(newShard)
     ShardMgr -> ClusterMgr: JoinShard(ctx, newShard, nil)
     ShardMgr -> ShardMgr: MigratePins(oldShard, newShard)\nLeaveShard(oldShard) after ShardOverlapDuration\nRunReshardPass(oldShard, newShard)
@@ -66,13 +67,25 @@ ShardMgr -> ShardMgr: rebroadcastSplitToAncestors()\nfor each ancestor: publishS
 ShardMgr -> ShardMgr: JoinShardAsObserver(ancestor), Publish SPLIT:child0:child1, LeaveShardAsObserver
 ShardMgr -> PubSub: SPLIT:child0:child1 on ancestor topic
 
+== Path 2c: PROBE response rate limiting ==
+
+Note over ShardMgr: When a PROBE is received, the node responds with a HEARTBEAT\nso the prober can count active peers.\nRate-limited: max 1 response per probeResponseCooldown (5s)\nto prevent heartbeat storms from simultaneous probers.
+
+ShardMgr -> ShardMgr: processMessage(PROBE)\nCheck lastProbeResponseTime
+alt time.Since(lastProbeResponseTime) >= probeResponseCooldown (5s)
+    ShardMgr -> ShardMgr: lastProbeResponseTime = now
+    ShardMgr -> PubSub: Publish HEARTBEAT (response to PROBE)
+else rate-limited
+    ShardMgr -> ShardMgr: skip (suppress duplicate response)
+end
+
 == Path 3: Merge up when understaffed in deep shard ==
 
-Note over ShardMgr: currentPeerCount < MinPeersPerShard\nparent has room, sibling empty or we're smaller/equal -> move to parent.
+Note over ShardMgr: currentPeerCount < MinPeersPerShard\nparent has room, sibling empty or we're smaller/equal -> move to parent.\nBlocked if time.Since(lastShardMove) < ShardMoveCooldown (30s).\nCooldown: MergeUpCooldown (2m) after last merge.\nSibling empty: SiblingEmptyMergeAfter (5m) before merge-up.\nProbe timeout: ProbeTimeoutMerge (6s).
 
 ShardMgr -> ShardMgr: checkAndMergeUpIfAlone()
-alt len(currentShard) >= 2\nAND currentPeerCount < MinPeersPerShard\nAND parentPeerCount < MaxPeersPerShard\nAND (sibling empty OR we're smaller/equal)
-    ShardMgr -> ShardMgr: currentShard = parentShard
+alt len(currentShard) >= 2\nAND currentPeerCount < MinPeersPerShard\nAND parentPeerCount < MaxPeersPerShard\nAND (sibling empty OR we're smaller/equal)\nAND time.Since(lastShardMove) >= ShardMoveCooldown (30s)
+    ShardMgr -> ShardMgr: currentShard = parentShard\nlastShardMove = now\nPublish LEAVE on old shard (immediate)
     ShardMgr -> PubSub: JoinShard(parentShard)
     ShardMgr -> ClusterMgr: JoinShard(ctx, parentShard, nil)
     ShardMgr -> ShardMgr: MigratePins(oldShard, parentShard)\nLeaveShard(oldShard) after ShardOverlapDuration\nRunReshardPass(oldShard, parentShard)

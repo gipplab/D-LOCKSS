@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -23,6 +24,9 @@ import (
 )
 
 func main() {
+	geoipDB := flag.String("geoip-db", "", "Path to a MaxMind/DB-IP .mmdb GeoIP database file")
+	flag.Parse()
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -39,7 +43,12 @@ func main() {
 		}
 	}
 
-	monitor := NewMonitor()
+	geoDBPath := *geoipDB
+	if geoDBPath == "" {
+		geoDBPath = os.Getenv("DLOCKSS_MONITOR_GEOIP_DB")
+	}
+
+	monitor := NewMonitor(geoDBPath)
 	h, err := startLibP2P(ctx, monitor)
 	if err != nil {
 		log.Fatalf("P2P error: %v", err)
@@ -373,7 +382,6 @@ func main() {
 			"ingester_id": ro.IngestedBy.String(),
 			"payload":     ro.Payload.String(),
 			"size":        ro.TotalSize,
-			"ts":          ro.Timestamp,
 			"sig":         base64.StdEncoding.EncodeToString(ro.Signature),
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -443,6 +451,9 @@ func main() {
 
 	<-ctx.Done()
 	log.Println("Shutting down gracefully...")
+	if monitor.geoDB != nil {
+		monitor.geoDB.Close()
+	}
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {

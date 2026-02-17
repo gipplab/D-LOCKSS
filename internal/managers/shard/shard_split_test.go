@@ -78,6 +78,9 @@ func (m *MockClusterManager) LeaveShard(shardID string) error { return nil }
 func (m *MockClusterManager) Pin(ctx context.Context, shardID string, c cid.Cid, replicationFactorMin, replicationFactorMax int) error {
 	return nil
 }
+func (m *MockClusterManager) PinIfAbsent(ctx context.Context, shardID string, c cid.Cid, replicationFactorMin, replicationFactorMax int) error {
+	return nil
+}
 func (m *MockClusterManager) Unpin(ctx context.Context, shardID string, c cid.Cid) error { return nil }
 func (m *MockClusterManager) GetAllocations(ctx context.Context, shardID string, c cid.Cid) ([]peer.ID, error) {
 	return nil, nil

@@ -6,7 +6,7 @@ import (
 )
 
 func TestUpdateNodeShardLocked_CrossBranchRejected(t *testing.T) {
-	m := NewMonitor()
+	m := NewMonitor("")
 	peerID := "12D3KooWTestCrossBranch123"
 	now := time.Now()
 
@@ -49,7 +49,7 @@ func TestUpdateNodeShardLocked_CrossBranchRejected(t *testing.T) {
 }
 
 func TestUpdateNodeShardLocked_ValidMovesAccepted(t *testing.T) {
-	m := NewMonitor()
+	m := NewMonitor("")
 	now := time.Now()
 
 	t.Run("split_0_to_00", func(t *testing.T) {

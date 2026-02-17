@@ -2,6 +2,7 @@ package shard
 
 import (
 	"log"
+	"math/rand"
 	"time"
 
 	"dlockss/internal/common"
@@ -23,11 +24,22 @@ func (sm *ShardManager) discoverAndMoveToDeeperShard() {
 	sm.mu.RLock()
 	currentShard := sm.currentShard
 	lastMerge := sm.lastMergeUpTime
+	lastAnyMove := sm.lastShardMove
 	sm.mu.RUnlock()
 
-	if currentShard == "" && !lastMerge.IsZero() && time.Since(lastMerge) < mergeUpCooldown {
+	// General move cooldown: don't re-descend right after any shard transition.
+	if !lastAnyMove.IsZero() && time.Since(lastAnyMove) < config.ShardMoveCooldown {
+		return
+	}
+
+	if !lastMerge.IsZero() && time.Since(lastMerge) < config.MergeUpCooldown {
 		if config.VerboseLogging {
-			log.Printf("[ShardDiscovery] Root: skipped (merged %v ago, cooldown %v)", time.Since(lastMerge).Round(time.Second), mergeUpCooldown)
+			label := currentShard
+			if label == "" {
+				label = "root"
+			}
+			log.Printf("[ShardDiscovery] Shard %s: skipped discovery (merged %v ago, cooldown %v)",
+				label, time.Since(lastMerge).Round(time.Second), config.MergeUpCooldown)
 		}
 		return
 	}
@@ -105,10 +117,17 @@ func (sm *ShardManager) runShardDiscovery() {
 			}
 		}
 
+		// Add 0-25% random jitter to desynchronize discovery timers across
+		// nodes.  Without jitter, nodes that start at similar times fire
+		// discovery simultaneously, leading to "thundering herd" probe storms
+		// and synchronized merge/re-join cascades.
+		jitter := time.Duration(rand.Int63n(int64(interval / 4)))
+		t := time.NewTimer(interval + jitter)
 		select {
 		case <-sm.ctx.Done():
+			t.Stop()
 			return
-		case <-time.After(interval):
+		case <-t.C:
 		}
 
 		sm.mu.RLock()

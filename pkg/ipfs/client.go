@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/ipfs/go-cid"
 	ipfsapi "github.com/ipfs/go-ipfs-api"
@@ -124,17 +125,15 @@ func (c *Client) UnpinRecursive(ctx context.Context, cid cid.Cid) error {
 
 func (c *Client) IsPinned(ctx context.Context, cid cid.Cid) (bool, error) {
 	var raw struct{ Keys map[string]ipfsapi.PinInfo }
-	if err := c.api.Request("pin/ls", cid.String()).Exec(ctx, &raw); err == nil {
-		_, ok := raw.Keys[cid.String()]
-		return ok, nil
+	if err := c.api.Request("pin/ls", cid.String()).Exec(ctx, &raw); err != nil {
+		// IPFS returns an error when the CID is not pinned — that's a valid "no".
+		if strings.Contains(err.Error(), "is not pinned") {
+			return false, nil
+		}
+		return false, fmt.Errorf("pin/ls check failed for %s: %w", cid.String(), err)
 	}
-
-	pins, err := c.api.Pins()
-	if err != nil {
-		return false, err
-	}
-	_, isPinned := pins[cid.String()]
-	return isPinned, nil
+	_, ok := raw.Keys[cid.String()]
+	return ok, nil
 }
 
 func (c *Client) GetFileSize(ctx context.Context, cid cid.Cid) (uint64, error) {

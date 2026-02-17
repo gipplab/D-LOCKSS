@@ -84,6 +84,8 @@ func (sm *ShardManager) PublishIngestMessageToCurrentAndChildIfSplit(data []byte
 		sm.PublishToShardCBOR(data, childShard)
 		sm.LeaveShardAsObserver(childShard)
 		log.Printf("[Shard] IngestMessage also published to child %s (split in progress)", childShard)
+	} else {
+		log.Printf("[Shard] Warning: could not join child %s as observer to forward IngestMessage during split", childShard)
 	}
 }
 

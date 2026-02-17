@@ -47,19 +47,18 @@ func LoadBadBits(path string) error {
 	}
 
 	for i, record := range records {
-		// Skip header if it looks like one
-		if i == 0 {
-			continue
-		}
 		if len(record) < 1 {
 			continue
 		}
-		cid := strings.TrimSpace(record[0])
-		if cid == "" {
+		val := strings.TrimSpace(record[0])
+		if val == "" {
+			continue
+		}
+		if i == 0 && !strings.HasPrefix(val, "bafy") && !strings.HasPrefix(val, "Qm") && !strings.HasPrefix(val, "bafk") {
 			continue
 		}
 
-		badBits.cids[cid] = true
+		badBits.cids[val] = true
 	}
 
 	badBits.loaded = true

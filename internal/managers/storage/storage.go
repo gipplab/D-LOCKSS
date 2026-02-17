@@ -122,19 +122,16 @@ func (sm *StorageManager) PinFile(manifestCIDStr string) bool {
 
 // UnpinFile removes a file/manifest from the pinned set.
 func (sm *StorageManager) UnpinFile(key string) {
-	if sm.pinnedFiles.Has(key) {
+	pinTime, was := sm.pinnedFiles.RemoveIfPresent(key)
+	if was {
 		sm.announceMu.Lock()
 		sm.announceKeysDirty = true
 		sm.announceMu.Unlock()
-		// Get pin time before removing to log how long it was pinned
-		pinTime := sm.pinnedFiles.GetPinTime(key)
-		sm.pinnedFiles.Remove(key)
 		if sm.metrics != nil {
 			sm.metrics.SetPinnedFilesCount(sm.pinnedFiles.Size())
 		}
-		timeSincePin := time.Since(pinTime)
 		log.Printf("[Storage] Unpinned file: %s (was pinned for %v, remaining pinned: %d)",
-			key, timeSincePin, sm.pinnedFiles.Size())
+			key, time.Since(pinTime), sm.pinnedFiles.Size())
 	} else {
 		log.Printf("[Storage] Attempted to unpin file that wasn't pinned: %s", key)
 	}

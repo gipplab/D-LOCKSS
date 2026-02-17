@@ -68,6 +68,18 @@ func (ps *PinnedSet) GetPinTime(key string) time.Time {
 	return ps.m[key]
 }
 
+// RemoveIfPresent atomically checks, removes, and returns the pin time.
+// Returns (pinTime, true) if the key was present, or (zero, false) if not.
+func (ps *PinnedSet) RemoveIfPresent(key string) (time.Time, bool) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	t, exists := ps.m[key]
+	if exists {
+		delete(ps.m, key)
+	}
+	return t, exists
+}
+
 func (ps *PinnedSet) Size() int {
 	ps.mu.RLock()
 	defer ps.mu.RUnlock()

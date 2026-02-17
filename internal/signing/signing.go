@@ -243,49 +243,6 @@ func (s *Signer) verifySignedMessage(receivedFrom peer.ID, sender peer.ID, ts in
 	return nil
 }
 
-// VerifySignedObject verifies a stored object signature (no replay). No DHT lookup.
-func (s *Signer) VerifySignedObject(sender peer.ID, ts int64, sig []byte, unsigned []byte) error {
-	if s.signaturesDisabled() {
-		return nil
-	}
-	if s.h == nil {
-		return fmt.Errorf("signer host is nil")
-	}
-	if sender == "" {
-		return fmt.Errorf("missing sender id")
-	}
-	if ts == 0 {
-		return fmt.Errorf("missing timestamp")
-	}
-	now := time.Now()
-	msgTime := time.Unix(ts, 0)
-	if msgTime.After(now.Add(effectiveFutureSkewTolerance())) {
-		return fmt.Errorf("timestamp too far in future: %v", msgTime)
-	}
-	if now.Sub(msgTime) > effectiveSignatureMaxAge() {
-		return fmt.Errorf("object signature too old: age=%v", now.Sub(msgTime))
-	}
-	if len(sig) == 0 {
-		return fmt.Errorf("missing signature")
-	}
-	if len(unsigned) == 0 {
-		return fmt.Errorf("empty message for verification")
-	}
-
-	pk := s.h.Peerstore().PubKey(sender)
-	if pk == nil {
-		return fmt.Errorf("missing public key for sender %s", sender.String())
-	}
-	ok, err := pk.Verify(unsigned, sig)
-	if err != nil {
-		return fmt.Errorf("signature verify error: %w", err)
-	}
-	if !ok {
-		return fmt.Errorf("invalid signature")
-	}
-	return nil
-}
-
 func (s *Signer) handleSignatureError(logContext string, err error) bool {
 	if err == nil {
 		return false
@@ -332,10 +289,4 @@ func (s *Signer) ShouldDropMessage(receivedFrom peer.ID, senderID peer.ID, times
 	}
 
 	return false
-}
-
-// VerifyAndAuthorizeMessage returns true to drop (auth/signature failed), false to accept.
-// Deprecated: use ShouldDropMessage for clearer semantics.
-func (s *Signer) VerifyAndAuthorizeMessage(receivedFrom peer.ID, senderID peer.ID, timestamp int64, nonce []byte, sig []byte, marshalForSigning func() ([]byte, error), logContext string) bool {
-	return s.ShouldDropMessage(receivedFrom, senderID, timestamp, nonce, sig, marshalForSigning, logContext)
 }

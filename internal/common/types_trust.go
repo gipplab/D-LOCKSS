@@ -42,7 +42,11 @@ func (tp *TrustedPeers) Has(pid peer.ID) bool {
 func (tp *TrustedPeers) SetAll(peers map[peer.ID]bool) {
 	tp.mu.Lock()
 	defer tp.mu.Unlock()
-	tp.m = peers
+	cp := make(map[peer.ID]bool, len(peers))
+	for k, v := range peers {
+		cp[k] = v
+	}
+	tp.m = cp
 }
 
 func (tp *TrustedPeers) All() []peer.ID {
@@ -95,13 +99,6 @@ func (ns *NonceStore) SeenBefore(sender peer.ID, nonce []byte) bool {
 	}
 	ns.entries[key] = now.Add(nonceTTL())
 	return false
-}
-
-func (ns *NonceStore) Record(sender peer.ID, nonce []byte) {
-	key := NonceKey(sender, nonce)
-	ns.mu.Lock()
-	defer ns.mu.Unlock()
-	ns.entries[key] = time.Now().Add(nonceTTL())
 }
 
 // RateLimiter tracks message rates per peer.

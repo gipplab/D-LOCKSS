@@ -203,7 +203,7 @@ func (sm *ShardManager) probeShard(shardID string, probeTimeout time.Duration) i
 	sm.mu.RUnlock()
 
 	if alreadyJoined && sub.topic != nil {
-		return sm.getProbePeerCount(shardID, sub.topic, 350*time.Second)
+		return sm.getProbePeerCount(shardID, 350*time.Second)
 	}
 	return sm.probeShardSilently(shardID, probeTimeout)
 }
@@ -295,7 +295,7 @@ func (sm *ShardManager) probeShardSilently(shardID string, probeTimeout time.Dur
 	return 0
 }
 
-func (sm *ShardManager) getProbePeerCount(shardID string, topic interface{ ListPeers() []peer.ID }, activeWindow time.Duration) int {
+func (sm *ShardManager) getProbePeerCount(shardID string, activeWindow time.Duration) int {
 	sm.mu.RLock()
 	_, observerOnly := sm.observerOnlyShards[shardID]
 	sm.mu.RUnlock()

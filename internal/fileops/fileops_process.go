@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/ipfs/go-cid"
 
@@ -44,10 +45,7 @@ func validateFilePath(path string) bool {
 
 // processNewFile imports a newly detected file into IPFS, builds a ResearchObject manifest, pins it, and announces it.
 func (fp *FileProcessor) processNewFile(path string) {
-	fp.semaphore <- struct{}{}
-	defer func() { <-fp.semaphore }()
-
-	log.Printf("[FileOps] Starting processing: %s", path)
+	log.Printf("[FileOps] Processing: %s", path)
 
 	if !validateFilePath(path) {
 		log.Printf("[FileOps] File validation failed: %s", path)
@@ -62,34 +60,49 @@ func (fp *FileProcessor) processNewFile(path string) {
 	ctx, cancel := context.WithTimeout(fp.ctx, config.FileImportTimeout)
 	defer cancel()
 
-	log.Printf("[FileOps] Importing file to IPFS: %s", path)
+	if config.VerboseLogging {
+		log.Printf("[FileOps] Importing file to IPFS: %s", path)
+	}
 	payloadCID, cleanupPayload, err := fp.importFileToIPFS(ctx, path)
 	if err != nil {
 		log.Printf("[FileOps] Failed to import file: %s, error: %v", path, err)
 		return
 	}
 
-	log.Printf("[FileOps] File imported, PayloadCID: %s", payloadCID.String())
-
-	log.Printf("[FileOps] Building manifest for: %s", path)
-	manifestCID, manifestCIDStr, err := fp.buildAndStoreManifest(ctx, path, payloadCID, cleanupPayload)
-	if err != nil {
-		log.Printf("[FileOps] Failed to build manifest: %s, error: %v", path, err)
+	payloadCIDStr := payloadCID.String()
+	fp.recentIngestMu.Lock()
+	if lastIngest, seen := fp.recentIngests[payloadCIDStr]; seen && time.Since(lastIngest) < recentIngestTTL {
+		fp.recentIngestMu.Unlock()
+		log.Printf("[FileOps] Skipping duplicate PayloadCID %s (path: %s, last ingested %v ago)",
+			payloadCIDStr, path, time.Since(lastIngest).Round(time.Second))
 		cleanupPayload()
 		return
 	}
-	log.Printf("[FileOps] Manifest created, ManifestCID: %s", manifestCIDStr)
+	fp.recentIngests[payloadCIDStr] = time.Now()
+	now := time.Now()
+	for k, t := range fp.recentIngests {
+		if now.Sub(t) > 2*recentIngestTTL {
+			delete(fp.recentIngests, k)
+		}
+	}
+	fp.recentIngestMu.Unlock()
 
-	log.Printf("[FileOps] Checking BadBits and pinning: %s", path)
-	if !fp.checkBadBitsAndPin(ctx, manifestCID, manifestCIDStr, path, cleanupPayload) {
-		log.Printf("[FileOps] BadBits check failed or pinning failed: %s", path)
+	if config.VerboseLogging {
+		log.Printf("[FileOps] Building manifest for: %s (PayloadCID: %s)", path, payloadCIDStr)
+	}
+	manifestCID, manifestCIDStr, err := fp.buildAndStoreManifest(ctx, path, payloadCID, cleanupPayload)
+	if err != nil {
+		log.Printf("[FileOps] Failed to build manifest: %s, error: %v", path, err)
 		return
 	}
-	log.Printf("[FileOps] File pinned successfully: %s", path)
 
-	log.Printf("[FileOps] Tracking and announcing: %s", path)
+	if !fp.checkBadBitsAndPin(ctx, manifestCID, manifestCIDStr, path, cleanupPayload) {
+		log.Printf("[FileOps] BadBits check or pinning failed: %s", path)
+		return
+	}
+
 	fp.trackAndAnnounceFile(manifestCID, manifestCIDStr, payloadCID)
-	log.Printf("[FileOps] File processing completed: %s", path)
+	log.Printf("[FileOps] Completed: %s -> ManifestCID %s (PayloadCID %s)", path, manifestCIDStr, payloadCIDStr)
 }
 
 func (fp *FileProcessor) importFileToIPFS(ctx context.Context, path string) (cid.Cid, func(), error) {
@@ -173,67 +186,51 @@ func (fp *FileProcessor) checkBadBitsAndPin(ctx context.Context, manifestCID cid
 		return false
 	}
 
-	log.Printf("[FileOps] Pinning manifest recursively: %s", manifestCIDStr)
+	if config.VerboseLogging {
+		log.Printf("[FileOps] Pinning manifest recursively: %s", manifestCIDStr)
+	}
 	if err := fp.ipfsClient.PinRecursive(ctx, manifestCID); err != nil {
 		log.Printf("[FileOps] Failed to pin ManifestCID %s: %v", manifestCIDStr, err)
 		common.LogError("FileOps", "pin ManifestCID recursively", manifestCIDStr, err)
 		cleanupPayload()
 		return false
 	}
-	log.Printf("[FileOps] Successfully pinned manifest: %s", manifestCIDStr)
 
 	return true
 }
 
 func (fp *FileProcessor) trackAndAnnounceFile(manifestCID cid.Cid, manifestCIDStr string, payloadCID cid.Cid) {
-	log.Printf("[FileOps] Calling pinFile for: %s", manifestCIDStr)
 	if !fp.storageMgr.PinFile(manifestCIDStr) {
-		log.Printf("[FileOps] Warning: pinFile returned false for %s (file may be blocked or already tracked)", manifestCIDStr)
+		log.Printf("[FileOps] Warning: pinFile returned false for %s (may be blocked or already tracked)", manifestCIDStr)
 		common.LogWarning("FileOps", "Failed to track ManifestCID", manifestCIDStr)
 		return
 	}
-	log.Printf("[FileOps] pinFile succeeded for: %s", manifestCIDStr)
 	fp.shardMgr.AnnouncePinned(manifestCIDStr)
 
 	payloadCIDStr := payloadCID.String()
-	log.Printf("[FileOps] Checking responsibility for PayloadCID: %s", payloadCIDStr)
 	isResponsible := fp.shardMgr.AmIResponsibleFor(payloadCIDStr)
-	log.Printf("[FileOps] Responsibility check for %s: responsible=%v", payloadCIDStr, isResponsible)
 
 	if isResponsible {
-		log.Printf("[FileOps] Pinning to Cluster (current shard) for: %s", manifestCIDStr)
 		if err := fp.shardMgr.PinToCluster(context.Background(), manifestCID); err != nil {
 			log.Printf("[FileOps] Error pinning to cluster: %v", err)
-		} else {
-			log.Printf("[FileOps] Successfully pinned to Cluster state")
+		} else if config.VerboseLogging {
+			log.Printf("[FileOps] Pinned to cluster state: %s", manifestCIDStr)
 		}
-	} else {
-		log.Printf("[FileOps] Not pinning to current cluster (custodial); file will be injected into target cluster only")
-	}
-
-	if fp.shardMgr == nil {
-		log.Printf("[FileOps] ERROR: shardMgr is nil! Cannot announce file %s", manifestCIDStr)
-		return
 	}
 
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[FileOps] PANIC in trackAndAnnounceFile after addKnownFile for %s: %v", manifestCIDStr, r)
+			log.Printf("[FileOps] PANIC in trackAndAnnounceFile for %s: %v", manifestCIDStr, r)
 		}
 	}()
 
-	log.Printf("[FileOps] About to call addKnownFile for %s", manifestCIDStr)
 	fp.storageMgr.AddKnownFile(manifestCIDStr)
-	log.Printf("[FileOps] Added to known files: %s", manifestCIDStr)
 
 	if isResponsible {
-		log.Printf("[FileOps] Calling announceResponsibleFile for %s", manifestCIDStr)
 		fp.announceResponsibleFile(manifestCID, manifestCIDStr, payloadCIDStr)
 	} else {
-		log.Printf("[FileOps] Calling announceCustodialFile for %s", manifestCIDStr)
 		fp.announceCustodialFile(manifestCID, manifestCIDStr, payloadCIDStr)
 	}
-	log.Printf("[FileOps] Announcement completed for %s", manifestCIDStr)
 }
 
 func (fp *FileProcessor) announceResponsibleFile(manifestCID cid.Cid, manifestCIDStr, payloadCIDStr string) {
@@ -285,7 +282,12 @@ func (fp *FileProcessor) announceCustodialFile(manifestCID cid.Cid, manifestCIDS
 		return
 	}
 
-	fp.shardMgr.JoinShard(targetShard)
+	if !fp.shardMgr.JoinShardAsObserver(targetShard) {
+		log.Printf("[Core] Failed to join target shard %s as observer for custodial inject", targetShard)
+		return
+	}
+	defer fp.shardMgr.LeaveShardAsObserver(targetShard)
+
 	if err := fp.shardMgr.EnsureClusterForShard(context.Background(), targetShard); err != nil {
 		log.Printf("[Core] Failed to ensure cluster for target shard %s: %v", targetShard, err)
 		return

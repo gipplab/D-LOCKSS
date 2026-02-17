@@ -29,6 +29,7 @@ func (cm *ClusterManager) MigratePins(ctx context.Context, sourceShardID, destSh
 
 	destDepth := len(destShardID)
 
+	migrated := 0
 	for _, c := range allocations {
 		key := c.String()
 		payloadCIDStr := common.GetPayloadCIDForShardAssignment(ctx, cm.ipfsClient, key)
@@ -38,12 +39,16 @@ func (cm *ClusterManager) MigratePins(ctx context.Context, sourceShardID, destSh
 		if targetPrefix != destShardID {
 			continue
 		}
-		if err := cm.Pin(ctx, destShardID, c, 0, 0); err != nil {
-			log.Printf("[ClusterMigration] Failed to migrate pin %s: %v", c, err)
+		if err := cm.Pin(ctx, destShardID, c, -1, -1); err != nil {
+			log.Printf("[ClusterMigration] Failed to migrate pin %s to dest: %v", c, err)
 			continue
 		}
+		if err := cm.Unpin(ctx, sourceShardID, c); err != nil {
+			log.Printf("[ClusterMigration] Failed to unpin %s from source: %v", c, err)
+		}
+		migrated++
 	}
 
-	log.Printf("[ClusterMigration] Migration finished from %s -> %s", sourceShardID, destShardID)
+	log.Printf("[ClusterMigration] Migration finished from %s -> %s (%d pins migrated)", sourceShardID, destShardID, migrated)
 	return nil
 }

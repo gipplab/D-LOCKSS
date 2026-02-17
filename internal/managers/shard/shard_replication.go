@@ -37,7 +37,16 @@ func (sm *ShardManager) handleReplicationRequest(msg *pubsub.Message, rr *schema
 	if !config.AutoReplicationEnabled {
 		return
 	}
+	select {
+	case sm.autoReplicationSem <- struct{}{}:
+	default:
+		if config.VerboseLogging {
+			log.Printf("[Shard] Auto-replication: skipping %s (concurrency limit reached)", manifestCIDStr)
+		}
+		return
+	}
 	go func() {
+		defer func() { <-sm.autoReplicationSem }()
 		fetchCtx, cancelFetch := context.WithTimeout(sm.ctx, config.AutoReplicationTimeout)
 		if err := sm.ipfsClient.PinRecursive(fetchCtx, c); err != nil {
 			cancelFetch()
@@ -49,11 +58,15 @@ func (sm *ShardManager) handleReplicationRequest(msg *pubsub.Message, rr *schema
 			log.Printf("[Shard] Auto-replication: cluster for shard %s: %v", shardID, err)
 			return
 		}
-		if err := sm.clusterMgr.Pin(sm.ctx, shardID, c, 0, 0); err != nil {
+		// Write to the local CRDT if the pin doesn't exist yet — same rationale
+		// as handleIngestMessage: CRDT delta propagation is unreliable, so each
+		// node ensures its CRDT has the entry.  Allocation conflicts don't
+		// matter because the PinTracker ignores allocations.
+		if err := sm.clusterMgr.PinIfAbsent(sm.ctx, shardID, c, -1, -1); err != nil {
 			log.Printf("[Shard] Auto-replication: failed to write CRDT pin for %s: %v", manifestCIDStr, err)
 		}
-		log.Printf("[Shard] Auto-replication: fetched and pinned %s to shard %s", manifestCIDStr, shardID)
 		sm.clusterMgr.TriggerSync(shardID)
+		log.Printf("[Shard] Auto-replication: fetched and pinned %s to shard %s", manifestCIDStr, shardID)
 	}()
 }
 
@@ -86,12 +99,17 @@ func (sm *ShardManager) handleIngestMessage(msg *pubsub.Message, im *schema.Inge
 		return
 	}
 
-	if err := sm.clusterMgr.Pin(sm.ctx, shardID, im.ManifestCID, -1, -1); err != nil {
+	// Write to the local CRDT if the pin doesn't exist yet.  CRDT delta
+	// propagation from the ingesting node is unreliable in practice (the
+	// GossipSub mesh for the shard's CRDT topic may not be fully formed,
+	// especially right after shard splits).  PinIfAbsent ensures every node
+	// has the pin in its local CRDT.  We no longer worry about allocation
+	// conflicts because the PinTracker ignores allocations — all nodes on a
+	// shard pin everything in the shard's CRDT.
+	if err := sm.clusterMgr.PinIfAbsent(sm.ctx, shardID, im.ManifestCID, -1, -1); err != nil {
 		log.Printf("[Shard] Failed to pin ingested file %s to cluster: %v", key, err)
-	} else {
-		log.Printf("[Shard] Automatically pinned ingested file %s to cluster %s", key, shardID)
-		sm.AnnouncePinned(key)
 	}
+	sm.clusterMgr.TriggerSync(shardID)
 }
 
 // RunReshardPass migrates or unpins files when moving between shards.
@@ -185,6 +203,8 @@ const orphanUnpinInterval = 2 * time.Minute
 
 // RunOrphanUnpinPass unpins files that belong to active child shards (we are still in parent).
 func (sm *ShardManager) RunOrphanUnpinPass() {
+	sm.pruneOrphanHandoffSent()
+
 	sm.mu.RLock()
 	currentShard := sm.currentShard
 	sm.mu.RUnlock()
@@ -297,6 +317,22 @@ func (sm *ShardManager) RunOrphanUnpinPass() {
 	}
 	if unpinned > 0 {
 		log.Printf("[Reshard] Orphan unpin pass: unpinned %d files that belong to child shards", unpinned)
+	}
+}
+
+func (sm *ShardManager) pruneOrphanHandoffSent() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	cutoff := time.Now().Add(-2 * config.OrphanHandoffGrace)
+	for key, children := range sm.orphanHandoffSent {
+		for child, info := range children {
+			if info.lastSent.Before(cutoff) {
+				delete(children, child)
+			}
+		}
+		if len(children) == 0 {
+			delete(sm.orphanHandoffSent, key)
+		}
 	}
 }
 
