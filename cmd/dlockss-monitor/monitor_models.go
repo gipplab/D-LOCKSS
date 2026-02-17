@@ -67,6 +67,7 @@ type NodeState struct {
 	ShardHistory   []ShardHistoryEntry `json:"shard_history"`
 	IPAddress      string              `json:"ip_address"`
 	Region         string              `json:"region"`
+	lastGeoAttempt time.Time           // when we last enqueued a geo lookup for this node
 	announcedFiles map[string]time.Time
 }
 
