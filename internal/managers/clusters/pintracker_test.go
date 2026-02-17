@@ -141,6 +141,9 @@ func TestPinTracker_allocation_pin(t *testing.T) {
 }
 
 func TestPinTracker_allocation_skip(t *testing.T) {
+	// Since v0.0.3, allocations are ignored — all nodes on a shard pin
+	// everything in the shard's CRDT. This test verifies that a pin
+	// allocated to another peer is still synced locally.
 	ourPeer := mustPeerIDFromSeed(t, "our")
 	otherPeer := mustPeerIDFromSeed(t, "other")
 	c1, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
@@ -159,8 +162,8 @@ func TestPinTracker_allocation_skip(t *testing.T) {
 	ipfs.mu.Lock()
 	n := len(ipfs.pinCalls)
 	ipfs.mu.Unlock()
-	if n != 0 {
-		t.Errorf("expected 0 PinRecursive calls (we are not allocated), got %d", n)
+	if n != 1 {
+		t.Errorf("expected 1 PinRecursive call (allocations ignored, pin everything), got %d", n)
 	}
 }
 
@@ -188,11 +191,16 @@ func TestPinTracker_empty_allocations_full_replication(t *testing.T) {
 	}
 }
 
-func TestPinTracker_unpin_when_no_longer_allocated(t *testing.T) {
+func TestPinTracker_tracking_released_when_removed_from_CRDT(t *testing.T) {
+	// Since v0.0.3, PinTracker does NOT call UnpinRecursive — it only
+	// releases tracking. Actual IPFS unpins are handled by the reshard
+	// pass which is migration-aware.
 	ourPeer := mustPeerIDFromSeed(t, "our")
 	c1, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
+	removed := make([]string, 0)
+	onRemoved := func(cidStr string) { removed = append(removed, cidStr) }
 	ipfs := &mockIPFSForTracker{peerIDStr: ourPeer.String()}
-	pt := NewLocalPinTracker(ipfs, "1", nil, nil)
+	pt := NewLocalPinTracker(ipfs, "1", nil, onRemoved)
 
 	stateWithPin := &mockState{
 		pins: []api.Pin{
@@ -209,18 +217,24 @@ func TestPinTracker_unpin_when_no_longer_allocated(t *testing.T) {
 		t.Fatalf("after first sync: expected 1 PinRecursive, got %d", pinCalls)
 	}
 
-	// Second sync: state has no pins (we're no longer allocated for c1)
+	// Second sync: state has no pins (removed from CRDT)
 	stateEmpty := &mockState{pins: nil}
 	consensusEmpty := &mockConsensus{st: stateEmpty}
 	pt.syncState(consensusEmpty)
 
+	// PinTracker should NOT call UnpinRecursive (migration-safe)
 	ipfs.mu.Lock()
 	unpinCalls := len(ipfs.unpinCalls)
 	ipfs.mu.Unlock()
-	if unpinCalls != 1 {
-		t.Errorf("expected 1 UnpinRecursive (no longer allocated), got %d", unpinCalls)
+	if unpinCalls != 0 {
+		t.Errorf("expected 0 UnpinRecursive (PinTracker only releases tracking), got %d", unpinCalls)
 	}
-	if unpinCalls >= 1 && ipfs.unpinCalls[0] != c1 {
-		t.Errorf("UnpinRecursive called with %s, want %s", ipfs.unpinCalls[0], c1)
+
+	// But onPinRemoved callback should have been called
+	if len(removed) != 1 {
+		t.Errorf("expected onPinRemoved called once, got %d", len(removed))
+	}
+	if len(removed) >= 1 && removed[0] != c1.String() {
+		t.Errorf("onPinRemoved called with %s, want %s", removed[0], c1)
 	}
 }

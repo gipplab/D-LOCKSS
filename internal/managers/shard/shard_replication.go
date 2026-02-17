@@ -26,6 +26,15 @@ func (sm *ShardManager) handleReplicationRequest(msg *pubsub.Message, rr *schema
 	manifestCIDStr := rr.ManifestCID.String()
 	c := rr.ManifestCID
 
+	// Reject legacy manifests that contain a timestamp (non-deterministic CIDs).
+	checkCtx, checkCancel := context.WithTimeout(sm.ctx, 5*time.Second)
+	legacy := common.IsLegacyManifest(checkCtx, sm.ipfsClient, manifestCIDStr)
+	checkCancel()
+	if legacy {
+		log.Printf("[Shard] Ignoring legacy manifest in ReplicationRequest: %s", manifestCIDStr)
+		return
+	}
+
 	if sm.storageMgr.IsPinned(manifestCIDStr) {
 		if err := sm.EnsureClusterForShard(sm.ctx, shardID); err != nil {
 			log.Printf("[Shard] ReplicationRequest: cluster for shard %s: %v", shardID, err)
@@ -82,6 +91,15 @@ func (sm *ShardManager) handleIngestMessage(msg *pubsub.Message, im *schema.Inge
 	}
 	key := im.ManifestCID.String()
 	sm.metrics.IncrementMessagesReceived()
+
+	// Reject legacy manifests that contain a timestamp (non-deterministic CIDs).
+	checkCtx, checkCancel := context.WithTimeout(sm.ctx, 5*time.Second)
+	legacy := common.IsLegacyManifest(checkCtx, sm.ipfsClient, key)
+	checkCancel()
+	if legacy {
+		log.Printf("[Shard] Ignoring legacy manifest (has timestamp): %s", key)
+		return
+	}
 
 	sm.storageMgr.AddKnownFile(key)
 
@@ -320,6 +338,69 @@ func (sm *ShardManager) RunOrphanUnpinPass() {
 	}
 }
 
+const legacyCleanupInterval = 5 * time.Minute
+
+// runLegacyManifestCleanup periodically scans pinned manifests and unpins any
+// that contain a legacy timestamp field (non-deterministic CIDs from the old format).
+func (sm *ShardManager) runLegacyManifestCleanup() {
+	// Run once shortly after startup to clean up existing legacy pins.
+	select {
+	case <-sm.ctx.Done():
+		return
+	case <-time.After(30 * time.Second):
+	}
+	sm.cleanupLegacyManifests()
+
+	ticker := time.NewTicker(legacyCleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-sm.ctx.Done():
+			return
+		case <-ticker.C:
+			sm.cleanupLegacyManifests()
+		}
+	}
+}
+
+func (sm *ShardManager) cleanupLegacyManifests() {
+	manifests := sm.storageMgr.GetPinnedManifests()
+	if len(manifests) == 0 {
+		return
+	}
+
+	sm.mu.RLock()
+	currentShard := sm.currentShard
+	sm.mu.RUnlock()
+
+	removed := 0
+	for _, manifestCIDStr := range manifests {
+		select {
+		case <-sm.ctx.Done():
+			return
+		default:
+		}
+		if !common.IsLegacyManifest(sm.ctx, sm.ipfsClient, manifestCIDStr) {
+			continue
+		}
+		manifestCID, err := common.KeyToCID(manifestCIDStr)
+		if err != nil {
+			continue
+		}
+		log.Printf("[Shard] Removing legacy manifest (has timestamp): %s", manifestCIDStr)
+		if currentShard != "" {
+			_ = sm.clusterMgr.Unpin(sm.ctx, currentShard, manifestCID)
+		}
+		_ = sm.ipfsClient.UnpinRecursive(sm.ctx, manifestCID)
+		sm.storageMgr.UnpinFile(manifestCIDStr)
+		removed++
+		time.Sleep(50 * time.Millisecond)
+	}
+	if removed > 0 {
+		log.Printf("[Shard] Legacy manifest cleanup: removed %d manifests with timestamps", removed)
+	}
+}
+
 func (sm *ShardManager) pruneOrphanHandoffSent() {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -367,6 +448,9 @@ func (sm *ShardManager) runReannouncePinsLoop() {
 			}
 			announced := 0
 			for _, manifestCIDStr := range manifests {
+				if common.IsLegacyManifest(sm.ctx, sm.ipfsClient, manifestCIDStr) {
+					continue
+				}
 				payloadCIDStr := common.GetPayloadCIDForShardAssignment(sm.ctx, sm.ipfsClient, manifestCIDStr)
 				if !sm.AmIResponsibleFor(payloadCIDStr) {
 					continue

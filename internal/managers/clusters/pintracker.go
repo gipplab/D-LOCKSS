@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"dlockss/internal/badbits"
+	"dlockss/pkg/schema"
 
 	"github.com/ipfs-cluster/ipfs-cluster/api"
 	"github.com/ipfs/go-cid"
@@ -58,6 +59,23 @@ type LocalPinTracker struct {
 
 	// Trigger channel for event-driven updates
 	trigger chan struct{}
+}
+
+// isLegacyManifest fetches the block for a CID and checks if it's a manifest
+// with a legacy timestamp field. Returns false if the block can't be fetched
+// or decoded (non-manifest CIDs, unavailable blocks).
+func (pt *LocalPinTracker) isLegacyManifest(c cid.Cid) bool {
+	ctx, cancel := context.WithTimeout(pt.ctx, 5*time.Second)
+	defer cancel()
+	data, err := pt.ipfsClient.GetBlock(ctx, c)
+	if err != nil {
+		return false
+	}
+	var ro schema.ResearchObject
+	if err := ro.UnmarshalCBOR(data); err != nil {
+		return false
+	}
+	return ro.HasLegacyTimestamp
 }
 
 func NewLocalPinTracker(ipfsClient IPFSClient, shardID string, onPinSynced OnPinSynced, onPinRemoved OnPinRemoved) *LocalPinTracker {
@@ -138,6 +156,11 @@ func (pt *LocalPinTracker) syncState(consensus ConsensusClient) {
 		// Check BadBits before syncing (Compliance Check)
 		if badbits.IsCIDBlocked(cStr) {
 			log.Printf("[PinTracker:%s] Refusing to sync blocked content %s", pt.shardID, c)
+			continue
+		}
+
+		// Skip legacy manifests that contain a timestamp field.
+		if pt.isLegacyManifest(c) {
 			continue
 		}
 

@@ -134,6 +134,7 @@ func (sm *ShardManager) Run() {
 	go sm.runReplicationChecker()
 	go sm.runReannouncePinsLoop()
 	go sm.runReshardedFilesSaveLoop()
+	go sm.runLegacyManifestCleanup()
 }
 
 func (sm *ShardManager) Close() {

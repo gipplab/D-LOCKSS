@@ -22,6 +22,12 @@ type ResearchObject struct {
 	Payload cid.Cid `cbor:"payload"` // Link to raw UnixFS DAG (file data)
 
 	TotalSize uint64 `cbor:"size"` // Total size in bytes
+
+	// HasLegacyTimestamp is true if the manifest was created with the old format
+	// that included a "ts" field. These manifests produce non-deterministic CIDs
+	// (same content → different ManifestCID on each ingest) and should be ignored.
+	// Not serialized — set during UnmarshalCBOR only.
+	HasLegacyTimestamp bool `cbor:"-"`
 }
 
 // MarshalCBOR serializes the ResearchObject to CBOR format.
@@ -158,8 +164,11 @@ func (ro *ResearchObject) UnmarshalCBOR(data []byte) error {
 	}
 
 	// Timestamp (optional, for backward compatibility with old manifests)
-	// Ignored — no longer stored in the struct.
-	_, _ = node.LookupByString("ts")
+	// Not stored in the struct, but we flag its presence so callers can
+	// identify and skip legacy manifests with non-deterministic CIDs.
+	if _, tsErr := node.LookupByString("ts"); tsErr == nil {
+		ro.HasLegacyTimestamp = true
+	}
 
 	// Payload
 	payloadNode, err := node.LookupByString("payload")

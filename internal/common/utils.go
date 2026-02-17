@@ -90,6 +90,29 @@ func GetPayloadCIDForShardAssignment(ctx context.Context, client ipfs.IPFSClient
 	return ro.Payload.String()
 }
 
+// IsLegacyManifest returns true if the manifest at the given CID contains a
+// legacy "ts" (timestamp) field. Legacy manifests produce non-deterministic
+// CIDs and should be ignored by the network.
+// Returns false if the block cannot be fetched or decoded (assume non-legacy).
+func IsLegacyManifest(ctx context.Context, client ipfs.IPFSClient, manifestCIDStr string) bool {
+	if client == nil {
+		return false
+	}
+	manifestCID, err := cid.Decode(manifestCIDStr)
+	if err != nil {
+		return false
+	}
+	manifestBytes, err := client.GetBlock(ctx, manifestCID)
+	if err != nil {
+		return false
+	}
+	var ro schema.ResearchObject
+	if err := ro.UnmarshalCBOR(manifestBytes); err != nil {
+		return false
+	}
+	return ro.HasLegacyTimestamp
+}
+
 func LogError(component, operation, identifier string, err error) {
 	log.Printf("[Error] %s: Failed to %s %s: %v", component, operation, identifier, err)
 }
