@@ -201,8 +201,9 @@ func (fp *FileProcessor) checkBadBitsAndPin(ctx context.Context, manifestCID cid
 
 func (fp *FileProcessor) trackAndAnnounceFile(manifestCID cid.Cid, manifestCIDStr string, payloadCID cid.Cid) {
 	if !fp.storageMgr.PinFile(manifestCIDStr) {
-		log.Printf("[FileOps] Warning: pinFile returned false for %s (may be blocked or already tracked)", manifestCIDStr)
-		common.LogWarning("FileOps", "Failed to track ManifestCID", manifestCIDStr)
+		if config.VerboseLogging {
+			log.Printf("[FileOps] Skipping %s (already tracked or blocked)", manifestCIDStr)
+		}
 		return
 	}
 	fp.shardMgr.AnnouncePinned(manifestCIDStr)

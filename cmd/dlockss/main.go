@@ -202,11 +202,24 @@ func main() {
 
 	// File processor and watcher
 	fp := fileops.NewFileProcessor(ipfsClient, shardMgr, storageMgr, privKey, signer)
-	fp.ScanExistingFiles()
 	go fp.WatchFolder(ctx)
 
-	// Run managers
+	// Run managers — must start before scanning existing files so the node
+	// can join its shard and discover splits before re-ingesting.
 	shardMgr.Run()
+
+	// Scan existing files after a short delay to let the node settle into
+	// its shard (discovery, split rebroadcast). This re-creates manifests
+	// for any files in the data directory, replacing legacy manifests
+	// (with timestamps) with deterministic ones.
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(15 * time.Second):
+		}
+		fp.ScanExistingFiles()
+	}()
 
 	// Graceful shutdown
 	sigCh := make(chan os.Signal, 1)
