@@ -119,7 +119,7 @@ func TestSplitShard_NoDeadlock(t *testing.T) {
 	// Create ShardManager with nil signer (safe because storage is empty, so RunReshardPass returns early)
 	// ds := dssync.MutexWrap(datastore.NewMapDatastore())
 	clusterMgr := &MockClusterManager{}
-	sm := NewShardManager(ctx, h, ps, ipfsClient, storageMgr, metrics, nil, nil, clusterMgr, "")
+	sm := NewShardManager(ctx, h, ps, ipfsClient, storageMgr, metrics, nil, nil, clusterMgr, "", "")
 
 	// Register shard info with metrics to simulate production setup
 	metrics.RegisterProviders(sm, storageMgr, nil)

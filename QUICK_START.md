@@ -37,12 +37,14 @@ Optional: build the monitor dashboard with `go build -o dlockss-monitor ./cmd/dl
 
 You should see:
 ```
+--- Node Name: my-node ---
 --- Node ID: 12D3KooW... ---
 [Sharding] Joined shard  (Topic: dlockss-creative-commons-shard-)
 [Config] ...
 [API] Starting observability server on :5050
 [FileWatcher] Watching ./data (and subdirectories) for new files...
 ```
+If no name is set via `DLOCKSS_NODE_NAME`, you will be prompted to enter one (press Enter to skip).
 
 ## Add Your First File
 
@@ -69,7 +71,7 @@ Edit `.env` file or set environment variables:
 # Main settings
 export DLOCKSS_DATA_DIR="./data"
 export DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/5001"
-export DLOCKSS_NODE_COUNTRY="DE"
+export DLOCKSS_NODE_NAME="my-node"  # Shown in monitor dashboard
 ```
 
 **Shard tuning (small testnets):** For ~15 nodes, use `DLOCKSS_MAX_PEERS_PER_SHARD=12` and `DLOCKSS_MIN_PEERS_PER_SHARD=6` (defaults) so the network splits into a small number of shards (e.g. root → `0` and `1`) instead of many understaffed ones. If you use a lower max (e.g. 6), keep `DLOCKSS_MIN_PEERS_PER_SHARD` at least 4. `DLOCKSS_SHARD_DISCOVERY_INTERVAL` (default 2m) controls how often nodes discover and migrate to deeper shards. `DLOCKSS_SHARD_SPLIT_REBROADCAST_INTERVAL` (default 60s) controls how often child shards rebroadcast SPLIT to ancestors for late joiners.

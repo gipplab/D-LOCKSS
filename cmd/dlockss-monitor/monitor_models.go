@@ -59,6 +59,7 @@ type ReplicationStatus struct {
 
 type NodeState struct {
 	PeerID         string              `json:"peer_id"`
+	NodeName       string              `json:"node_name,omitempty"`
 	CurrentShard   string              `json:"current_shard"`
 	Role           string              `json:"role,omitempty"` // ACTIVE, PASSIVE, or PROBE (empty = ACTIVE)
 	PinnedFiles    int                 `json:"pinned_files"`

@@ -169,6 +169,7 @@ const dashboardHTML = `<!DOCTYPE html>
                 const aliases = getAliases();
                 const nodes = Object.values(data).map(n => n.data).sort((a, b) => a.peer_id.localeCompare(b.peer_id));
                 const meta = data;
+                const nodeNames = {}; Object.entries(data).forEach(([pid, m]) => { if (m.node_name) nodeNames[m.data.peer_id] = m.node_name; }); window._nodeNames = nodeNames;
                 document.getElementById('total-nodes').textContent = nodes.length;
                 const pinnedVal = n => (n.storage.pinned_in_shard != null) ? n.storage.pinned_in_shard : n.storage.pinned_files;
                 document.getElementById('total-pinned').textContent = nodes.reduce((s,n) => s + (pinnedVal(n)||0), 0).toLocaleString();
@@ -176,7 +177,7 @@ const dashboardHTML = `<!DOCTYPE html>
                 document.getElementById('total-shards').textContent = new Set(nodes.map(n => n.current_shard)).size;
                 fetch('/api/replication?t=' + Date.now()).then(r=>r.json()).then(data => { const dist = data.replication_distribution || [0,0,0,0,0,0,0,0,0,0,0]; if (replicationChart && replicationChart.data && replicationChart.data.datasets && replicationChart.data.datasets[0]) { replicationChart.data.datasets[0].data = Array.isArray(dist) ? dist : [0,0,0,0,0,0,0,0,0,0,0]; replicationChart.update(); } const byShard = data.files_at_target_per_shard || {}; const el = document.getElementById('replicationByShard'); if (el && Object.keys(byShard).length > 0) { const parts = Object.entries(byShard).sort((a,b)=>String(a[0]).localeCompare(String(b[0]))).map(([s,c]) => (s === '' ? 'ROOT' : s) + ': ' + c + ' files'); el.textContent = 'Files at target per shard: ' + parts.join(', '); } else if (el) el.textContent = ''; }).catch(() => { if (replicationChart && replicationChart.data && replicationChart.data.datasets && replicationChart.data.datasets[0]) { replicationChart.data.datasets[0].data = [0,0,0,0,0,0,0,0,0,0,0]; replicationChart.update(); } });
                 window._chartNodeOrder = nodes.map(n => n.peer_id);
-                filesChart.data.labels = nodes.map(n => aliases[n.peer_id] || n.peer_id.slice(-6));
+                filesChart.data.labels = nodes.map(n => aliases[n.peer_id] || nodeNames[n.peer_id] || n.peer_id.slice(-6));
                 filesChart.data.datasets[0].data = nodes.map(n => pinnedVal(n) || 0);
                 filesChart.update();
                 const sCounts = {}; nodes.forEach(n => sCounts[n.current_shard] = (sCounts[n.current_shard]||0)+1); shardChart.data.labels = Object.keys(sCounts); shardChart.data.datasets[0].data = Object.values(sCounts);
@@ -184,10 +185,11 @@ const dashboardHTML = `<!DOCTYPE html>
                 shardChart.data.datasets[0].backgroundColor = Object.keys(sCounts).map((_,i) => colorPalette[i % colorPalette.length]); shardChart.update();
                 const tbody = document.getElementById('nodeTableBody');
                 tbody.innerHTML = nodes.map(n => {
-                    const m = meta[n.peer_id]; const alias = aliases[n.peer_id] || ''; const lastSeen = Math.floor((Date.now()/1000) - m.last_seen);
-                    const peerIdEscaped = escapeJs(n.peer_id); const aliasEscaped = escapeJs(alias); const peerIdHtml = escapeHtml(n.peer_id); const aliasHtml = escapeHtml(alias); const regionHtml = escapeHtml(m.region || '-'); const shardHtml = escapeHtml(n.current_shard);
+                    const m = meta[n.peer_id]; const alias = aliases[n.peer_id] || ''; const serverName = nodeNames[n.peer_id] || ''; const lastSeen = Math.floor((Date.now()/1000) - m.last_seen);
+                    const peerIdEscaped = escapeJs(n.peer_id); const aliasEscaped = escapeJs(alias); const peerIdHtml = escapeHtml(n.peer_id); const aliasHtml = escapeHtml(alias); const serverNameHtml = escapeHtml(serverName); const regionHtml = escapeHtml(m.region || '-'); const shardHtml = escapeHtml(n.current_shard);
+                    const displayName = aliasHtml || serverNameHtml || (peerIdHtml.slice(0,12) + '...');
                     const pinned = (n.storage.pinned_in_shard != null) ? n.storage.pinned_in_shard : n.storage.pinned_files;
-                    return '<tr data-peer-id="' + escapeHtml(n.peer_id.toLowerCase()) + '"><td><button class="btn-text alias-edit-btn" onclick="editAlias(\'' + peerIdEscaped + '\', \'' + aliasEscaped + '\', this)">EDIT</button></td><td class="peer-id-cell"><div class="alias-display-container"><div style="font-weight:600;">' + (aliasHtml || peerIdHtml.slice(0,12) + '...') + '</div><div style="font-size:0.8em; color:#666;">' + peerIdHtml + '</div></div></td><td>' + (m.region ? regionHtml : '<span style="color:#999" title="Geo lookup pending or unavailable">-</span>') + '</td><td><span class="shard-badge">' + shardHtml + '</span></td><td>' + n.peers_in_shard + '</td><td>' + pinned + '</td><td>' + n.storage.known_files + '</td><td>' + Math.floor(n.uptime_seconds/60) + 'm</td><td><span class="status-text status-online">[ACTIVE]</span> ' + lastSeen + 's ago</td></tr>';
+                    return '<tr data-peer-id="' + escapeHtml(n.peer_id.toLowerCase()) + '"><td><button class="btn-text alias-edit-btn" onclick="editAlias(\'' + peerIdEscaped + '\', \'' + aliasEscaped + '\', this)">EDIT</button></td><td class="peer-id-cell"><div class="alias-display-container"><div style="font-weight:600;">' + displayName + '</div><div style="font-size:0.8em; color:#666;">' + peerIdHtml + '</div></div></td><td>' + (m.region ? regionHtml : '<span style="color:#999" title="Geo lookup pending or unavailable">-</span>') + '</td><td><span class="shard-badge">' + shardHtml + '</span></td><td>' + n.peers_in_shard + '</td><td>' + pinned + '</td><td>' + n.storage.known_files + '</td><td>' + Math.floor(n.uptime_seconds/60) + 'm</td><td><span class="status-text status-online">[ACTIVE]</span> ' + lastSeen + 's ago</td></tr>';
                 }).join('');
                 restoreEditingState();
             });
@@ -222,7 +224,7 @@ const dashboardHTML = `<!DOCTYPE html>
         function hideCidsModal() { document.getElementById('cids-modal').style.display = 'none'; }
         function showNodeFilesModal(peerId) {
             const aliases = loadAliases();
-            const label = aliases[peerId] || peerId.slice(-6);
+            const label = aliases[peerId] || (window._nodeNames && window._nodeNames[peerId]) || peerId.slice(-6);
             document.getElementById('node-files-modal-title').textContent = 'Pinned files: ' + label;
             document.getElementById('node-files-modal').style.display = 'flex';
             document.getElementById('node-files-modal-search').value = '';
@@ -265,11 +267,14 @@ const dashboardHTML = `<!DOCTYPE html>
                 list.innerHTML = entries.map(({ peer_id, meta }) => {
                     const n = meta.data;
                     const alias = aliases[peer_id] || '';
+                    const serverName = meta.node_name || '';
+                    const displayName = alias || serverName || peer_id;
                     const lastSeen = Math.floor((Date.now()/1000) - (meta.last_seen || 0));
-                    const peerIdHtml = escapeHtml(peer_id); const aliasHtml = escapeHtml(alias); const regionHtml = escapeHtml(meta.region || '-');
+                    const peerIdHtml = escapeHtml(peer_id); const displayNameHtml = escapeHtml(displayName); const regionHtml = escapeHtml(meta.region || '-');
                     const pinned = (n.storage.pinned_in_shard != null) ? n.storage.pinned_in_shard : n.storage.pinned_files;
-                    const searchText = (alias + ' ' + peer_id + ' ' + (meta.region||'')).toLowerCase();
-                    return '<div class="cid-row node-row" data-peer-id="' + escapeHtml(peer_id.toLowerCase()) + '" data-search="' + escapeHtml(searchText) + '"><div class="cid-value">' + (aliasHtml || peerIdHtml) + '</div><div class="cid-meta">' + (alias ? peerIdHtml + ' | ' : '') + 'Region: ' + regionHtml + ' | Pinned: ' + pinned + ' | Known: ' + (n.storage.known_files||0) + ' | Last seen: ' + lastSeen + 's ago</div></div>';
+                    const searchText = (alias + ' ' + serverName + ' ' + peer_id + ' ' + (meta.region||'')).toLowerCase();
+                    const showPeerId = (displayName !== peer_id) ? peerIdHtml + ' | ' : '';
+                    return '<div class="cid-row node-row" data-peer-id="' + escapeHtml(peer_id.toLowerCase()) + '" data-search="' + escapeHtml(searchText) + '"><div class="cid-value">' + displayNameHtml + '</div><div class="cid-meta">' + showPeerId + 'Region: ' + regionHtml + ' | Pinned: ' + pinned + ' | Known: ' + (n.storage.known_files||0) + ' | Last seen: ' + lastSeen + 's ago</div></div>';
                 }).join('');
             }).catch(() => { document.getElementById('shard-nodes-modal-list').innerHTML = '<p style="color:#999;">Failed to load nodes.</p>'; });
         }

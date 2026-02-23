@@ -19,19 +19,18 @@ func (sm *ShardManager) JoinShard(shardID string) {
 	sub, exists := sm.shardSubs[shardID]
 	if exists {
 		if sub.observerOnly {
-			// Promote observer to full member: we're already subscribed, just announce so we count as a member.
 			sub.observerOnly = false
 			delete(sm.observerOnlyShards, shardID)
 			topic := sub.topic
 			sm.mu.Unlock()
 			role := sm.getOurRole()
-			joinMsg := []byte("JOIN:" + sm.h.ID().String() + ":" + role)
+			joinMsg := []byte("JOIN:" + sm.h.ID().String() + ":" + role + ":" + sm.nodeName)
 			_ = topic.Publish(sm.ctx, joinMsg)
 			pinnedCount := 0
 			if sm.storageMgr != nil {
 				pinnedCount = sm.storageMgr.GetPinnedCount()
 			}
-			heartbeatMsg := []byte(fmt.Sprintf("HEARTBEAT:%s:%d:%s", sm.h.ID().String(), pinnedCount, role))
+			heartbeatMsg := []byte(fmt.Sprintf("HEARTBEAT:%s:%d:%s:%s", sm.h.ID().String(), pinnedCount, role, sm.nodeName))
 			_ = topic.Publish(sm.ctx, heartbeatMsg)
 			log.Printf("[Sharding] Promoted observer to full member in shard %s", shardID)
 			return
@@ -84,13 +83,13 @@ func (sm *ShardManager) JoinShard(shardID string) {
 	log.Printf("[Sharding] Joined shard %s (Topic: %s)", shardID, topicName)
 
 	role := sm.getOurRole()
-	joinMsg := []byte("JOIN:" + sm.h.ID().String() + ":" + role)
+	joinMsg := []byte("JOIN:" + sm.h.ID().String() + ":" + role + ":" + sm.nodeName)
 	_ = newSub.topic.Publish(sm.ctx, joinMsg)
 	pinnedCount := 0
 	if sm.storageMgr != nil {
 		pinnedCount = sm.storageMgr.GetPinnedCount()
 	}
-	heartbeatMsg := []byte(fmt.Sprintf("HEARTBEAT:%s:%d:%s", sm.h.ID().String(), pinnedCount, role))
+	heartbeatMsg := []byte(fmt.Sprintf("HEARTBEAT:%s:%d:%s:%s", sm.h.ID().String(), pinnedCount, role, sm.nodeName))
 	_ = newSub.topic.Publish(sm.ctx, heartbeatMsg)
 
 	go sm.readLoop(ctx, newSub)
