@@ -113,8 +113,14 @@ func main() {
 	}
 	h, err := libp2p.New(
 		libp2p.Identity(privKey),
-		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0", "/ip6/::/tcp/0"),
-		// Prioritize Noise over TLS to avoid handshake issues during simultaneous connect
+		libp2p.ListenAddrStrings(
+			"/ip4/0.0.0.0/tcp/0",
+			"/ip6/::/tcp/0",
+			"/ip4/0.0.0.0/udp/0/quic-v1",
+			"/ip6/::/udp/0/quic-v1",
+		),
+		libp2p.NATPortMap(),
+		libp2p.EnableHolePunching(),
 		libp2p.ChainOptions(
 			libp2p.Security(noise.ID, noise.New),
 		),

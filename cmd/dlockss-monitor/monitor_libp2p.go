@@ -76,8 +76,15 @@ func startLibP2P(ctx context.Context, monitor *Monitor) (host.Host, error) {
 	}
 	h, err := libp2p.New(
 		libp2p.Identity(privKey),
-		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
+		libp2p.ListenAddrStrings(
+			"/ip4/0.0.0.0/tcp/0",
+			"/ip6/::/tcp/0",
+			"/ip4/0.0.0.0/udp/0/quic-v1",
+			"/ip6/::/udp/0/quic-v1",
+		),
 		libp2p.EnableNATService(),
+		libp2p.NATPortMap(),
+		libp2p.EnableHolePunching(),
 	)
 	if err != nil {
 		return nil, err
