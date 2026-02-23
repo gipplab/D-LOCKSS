@@ -94,10 +94,10 @@ func (m *Monitor) setPeerShardLastSeenUnlocked(peerIDStr, shardID string, t time
 }
 
 func (m *Monitor) handleHeartbeat(senderID peer.ID, shardID string, ip string, pinnedCount int) {
-	m.handleHeartbeatWithRole(senderID, shardID, ip, pinnedCount, "")
+	m.handleHeartbeatWithRole(senderID, shardID, ip, pinnedCount, "", "")
 }
 
-func (m *Monitor) handleHeartbeatWithRole(senderID peer.ID, shardID string, ip string, pinnedCount int, role string) (shardUpdated bool) {
+func (m *Monitor) handleHeartbeatWithRole(senderID peer.ID, shardID string, ip string, pinnedCount int, role string, nodeName string) (shardUpdated bool) {
 	now := time.Now()
 	peerIDStr := senderID.String()
 	if role == "" {
@@ -111,9 +111,14 @@ func (m *Monitor) handleHeartbeatWithRole(senderID peer.ID, shardID string, ip s
 
 	nodeState, exists := m.nodes[peerIDStr]
 	if !exists {
-		log.Printf("[Monitor] New node discovered via heartbeat: %s (shard: %s, pinned: %d, role: %s)", peerIDStr, shardLogLabel(shardID), pinnedCount, role)
+		logName := peerIDStr
+		if nodeName != "" {
+			logName = nodeName + " (" + peerIDStr + ")"
+		}
+		log.Printf("[Monitor] New node discovered via heartbeat: %s (shard: %s, pinned: %d, role: %s)", logName, shardLogLabel(shardID), pinnedCount, role)
 		nodeState = &NodeState{
 			PeerID:         peerIDStr,
+			NodeName:       nodeName,
 			CurrentShard:   shardID,
 			Role:           role,
 			PinnedFiles:    pinnedCount,
@@ -129,6 +134,9 @@ func (m *Monitor) handleHeartbeatWithRole(senderID peer.ID, shardID string, ip s
 	}
 	nodeState.LastSeen = now
 	nodeState.Role = role
+	if nodeName != "" {
+		nodeState.NodeName = nodeName
+	}
 	if pinnedCount >= 0 {
 		nodeState.PinnedFiles = pinnedCount
 		if pinnedCount == 0 {

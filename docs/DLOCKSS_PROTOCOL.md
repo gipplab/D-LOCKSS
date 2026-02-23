@@ -36,6 +36,21 @@ The network is partitioned into PubSub topics for scalability:
 *   **CRDT topics (cluster consensus, internal)**: `dlockss-shard-<id>`
     *   Used by the embedded IPFS Cluster CRDT per shard. Not subscribed to directly for application messages.
 
+### 2.2 Text-Based Shard Messages
+
+These plain-text messages are published to shard topics for membership and status:
+
+| Message | Format | Purpose |
+|---------|--------|---------|
+| `HEARTBEAT` | `HEARTBEAT:<PeerID>:<pinnedCount>:<role>:<nodeName>` | Periodic heartbeat with pinned file count, role (ACTIVE/PASSIVE/PROBE), and optional human-readable node name |
+| `JOIN` | `JOIN:<PeerID>:<role>:<nodeName>` | Announce membership in a shard (role + optional name) |
+| `LEAVE` | `LEAVE:<PeerID>` | Announce departure from a shard |
+| `PINNED` | `PINNED:<ManifestCID>` | Announce a pinned file (sent in batches with heartbeat) |
+| `PROBE` | `PROBE:<PeerID>` | Observer presence (monitor/merge probes; not counted as membership) |
+| `SPLIT` | `SPLIT:<child0>:<child1>` | Announce shard split to child shards |
+
+The `<nodeName>` field is optional; nodes without a configured name send an empty string. The trailing field is backward-compatible with older nodes that don't parse it.
+
 ---
 
 ## 3. Data Structures
@@ -178,18 +193,44 @@ Replication is handled by the **Cluster Manager** and **LocalPinTracker** per sh
 
 ## 7. Security Mechanisms
 
-### 7.1 Integrity & Authenticity
+### 7.1 Node Identity & Key Storage
+
+A node's **Peer ID** is derived from its Ed25519 private key. This key is used for all message signing, libp2p authentication, and shard assignment. The key is resolved at startup in the following order:
+
+| Priority | Source | When used | Storage location |
+|----------|--------|-----------|------------------|
+| 1 | IPFS repo | `IPFS_PATH` is set and repo is accessible | `$IPFS_PATH/config` (`Identity.PrivKey`) |
+| 2 | Persistent key file | `IPFS_PATH` unset or repo inaccessible | `DLOCKSS_IDENTITY_PATH` (default: `{DLOCKSS_DATA_DIR}/../dlockss.key`) |
+| 3 | Auto-generated | No existing key found | Saved to the path from priority 2 |
+
+**Default file layout** (with `DLOCKSS_DATA_DIR=./data`):
+
+```
+./
+├── data/              ← ingest directory (DLOCKSS_DATA_DIR), watched for new files
+├── dlockss.key        ← identity private key (auto-generated or migrated)
+├── node_name          ← persisted node name
+└── cluster_store/     ← CRDT state (LevelDB)
+```
+
+State files are placed in the **parent** of the data directory so the file watcher does not ingest them. The node validates this at startup and refuses to start if any state file resolves inside the ingest directory.
+
+**Docker / remote Kubo:** When running D-LOCKSS in a container that connects to an external Kubo node via API (no `IPFS_PATH` access), mount a persistent volume and point `DLOCKSS_DATA_DIR` to a subdirectory on it. The identity key will be saved alongside the data directory on the volume and survive container rebuilds. Optionally set `DLOCKSS_IDENTITY_PATH` explicitly.
+
+**Legacy migration:** If a `dlockss.key` exists in the working directory but not at the configured identity path (e.g. after upgrading), it is automatically copied to the new location so the node retains its Peer ID.
+
+### 7.2 Integrity & Authenticity
 *   **Content Addressing**: CIDs guarantee content integrity.
 *   **Signatures**: All `ResearchObjects` and protocol messages are signed by the sender's private key.
 *   **Nonces**: Protocol messages include nonces to prevent replay attacks.
 
-### 7.2 Liar Detection
+### 7.3 Liar Detection
 *   Nodes verify that the actual file size matches the `TotalSize` claimed in the `ResearchObject` manifest.
 *   If a mismatch is detected, the file is unpinned and treated as invalid.
 
-### 7.3 BadBits (Denylist)
+### 7.4 BadBits (Denylist)
 *   Nodes maintain a `badbits.csv` denylist of CIDs (e.g., for DMCA compliance).
 *   Files matching these CIDs are refused for ingestion and replication.
 
-### 7.4 Rate Limiting
+### 7.5 Rate Limiting
 *   Per-peer rate limits (RateLimiter.Check) on protocol messages (Ingest, ReplicationRequest) to prevent flooding. Applied in ShardManager before processing CBOR messages.

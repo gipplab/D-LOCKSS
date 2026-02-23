@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -42,6 +44,43 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 )
 
+// resolveNodeName determines the node's human-readable name. Priority:
+// 1. DLOCKSS_NODE_NAME env var  2. Persisted file  3. Interactive prompt
+func resolveNodeName() string {
+	if config.NodeName != "" {
+		persistNodeName(config.NodeName)
+		return config.NodeName
+	}
+	nameFile := config.NodeNamePath
+	if data, err := os.ReadFile(nameFile); err == nil {
+		if name := strings.TrimSpace(string(data)); name != "" {
+			log.Printf("[Config] Loaded node name from %s: %s", nameFile, name)
+			return name
+		}
+	}
+	fmt.Print("Enter a name for this node (or press Enter to skip): ")
+	scanner := bufio.NewScanner(os.Stdin)
+	if scanner.Scan() {
+		if name := strings.TrimSpace(scanner.Text()); name != "" {
+			persistNodeName(name)
+			return name
+		}
+	}
+	return ""
+}
+
+func persistNodeName(name string) {
+	nameFile := config.NodeNamePath
+	if dir := filepath.Dir(nameFile); dir != "." {
+		_ = os.MkdirAll(dir, 0755)
+	}
+	if err := os.WriteFile(nameFile, []byte(name+"\n"), 0644); err != nil {
+		log.Printf("[Config] Warning: could not persist node name to %s: %v", nameFile, err)
+	} else {
+		log.Printf("[Config] Persisted node name to %s: %s", nameFile, name)
+	}
+}
+
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -49,6 +88,15 @@ func main() {
 	// Config and BadBits
 	_ = badbits.LoadBadBits(config.BadBitsPath)
 	config.LogConfiguration()
+
+	if msg := config.ValidatePathSafety(); msg != "" {
+		log.Fatalf("[Fatal] Unsafe path configuration: %s", msg)
+	}
+
+	nodeName := resolveNodeName()
+	if nodeName != "" {
+		log.Printf("--- Node Name: %s ---", nodeName)
+	}
 
 	// IPFS client and DHT (required)
 	ipfsClient, err := ipfs.NewClient(config.IPFSNodeAddress)
@@ -65,8 +113,14 @@ func main() {
 	}
 	h, err := libp2p.New(
 		libp2p.Identity(privKey),
-		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0", "/ip6/::/tcp/0"),
-		// Prioritize Noise over TLS to avoid handshake issues during simultaneous connect
+		libp2p.ListenAddrStrings(
+			"/ip4/0.0.0.0/tcp/0",
+			"/ip6/::/tcp/0",
+			"/ip4/0.0.0.0/udp/0/quic-v1",
+			"/ip6/::/udp/0/quic-v1",
+		),
+		libp2p.NATPortMap(),
+		libp2p.EnableHolePunching(),
 		libp2p.ChainOptions(
 			libp2p.Security(noise.ID, noise.New),
 		),
@@ -183,7 +237,7 @@ func main() {
 		storageMgr.UnpinFile(cid)
 	}
 	clusterMgr := clusters.NewClusterManager(h, ps, dht, dstore, ipfsClient, trustMgr.GetTrustedPeers(), onPinSynced, onPinRemoved)
-	shardMgr := shard.NewShardManager(ctx, h, ps, ipfsClient, storageMgr, metrics, signer, rateLimiter, clusterMgr, "")
+	shardMgr := shard.NewShardManager(ctx, h, ps, ipfsClient, storageMgr, metrics, signer, rateLimiter, clusterMgr, "", nodeName)
 	clusterMgr.SetShardPeerProvider(shardMgr) // CRDT Peers() and allocations use real shard membership
 	announcePinned = shardMgr.AnnouncePinned
 
@@ -282,10 +336,7 @@ func loadIdentity() (crypto.PrivKey, error) {
 }
 
 func loadOrCreateIdentity() (crypto.PrivKey, error) {
-	identityPath := "dlockss.key"
-	if envPath := os.Getenv("DLOCKSS_IDENTITY_PATH"); envPath != "" {
-		identityPath = envPath
-	}
+	identityPath := config.IdentityPath
 
 	if _, err := os.Stat(identityPath); err == nil {
 		data, err := os.ReadFile(identityPath)
@@ -296,8 +347,28 @@ func loadOrCreateIdentity() (crypto.PrivKey, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to unmarshal identity: %w", err)
 		}
-		log.Printf("[Config] Loaded persistent identity from %s (IPFS_PATH unset, two peer IDs if using separate IPFS)", identityPath)
+		log.Printf("[Config] Loaded persistent identity from %s", identityPath)
 		return priv, nil
+	}
+
+	// Migrate legacy key from CWD if it exists there but not at the configured path.
+	if legacyPath := "dlockss.key"; legacyPath != identityPath {
+		if _, err := os.Stat(legacyPath); err == nil {
+			data, err := os.ReadFile(legacyPath)
+			if err == nil {
+				if dir := filepath.Dir(identityPath); dir != "." {
+					_ = os.MkdirAll(dir, 0755)
+				}
+				if err := os.WriteFile(identityPath, data, 0600); err == nil {
+					log.Printf("[Config] Migrated legacy identity from %s to %s", legacyPath, identityPath)
+					priv, err := crypto.UnmarshalPrivateKey(data)
+					if err != nil {
+						return nil, fmt.Errorf("failed to unmarshal migrated identity: %w", err)
+					}
+					return priv, nil
+				}
+			}
+		}
 	}
 
 	privKey, _, err := crypto.GenerateEd25519Key(rand.Reader)
@@ -310,6 +381,9 @@ func loadOrCreateIdentity() (crypto.PrivKey, error) {
 		return nil, fmt.Errorf("failed to marshal identity: %w", err)
 	}
 
+	if dir := filepath.Dir(identityPath); dir != "." {
+		_ = os.MkdirAll(dir, 0755)
+	}
 	if err := os.WriteFile(identityPath, data, 0600); err != nil {
 		log.Printf("[Config] Warning: Failed to save identity to %s: %v", identityPath, err)
 	} else {

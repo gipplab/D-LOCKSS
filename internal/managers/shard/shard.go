@@ -46,6 +46,7 @@ type ShardManager struct {
 	signer         *signing.Signer
 	reshardedFiles *common.KnownFiles
 	rateLimiter    *common.RateLimiter
+	nodeName       string
 
 	mu           sync.RWMutex
 	currentShard string
@@ -91,6 +92,7 @@ func NewShardManager(
 	rateLimiter *common.RateLimiter,
 	clusterMgr clusters.ClusterManagerInterface,
 	startShard string,
+	nodeName string,
 ) *ShardManager {
 	sm := &ShardManager{
 		ctx:                        ctx,
@@ -102,6 +104,7 @@ func NewShardManager(
 		metrics:                    metrics,
 		signer:                     signer,
 		rateLimiter:                rateLimiter,
+		nodeName:                   nodeName,
 		reshardedFiles:             common.NewKnownFiles(),
 		currentShard:               startShard,
 		shardSubs:                  make(map[string]*shardSubscription),

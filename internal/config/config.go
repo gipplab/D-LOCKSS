@@ -1,10 +1,12 @@
 package config
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -64,6 +66,61 @@ func getClusterStorePath() string {
 		return p
 	}
 	return filepath.Join(filepath.Dir(FileWatchFolder), "cluster_store")
+}
+
+func getIdentityPath() string {
+	if p := os.Getenv("DLOCKSS_IDENTITY_PATH"); p != "" {
+		return p
+	}
+	return filepath.Join(filepath.Dir(FileWatchFolder), "dlockss.key")
+}
+
+func getNodeNamePath() string {
+	return filepath.Join(filepath.Dir(FileWatchFolder), "node_name")
+}
+
+// isInsideDir reports whether path resolves to a location inside dir.
+func isInsideDir(path, dir string) bool {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(absDir, absPath)
+	if err != nil {
+		return false
+	}
+	return !strings.HasPrefix(rel, "..")
+}
+
+// ValidatePathSafety checks that state files (identity, node_name, cluster_store)
+// do not reside inside the ingest directory (FileWatchFolder). Returns a non-empty
+// error message listing offenders, or "" if all paths are safe.
+func ValidatePathSafety() string {
+	checks := []struct {
+		label string
+		path  string
+	}{
+		{"IdentityPath (DLOCKSS_IDENTITY_PATH)", IdentityPath},
+		{"NodeNamePath", NodeNamePath},
+		{"ClusterStorePath (DLOCKSS_CLUSTER_STORE)", ClusterStorePath},
+	}
+	var problems []string
+	for _, c := range checks {
+		if isInsideDir(c.path, FileWatchFolder) {
+			problems = append(problems, fmt.Sprintf("  %s = %s", c.label, c.path))
+		}
+	}
+	if len(problems) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"the following state paths resolve inside the ingest directory (%s) and would be ingested as data:\n%s\n"+
+			"Set DLOCKSS_DATA_DIR to a dedicated subdirectory (e.g. ./data) or override the conflicting paths.",
+		FileWatchFolder, strings.Join(problems, "\n"))
 }
 
 func LogConfiguration() {
@@ -160,6 +217,7 @@ func LogConfiguration() {
 	} else {
 		log.Printf("[Config] Heartbeat Interval: auto (ShardPeerCheckInterval/3, min 10s)")
 	}
+	log.Printf("[Config] Identity Path: %s", IdentityPath)
 	log.Printf("[Config] Verbose Logging: %v", VerboseLogging)
 	log.Printf("[Config] Merge Up Cooldown: %v", MergeUpCooldown)
 	log.Printf("[Config] Probe Timeout Merge: %v", ProbeTimeoutMerge)
@@ -240,4 +298,8 @@ var (
 	ProbeTimeoutMerge      = getEnvDuration("DLOCKSS_PROBE_TIMEOUT_MERGE", 6*time.Second)
 	SiblingEmptyMergeAfter = getEnvDuration("DLOCKSS_SIBLING_EMPTY_MERGE_AFTER", 5*time.Minute)
 	ShardMoveCooldown      = getEnvDuration("DLOCKSS_SHARD_MOVE_COOLDOWN", 30*time.Second)
+
+	NodeName     = getEnvString("DLOCKSS_NODE_NAME", "")
+	IdentityPath = getIdentityPath()
+	NodeNamePath = getNodeNamePath()
 )

@@ -263,7 +263,7 @@ func (sm *ShardManager) sendHeartbeat() {
 
 	pinnedCount := sm.storageMgr.GetPinnedCount()
 	role := sm.getOurRole()
-	heartbeatMsg := []byte(fmt.Sprintf("HEARTBEAT:%s:%d:%s", sm.h.ID().String(), pinnedCount, role))
+	heartbeatMsg := []byte(fmt.Sprintf("HEARTBEAT:%s:%d:%s:%s", sm.h.ID().String(), pinnedCount, role, sm.nodeName))
 	if err := sub.topic.Publish(sm.ctx, heartbeatMsg); err != nil {
 		return
 	}
@@ -372,7 +372,7 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 					pinnedCount = sm.storageMgr.GetPinnedCount()
 				}
 				role := sm.getOurRole()
-				hb := []byte(fmt.Sprintf("HEARTBEAT:%s:%d:%s", sm.h.ID().String(), pinnedCount, role))
+				hb := []byte(fmt.Sprintf("HEARTBEAT:%s:%d:%s:%s", sm.h.ID().String(), pinnedCount, role, sm.nodeName))
 				_ = probeSub.topic.Publish(sm.ctx, hb)
 			}
 			return

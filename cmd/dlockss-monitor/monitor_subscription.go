@@ -117,7 +117,7 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 			}
 
 			if len(msg.Data) > 0 && len(msg.Data) < 500 && string(msg.Data[:min(10, len(msg.Data))]) == "HEARTBEAT:" {
-				parts := strings.SplitN(string(msg.Data), ":", 4)
+				parts := strings.SplitN(string(msg.Data), ":", 5)
 				role := "ACTIVE"
 				if len(parts) >= 4 {
 					switch strings.ToUpper(parts[3]) {
@@ -126,6 +126,10 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 					case "PROBE":
 						role = "PROBE"
 					}
+				}
+				nodeName := ""
+				if len(parts) >= 5 {
+					nodeName = parts[4]
 				}
 				if len(parts) >= 2 && parts[1] != "" {
 					authorID, err := peer.Decode(parts[1])
@@ -145,9 +149,13 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 						}
 					}
 					if shardID != "" {
-						log.Printf("[Monitor] HEARTBEAT shard=%s author=%s pinned=%d role=%s", shardID, authorID.String(), pinnedCount, role)
+						logLabel := authorID.String()
+						if nodeName != "" {
+							logLabel = nodeName + " (" + authorID.String() + ")"
+						}
+						log.Printf("[Monitor] HEARTBEAT shard=%s author=%s pinned=%d role=%s", shardID, logLabel, pinnedCount, role)
 					}
-					m.handleHeartbeatWithRole(authorID, shardID, ip, pinnedCount, role)
+					m.handleHeartbeatWithRole(authorID, shardID, ip, pinnedCount, role, nodeName)
 				} else {
 					m.handleHeartbeat(senderID, shardID, ip, -1)
 				}
@@ -179,11 +187,15 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 			}
 
 			if len(msg.Data) > 5 && string(msg.Data[:5]) == "JOIN:" {
-				parts := strings.SplitN(string(msg.Data[5:]), ":", 2)
+				parts := strings.SplitN(string(msg.Data[5:]), ":", 3)
 				peerIDStr := strings.TrimSpace(parts[0])
 				role := "ACTIVE"
 				if len(parts) >= 2 && strings.ToUpper(parts[1]) == "PASSIVE" {
 					role = "PASSIVE"
+				}
+				nodeName := ""
+				if len(parts) >= 3 {
+					nodeName = parts[2]
 				}
 				if peerIDStr != "" {
 					joinID, err := peer.Decode(peerIDStr)
@@ -193,8 +205,12 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 						}
 					}
 					if err == nil {
-						if m.handleHeartbeatWithRole(joinID, shardID, ip, -1, role) {
-							log.Printf("[Monitor] SHARD_JOIN peer=%s shard=%s role=%s", joinID.String(), shardLogLabel(shardID), role)
+						if m.handleHeartbeatWithRole(joinID, shardID, ip, -1, role, nodeName) {
+							logLabel := joinID.String()
+							if nodeName != "" {
+								logLabel = nodeName + " (" + joinID.String() + ")"
+							}
+							log.Printf("[Monitor] SHARD_JOIN peer=%s shard=%s role=%s", logLabel, shardLogLabel(shardID), role)
 						}
 					}
 				}

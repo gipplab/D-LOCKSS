@@ -65,6 +65,7 @@ func main() {
 		type nodeSnap struct {
 			id            string
 			peerID        string
+			nodeName      string
 			currentShard  string
 			knownFiles    int
 			lastSeen      int64
@@ -93,7 +94,8 @@ func main() {
 			if query != "" {
 				match := strings.Contains(strings.ToLower(id), query) ||
 					strings.Contains(strings.ToLower(node.Region), query) ||
-					strings.Contains(strings.ToLower(node.CurrentShard), query)
+					strings.Contains(strings.ToLower(node.CurrentShard), query) ||
+					strings.Contains(strings.ToLower(node.NodeName), query)
 				if !match {
 					continue
 				}
@@ -116,7 +118,7 @@ func main() {
 				pinnedFiles = 0
 			}
 			snapshot = append(snapshot, nodeSnap{
-				id: id, peerID: node.PeerID, currentShard: node.CurrentShard, knownFiles: node.KnownFiles,
+				id: id, peerID: node.PeerID, nodeName: node.NodeName, currentShard: node.CurrentShard, knownFiles: node.KnownFiles,
 				lastSeen: node.LastSeen.Unix(), region: node.Region,
 				shard: shard, peersInShard: peersInShard, uptimeSeconds: uptimeSeconds, pinnedFiles: pinnedFiles,
 			})
@@ -139,6 +141,7 @@ func main() {
 				"data":      status,
 				"last_seen": s.lastSeen,
 				"region":    s.region,
+				"node_name": s.nodeName,
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -160,6 +163,7 @@ func main() {
 		type nodeSnap struct {
 			id            string
 			peerID        string
+			nodeName      string
 			currentShard  string
 			knownFiles    int
 			lastSeen      int64
@@ -205,7 +209,7 @@ func main() {
 				pinnedFiles = 0
 			}
 			snapshot = append(snapshot, nodeSnap{
-				id: id, peerID: node.PeerID, currentShard: node.CurrentShard, knownFiles: node.KnownFiles,
+				id: id, peerID: node.PeerID, nodeName: node.NodeName, currentShard: node.CurrentShard, knownFiles: node.KnownFiles,
 				lastSeen: node.LastSeen.Unix(), region: node.Region,
 				shard: shard, peersInShard: peersInShard, uptimeSeconds: uptimeSeconds, pinnedFiles: pinnedFiles,
 			})
@@ -228,6 +232,7 @@ func main() {
 				"data":      status,
 				"last_seen": s.lastSeen,
 				"region":    s.region,
+				"node_name": s.nodeName,
 			}
 		}
 		shardLabel := shardFilter

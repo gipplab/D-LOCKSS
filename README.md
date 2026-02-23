@@ -44,6 +44,10 @@ Configure via environment variables:
 # Data Directory
 export DLOCKSS_DATA_DIR="$HOME/my-data"
 
+# Node Identity
+export DLOCKSS_NODE_NAME="my-node"            # Human-readable name (shown in monitor)
+export DLOCKSS_IDENTITY_PATH="/data/dlockss.key"  # Persistent identity key location
+
 # Replication Targets
 export DLOCKSS_MIN_REPLICATION=5
 export DLOCKSS_MAX_REPLICATION=10
@@ -54,6 +58,28 @@ export DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/5001"
 # Logging
 export DLOCKSS_VERBOSE_LOGGING=true # Enable detailed metrics and status logs
 ```
+
+#### Node Naming
+
+Nodes can have a human-readable name displayed in the monitor dashboard. The name is resolved in order:
+
+1. `DLOCKSS_NODE_NAME` environment variable (highest priority)
+2. Persisted name file (`node_name` alongside the data directory)
+3. Interactive prompt on first startup (when running outside Docker/testnet)
+
+Testnet nodes are automatically named `testnet_1`, `testnet_2`, etc.
+
+#### Identity Persistence
+
+The node's libp2p identity (private key) determines its **Peer ID**. The identity is resolved in order:
+
+1. **IPFS repo identity** (`IPFS_PATH` set): Reads the key from the Kubo config so D-LOCKSS and IPFS share one Peer ID. Ideal for nodes running Kubo locally (e.g. on a Pi).
+2. **Persistent key file** (`DLOCKSS_IDENTITY_PATH` or default `{data_dir_parent}/dlockss.key`): Used when connecting to a remote/Docker Kubo node where the repo is not accessible.
+3. **Auto-generated**: If no key exists, a new Ed25519 key is generated and saved to the identity path.
+
+For Docker deployments: mount a persistent volume and set `DLOCKSS_DATA_DIR` to a subdirectory on that volume. The identity key, node name, and cluster state are stored alongside the data directory and will survive container rebuilds.
+
+> **Path safety:** The node refuses to start if the identity key, node name, or cluster store would be placed *inside* the ingest directory (`DLOCKSS_DATA_DIR`), since the file watcher would try to ingest them. Always set `DLOCKSS_DATA_DIR` to a dedicated subdirectory (e.g. `./data`, not `.`).
 
 See [docs/DLOCKSS_PROTOCOL.md](docs/DLOCKSS_PROTOCOL.md) for protocol details.
 
@@ -99,7 +125,7 @@ Optional monitor (dashboard):
 go build -o dlockss-monitor ./cmd/dlockss-monitor
 ./dlockss-monitor
 ```
-Open http://localhost:8080. Each node has **one peer ID**: when `IPFS_PATH` is set (e.g. in testnet), D-LOCKSS uses the IPFS repo identity so the same ID appears in the monitor and in `node_x.ipfs.log`.
+Open http://localhost:8080. The monitor displays each node's **name** (if configured via `DLOCKSS_NODE_NAME`), falling back to the Peer ID. Names propagate via HEARTBEAT/JOIN messages and appear in the node table, charts, and shard modals. Client-side aliases (EDIT button) override server-side names. Each node has **one peer ID**: when `IPFS_PATH` is set (e.g. in testnet), D-LOCKSS uses the IPFS repo identity so the same ID appears in the monitor and in `node_x.ipfs.log`.
 
 For geographic region display, optionally provide a GeoIP database:
 ```bash
@@ -114,7 +140,7 @@ The monitor bootstrap-subscribes to all shards up to depth 5 (63 shards) so it c
 Alternatively use: https://dlockss-monitor.wmcloud.org.
 
 ### Testnet
-From `testnet/`: `./run_testnet.sh` starts multiple D-LOCKSS nodes and IPFS daemons. Each node has **one peer ID** (D-LOCKSS loads the identity from the node's IPFS repo via `IPFS_PATH`). Press Enter in the script to shut down.
+From `testnet/`: `./run_testnet.sh` starts multiple D-LOCKSS nodes and IPFS daemons. Each node is automatically named `testnet_1`, `testnet_2`, etc. (visible in the monitor) and has **one peer ID** (D-LOCKSS loads the identity from the node's IPFS repo via `IPFS_PATH`). Press Enter in the script to shut down.
 
 ### Testing
 ```bash
