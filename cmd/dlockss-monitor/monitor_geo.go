@@ -19,7 +19,13 @@ const (
 	geoAPIBatchInterval = 5 * time.Second
 	geoAPITimeout       = 10 * time.Second
 	geoMaxQueueSize     = 500
+	geoCacheTTL         = 24 * time.Hour
 )
+
+type geoCacheEntry struct {
+	region string
+	seen   time.Time
+}
 
 // openGeoIPDB opens a MaxMind-format .mmdb file for local geo lookups.
 // Returns nil if path is empty or the file cannot be opened.
@@ -49,8 +55,11 @@ func (m *Monitor) lookupGeoIP(ipStr string) string {
 	if m.geoDB != nil {
 		return m.lookupLocalDB(ipStr)
 	}
-	if region, ok := m.geoCache.Load(ipStr); ok {
-		return region.(string)
+	if entry, ok := m.geoCache.Load(ipStr); ok {
+		e := entry.(geoCacheEntry)
+		e.seen = time.Now()
+		m.geoCache.Store(ipStr, e)
+		return e.region
 	}
 	select {
 	case m.geoQueue <- ipStr:
@@ -114,7 +123,10 @@ func (m *Monitor) processGeoBatch(client *http.Client) {
 	for len(batch) < geoAPIMaxBatch {
 		select {
 		case ip := <-m.geoQueue:
-			if _, cached := m.geoCache.Load(ip); cached {
+			if e, cached := m.geoCache.Load(ip); cached {
+				ent := e.(geoCacheEntry)
+				ent.seen = time.Now()
+				m.geoCache.Store(ip, ent)
 				continue
 			}
 			if seen[ip] {
@@ -178,7 +190,7 @@ drained:
 		}
 		region := formatGeoResult(r.CountryCode, "", r.RegionName)
 		if region != "" {
-			m.geoCache.Store(r.Query, region)
+			m.geoCache.Store(r.Query, geoCacheEntry{region: region, seen: time.Now()})
 			resolved[r.Query] = region
 		}
 	}
@@ -213,6 +225,16 @@ func isPrivateIP(ipStr string) bool {
 		}
 	}
 	return false
+}
+
+func (m *Monitor) evictStaleGeoCache() {
+	cutoff := time.Now().Add(-geoCacheTTL)
+	m.geoCache.Range(func(key, value interface{}) bool {
+		if entry, ok := value.(geoCacheEntry); ok && entry.seen.Before(cutoff) {
+			m.geoCache.Delete(key)
+		}
+		return true
+	})
 }
 
 // compile-time check that sync.Map is used (avoids unused import if refactored)

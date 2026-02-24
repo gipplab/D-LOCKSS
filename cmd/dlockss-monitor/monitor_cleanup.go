@@ -4,6 +4,8 @@ import (
 	"context"
 	"log"
 	"time"
+
+	"github.com/libp2p/go-libp2p/core/network"
 )
 
 // SplitGracePeriod: after a split, don't prune nodes for this duration to allow
@@ -32,6 +34,7 @@ func (m *Monitor) PruneStaleNodes() {
 			delete(m.nodes, id)
 			delete(m.nodeFiles, id)
 			delete(m.peerShardLastSeen, id)
+			delete(m.peerLastSiblingMove, id)
 			// Remove this peer from manifestReplication maps.
 			for manifest, peers := range m.manifestReplication {
 				delete(peers, id)
@@ -92,6 +95,42 @@ func (m *Monitor) pruneOrphanedSplitEvents() {
 	m.splitEvents = filtered
 }
 
+// evictStalePeerstoreEntries removes peers from the libp2p peerstore that are
+// disconnected and not tracked in the monitor's nodes map. Without this, the
+// peerstore grows unbounded from DHT crawls and transient connections.
+func (m *Monitor) evictStalePeerstoreEntries() {
+	if m.host == nil {
+		return
+	}
+	ps := m.host.Peerstore()
+	selfID := m.host.ID()
+
+	m.mu.RLock()
+	activeNodes := make(map[string]bool, len(m.nodes))
+	for id := range m.nodes {
+		activeNodes[id] = true
+	}
+	m.mu.RUnlock()
+
+	var evicted int
+	for _, pid := range ps.PeersWithAddrs() {
+		if pid == selfID {
+			continue
+		}
+		if m.host.Network().Connectedness(pid) == network.Connected {
+			continue
+		}
+		if activeNodes[pid.String()] {
+			continue
+		}
+		ps.RemovePeer(pid)
+		evicted++
+	}
+	if evicted > 0 {
+		log.Printf("[Monitor] Peerstore GC: evicted %d stale peers", evicted)
+	}
+}
+
 func (m *Monitor) cleanupStaleCIDs(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
@@ -100,6 +139,8 @@ func (m *Monitor) cleanupStaleCIDs(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			m.evictStaleGeoCache()
+			m.evictStalePeerstoreEntries()
 			cutoff := time.Now().Add(-30 * time.Minute)
 			m.mu.Lock()
 			for cid, lastSeen := range m.uniqueCIDs {
