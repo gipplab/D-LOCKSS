@@ -120,6 +120,12 @@ const dashboardHTML = `<!DOCTYPE html>
             <div class="modal-body"><div id="shard-nodes-modal-list"></div></div>
         </div>
     </div>
+    <div id="identify-modal" class="modal-overlay" style="display: none;">
+        <div class="modal" style="width: 700px;">
+            <div class="modal-header"><h3 style="margin:0; text-transform: uppercase; font-size: 1em;" id="identify-modal-title">Peer Identify</h3><button class="btn-text" id="identify-modal-close">CLOSE</button></div>
+            <div class="modal-body"><div id="identify-modal-content"></div></div>
+        </div>
+    </div>
     <script>
         let filesChart, shardChart, replicationChart;
         const ALIASES_STORAGE_KEY = 'dlockss_node_aliases';
@@ -189,7 +195,7 @@ const dashboardHTML = `<!DOCTYPE html>
                     const peerIdEscaped = escapeJs(n.peer_id); const aliasEscaped = escapeJs(alias); const peerIdHtml = escapeHtml(n.peer_id); const aliasHtml = escapeHtml(alias); const serverNameHtml = escapeHtml(serverName); const regionHtml = escapeHtml(m.region || '-'); const shardHtml = escapeHtml(n.current_shard);
                     const displayName = aliasHtml || serverNameHtml || (peerIdHtml.slice(0,12) + '...');
                     const pinned = (n.storage.pinned_in_shard != null) ? n.storage.pinned_in_shard : n.storage.pinned_files;
-                    return '<tr data-peer-id="' + escapeHtml(n.peer_id.toLowerCase()) + '"><td><button class="btn-text alias-edit-btn" onclick="editAlias(\'' + peerIdEscaped + '\', \'' + aliasEscaped + '\', this)">EDIT</button></td><td class="peer-id-cell"><div class="alias-display-container"><div style="font-weight:600;">' + displayName + '</div><div style="font-size:0.8em; color:#666;">' + peerIdHtml + '</div></div></td><td>' + (m.region ? regionHtml : '<span style="color:#999" title="Geo lookup pending or unavailable">-</span>') + '</td><td><span class="shard-badge">' + shardHtml + '</span></td><td>' + n.peers_in_shard + '</td><td>' + pinned + '</td><td>' + n.storage.known_files + '</td><td>' + Math.floor(n.uptime_seconds/60) + 'm</td><td><span class="status-text status-online">[ACTIVE]</span> ' + lastSeen + 's ago</td></tr>';
+                    return '<tr data-peer-id="' + escapeHtml(n.peer_id.toLowerCase()) + '"><td><button class="btn-text alias-edit-btn" onclick="editAlias(\'' + peerIdEscaped + '\', \'' + aliasEscaped + '\', this)">EDIT</button></td><td class="peer-id-cell"><div class="alias-display-container"><div style="font-weight:600;">' + displayName + '</div><div style="font-size:0.8em; color:#4af; cursor:pointer; text-decoration:underline;" onclick="event.stopPropagation(); showIdentifyModal(\'' + peerIdEscaped + '\')">' + peerIdHtml + '</div></div></td><td>' + (m.region ? regionHtml : '<span style="color:#999" title="Geo lookup pending or unavailable">-</span>') + '</td><td><span class="shard-badge">' + shardHtml + '</span></td><td>' + n.peers_in_shard + '</td><td>' + pinned + '</td><td>' + n.storage.known_files + '</td><td>' + Math.floor(n.uptime_seconds/60) + 'm</td><td><span class="status-text status-online">[ACTIVE]</span> ' + lastSeen + 's ago</td></tr>';
                 }).join('');
                 restoreEditingState();
             });
@@ -279,6 +285,30 @@ const dashboardHTML = `<!DOCTYPE html>
             }).catch(() => { document.getElementById('shard-nodes-modal-list').innerHTML = '<p style="color:#999;">Failed to load nodes.</p>'; });
         }
         function hideShardNodesModal() { document.getElementById('shard-nodes-modal').style.display = 'none'; }
+        function showIdentifyModal(peerId) {
+            const aliases = loadAliases();
+            const label = aliases[peerId] || (window._nodeNames && window._nodeNames[peerId]) || peerId.slice(0, 12) + '...';
+            document.getElementById('identify-modal-title').textContent = 'Identify: ' + label;
+            document.getElementById('identify-modal').style.display = 'flex';
+            document.getElementById('identify-modal-content').innerHTML = '<p style="color:#999;">Connecting...</p>';
+            fetch('/api/identify?peer=' + encodeURIComponent(peerId) + '&t=' + Date.now()).then(r => r.json()).then(data => {
+                const c = document.getElementById('identify-modal-content');
+                const connected = data.connected ? '<span style="color:#4ecdc4;">connected</span>' : '<span style="color:#ff6b6b;">not connected</span>';
+                const addrs = (data.addresses || []).map(a => '<div style="padding:2px 0; font-size:0.85em;">' + escapeHtml(a) + '</div>').join('') || '<span style="color:#666;">none</span>';
+                const protos = (data.protocols || []).map(p => '<span style="display:inline-block; background:#ccc; border:1px solid #444; border-radius:3px; padding:1px 6px; margin:2px; font-size:0.8em;">' + escapeHtml(p) + '</span>').join('') || '<span style="color:#666;">none</span>';
+                c.innerHTML = '<table style="width:100%; border-collapse:collapse;">' +
+                    '<tr><td style="padding:6px 8px; color:#999; width:130px; vertical-align:top;">Peer ID</td><td style="padding:6px 8px; word-break:break-all;">' + escapeHtml(data.peer_id || peerId) + '</td></tr>' +
+                    '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Status</td><td style="padding:6px 8px;">' + connected + '</td></tr>' +
+                    '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Agent</td><td style="padding:6px 8px;">' + escapeHtml(data.agent_version || '-') + '</td></tr>' +
+                    '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Protocol</td><td style="padding:6px 8px;">' + escapeHtml(data.protocol_version || '-') + '</td></tr>' +
+                    '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Addresses</td><td style="padding:6px 8px;">' + addrs + '</td></tr>' +
+                    '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Protocols</td><td style="padding:6px 8px;">' + protos + '</td></tr>' +
+                    '</table>';
+            }).catch(e => {
+                document.getElementById('identify-modal-content').innerHTML = '<p style="color:#ff6b6b;">Failed: ' + escapeHtml(e.message) + '</p>';
+            });
+        }
+        function hideIdentifyModal() { document.getElementById('identify-modal').style.display = 'none'; }
         function viewManifestJson(manifestCid) {
             const manifest = (window._manifests || {})[manifestCid];
             if (!manifest) return;
@@ -338,6 +368,8 @@ const dashboardHTML = `<!DOCTYPE html>
         };
         document.getElementById('shard-nodes-modal-close').onclick = hideShardNodesModal;
         document.getElementById('shard-nodes-modal').onclick = function(e) { if (e.target === this) hideShardNodesModal(); };
+        document.getElementById('identify-modal-close').onclick = hideIdentifyModal;
+        document.getElementById('identify-modal').onclick = function(e) { if (e.target === this) hideIdentifyModal(); };
         document.getElementById('shard-nodes-modal-search').oninput = function() {
             const q = this.value.toLowerCase();
             document.querySelectorAll('#shard-nodes-modal-list .node-row').forEach(row => {
