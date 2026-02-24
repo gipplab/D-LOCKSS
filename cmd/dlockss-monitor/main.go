@@ -21,6 +21,9 @@ import (
 	"time"
 
 	"dlockss/pkg/schema"
+
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 func main() {
@@ -391,6 +394,54 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{"payload_cid": ro.Payload.String(), "manifest": manifest})
+	})
+
+	mux.HandleFunc("/api/identify", func(w http.ResponseWriter, r *http.Request) {
+		peerStr := strings.TrimSpace(r.URL.Query().Get("peer"))
+		if peerStr == "" {
+			http.Error(w, `{"error":"missing peer parameter"}`, http.StatusBadRequest)
+			return
+		}
+		pid, err := peer.Decode(peerStr)
+		if err != nil {
+			http.Error(w, `{"error":"invalid peer ID"}`, http.StatusBadRequest)
+			return
+		}
+
+		connectCtx, connectCancel := context.WithTimeout(ctx, 10*time.Second)
+		defer connectCancel()
+
+		addrs := monitor.host.Peerstore().Addrs(pid)
+		if len(addrs) > 0 {
+			_ = monitor.host.Connect(connectCtx, peer.AddrInfo{ID: pid, Addrs: addrs})
+		}
+
+		connected := monitor.host.Network().Connectedness(pid) == network.Connected
+
+		agentVersion, _ := monitor.host.Peerstore().Get(pid, "AgentVersion")
+		protocolVersion, _ := monitor.host.Peerstore().Get(pid, "ProtocolVersion")
+		protocols, _ := monitor.host.Peerstore().GetProtocols(pid)
+
+		addrStrs := make([]string, 0, len(addrs))
+		for _, a := range monitor.host.Peerstore().Addrs(pid) {
+			addrStrs = append(addrStrs, a.String())
+		}
+
+		protoStrs := make([]string, 0, len(protocols))
+		for _, p := range protocols {
+			protoStrs = append(protoStrs, string(p))
+		}
+
+		result := map[string]interface{}{
+			"peer_id":          pid.String(),
+			"agent_version":    fmt.Sprintf("%v", agentVersion),
+			"protocol_version": fmt.Sprintf("%v", protocolVersion),
+			"protocols":        protoStrs,
+			"addresses":        addrStrs,
+			"connected":        connected,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
