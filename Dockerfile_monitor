@@ -27,6 +27,12 @@ FROM alpine:3.21 AS final
 # Copy the compiled binary from the builder stage
 COPY --from=builder /build/dlockss /bin/app
 
+# Go runtime: lean memory for long-running container (avoids OOM after days)
+# - return freed memory to OS; cap heap; trigger GC earlier
+ENV GODEBUG=madvdontneed=1 \
+    GOMEMLIMIT=512MiB \
+    GOGC=50
+
 # Expose the application's port
 EXPOSE 8000
 
