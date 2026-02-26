@@ -104,16 +104,16 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 			ip := ""
 			senderID := msg.GetFrom()
 			if m.host != nil && senderID != "" {
+				var ips []string
 				for _, addr := range m.host.Peerstore().Addrs(senderID) {
 					if ipVal, err := addr.ValueForProtocol(ma.P_IP4); err == nil {
-						ip = ipVal
-						break
+						ips = append(ips, ipVal)
 					}
 					if ipVal, err := addr.ValueForProtocol(ma.P_IP6); err == nil {
-						ip = ipVal
-						break
+						ips = append(ips, ipVal)
 					}
 				}
+				ip = preferPublicIP(ips)
 			}
 
 			if len(msg.Data) > 0 && len(msg.Data) < 500 && string(msg.Data[:min(10, len(msg.Data))]) == "HEARTBEAT:" {

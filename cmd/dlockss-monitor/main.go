@@ -26,6 +26,14 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
+// regionForDisplay returns "" for "LOC - LAN" so the UI shows "-"; other regions unchanged.
+func regionForDisplay(region string) string {
+	if region == "LOC - LAN" {
+		return ""
+	}
+	return region
+}
+
 func main() {
 	geoipDB := flag.String("geoip-db", "", "Path to a MaxMind/DB-IP .mmdb GeoIP database file")
 	flag.Parse()
@@ -143,7 +151,7 @@ func main() {
 			response[s.id] = map[string]interface{}{
 				"data":      status,
 				"last_seen": s.lastSeen,
-				"region":    s.region,
+				"region":    regionForDisplay(s.region),
 				"node_name": s.nodeName,
 			}
 		}
@@ -234,7 +242,7 @@ func main() {
 			response[s.id] = map[string]interface{}{
 				"data":      status,
 				"last_seen": s.lastSeen,
-				"region":    s.region,
+				"region":    regionForDisplay(s.region),
 				"node_name": s.nodeName,
 			}
 		}
