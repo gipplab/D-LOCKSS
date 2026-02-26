@@ -247,12 +247,18 @@ func main() {
 
 	// Shard manager (replication set later to break cycle).
 	// onPinSynced: when PinTracker syncs a pin from CRDT, register with storage and announce PINNED immediately so monitor sees replication right away (not only on next heartbeat batch).
+	// Also advertise the manifest to the DHT so ipfs.io and other gateways see this node as a provider (replicas otherwise never Provide).
 	var announcePinned func(string)
 	onPinSynced := func(cid string) {
 		storageMgr.PinFile(cid)
 		if announcePinned != nil {
 			announcePinned(cid)
 		}
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
+			defer cancel()
+			storageMgr.ProvideFile(ctx, cid)
+		}()
 	}
 	onPinRemoved := func(cid string) {
 		storageMgr.UnpinFile(cid)

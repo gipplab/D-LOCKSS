@@ -163,7 +163,7 @@ class StorageManager {
     + GetPinnedManifests(): []string
     + GetKnownFiles(): *KnownFiles
     + GetNextFileToAnnounce(): string
-    + ProvideFile(ctx, manifestCIDStr)
+    + ProvideFile(ctx, cidStr)  ' manifest & payload when responsible; manifest when replica syncs
 }
 
 class cachedReplication {
