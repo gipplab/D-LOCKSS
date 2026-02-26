@@ -41,7 +41,9 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
+	"github.com/pbnjay/memory"
 )
 
 // resolveNodeName determines the node's human-readable name. Priority:
@@ -111,7 +113,26 @@ func main() {
 	if err != nil {
 		log.Fatalf("[Fatal] Failed to load identity: %v", err)
 	}
+
+	// Resource manager with a minimum connection floor so shard peers can always connect
+	// (default AutoScale on low-memory nodes can hit "resource limit exceeded" and block shard coordination).
+	limits := rcmgr.DefaultLimits
+	libp2p.SetDefaultServiceLimits(&limits)
+	mem := memory.TotalMemory() / 8
+	const minMemForScale = 384 << 20 // 384 MiB floor so limits allow enough conns for shard peers
+	if mem < minMemForScale {
+		mem = minMemForScale
+	}
+	scaled := limits.Scale(int64(mem), 512)
+	limiter := rcmgr.NewFixedLimiter(scaled)
+	rcm, err := rcmgr.NewResourceManager(limiter)
+	if err != nil {
+		log.Fatalf("[Fatal] Failed to create resource manager: %v", err)
+	}
+	defer rcm.Close()
+
 	h, err := libp2p.New(
+		libp2p.ResourceManager(rcm),
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings(
 			"/ip4/0.0.0.0/tcp/0",

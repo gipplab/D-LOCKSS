@@ -49,8 +49,9 @@ func (m *Monitor) lookupGeoIP(ipStr string) string {
 	if ipStr == "" {
 		return ""
 	}
+	// Private IPs: return "" so we don't store a region; next message may have a public addr.
 	if isPrivateIP(ipStr) {
-		return "LOC - LAN"
+		return ""
 	}
 	if m.geoDB != nil {
 		return m.lookupLocalDB(ipStr)
@@ -225,6 +226,24 @@ func isPrivateIP(ipStr string) bool {
 		}
 	}
 	return false
+}
+
+// preferPublicIP returns the first non-private IP from the list, or the first IP if all are private.
+// Use this when a peer has multiple addresses (e.g. LAN + public) so region/geo stays stable.
+func preferPublicIP(ips []string) string {
+	var fallback string
+	for _, ip := range ips {
+		if ip == "" {
+			continue
+		}
+		if fallback == "" {
+			fallback = ip
+		}
+		if !isPrivateIP(ip) {
+			return ip
+		}
+	}
+	return fallback
 }
 
 func (m *Monitor) evictStaleGeoCache() {
