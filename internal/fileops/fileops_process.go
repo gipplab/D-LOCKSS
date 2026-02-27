@@ -259,12 +259,17 @@ func (fp *FileProcessor) announceResponsibleFile(manifestCID cid.Cid, manifestCI
 
 	fp.shardMgr.PublishIngestMessageToCurrentAndChildIfSplit(b, currentShard, payloadCIDStr)
 
-	// Announce both manifest and payload to the DHT so ipfs.io (and other gateways) can find providers immediately.
-	provideCtx, provideCancel := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
+	// Announce both manifest and payload to the DHT so gateways can find providers.
+	// Each gets its own timeout so a slow manifest provide can't starve the payload.
 	go func() {
-		defer provideCancel()
-		fp.storageMgr.ProvideFile(provideCtx, manifestCIDStr)
-		fp.storageMgr.ProvideFile(provideCtx, payloadCIDStr)
+		ctx1, cancel1 := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
+		defer cancel1()
+		fp.storageMgr.ProvideFile(ctx1, manifestCIDStr)
+	}()
+	go func() {
+		ctx2, cancel2 := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
+		defer cancel2()
+		fp.storageMgr.ProvideFile(ctx2, payloadCIDStr)
 	}()
 }
 

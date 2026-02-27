@@ -107,26 +107,7 @@ func (a *IPFSDHTAdapter) worker() {
 		case <-a.workerCtx.Done():
 			return
 		case req := <-a.provideQueue:
-			opCtx := req.ctx
-			if deadline, ok := req.ctx.Deadline(); ok {
-				remaining := time.Until(deadline)
-				if remaining < a.provideTimeout/2 {
-					var cancel context.CancelFunc
-					opCtx, cancel = context.WithTimeout(context.Background(), a.provideTimeout)
-					defer cancel()
-				}
-			} else {
-				var cancel context.CancelFunc
-				opCtx, cancel = context.WithTimeout(context.Background(), a.provideTimeout)
-				defer cancel()
-			}
-
-			err := a.provideInternal(opCtx, req.key, req.broadcast)
-
-			select {
-			case req.resultCh <- err:
-			case <-req.ctx.Done():
-			}
+			a.processProvideRequest(req)
 
 			a.intervalMu.RLock()
 			interval := a.provideInterval
@@ -139,6 +120,29 @@ func (a *IPFSDHTAdapter) worker() {
 				}
 			}
 		}
+	}
+}
+
+func (a *IPFSDHTAdapter) processProvideRequest(req *provideRequest) {
+	opCtx := req.ctx
+	if deadline, ok := req.ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining < a.provideTimeout/2 {
+			var cancel context.CancelFunc
+			opCtx, cancel = context.WithTimeout(context.Background(), a.provideTimeout)
+			defer cancel()
+		}
+	} else {
+		var cancel context.CancelFunc
+		opCtx, cancel = context.WithTimeout(context.Background(), a.provideTimeout)
+		defer cancel()
+	}
+
+	err := a.provideInternal(opCtx, req.key, req.broadcast)
+
+	select {
+	case req.resultCh <- err:
+	case <-req.ctx.Done():
 	}
 }
 

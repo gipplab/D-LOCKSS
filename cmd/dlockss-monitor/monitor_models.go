@@ -67,8 +67,6 @@ type NodeState struct {
 	LastSeen       time.Time           `json:"last_seen"`
 	ShardHistory   []ShardHistoryEntry `json:"shard_history"`
 	IPAddress      string              `json:"ip_address"`
-	Region         string              `json:"region"`
-	lastGeoAttempt time.Time           // when we last enqueued a geo lookup for this node
 	announcedFiles map[string]time.Time
 }
 
@@ -96,8 +94,7 @@ type Monitor struct {
 	nodes               map[string]*NodeState
 	splitEvents         []ShardSplitEvent
 	geoDB               *geoip2.Reader // local GeoIP database; nil if not configured
-	geoCache            sync.Map       // IP → region string; permanent cache for API lookups
-	geoQueue            chan string    // IPs pending API geo lookup
+	geoCache            sync.Map       // IP → region string; cache for on-demand lookups
 	treeCache           *ShardTreeNode
 	treeCacheTime       time.Time
 	treeDirty           bool
@@ -160,7 +157,6 @@ func NewMonitor(geoDBPath string) *Monitor {
 		nodes:               make(map[string]*NodeState),
 		splitEvents:         make([]ShardSplitEvent, 0, 100),
 		geoDB:               openGeoIPDB(geoDBPath),
-		geoQueue:            make(chan string, geoMaxQueueSize),
 		uniqueCIDs:          make(map[string]time.Time),
 		shardTopics:         make(map[string]*pubsub.Topic),
 		nodeFiles:           make(map[string]map[string]time.Time),
@@ -173,8 +169,7 @@ func NewMonitor(geoDBPath string) *Monitor {
 	if m.geoDB != nil {
 		log.Println("[Monitor] GeoIP: using local database (instant lookups)")
 	} else {
-		log.Println("[Monitor] GeoIP: using ip-api.com API (async batch lookups)")
-		go m.geoAPIWorker()
+		log.Println("[Monitor] GeoIP: using ip-api.com API (on-demand via identify)")
 	}
 	go m.runReplicationCleanup()
 	return m

@@ -30,7 +30,9 @@ import (
 	"dlockss/internal/telemetry"
 	"dlockss/internal/trust"
 	"dlockss/pkg/ipfs"
+	"dlockss/pkg/schema"
 
+	"github.com/ipfs/go-cid"
 	leveldb "github.com/ipfs/go-ds-leveldb"
 	"github.com/libp2p/go-libp2p"
 	kaddht "github.com/libp2p/go-libp2p-kad-dht"
@@ -142,6 +144,8 @@ func main() {
 		),
 		libp2p.NATPortMap(),
 		libp2p.EnableHolePunching(),
+		libp2p.EnableAutoRelayWithStaticRelays(kaddht.GetDefaultBootstrapPeerAddrInfos()),
+		libp2p.EnableNATService(),
 		libp2p.ChainOptions(
 			libp2p.Security(noise.ID, noise.New),
 		),
@@ -247,17 +251,43 @@ func main() {
 
 	// Shard manager (replication set later to break cycle).
 	// onPinSynced: when PinTracker syncs a pin from CRDT, register with storage and announce PINNED immediately so monitor sees replication right away (not only on next heartbeat batch).
-	// Also advertise the manifest to the DHT so ipfs.io and other gateways see this node as a provider (replicas otherwise never Provide).
+	// Also advertise manifest and payload to the DHT so retrieval checkers (e.g. check.ipfs.network) and gateways see all replicas as providers.
 	var announcePinned func(string)
-	onPinSynced := func(cid string) {
-		storageMgr.PinFile(cid)
+	onPinSynced := func(manifestCIDStr string) {
+		storageMgr.PinFile(manifestCIDStr)
 		if announcePinned != nil {
-			announcePinned(cid)
+			announcePinned(manifestCIDStr)
 		}
+		// Provide manifest in its own goroutine with its own timeout.
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
-			defer cancel()
-			storageMgr.ProvideFile(ctx, cid)
+			pctx, pcancel := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
+			defer pcancel()
+			storageMgr.ProvideFile(pctx, manifestCIDStr)
+		}()
+		// Resolve payload from manifest and provide it separately so payload has N providers.
+		go func() {
+			pctx, pcancel := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
+			defer pcancel()
+			manifestCID, err := cid.Decode(manifestCIDStr)
+			if err != nil {
+				return
+			}
+			block, err := ipfsClient.GetBlock(pctx, manifestCID)
+			if err != nil {
+				log.Printf("[DHT] Failed to resolve payload from manifest %s: %v", manifestCIDStr, err)
+				return
+			}
+			var ro schema.ResearchObject
+			if err := ro.UnmarshalCBOR(block); err != nil {
+				return
+			}
+			if ro.HasLegacyTimestamp {
+				return
+			}
+			payloadStr := ro.Payload.String()
+			if payloadStr != "" {
+				storageMgr.ProvideFile(pctx, payloadStr)
+			}
 		}()
 	}
 	onPinRemoved := func(cid string) {

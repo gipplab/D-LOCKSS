@@ -2,6 +2,7 @@ package shard
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"log"
 	"math/rand"
@@ -272,6 +273,54 @@ func (sm *ShardManager) sendHeartbeat() {
 	}
 
 	sm.announcePinnedFilesBatch(sub.topic, 20)
+
+	sm.reprovideNextPinnedFile()
+}
+
+// reprovideNextPinnedFile provides one pinned manifest (and its payload) to the
+// DHT each heartbeat. This keeps provider records fresh (~24h expiry) and
+// recovers from failed initial provides at startup when the queue overflows.
+// A CAS guard prevents concurrent re-provides from piling up.
+var reprovideInFlight atomic.Bool
+
+func (sm *ShardManager) reprovideNextPinnedFile() {
+	if !reprovideInFlight.CompareAndSwap(false, true) {
+		return
+	}
+	manifestCIDStr := sm.storageMgr.GetNextFileToAnnounce()
+	if manifestCIDStr == "" {
+		reprovideInFlight.Store(false)
+		return
+	}
+	go func() {
+		defer reprovideInFlight.Store(false)
+
+		pctx, pcancel := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
+		defer pcancel()
+		sm.storageMgr.ProvideFile(pctx, manifestCIDStr)
+
+		manifestCID, err := cid.Decode(manifestCIDStr)
+		if err != nil {
+			return
+		}
+		block, err := sm.ipfsClient.GetBlock(pctx, manifestCID)
+		if err != nil {
+			return
+		}
+		var ro schema.ResearchObject
+		if err := ro.UnmarshalCBOR(block); err != nil {
+			return
+		}
+		if ro.HasLegacyTimestamp {
+			return
+		}
+		payloadStr := ro.Payload.String()
+		if payloadStr != "" {
+			pctx2, pcancel2 := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
+			defer pcancel2()
+			sm.storageMgr.ProvideFile(pctx2, payloadStr)
+		}
+	}()
 }
 
 func (sm *ShardManager) announcePinnedFilesBatch(topic *pubsub.Topic, batchSize int) {

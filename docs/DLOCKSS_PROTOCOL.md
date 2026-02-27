@@ -177,7 +177,7 @@ Replication is handled by the **Cluster Manager** and **LocalPinTracker** per sh
 2.  **State Sync**: The CRDT (Merkle-DAG based) propagates pin/unpin to all peers in the shard via PubSub (`dlockss-shard-<id>`).
 3.  **Local Pin Tracker**:
     *   Each node runs a `LocalPinTracker` per shard that polls CRDT State() (and on TriggerSync).
-    *   For each pin in state, if this node is in **Allocations** (or Allocations is empty), it pins the CID locally via IPFS and calls onPinSynced (StorageManager.PinFile, AnnouncePinned, and **ProvideFile(manifestCID)** so this node is advertised to the DHT as a provider; gateways then see multiple providers).
+    *   For each pin in state, if this node is in **Allocations** (or Allocations is empty), it pins the CID locally via IPFS and calls onPinSynced (StorageManager.PinFile, AnnouncePinned, and **ProvideFile(manifestCID)** and **ProvideFile(payloadCID)** so this node is advertised to the DHT for both CIDs; retrieval checkers and gateways then see N providers for manifest and payload).
     *   Pins no longer in state or no longer allocated are unpinned locally and onPinRemoved is called.
 4.  **Repair**: Under-replicated files trigger ReplicationRequest on the shard topic; peers that have the file JoinShard(targetShard), Pin, TriggerSync. CRDT sync and LocalPinTracker then replicate to allocated peers.
 

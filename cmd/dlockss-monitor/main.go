@@ -26,14 +26,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-// regionForDisplay returns "" for "LOC - LAN" so the UI shows "-"; other regions unchanged.
-func regionForDisplay(region string) string {
-	if region == "LOC - LAN" {
-		return ""
-	}
-	return region
-}
-
 func main() {
 	geoipDB := flag.String("geoip-db", "", "Path to a MaxMind/DB-IP .mmdb GeoIP database file")
 	flag.Parse()
@@ -70,7 +62,6 @@ func main() {
 
 	mux.HandleFunc("/api/nodes", func(w http.ResponseWriter, r *http.Request) {
 		monitor.PruneStaleNodes()
-		// Build snapshot under lock; release before calling getPinnedInShardForNode to avoid deadlock (getPinnedInShardForNode takes RLock internally).
 		monitor.mu.RLock()
 		shardCounts := make(map[string]int)
 		type nodeSnap struct {
@@ -80,7 +71,6 @@ func main() {
 			currentShard  string
 			knownFiles    int
 			lastSeen      int64
-			region        string
 			shard         string
 			peersInShard  int
 			uptimeSeconds float64
@@ -104,7 +94,6 @@ func main() {
 			}
 			if query != "" {
 				match := strings.Contains(strings.ToLower(id), query) ||
-					strings.Contains(strings.ToLower(node.Region), query) ||
 					strings.Contains(strings.ToLower(node.CurrentShard), query) ||
 					strings.Contains(strings.ToLower(node.NodeName), query)
 				if !match {
@@ -130,7 +119,7 @@ func main() {
 			}
 			snapshot = append(snapshot, nodeSnap{
 				id: id, peerID: node.PeerID, nodeName: node.NodeName, currentShard: node.CurrentShard, knownFiles: node.KnownFiles,
-				lastSeen: node.LastSeen.Unix(), region: node.Region,
+				lastSeen: node.LastSeen.Unix(),
 				shard: shard, peersInShard: peersInShard, uptimeSeconds: uptimeSeconds, pinnedFiles: pinnedFiles,
 			})
 		}
@@ -151,7 +140,6 @@ func main() {
 			response[s.id] = map[string]interface{}{
 				"data":      status,
 				"last_seen": s.lastSeen,
-				"region":    regionForDisplay(s.region),
 				"node_name": s.nodeName,
 			}
 		}
@@ -167,7 +155,6 @@ func main() {
 
 	mux.HandleFunc("/api/shard-nodes", func(w http.ResponseWriter, r *http.Request) {
 		shardFilter := r.URL.Query().Get("shard")
-		// shardFilter "" = root, "0", "1", "00", etc. for other shards
 		monitor.PruneStaleNodes()
 		monitor.mu.RLock()
 		shardCounts := make(map[string]int)
@@ -178,7 +165,6 @@ func main() {
 			currentShard  string
 			knownFiles    int
 			lastSeen      int64
-			region        string
 			shard         string
 			peersInShard  int
 			uptimeSeconds float64
@@ -221,7 +207,7 @@ func main() {
 			}
 			snapshot = append(snapshot, nodeSnap{
 				id: id, peerID: node.PeerID, nodeName: node.NodeName, currentShard: node.CurrentShard, knownFiles: node.KnownFiles,
-				lastSeen: node.LastSeen.Unix(), region: node.Region,
+				lastSeen: node.LastSeen.Unix(),
 				shard: shard, peersInShard: peersInShard, uptimeSeconds: uptimeSeconds, pinnedFiles: pinnedFiles,
 			})
 		}
@@ -242,7 +228,6 @@ func main() {
 			response[s.id] = map[string]interface{}{
 				"data":      status,
 				"last_seen": s.lastSeen,
-				"region":    regionForDisplay(s.region),
 				"node_name": s.nodeName,
 			}
 		}
@@ -440,6 +425,8 @@ func main() {
 			protoStrs = append(protoStrs, string(p))
 		}
 
+		region := monitor.resolveRegionFromAddrs(monitor.host.Peerstore().Addrs(pid))
+
 		result := map[string]interface{}{
 			"peer_id":          pid.String(),
 			"agent_version":    fmt.Sprintf("%v", agentVersion),
@@ -447,6 +434,7 @@ func main() {
 			"protocols":        protoStrs,
 			"addresses":        addrStrs,
 			"connected":        connected,
+			"region":           region,
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(result)

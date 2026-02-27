@@ -91,9 +91,9 @@ const dashboardHTML = `<!DOCTYPE html>
         <div class="node-table" id="network-nodes-section">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
                 <h3 style="margin:0; text-transform:uppercase; font-size:1em;">Network Nodes</h3>
-                <input type="text" id="nodeSearch" placeholder="SEARCH ID/REGION/SHARD..." style="padding: 8px; border: 1px solid #333; width: 300px; font-family:inherit;" onkeyup="debouncedFilter()">
+                <input type="text" id="nodeSearch" placeholder="SEARCH ID/SHARD..." style="padding: 8px; border: 1px solid #333; width: 300px; font-family:inherit;" onkeyup="debouncedFilter()">
             </div>
-            <table id="nodeTable"><thead><tr><th style="width: 80px;">Action</th><th>Peer ID</th><th>Region</th><th>Shard</th><th>Peers</th><th>Pinned</th><th>Known</th><th>Uptime</th><th>Last Seen</th></tr></thead><tbody id="nodeTableBody"></tbody></table>
+            <table id="nodeTable"><thead><tr><th style="width: 80px;">Action</th><th>Peer ID</th><th>Shard</th><th>Peers</th><th>Pinned</th><th>Known</th><th>Uptime</th><th>Last Seen</th></tr></thead><tbody id="nodeTableBody"></tbody></table>
         </div>
     </div>
     <div id="cids-modal" class="modal-overlay" style="display: none;">
@@ -192,10 +192,10 @@ const dashboardHTML = `<!DOCTYPE html>
                 const tbody = document.getElementById('nodeTableBody');
                 tbody.innerHTML = nodes.map(n => {
                     const m = meta[n.peer_id]; const alias = aliases[n.peer_id] || ''; const serverName = nodeNames[n.peer_id] || ''; const lastSeen = Math.floor((Date.now()/1000) - m.last_seen);
-                    const peerIdEscaped = escapeJs(n.peer_id); const aliasEscaped = escapeJs(alias); const peerIdHtml = escapeHtml(n.peer_id); const aliasHtml = escapeHtml(alias); const serverNameHtml = escapeHtml(serverName); const regionHtml = escapeHtml(m.region || '-'); const shardHtml = escapeHtml(n.current_shard);
+                    const peerIdEscaped = escapeJs(n.peer_id); const aliasEscaped = escapeJs(alias); const peerIdHtml = escapeHtml(n.peer_id); const aliasHtml = escapeHtml(alias); const serverNameHtml = escapeHtml(serverName); const shardHtml = escapeHtml(n.current_shard);
                     const displayName = aliasHtml || serverNameHtml || (peerIdHtml.slice(0,12) + '...');
                     const pinned = (n.storage.pinned_in_shard != null) ? n.storage.pinned_in_shard : n.storage.pinned_files;
-                    return '<tr data-peer-id="' + escapeHtml(n.peer_id.toLowerCase()) + '"><td><button class="btn-text alias-edit-btn" onclick="editAlias(\'' + peerIdEscaped + '\', \'' + aliasEscaped + '\', this)">EDIT</button></td><td class="peer-id-cell"><div class="alias-display-container"><div style="font-weight:600;">' + displayName + '</div><div style="font-size:0.8em; color:#4af; cursor:pointer; text-decoration:underline;" onclick="event.stopPropagation(); showIdentifyModal(\'' + peerIdEscaped + '\')">' + peerIdHtml + '</div></div></td><td>' + (m.region ? regionHtml : '<span style="color:#999" title="Geo lookup pending or unavailable">-</span>') + '</td><td><span class="shard-badge">' + shardHtml + '</span></td><td>' + n.peers_in_shard + '</td><td>' + pinned + '</td><td>' + n.storage.known_files + '</td><td>' + Math.floor(n.uptime_seconds/60) + 'm</td><td><span class="status-text status-online">[ACTIVE]</span> ' + lastSeen + 's ago</td></tr>';
+                    return '<tr data-peer-id="' + escapeHtml(n.peer_id.toLowerCase()) + '"><td><button class="btn-text alias-edit-btn" onclick="editAlias(\'' + peerIdEscaped + '\', \'' + aliasEscaped + '\', this)">EDIT</button></td><td class="peer-id-cell"><div class="alias-display-container"><div style="font-weight:600;">' + displayName + '</div><div style="font-size:0.8em; color:#4af; cursor:pointer; text-decoration:underline;" onclick="event.stopPropagation(); showIdentifyModal(\'' + peerIdEscaped + '\')">' + peerIdHtml + '</div></div></td><td><span class="shard-badge">' + shardHtml + '</span></td><td>' + n.peers_in_shard + '</td><td>' + pinned + '</td><td>' + n.storage.known_files + '</td><td>' + Math.floor(n.uptime_seconds/60) + 'm</td><td><span class="status-text status-online">[ACTIVE]</span> ' + lastSeen + 's ago</td></tr>';
                 }).join('');
                 restoreEditingState();
             });
@@ -276,11 +276,11 @@ const dashboardHTML = `<!DOCTYPE html>
                     const serverName = meta.node_name || '';
                     const displayName = alias || serverName || peer_id;
                     const lastSeen = Math.floor((Date.now()/1000) - (meta.last_seen || 0));
-                    const peerIdHtml = escapeHtml(peer_id); const displayNameHtml = escapeHtml(displayName); const regionHtml = escapeHtml(meta.region || '-');
+                    const peerIdHtml = escapeHtml(peer_id); const displayNameHtml = escapeHtml(displayName);
                     const pinned = (n.storage.pinned_in_shard != null) ? n.storage.pinned_in_shard : n.storage.pinned_files;
-                    const searchText = (alias + ' ' + serverName + ' ' + peer_id + ' ' + (meta.region||'')).toLowerCase();
+                    const searchText = (alias + ' ' + serverName + ' ' + peer_id).toLowerCase();
                     const showPeerId = (displayName !== peer_id) ? peerIdHtml + ' | ' : '';
-                    return '<div class="cid-row node-row" data-peer-id="' + escapeHtml(peer_id.toLowerCase()) + '" data-search="' + escapeHtml(searchText) + '"><div class="cid-value">' + displayNameHtml + '</div><div class="cid-meta">' + showPeerId + 'Region: ' + regionHtml + ' | Pinned: ' + pinned + ' | Known: ' + (n.storage.known_files||0) + ' | Last seen: ' + lastSeen + 's ago</div></div>';
+                    return '<div class="cid-row node-row" data-peer-id="' + escapeHtml(peer_id.toLowerCase()) + '" data-search="' + escapeHtml(searchText) + '"><div class="cid-value">' + displayNameHtml + '</div><div class="cid-meta">' + showPeerId + 'Pinned: ' + pinned + ' | Known: ' + (n.storage.known_files||0) + ' | Last seen: ' + lastSeen + 's ago</div></div>';
                 }).join('');
             }).catch(() => { document.getElementById('shard-nodes-modal-list').innerHTML = '<p style="color:#999;">Failed to load nodes.</p>'; });
         }
@@ -296,9 +296,11 @@ const dashboardHTML = `<!DOCTYPE html>
                 const connected = data.connected ? '<span style="color:#4ecdc4;">connected</span>' : '<span style="color:#ff6b6b;">not connected</span>';
                 const addrs = (data.addresses || []).map(a => '<div style="padding:2px 0; font-size:0.85em;">' + escapeHtml(a) + '</div>').join('') || '<span style="color:#666;">none</span>';
                 const protos = (data.protocols || []).map(p => '<span style="display:inline-block; background:#ccc; border:1px solid #444; border-radius:3px; padding:1px 6px; margin:2px; font-size:0.8em;">' + escapeHtml(p) + '</span>').join('') || '<span style="color:#666;">none</span>';
+                const regionVal = data.region ? escapeHtml(data.region) : '<span style="color:#999;">unknown</span>';
                 c.innerHTML = '<table style="width:100%; border-collapse:collapse;">' +
                     '<tr><td style="padding:6px 8px; color:#999; width:130px; vertical-align:top;">Peer ID</td><td style="padding:6px 8px; word-break:break-all;">' + escapeHtml(data.peer_id || peerId) + '</td></tr>' +
                     '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Status</td><td style="padding:6px 8px;">' + connected + '</td></tr>' +
+                    '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Region</td><td style="padding:6px 8px;">' + regionVal + '</td></tr>' +
                     '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Agent</td><td style="padding:6px 8px;">' + escapeHtml(data.agent_version || '-') + '</td></tr>' +
                     '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Protocol</td><td style="padding:6px 8px;">' + escapeHtml(data.protocol_version || '-') + '</td></tr>' +
                     '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Addresses</td><td style="padding:6px 8px;">' + addrs + '</td></tr>' +

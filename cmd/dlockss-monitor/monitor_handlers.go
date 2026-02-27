@@ -72,9 +72,6 @@ func (m *Monitor) handleIngestMessage(im *schema.IngestMessage, senderID peer.ID
 
 	if ip != "" && ip != nodeState.IPAddress {
 		nodeState.IPAddress = ip
-		if region := m.lookupGeoIP(ip); region != "" {
-			nodeState.Region = region
-		}
 	}
 }
 
@@ -184,13 +181,6 @@ func (m *Monitor) handleHeartbeatWithRole(senderID peer.ID, shardID string, ip s
 	}
 	if ip != "" && ip != nodeState.IPAddress {
 		nodeState.IPAddress = ip
-		if region := m.lookupGeoIP(ip); region != "" {
-			nodeState.Region = region
-		}
-	} else if ip != "" && nodeState.Region == "" {
-		if region := m.lookupGeoIP(ip); region != "" {
-			nodeState.Region = region
-		}
 	}
 	return shardUpdated
 }
