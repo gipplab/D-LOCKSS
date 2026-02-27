@@ -401,7 +401,7 @@ func main() {
 			return
 		}
 
-		connectCtx, connectCancel := context.WithTimeout(ctx, 10*time.Second)
+		connectCtx, connectCancel := context.WithTimeout(ctx, 8*time.Second)
 		defer connectCancel()
 
 		addrs := monitor.host.Peerstore().Addrs(pid)
@@ -449,7 +449,7 @@ func main() {
 		Addr:         fmt.Sprintf(":%d", WebUIPort),
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		WriteTimeout: 20 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 

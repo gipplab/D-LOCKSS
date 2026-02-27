@@ -291,7 +291,7 @@ const dashboardHTML = `<!DOCTYPE html>
             document.getElementById('identify-modal-title').textContent = 'Identify: ' + label;
             document.getElementById('identify-modal').style.display = 'flex';
             document.getElementById('identify-modal-content').innerHTML = '<p style="color:#999;">Connecting...</p>';
-            fetch('/api/identify?peer=' + encodeURIComponent(peerId) + '&t=' + Date.now()).then(r => r.json()).then(data => {
+            fetch('/api/identify?peer=' + encodeURIComponent(peerId) + '&t=' + Date.now()).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }).then(data => {
                 const c = document.getElementById('identify-modal-content');
                 const connected = data.connected ? '<span style="color:#4ecdc4;">connected</span>' : '<span style="color:#ff6b6b;">not connected</span>';
                 const addrs = (data.addresses || []).map(a => '<div style="padding:2px 0; font-size:0.85em;">' + escapeHtml(a) + '</div>').join('') || '<span style="color:#666;">none</span>';
