@@ -264,7 +264,12 @@ func main() {
 			defer pcancel()
 			storageMgr.ProvideFile(pctx, manifestCIDStr)
 		}()
-		// Resolve payload from manifest and provide it separately so payload has N providers.
+		// Resolve payload from manifest, pin it as its own root (so Kubo's
+		// reprovider with "pinned" strategy re-announces it), and provide it
+		// to the DHT.  On the ingesting node the payload is already a pin
+		// root from ImportFile; on replicas only ManifestCID is pinned so
+		// this call adds the missing pin entry.  Blocks are already local
+		// from the manifest's recursive pin so this returns quickly.
 		go func() {
 			pctx, pcancel := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
 			defer pcancel()
@@ -284,10 +289,14 @@ func main() {
 			if ro.HasLegacyTimestamp {
 				return
 			}
-			payloadStr := ro.Payload.String()
-			if payloadStr != "" {
-				storageMgr.ProvideFile(pctx, payloadStr)
+			payloadCID := ro.Payload
+			if !payloadCID.Defined() {
+				return
 			}
+			if err := ipfsClient.PinRecursive(pctx, payloadCID); err != nil {
+				log.Printf("[DHT] Failed to pin payload %s: %v", payloadCID, err)
+			}
+			storageMgr.ProvideFile(pctx, payloadCID.String())
 		}()
 	}
 	onPinRemoved := func(cid string) {

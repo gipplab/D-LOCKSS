@@ -277,10 +277,11 @@ func (sm *ShardManager) sendHeartbeat() {
 	sm.reprovideNextPinnedFile()
 }
 
-// reprovideNextPinnedFile provides one pinned manifest (and its payload) to the
-// DHT each heartbeat. This keeps provider records fresh (~24h expiry) and
-// recovers from failed initial provides at startup when the queue overflows.
-// A CAS guard prevents concurrent re-provides from piling up.
+// reprovideNextPinnedFile re-pins one manifest each heartbeat (fetching any
+// missing blocks), then provides both manifest and payload CIDs to the DHT.
+// This gradually completes incomplete DAGs on resource-constrained nodes
+// and keeps DHT provider records fresh (~24h expiry).
+// A CAS guard prevents concurrent iterations from piling up.
 var reprovideInFlight atomic.Bool
 
 func (sm *ShardManager) reprovideNextPinnedFile() {
@@ -295,14 +296,28 @@ func (sm *ShardManager) reprovideNextPinnedFile() {
 	go func() {
 		defer reprovideInFlight.Store(false)
 
-		pctx, pcancel := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
-		defer pcancel()
-		sm.storageMgr.ProvideFile(pctx, manifestCIDStr)
-
 		manifestCID, err := cid.Decode(manifestCIDStr)
 		if err != nil {
 			return
 		}
+
+		// Re-pin to fetch any blocks missed by the initial PinRecursive
+		// (e.g. OOM/timeout on low-memory Pis). Idempotent: returns
+		// quickly when the DAG is already complete locally.
+		pinCtx, pinCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		if err := sm.ipfsClient.PinRecursive(pinCtx, manifestCID); err != nil {
+			pinCancel()
+			if config.VerboseLogging {
+				log.Printf("[Reprovide] PinRecursive %s: %v (will retry next cycle)", manifestCIDStr, err)
+			}
+			return
+		}
+		pinCancel()
+
+		pctx, pcancel := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
+		defer pcancel()
+		sm.storageMgr.ProvideFile(pctx, manifestCIDStr)
+
 		block, err := sm.ipfsClient.GetBlock(pctx, manifestCID)
 		if err != nil {
 			return
@@ -314,12 +329,21 @@ func (sm *ShardManager) reprovideNextPinnedFile() {
 		if ro.HasLegacyTimestamp {
 			return
 		}
-		payloadStr := ro.Payload.String()
-		if payloadStr != "" {
-			pctx2, pcancel2 := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
-			defer pcancel2()
-			sm.storageMgr.ProvideFile(pctx2, payloadStr)
+		payloadCID := ro.Payload
+		if !payloadCID.Defined() {
+			return
 		}
+		// Pin payload as its own root so Kubo's reprovider ("pinned"
+		// strategy) announces it.  Blocks are already local from the
+		// manifest's recursive pin, so this returns quickly.
+		if err := sm.ipfsClient.PinRecursive(context.Background(), payloadCID); err != nil {
+			if config.VerboseLogging {
+				log.Printf("[Reprovide] PinRecursive payload %s: %v", payloadCID, err)
+			}
+		}
+		pctx2, pcancel2 := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
+		defer pcancel2()
+		sm.storageMgr.ProvideFile(pctx2, payloadCID.String())
 	}()
 }
 
