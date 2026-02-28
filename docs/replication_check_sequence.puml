@@ -24,8 +24,9 @@ loop For each Pin in State
     alt We are allocated for this CID
         PinTracker -> IPFS: IsPinned(CID)?
         alt Not Pinned Locally
-            PinTracker -> IPFS: PinRecursive(CID)
-            PinTracker -> Storage: onPinSynced(cid)  ' PinFile, AnnouncePinned
+            PinTracker -> IPFS: PinRecursive(ManifestCID)
+            PinTracker -> Storage: onPinSynced(manifestCID)
+            Note over PinTracker, Storage: onPinSynced: PinFile, AnnouncePinned,\nPinRecursive(PayloadCID) as own root\n(so Kubo reprovider announces it),\nProvideFile(ManifestCID), ProvideFile(PayloadCID)
         end
     end
 end

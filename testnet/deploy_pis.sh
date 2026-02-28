@@ -103,7 +103,7 @@ else:
 \" 2>/dev/null; true" || true
 
     echo "  Enabling Kubo relay client (so Pis behind NAT are reachable via relay)..."
-    ssh "${PI_USER}@${CONN_HOST}" "test -f '${IPFS_REPO}/config' && IPFS_PATH='${IPFS_REPO}' ipfs config --json Swarm.RelayClient.Enabled true 2>/dev/null; IPFS_PATH='${IPFS_REPO}' ipfs config --json Swarm.EnableAutoRelay true 2>/dev/null; true" || true
+    ssh "${PI_USER}@${CONN_HOST}" "test -f '${IPFS_REPO}/config' && IPFS_PATH='${IPFS_REPO}' ipfs config --json Swarm.RelayClient.Enabled true 2>/dev/null; true" || true
 
     echo "  Ensuring zram (compressed swap) for 1GB Pi..."
     ssh "${PI_USER}@${CONN_HOST}" "command -v zramctl &>/dev/null || (sudo apt-get update -qq 2>/dev/null && sudo apt-get install -y zram-tools 2>/dev/null); (sudo systemctl enable zram-tools 2>/dev/null; sudo systemctl start zram-tools 2>/dev/null); true" || true

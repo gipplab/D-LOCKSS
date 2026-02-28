@@ -177,13 +177,27 @@ Replication is handled by the **Cluster Manager** and **LocalPinTracker** per sh
 2.  **State Sync**: The CRDT (Merkle-DAG based) propagates pin/unpin to all peers in the shard via PubSub (`dlockss-shard-<id>`).
 3.  **Local Pin Tracker**:
     *   Each node runs a `LocalPinTracker` per shard that polls CRDT State() (and on TriggerSync).
-    *   For each pin in state, if this node is in **Allocations** (or Allocations is empty), it pins the CID locally via IPFS and calls onPinSynced (StorageManager.PinFile, AnnouncePinned, and **ProvideFile(manifestCID)** and **ProvideFile(payloadCID)** so this node is advertised to the DHT for both CIDs; retrieval checkers and gateways then see N providers for manifest and payload).
+    *   For each pin in state, if this node is in **Allocations** (or Allocations is empty), it pins the ManifestCID locally via IPFS. The **onPinSynced** callback then: (a) registers the file with StorageManager, (b) announces PINNED, (c) resolves the PayloadCID from the manifest, (d) **pins the PayloadCID as its own root** so Kubo's reprovider (`pinned` strategy) re-announces it, and (e) provides both ManifestCID and PayloadCID to the DHT. On the ingesting node the payload is already a pin root from `ImportFile`; on replicas only the ManifestCID was pinned, so step (d) adds the missing pin entry — blocks are already local from the manifest's recursive pin so this returns quickly.
     *   Pins no longer in state or no longer allocated are unpinned locally and onPinRemoved is called.
 4.  **Repair**: Under-replicated files trigger ReplicationRequest on the shard topic; peers that have the file JoinShard(targetShard), Pin, TriggerSync. CRDT sync and LocalPinTracker then replicate to allocated peers.
 
-### 6.2.1 Public retrieval (e.g. ipfs.io)
+### 6.2.1 Heartbeat-Driven Re-Pin and Re-Provide
 
-Cluster data is advertised to the **public IPFS DHT** (manifest and payload when responsible; manifest when a replica syncs a pin). Public gateways such as ipfs.io use the same DHT to find providers. For gateways to **actually fetch** content, nodes that hold the data must be **reachable** from the internet (e.g. public IP or relay). Nodes behind NAT with no port forwarding may appear as providers in the DHT but fail to accept connections from the gateway.
+Each heartbeat cycle (~10s), every node picks **one** pinned manifest CID (round-robin) and:
+
+1. **Re-pins the ManifestCID recursively** (`PinRecursive`, 2min timeout). This is idempotent — returns instantly when the DAG is already complete locally, and incrementally fetches missing blocks otherwise. On resource-constrained nodes (e.g. Raspberry Pis) where the initial `PinRecursive` may have timed out or been OOM-killed before completing the full DAG, this gradually fills in the missing blocks over successive heartbeats.
+2. **Pins the PayloadCID as its own root** so Kubo's reprovider (`pinned` strategy) re-announces it. Blocks are already local from step 1, so this returns quickly.
+3. **Provides the manifest CID and its payload CID to the DHT** (only if the re-pin succeeded).
+
+A `CompareAndSwap` guard prevents concurrent re-provides from piling up; if the previous heartbeat's re-pin is still in flight, the current one is skipped.
+
+This mechanism serves two purposes:
+- **DAG completion**: Pis that failed to fully fetch a large file on first pin will eventually complete it without any manual intervention.
+- **DHT freshness**: Provider records expire after ~24h; periodic re-provides keep them live.
+
+### 6.2.2 Public retrieval (e.g. ipfs.io)
+
+Cluster data is advertised to the **public IPFS DHT** (manifest and payload when responsible; manifest and payload when a replica syncs a pin; and periodically via heartbeat re-provide). Public gateways such as ipfs.io use the same DHT to find providers. For gateways to **actually fetch** content, nodes that hold the data must be **reachable** from the internet (e.g. public IP or relay). Nodes behind NAT with no port forwarding may appear as providers in the DHT but fail to accept connections from the gateway.
 
 ### 6.3 Custodial Handoff (Tourist)
 

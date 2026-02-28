@@ -105,6 +105,18 @@ export DLOCKSS_DHT_MAX_SAMPLE_SIZE=100
 
 This reduces minimum convergence time from ~3-4 minutes to ~30-60 seconds.
 
+### Heartbeat-Driven Gradual DAG Completion (Built-In)
+
+Every heartbeat (~10s), each node picks one pinned manifest (round-robin) and calls `PinRecursive` with a 2-minute timeout. This is idempotent: if the DAG is already fully local it returns instantly, otherwise it incrementally fetches the missing blocks. On success, the manifest and payload CIDs are re-provided to the DHT.
+
+**Impact on resource-constrained nodes (Raspberry Pis):**
+- Initial `PinRecursive` during replication may time out or OOM before fetching the full DAG.
+- Instead of leaving the file permanently incomplete, subsequent heartbeats gradually fetch the remaining blocks.
+- After all blocks are local, Kubo's reprovider stops emitting "block not found locally, cannot provide" errors.
+- DHT provider records (which expire after ~24h) are kept fresh without relying solely on Kubo's reprovider.
+
+No configuration needed — this runs automatically on every node.
+
 ## Production Considerations
 
 For production networks:

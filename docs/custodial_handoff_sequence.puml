@@ -28,8 +28,10 @@ CRDT -> Responsible: Sync State (PubSub dlockss-shard-<targetShard>)
 
 Responsible -> CRDT: LocalPinTracker sees new pin (we are in Allocations)
 Responsible -> IPFS: PinRecursive(ManifestCID)
-Responsible -> Storage: onPinSynced(cid)
-Note over Responsible: Responsible node holds file in target cluster
+Responsible -> Storage: onPinSynced(manifestCID)
+Responsible -> IPFS: PinRecursive(PayloadCID) as own root\n(so Kubo reprovider announces it)
+Responsible -> Storage: ProvideFile(ManifestCID)\nProvideFile(PayloadCID)
+Note over Responsible: Responsible node holds file in target cluster.\nKubo reprovider re-announces both CIDs.
 
 Note over Custodial: Custodial remains in target shard as tourist.\nNo automatic unpin when replication sufficient;\nreshard/split may leave target shard later.
 
