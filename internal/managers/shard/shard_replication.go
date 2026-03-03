@@ -207,7 +207,9 @@ func (sm *ShardManager) RunReshardPass(oldShard, newShard string) {
 				if err := sm.clusterMgr.Unpin(sm.ctx, oldShard, manifestCID); err != nil {
 					log.Printf("[Reshard] Unpin from old shard failed: %v", err)
 				}
-				_ = sm.ipfsClient.UnpinRecursive(sm.ctx, manifestCID)
+				if err := sm.ipfsClient.UnpinRecursive(sm.ctx, manifestCID); err != nil {
+					log.Printf("[Reshard] IPFS unpin failed for %s: %v", key, err)
+				}
 				sm.storageMgr.UnpinFile(key)
 			}
 		}
@@ -314,8 +316,12 @@ func (sm *ShardManager) RunOrphanUnpinPass() {
 		}
 
 		log.Printf("[Reshard] Orphan unpin: %s (belongs to child %s)", key, targetChild)
-		_ = sm.clusterMgr.Unpin(sm.ctx, currentShard, manifestCID)
-		_ = sm.ipfsClient.UnpinRecursive(sm.ctx, manifestCID)
+		if err := sm.clusterMgr.Unpin(sm.ctx, currentShard, manifestCID); err != nil {
+			log.Printf("[Reshard] Cluster unpin failed for %s: %v", key, err)
+		}
+		if err := sm.ipfsClient.UnpinRecursive(sm.ctx, manifestCID); err != nil {
+			log.Printf("[Reshard] IPFS unpin failed for %s: %v", key, err)
+		}
 		sm.storageMgr.UnpinFile(key)
 		sm.mu.Lock()
 		if sm.orphanHandoffSent[key] != nil {
@@ -384,9 +390,13 @@ func (sm *ShardManager) cleanupLegacyManifests() {
 		}
 		log.Printf("[Shard] Removing legacy manifest (has timestamp): %s", manifestCIDStr)
 		if currentShard != "" {
-			_ = sm.clusterMgr.Unpin(sm.ctx, currentShard, manifestCID)
+			if err := sm.clusterMgr.Unpin(sm.ctx, currentShard, manifestCID); err != nil {
+				log.Printf("[Shard] Cluster unpin failed for legacy %s: %v", manifestCIDStr, err)
+			}
 		}
-		_ = sm.ipfsClient.UnpinRecursive(sm.ctx, manifestCID)
+		if err := sm.ipfsClient.UnpinRecursive(sm.ctx, manifestCID); err != nil {
+			log.Printf("[Shard] IPFS unpin failed for legacy %s: %v", manifestCIDStr, err)
+		}
 		sm.storageMgr.UnpinFile(manifestCIDStr)
 		removed++
 		time.Sleep(50 * time.Millisecond)

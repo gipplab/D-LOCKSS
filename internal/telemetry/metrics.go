@@ -65,15 +65,6 @@ var (
 		Name: "dlockss_active_peers",
 		Help: "Number of peers in the current shard",
 	})
-	promWorkerPoolActive = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "dlockss_worker_pool_active",
-		Help: "Number of active replication workers",
-	})
-	promQueueDepth = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "dlockss_replication_queue_depth",
-		Help: "Current depth of the replication job queue",
-	})
-
 	// Cluster-style metrics (per shard, from CRDT)
 	promClusterPinsTotal = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "dlockss_cluster_pins_total",
@@ -103,8 +94,6 @@ func init() {
 		promPinnedFiles,
 		promKnownFiles,
 		promActivePeers,
-		promWorkerPoolActive,
-		promQueueDepth,
 		promClusterPinsTotal,
 		promClusterPeersTotal,
 		promClusterAllocationsTotal,

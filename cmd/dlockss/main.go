@@ -89,7 +89,9 @@ func main() {
 	defer cancel()
 
 	// Config and BadBits
-	_ = badbits.LoadBadBits(config.BadBitsPath)
+	if err := badbits.LoadBadBits(config.BadBitsPath); err != nil {
+		log.Printf("[Warning] Failed to load bad bits list: %v", err)
+	}
 	config.LogConfiguration()
 
 	if msg := config.ValidatePathSafety(); msg != "" {
