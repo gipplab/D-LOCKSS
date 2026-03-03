@@ -33,7 +33,7 @@ func newTestShardManager(t *testing.T, ctx context.Context, startShard string) *
 
 	metrics := telemetry.NewMetricsManager()
 	dht := &MockDHTProvider{}
-	storageMgr := storage.NewStorageManager(dht, metrics)
+	storageMgr := storage.NewStorageManager(dht, metrics, nil)
 	clusterMgr := &MockClusterManager{}
 
 	sm := NewShardManager(ctx, h, ps, &MockIPFSClient{}, storageMgr, metrics, nil, nil, clusterMgr, startShard, "")
@@ -283,7 +283,7 @@ func TestMoveToShard_PublishesLeave(t *testing.T) {
 	// Set up ShardManager on h1 starting in shard "0"
 	metrics := telemetry.NewMetricsManager()
 	dht := &MockDHTProvider{}
-	storageMgr := storage.NewStorageManager(dht, metrics)
+	storageMgr := storage.NewStorageManager(dht, metrics, nil)
 	clusterMgr := &MockClusterManager{}
 	sm := NewShardManager(ctx, h1, ps1, &MockIPFSClient{}, storageMgr, metrics, nil, nil, clusterMgr, "0", "")
 	_ = sm
@@ -369,7 +369,7 @@ func TestProcessMessage_ProbeTriggersHeartbeat(t *testing.T) {
 	// Set up ShardManager on h1 in shard "0"
 	metrics := telemetry.NewMetricsManager()
 	dht := &MockDHTProvider{}
-	storageMgr := storage.NewStorageManager(dht, metrics)
+	storageMgr := storage.NewStorageManager(dht, metrics, nil)
 	clusterMgr := &MockClusterManager{}
 	sm := NewShardManager(ctx, h1, ps1, &MockIPFSClient{}, storageMgr, metrics, nil, nil, clusterMgr, "0", "")
 	_ = sm

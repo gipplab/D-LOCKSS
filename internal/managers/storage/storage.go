@@ -16,6 +16,8 @@ import (
 // StorageManager handles local file state and DHT announcements.
 type StorageManager struct {
 	dht                   common.DHTProvider
+	badBits               *badbits.Filter
+	disk                  *DiskMonitor
 	pinnedFiles           *common.PinnedSet
 	knownFiles            *common.KnownFiles
 	recentlyRemoved       *common.RecentlyRemoved
@@ -31,10 +33,11 @@ type StorageManager struct {
 }
 
 // NewStorageManager creates a new StorageManager.
-func NewStorageManager(dht common.DHTProvider, metrics *telemetry.MetricsManager) *StorageManager {
-	// Handle nil metrics gracefully (for tests)
+func NewStorageManager(dht common.DHTProvider, metrics *telemetry.MetricsManager, badBits *badbits.Filter) *StorageManager {
 	return &StorageManager{
 		dht:                   dht,
+		badBits:               badBits,
+		disk:                  NewDiskMonitor(config.FileWatchFolder),
 		pinnedFiles:           common.NewPinnedSet(),
 		knownFiles:            common.NewKnownFiles(),
 		recentlyRemoved:       common.NewRecentlyRemoved(),
@@ -42,6 +45,11 @@ func NewStorageManager(dht common.DHTProvider, metrics *telemetry.MetricsManager
 		failedOperations:      common.NewBackoffTable(),
 		metrics:               metrics,
 	}
+}
+
+// CanAcceptCustodialFile delegates to the DiskMonitor.
+func (sm *StorageManager) CanAcceptCustodialFile() bool {
+	return sm.disk.CanAcceptCustodialFile()
 }
 
 // GetNextFileToAnnounce returns next file key for round-robin PINNED announcements.
@@ -89,7 +97,7 @@ func (sm *StorageManager) GetPinnedManifests() []string {
 // It tracks the ManifestCID in our internal state and announces to DHT.
 func (sm *StorageManager) PinFile(manifestCIDStr string) bool {
 	// Check BadBits
-	if badbits.IsCIDBlocked(manifestCIDStr) {
+	if sm.badBits.IsBlocked(manifestCIDStr) {
 		log.Printf("[Storage] Refused to pin blocked CID: %s", manifestCIDStr)
 		return false
 	}
@@ -201,6 +209,11 @@ func (sm *StorageManager) GetReplicationLevels() map[string]int {
 
 func (sm *StorageManager) GetKnownFiles() *common.KnownFiles {
 	return sm.knownFiles
+}
+
+// GetAllKnownFiles returns a snapshot of all known file keys.
+func (sm *StorageManager) GetAllKnownFiles() map[string]bool {
+	return sm.knownFiles.All()
 }
 
 func (sm *StorageManager) GetPinTime(key string) time.Time {

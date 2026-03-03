@@ -74,6 +74,11 @@ func (sm *ShardManager) GetHost() host.Host {
 	return sm.h
 }
 
+// PeerID returns the local peer's ID.
+func (sm *ShardManager) PeerID() peer.ID {
+	return sm.h.ID()
+}
+
 func (sm *ShardManager) GetShardPeers() []peer.ID {
 	sm.mu.RLock()
 	currentShard := sm.currentShard

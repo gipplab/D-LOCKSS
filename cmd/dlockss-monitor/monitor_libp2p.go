@@ -89,10 +89,10 @@ func startLibP2P(ctx context.Context, monitor *Monitor) (host.Host, error) {
 	go monitor.cleanupStaleCIDs(ctx)
 	// Bootstrap subscribe to all shards up to depth so we see nodes even when joining late
 	// (when all nodes have already moved to deeper shards like 00, 01, 10, 11, etc.).
-	for _, shardID := range shardIDsUpToDepth(bootstrapShardDepth) {
+	for _, shardID := range shardIDsUpToDepth(monitor.cfg.BootstrapShardDepth) {
 		monitor.ensureShardSubscription(ctx, shardID)
 	}
-	log.Printf("[Monitor] Bootstrap subscribed to %d shards (depth %d)", 1<<(bootstrapShardDepth+1)-1, bootstrapShardDepth)
+	log.Printf("[Monitor] Bootstrap subscribed to %d shards (depth %d)", 1<<(monitor.cfg.BootstrapShardDepth+1)-1, monitor.cfg.BootstrapShardDepth)
 	go monitor.subscribeToActiveShards(ctx)
 
 	kademliaDHT, err := dht.New(ctx, h)

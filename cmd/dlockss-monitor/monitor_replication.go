@@ -10,6 +10,132 @@ import (
 	"dlockss/internal/common"
 )
 
+// replicationSnapshot holds pre-computed state shared across replication computations.
+// Build once with newReplicationSnapshot(), then call resolveManifest() per manifest.
+// Caller must hold m.mu at least as RLock.
+type replicationSnapshot struct {
+	shardPeerCount map[string]int
+	depth          int
+	cutoff         time.Time
+	m              *Monitor
+}
+
+func (m *Monitor) newReplicationSnapshotUnlocked() replicationSnapshot {
+	spc := make(map[string]int)
+	depth := 0
+	for id, node := range m.nodes {
+		if !m.isDisplayableNodeUnlocked(id, node) {
+			continue
+		}
+		shard := node.EffectiveShard()
+		spc[shard]++
+		if len(shard) > depth {
+			depth = len(shard)
+		}
+	}
+	return replicationSnapshot{
+		shardPeerCount: spc,
+		depth:          depth,
+		cutoff:         time.Now().Add(-ReplicationAnnounceTTL),
+		m:              m,
+	}
+}
+
+// manifestResult holds the resolved replication state for a single manifest.
+type manifestResult struct {
+	count       int
+	maxRep      int
+	targetShard string
+}
+
+// buildShardCounts returns per-shard replica counts for a manifest,
+// filtering out stale peers. Caller must hold m.mu.
+func (rs *replicationSnapshot) buildShardCounts(peers map[string]time.Time) map[string]int {
+	counts := make(map[string]int)
+	for peerID := range peers {
+		node, ok := rs.m.nodes[peerID]
+		if !ok || !rs.m.isDisplayableNodeUnlocked(peerID, node) {
+			continue
+		}
+		shard := node.EffectiveShard()
+		if rs.m.peerShardLastSeen[peerID] != nil {
+			if last := rs.m.peerShardLastSeen[peerID][shard]; last.Before(rs.cutoff) {
+				continue
+			}
+		}
+		counts[shard]++
+	}
+	return counts
+}
+
+// resolveManifest computes the effective replica count and max replication for
+// a manifest. Returns zero count if the manifest should be skipped.
+func (rs *replicationSnapshot) resolveManifest(manifest string, peers map[string]time.Time, shardCounts map[string]int) manifestResult {
+	targetShard := rs.m.manifestShard[manifest]
+	if targetShard == "" || rs.shardPeerCount[targetShard] == 0 {
+		targetShard, _ = effectiveTargetShardForManifest(manifest, rs.depth, rs.shardPeerCount)
+	}
+
+	count := shardCounts[targetShard]
+	maxRep := rs.shardPeerCount[targetShard]
+
+	// Parent with 0 nodes after split: aggregate descendant shards.
+	if maxRep == 0 && len(targetShard) > 0 {
+		descReplicas, descNodes := sumDescendantReplicasAndNodes(shardCounts, rs.shardPeerCount, targetShard)
+		if descReplicas > 0 {
+			count = descReplicas
+			maxRep = descNodes
+		}
+	}
+
+	// Sibling aggregation: replicas split across children of the same parent.
+	if count > 0 && len(targetShard) >= 1 {
+		minRep := MonitorMinReplication
+		if maxRep > 0 && minRep > maxRep {
+			minRep = maxRep
+		}
+		if count < minRep {
+			parent := targetShard[:len(targetShard)-1]
+			if rs.shardPeerCount[parent] == 0 {
+				descReplicas, descNodes := sumDescendantReplicasAndNodes(shardCounts, rs.shardPeerCount, parent)
+				if descReplicas > count {
+					count = descReplicas
+					maxRep = descNodes
+				}
+			}
+		}
+	}
+
+	// Fallback: use shard with most replicas if target has none.
+	if count == 0 {
+		targetShard = shardWithMostReplicas(shardCounts, rs.shardPeerCount)
+		if targetShard == "" {
+			return manifestResult{}
+		}
+		count = shardCounts[targetShard]
+		maxRep = rs.shardPeerCount[targetShard]
+	}
+
+	if maxRep == 0 {
+		maxRep = len(peers)
+	}
+	if count == 0 {
+		return manifestResult{}
+	}
+	return manifestResult{count: count, maxRep: maxRep, targetShard: targetShard}
+}
+
+// isAtTarget returns true if count is within the replication target range.
+func (mr manifestResult) isAtTarget() bool {
+	minRep := MonitorMinReplication
+	if mr.maxRep > 0 && minRep > mr.maxRep {
+		minRep = mr.maxRep
+	}
+	return mr.count >= minRep && mr.count <= mr.maxRep
+}
+
+// --- Public methods using the shared helpers ---
+
 func (m *Monitor) runReplicationCleanup() {
 	ticker := time.NewTicker(ReplicationCleanupEvery)
 	defer ticker.Stop()
@@ -93,8 +219,6 @@ func effectiveTargetShardForManifest(manifestCIDStr string, depth int, shardPeer
 	return "", 0
 }
 
-// shardWithMostReplicas returns the shard that has the most replicas for a manifest (from shardCounts),
-// or "" if none. Used when the observed/hash-based target shard has 0 replicas (e.g. nodes moved to children).
 func shardWithMostReplicas(shardCounts map[string]int, shardPeerCount map[string]int) string {
 	var best string
 	maxCount := 0
@@ -113,9 +237,6 @@ func shardWithMostReplicas(shardCounts map[string]int, shardPeerCount map[string
 	return best
 }
 
-// sumDescendantReplicasAndNodes returns total replicas and total nodes over all shards that are
-// strict descendants of parentShard (same prefix, longer). Used when the logical target shard is
-// a parent that has 0 nodes after a split; replicas may be split across child shards (e.g. 10 and 11).
 func sumDescendantReplicasAndNodes(manifestShardCounts map[string]int, shardPeerCount map[string]int, parentShard string) (totalReplicas int, totalNodes int) {
 	for shard, c := range manifestShardCounts {
 		if strings.HasPrefix(shard, parentShard) && len(shard) > len(parentShard) {
@@ -132,7 +253,6 @@ func (m *Monitor) replicationNetworkDepth() int {
 	return m.replicationNetworkDepthUnlocked()
 }
 
-// replicationNetworkDepthUnlocked returns max shard depth; caller must hold m.mu (at least RLock).
 func (m *Monitor) replicationNetworkDepthUnlocked() int {
 	maxLen := 0
 	for id, node := range m.nodes {
@@ -151,114 +271,26 @@ func (m *Monitor) getReplicationStats() (distribution [11]int, avgLevel float64,
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	shardPeerCount := make(map[string]int)
-	for id, node := range m.nodes {
-		if !m.isDisplayableNodeUnlocked(id, node) {
-			continue
-		}
-		shard := node.EffectiveShard()
-		shardPeerCount[shard]++
-	}
+	rs := m.newReplicationSnapshotUnlocked()
+	var totalReplication, manifestCount int
 
-	depth := 0
-	for id, n := range m.nodes {
-		if !m.isDisplayableNodeUnlocked(id, n) {
-			continue
-		}
-		shard := n.EffectiveShard()
-		if len(shard) > depth {
-			depth = len(shard)
-		}
-	}
-	cutoff := time.Now().Add(-ReplicationAnnounceTTL)
-
-	var totalReplication int
-	var manifestCount int
 	for manifest, peers := range m.manifestReplication {
 		if len(peers) == 0 {
 			continue
 		}
-		// Use observed shard from PINNED announcements (nodes use PayloadCID for shard assignment).
-		// Fall back to ManifestCID-based computation if never observed OR if the observed
-		// shard is now empty (e.g. parent shard after a split).
-		targetShard := m.manifestShard[manifest]
-		if targetShard == "" || shardPeerCount[targetShard] == 0 {
-			targetShard, _ = effectiveTargetShardForManifest(manifest, depth, shardPeerCount)
-		}
-		// Build per-shard replica counts for this manifest (for fallback when target has 0).
-		manifestShardCounts := make(map[string]int)
-		for peerID := range peers {
-			node, ok := m.nodes[peerID]
-			if !ok || !m.isDisplayableNodeUnlocked(peerID, node) {
-				continue
-			}
-			shard := node.EffectiveShard()
-			if m.peerShardLastSeen[peerID] != nil {
-				if last := m.peerShardLastSeen[peerID][shard]; last.Before(cutoff) {
-					continue
-				}
-			}
-			manifestShardCounts[shard]++
-		}
-		count := manifestShardCounts[targetShard]
-		maxRep := shardPeerCount[targetShard]
-		// When logical target is a parent with 0 nodes (after split), replicas may be split across
-		// child shards (e.g. 10 and 11). Aggregate count and maxRep over all descendant shards
-		// so the manifest can be counted as at target when total replicas are sufficient.
-		if maxRep == 0 && len(targetShard) > 0 {
-			descReplicas, descNodes := sumDescendantReplicasAndNodes(manifestShardCounts, shardPeerCount, targetShard)
-			if descReplicas > 0 {
-				count = descReplicas
-				maxRep = descNodes
-			}
-		}
-		// When target is one child (e.g. "00") but replicas are split across siblings (00+01),
-		// manifestShard may have been set to "00" by the first announcement. If we're still
-		// under-replicated, try aggregating over the parent's descendants (parent has 0 nodes after split).
-		if count > 0 && len(targetShard) >= 1 {
-			minRep := MonitorMinReplication
-			if maxRep > 0 && minRep > maxRep {
-				minRep = maxRep
-			}
-			if count < minRep {
-				parent := targetShard[:len(targetShard)-1]
-				if shardPeerCount[parent] == 0 {
-					descReplicas, descNodes := sumDescendantReplicasAndNodes(manifestShardCounts, shardPeerCount, parent)
-					if descReplicas > count {
-						count = descReplicas
-						maxRep = descNodes
-					}
-				}
-			}
-		}
-		// If observed/hash-based target has no replicas (e.g. nodes moved to child shards),
-		// use the shard where this manifest actually has replicas.
-		if count == 0 {
-			targetShard = shardWithMostReplicas(manifestShardCounts, shardPeerCount)
-			if targetShard == "" {
-				continue
-			}
-			count = manifestShardCounts[targetShard]
-			maxRep = shardPeerCount[targetShard]
-		}
-		if maxRep == 0 {
-			maxRep = len(peers)
-		}
-		if count == 0 {
+		shardCounts := rs.buildShardCounts(peers)
+		mr := rs.resolveManifest(manifest, peers, shardCounts)
+		if mr.count == 0 {
 			continue
 		}
 		manifestCount++
-		totalReplication += count
-		if count >= 10 {
+		totalReplication += mr.count
+		if mr.count >= 10 {
 			distribution[10]++
 		} else {
-			distribution[count]++
+			distribution[mr.count]++
 		}
-		minRep := MonitorMinReplication
-		if maxRep > 0 && minRep > maxRep {
-			minRep = maxRep
-		}
-		if count >= minRep && count <= maxRep {
+		if mr.isAtTarget() {
 			filesAtTarget++
 		}
 	}
@@ -268,118 +300,32 @@ func (m *Monitor) getReplicationStats() (distribution [11]int, avgLevel float64,
 	return distribution, avgLevel, filesAtTarget
 }
 
-// ReplicationCIDEntry holds a manifest CID and its replication metadata for the replication-cids API.
-type ReplicationCIDEntry struct {
-	CID      string `json:"cid"`
-	Shard    string `json:"shard"`
-	Replicas int    `json:"replicas"`
-}
-
-// getReplicationCIDsByLevel returns CIDs at the given replication level (0–10).
-// Level 0–9 = exactly that many replicas; level 10 = 10+ replicas.
-func (m *Monitor) getReplicationCIDsByLevel(level int) []ReplicationCIDEntry {
+func (m *Monitor) getReplicationCIDsByLevel(level int) []CIDEntry {
 	if level < 0 || level > 10 {
 		return nil
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	shardPeerCount := make(map[string]int)
-	for id, node := range m.nodes {
-		if !m.isDisplayableNodeUnlocked(id, node) {
-			continue
-		}
-		shard := node.EffectiveShard()
-		shardPeerCount[shard]++
-	}
+	rs := m.newReplicationSnapshotUnlocked()
+	var result []CIDEntry
 
-	depth := 0
-	for id, n := range m.nodes {
-		if !m.isDisplayableNodeUnlocked(id, n) {
-			continue
-		}
-		shard := n.EffectiveShard()
-		if len(shard) > depth {
-			depth = len(shard)
-		}
-	}
-	cutoff := time.Now().Add(-ReplicationAnnounceTTL)
-
-	var result []ReplicationCIDEntry
 	for manifest, peers := range m.manifestReplication {
 		if len(peers) == 0 {
 			continue
 		}
-		targetShard := m.manifestShard[manifest]
-		if targetShard == "" || shardPeerCount[targetShard] == 0 {
-			targetShard, _ = effectiveTargetShardForManifest(manifest, depth, shardPeerCount)
-		}
-		manifestShardCounts := make(map[string]int)
-		for peerID := range peers {
-			node, ok := m.nodes[peerID]
-			if !ok || !m.isDisplayableNodeUnlocked(peerID, node) {
-				continue
-			}
-			shard := node.EffectiveShard()
-			if m.peerShardLastSeen[peerID] != nil {
-				if last := m.peerShardLastSeen[peerID][shard]; last.Before(cutoff) {
-					continue
-				}
-			}
-			manifestShardCounts[shard]++
-		}
-		count := manifestShardCounts[targetShard]
-		maxRep := shardPeerCount[targetShard]
-		if maxRep == 0 && len(targetShard) > 0 {
-			descReplicas, descNodes := sumDescendantReplicasAndNodes(manifestShardCounts, shardPeerCount, targetShard)
-			if descReplicas > 0 {
-				count = descReplicas
-				maxRep = descNodes
-			}
-		}
-		if count > 0 && len(targetShard) >= 1 {
-			minRep := MonitorMinReplication
-			if maxRep > 0 && minRep > maxRep {
-				minRep = maxRep
-			}
-			if count < minRep {
-				parent := targetShard[:len(targetShard)-1]
-				if shardPeerCount[parent] == 0 {
-					descReplicas, descNodes := sumDescendantReplicasAndNodes(manifestShardCounts, shardPeerCount, parent)
-					if descReplicas > count {
-						count = descReplicas
-						maxRep = descNodes
-					}
-				}
-			}
-		}
-		if count == 0 {
-			targetShard = shardWithMostReplicas(manifestShardCounts, shardPeerCount)
-			if targetShard == "" {
-				continue
-			}
-			count = manifestShardCounts[targetShard]
-			maxRep = shardPeerCount[targetShard]
-		}
-		if maxRep == 0 {
-			maxRep = len(peers)
-		}
-		if count == 0 {
+		shardCounts := rs.buildShardCounts(peers)
+		mr := rs.resolveManifest(manifest, peers, shardCounts)
+		if mr.count == 0 {
 			continue
 		}
-		// Check if this manifest belongs to the requested level bucket.
-		var matches bool
-		if level == 10 {
-			matches = count >= 10
-		} else {
-			matches = count == level
-		}
+		matches := (level == 10 && mr.count >= 10) || (level < 10 && mr.count == level)
 		if matches {
 			shardLabel := m.manifestShard[manifest]
 			if shardLabel == "" {
 				shardLabel = "root"
 			}
-			result = append(result, ReplicationCIDEntry{CID: manifest, Shard: shardLabel, Replicas: count})
+			result = append(result, CIDEntry{CID: manifest, Shard: shardLabel, Replicas: mr.count})
 		}
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].CID < result[j].CID })
@@ -390,103 +336,38 @@ func (m *Monitor) getReplicationByShard() map[string]int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	shardPeerCount := make(map[string]int)
-	for id, node := range m.nodes {
-		if !m.isDisplayableNodeUnlocked(id, node) {
-			continue
-		}
-		shard := node.EffectiveShard()
-		shardPeerCount[shard]++
-	}
+	rs := m.newReplicationSnapshotUnlocked()
 
-	depth := 0
-	for id, n := range m.nodes {
-		if !m.isDisplayableNodeUnlocked(id, n) {
-			continue
-		}
-		shard := n.EffectiveShard()
-		if len(shard) > depth {
-			depth = len(shard)
-		}
+	// Build per-manifest shard counts for attribution.
+	type manifestInfo struct {
+		shardCounts map[string]int
+		peers       map[string]time.Time
 	}
-	cutoff := time.Now().Add(-ReplicationAnnounceTTL)
-
-	perManifestPerShard := make(map[string]map[string]int)
+	manifests := make(map[string]manifestInfo, len(m.manifestReplication))
 	for manifest, peers := range m.manifestReplication {
 		if len(peers) == 0 {
 			continue
 		}
-		perManifestPerShard[manifest] = make(map[string]int)
-		for peerID := range peers {
-			node, ok := m.nodes[peerID]
-			if !ok || !m.isDisplayableNodeUnlocked(peerID, node) {
-				continue
-			}
-			shard := node.EffectiveShard()
-			if m.peerShardLastSeen[peerID] != nil {
-				if last := m.peerShardLastSeen[peerID][shard]; last.Before(cutoff) {
-					continue
-				}
-			}
-			perManifestPerShard[manifest][shard]++
+		manifests[manifest] = manifestInfo{
+			shardCounts: rs.buildShardCounts(peers),
+			peers:       peers,
 		}
 	}
 
 	filesAtTargetPerShard := make(map[string]int)
-	for manifest, shardCounts := range perManifestPerShard {
-		// Use observed shard from PINNED announcements; fall back to ManifestCID-based computation
-		// if never observed or if the observed shard is now empty.
-		targetShard := m.manifestShard[manifest]
-		if targetShard == "" || shardPeerCount[targetShard] == 0 {
-			targetShard, _ = effectiveTargetShardForManifest(manifest, depth, shardPeerCount)
-		}
-		count := shardCounts[targetShard]
-		maxRep := shardPeerCount[targetShard]
-		// When logical target is a parent with 0 nodes (after split), aggregate over descendant shards.
-		attributeShard := targetShard // shard we credit for "files at target" (for per-shard display)
-		if maxRep == 0 && len(targetShard) > 0 {
-			descReplicas, descNodes := sumDescendantReplicasAndNodes(shardCounts, shardPeerCount, targetShard)
-			if descReplicas > 0 {
-				count = descReplicas
-				maxRep = descNodes
-				attributeShard = shardWithMostReplicas(shardCounts, shardPeerCount) // credit child with most replicas
-			}
-		}
-		// When target is one child but replicas are split across siblings, try parent's descendants.
-		minRep := MonitorMinReplication
-		if maxRep > 0 && minRep > maxRep {
-			minRep = maxRep
-		}
-		if count > 0 && count < minRep && len(targetShard) >= 1 {
-			parent := targetShard[:len(targetShard)-1]
-			if shardPeerCount[parent] == 0 {
-				descReplicas, descNodes := sumDescendantReplicasAndNodes(shardCounts, shardPeerCount, parent)
-				if descReplicas > count {
-					count = descReplicas
-					maxRep = descNodes
-					attributeShard = shardWithMostReplicas(shardCounts, shardPeerCount)
-				}
-			}
-		}
-		// If observed/hash-based target has no replicas (e.g. nodes moved to child shards after
-		// first PINNED from parent), assign this manifest to the shard where it actually has replicas.
-		if count == 0 {
-			targetShard = shardWithMostReplicas(shardCounts, shardPeerCount)
-			if targetShard == "" {
-				continue
-			}
-			attributeShard = targetShard
-			count = shardCounts[targetShard]
-			maxRep = shardPeerCount[targetShard]
-		}
-		if maxRep == 0 {
+	for manifest, info := range manifests {
+		mr := rs.resolveManifest(manifest, info.peers, info.shardCounts)
+		if mr.count == 0 || mr.maxRep == 0 {
 			continue
 		}
-		minRep = MonitorMinReplication
-		if minRep > maxRep {
-			minRep = maxRep
-		}
-		if count >= minRep && count <= maxRep {
+		if mr.isAtTarget() {
+			// Attribute to the resolved target shard (or child with most replicas if parent split).
+			attributeShard := mr.targetShard
+			if rs.shardPeerCount[attributeShard] == 0 {
+				if best := shardWithMostReplicas(info.shardCounts, rs.shardPeerCount); best != "" {
+					attributeShard = best
+				}
+			}
 			filesAtTargetPerShard[attributeShard]++
 		}
 	}

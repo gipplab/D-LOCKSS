@@ -2,7 +2,6 @@ package clusters
 
 import (
 	"context"
-	"io"
 	"sync"
 	"testing"
 
@@ -53,17 +52,12 @@ func (m *mockConsensus) Peers(ctx context.Context) ([]peer.ID, error) {
 }
 func (m *mockConsensus) Shutdown(ctx context.Context) error { return nil }
 
-// mockIPFSForTracker implements IPFSClient and records Pin/Unpin calls.
+// mockIPFSForTracker implements IPFSPinner and records Pin calls.
 type mockIPFSForTracker struct {
-	mu         sync.Mutex
-	peerIDStr  string
-	pinCalls   []cid.Cid
-	unpinCalls []cid.Cid
+	mu       sync.Mutex
+	pinCalls []cid.Cid
 }
 
-func (m *mockIPFSForTracker) GetPeerID(ctx context.Context) (string, error) {
-	return m.peerIDStr, nil
-}
 func (m *mockIPFSForTracker) IsPinned(ctx context.Context, c cid.Cid) (bool, error) {
 	return false, nil
 }
@@ -73,29 +67,8 @@ func (m *mockIPFSForTracker) PinRecursive(ctx context.Context, c cid.Cid) error 
 	m.mu.Unlock()
 	return nil
 }
-func (m *mockIPFSForTracker) UnpinRecursive(ctx context.Context, c cid.Cid) error {
-	m.mu.Lock()
-	m.unpinCalls = append(m.unpinCalls, c)
-	m.mu.Unlock()
-	return nil
-}
 func (m *mockIPFSForTracker) GetBlock(ctx context.Context, c cid.Cid) ([]byte, error) {
 	return nil, nil
-}
-func (m *mockIPFSForTracker) GetFileSize(ctx context.Context, c cid.Cid) (uint64, error) {
-	return 0, nil
-}
-func (m *mockIPFSForTracker) ImportFile(ctx context.Context, path string) (cid.Cid, error) {
-	return cid.Cid{}, nil
-}
-func (m *mockIPFSForTracker) ImportReader(ctx context.Context, r io.Reader) (cid.Cid, error) {
-	return cid.Cid{}, nil
-}
-func (m *mockIPFSForTracker) PutDagCBOR(ctx context.Context, data []byte) (cid.Cid, error) {
-	return cid.Cid{}, nil
-}
-func (m *mockIPFSForTracker) SwarmConnect(ctx context.Context, addrs []string) error {
-	return nil
 }
 func mustPeerIDFromSeed(t *testing.T, seed string) peer.ID {
 	t.Helper()
@@ -113,8 +86,8 @@ func mustPeerIDFromSeed(t *testing.T, seed string) peer.ID {
 func TestPinTracker_allocation_pin(t *testing.T) {
 	ourPeer := mustPeerIDFromSeed(t, "our")
 	c1, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
-	ipfs := &mockIPFSForTracker{peerIDStr: ourPeer.String()}
-	pt := NewLocalPinTracker(ipfs, "1", nil, nil)
+	ipfs := &mockIPFSForTracker{}
+	pt := NewLocalPinTracker(ipfs, "1", nil, nil, nil)
 
 	state := &mockState{
 		pins: []api.Pin{
@@ -140,11 +113,10 @@ func TestPinTracker_allocation_skip(t *testing.T) {
 	// Since v0.0.3, allocations are ignored — all nodes on a shard pin
 	// everything in the shard's CRDT. This test verifies that a pin
 	// allocated to another peer is still synced locally.
-	ourPeer := mustPeerIDFromSeed(t, "our")
 	otherPeer := mustPeerIDFromSeed(t, "other")
 	c1, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
-	ipfs := &mockIPFSForTracker{peerIDStr: ourPeer.String()}
-	pt := NewLocalPinTracker(ipfs, "1", nil, nil)
+	ipfs := &mockIPFSForTracker{}
+	pt := NewLocalPinTracker(ipfs, "1", nil, nil, nil)
 
 	state := &mockState{
 		pins: []api.Pin{
@@ -164,10 +136,9 @@ func TestPinTracker_allocation_skip(t *testing.T) {
 }
 
 func TestPinTracker_empty_allocations_full_replication(t *testing.T) {
-	ourPeer := mustPeerIDFromSeed(t, "our")
 	c1, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
-	ipfs := &mockIPFSForTracker{peerIDStr: ourPeer.String()}
-	pt := NewLocalPinTracker(ipfs, "1", nil, nil)
+	ipfs := &mockIPFSForTracker{}
+	pt := NewLocalPinTracker(ipfs, "1", nil, nil, nil)
 
 	// Empty Allocations means "pin everywhere" (full replication)
 	state := &mockState{
@@ -195,8 +166,8 @@ func TestPinTracker_tracking_released_when_removed_from_CRDT(t *testing.T) {
 	c1, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
 	removed := make([]string, 0)
 	onRemoved := func(cidStr string) { removed = append(removed, cidStr) }
-	ipfs := &mockIPFSForTracker{peerIDStr: ourPeer.String()}
-	pt := NewLocalPinTracker(ipfs, "1", nil, onRemoved)
+	ipfs := &mockIPFSForTracker{}
+	pt := NewLocalPinTracker(ipfs, "1", nil, onRemoved, nil)
 
 	stateWithPin := &mockState{
 		pins: []api.Pin{
@@ -218,15 +189,9 @@ func TestPinTracker_tracking_released_when_removed_from_CRDT(t *testing.T) {
 	consensusEmpty := &mockConsensus{st: stateEmpty}
 	pt.syncState(consensusEmpty)
 
-	// PinTracker should NOT call UnpinRecursive (migration-safe)
-	ipfs.mu.Lock()
-	unpinCalls := len(ipfs.unpinCalls)
-	ipfs.mu.Unlock()
-	if unpinCalls != 0 {
-		t.Errorf("expected 0 UnpinRecursive (PinTracker only releases tracking), got %d", unpinCalls)
-	}
-
-	// But onPinRemoved callback should have been called
+	// PinTracker should NOT call UnpinRecursive (migration-safe);
+	// the IPFSPinner interface doesn't even include UnpinRecursive.
+	// But onPinRemoved callback should have been called.
 	if len(removed) != 1 {
 		t.Errorf("expected onPinRemoved called once, got %d", len(removed))
 	}

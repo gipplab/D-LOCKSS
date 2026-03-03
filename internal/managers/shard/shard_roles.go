@@ -7,8 +7,6 @@ import (
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/peer"
-
-	"dlockss/internal/managers/storage"
 )
 
 // PeerRole indicates whether a peer is actively contributing to replication.
@@ -48,7 +46,7 @@ func parseHeartbeatRole(data []byte) PeerRole {
 
 // getOurRole returns ACTIVE if we can accept custodial files, PASSIVE otherwise.
 func (sm *ShardManager) getOurRole() PeerRole {
-	if storage.CanAcceptCustodialFile() {
+	if sm.storageMgr.CanAcceptCustodialFile() {
 		return RoleActive
 	}
 	return RolePassive

@@ -33,16 +33,17 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	cfg := DefaultMonitorConfig()
 	if v := os.Getenv("DLOCKSS_MONITOR_NODE_CLEANUP_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			nodeCleanupTimeout = d
-			log.Printf("[Monitor] Node cleanup timeout: %s (from env)", nodeCleanupTimeout)
+			cfg.NodeCleanupTimeout = d
+			log.Printf("[Monitor] Node cleanup timeout: %s (from env)", cfg.NodeCleanupTimeout)
 		}
 	}
 	if v := os.Getenv("DLOCKSS_MONITOR_BOOTSTRAP_SHARD_DEPTH"); v != "" {
 		if d, err := strconv.Atoi(v); err == nil && d >= 0 && d <= 12 {
-			bootstrapShardDepth = d
-			log.Printf("[Monitor] Bootstrap shard depth: %d (from env)", bootstrapShardDepth)
+			cfg.BootstrapShardDepth = d
+			log.Printf("[Monitor] Bootstrap shard depth: %d (from env)", cfg.BootstrapShardDepth)
 		}
 	}
 
@@ -52,7 +53,7 @@ func main() {
 	}
 	geminiAPIKey := os.Getenv("GEMINI_API_KEY")
 
-	monitor := NewMonitor(geoDBPath, geminiAPIKey)
+	monitor := NewMonitor(cfg, geoDBPath, geminiAPIKey)
 	h, err := startLibP2P(ctx, monitor)
 	if err != nil {
 		log.Fatalf("P2P error: %v", err)
@@ -251,7 +252,7 @@ func main() {
 				TopicPrefix string `json:"topic_prefix"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				http.Error(w, `{"error":"invalid JSON, expected {\"topic_prefix\":\"...\"}"}`, http.StatusBadRequest)
+				writeJSONError(w, `invalid JSON, expected {"topic_prefix":"..."}`, http.StatusBadRequest)
 				return
 			}
 			monitor.SwitchTopicPrefix(ctx, body.TopicPrefix)
@@ -266,57 +267,32 @@ func main() {
 	mux.HandleFunc("/api/node-files", func(w http.ResponseWriter, r *http.Request) {
 		peerID := r.URL.Query().Get("peer")
 		if peerID == "" {
-			http.Error(w, `{"error":"missing peer parameter"}`, http.StatusBadRequest)
+			writeJSONError(w, "missing peer parameter", http.StatusBadRequest)
 			return
 		}
 		monitor.mu.RLock()
-		type cidEntry struct {
-			CID      string `json:"cid"`
-			Shard    string `json:"shard"`
-			Replicas int    `json:"replicas"`
-		}
-		entries := make([]cidEntry, 0)
+		var entries []CIDEntry
 		if files, ok := monitor.nodeFiles[peerID]; ok {
-			for cidStr := range files {
-				replicas := 0
-				if peers, ok := monitor.manifestReplication[cidStr]; ok {
-					replicas = len(peers)
-				}
-				shard := monitor.manifestShard[cidStr]
-				entries = append(entries, cidEntry{CID: cidStr, Shard: shard, Replicas: replicas})
-			}
+			entries = monitor.buildCIDEntriesUnlocked(files)
+		} else {
+			entries = []CIDEntry{}
 		}
 		monitor.mu.RUnlock()
-		sort.Slice(entries, func(i, j int) bool { return entries[i].CID < entries[j].CID })
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{"peer_id": peerID, "cids": entries, "count": len(entries)})
 	})
 
 	mux.HandleFunc("/api/unique-cids", func(w http.ResponseWriter, r *http.Request) {
 		monitor.mu.RLock()
-		type cidEntry struct {
-			CID      string `json:"cid"`
-			Shard    string `json:"shard"`
-			Replicas int    `json:"replicas"`
-		}
-		entries := make([]cidEntry, 0, len(monitor.uniqueCIDs))
-		for cidStr := range monitor.uniqueCIDs {
-			replicas := 0
-			if peers, ok := monitor.manifestReplication[cidStr]; ok {
-				replicas = len(peers)
-			}
-			shard := monitor.manifestShard[cidStr]
-			entries = append(entries, cidEntry{CID: cidStr, Shard: shard, Replicas: replicas})
-		}
+		entries := monitor.buildCIDEntriesUnlocked(monitor.uniqueCIDs)
 		monitor.mu.RUnlock()
-		sort.Slice(entries, func(i, j int) bool { return entries[i].CID < entries[j].CID })
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{"cids": entries, "count": len(entries)})
 	})
 
 	mux.HandleFunc("/api/replication", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeJSONError(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		dist, avg, atTarget := monitor.getReplicationStats()
@@ -335,12 +311,12 @@ func main() {
 	mux.HandleFunc("/api/replication-cids", func(w http.ResponseWriter, r *http.Request) {
 		levelStr := r.URL.Query().Get("level")
 		if levelStr == "" {
-			http.Error(w, `{"error":"missing level parameter"}`, http.StatusBadRequest)
+			writeJSONError(w, "missing level parameter", http.StatusBadRequest)
 			return
 		}
 		level, err := strconv.Atoi(levelStr)
 		if err != nil || level < 0 || level > 10 {
-			http.Error(w, `{"error":"level must be 0-10"}`, http.StatusBadRequest)
+			writeJSONError(w, "level must be 0-10", http.StatusBadRequest)
 			return
 		}
 		entries := monitor.getReplicationCIDsByLevel(level)
@@ -351,36 +327,28 @@ func main() {
 	mux.HandleFunc("/api/manifest-payload", func(w http.ResponseWriter, r *http.Request) {
 		manifestCID := strings.TrimSpace(r.URL.Query().Get("cid"))
 		if manifestCID == "" {
-			http.Error(w, `{"error":"missing cid parameter"}`, http.StatusBadRequest)
+			writeJSONError(w, "missing cid parameter", http.StatusBadRequest)
 			return
 		}
 		reqURL := "https://ipfs.io/ipfs/" + url.PathEscape(manifestCID)
 		resp, err := http.Get(reqURL)
 		if err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadGateway)
-			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			writeJSONError(w, err.Error(), http.StatusBadGateway)
 			return
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadGateway)
-			json.NewEncoder(w).Encode(map[string]string{"error": "gateway: " + resp.Status})
+			writeJSONError(w, "gateway: "+resp.Status, http.StatusBadGateway)
 			return
 		}
 		block, err := io.ReadAll(resp.Body)
 		if err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			writeJSONError(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		var ro schema.ResearchObject
 		if err := ro.UnmarshalCBOR(block); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"error": "invalid manifest: " + err.Error()})
+			writeJSONError(w, "invalid manifest: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 		manifest := map[string]interface{}{
@@ -397,12 +365,12 @@ func main() {
 	mux.HandleFunc("/api/identify", func(w http.ResponseWriter, r *http.Request) {
 		peerStr := strings.TrimSpace(r.URL.Query().Get("peer"))
 		if peerStr == "" {
-			http.Error(w, `{"error":"missing peer parameter"}`, http.StatusBadRequest)
+			writeJSONError(w, "missing peer parameter", http.StatusBadRequest)
 			return
 		}
 		pid, err := peer.Decode(peerStr)
 		if err != nil {
-			http.Error(w, `{"error":"invalid peer ID"}`, http.StatusBadRequest)
+			writeJSONError(w, "invalid peer ID", http.StatusBadRequest)
 			return
 		}
 

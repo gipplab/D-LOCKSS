@@ -9,12 +9,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
 
+	"dlockss/internal/badbits"
 	"dlockss/internal/common"
 	"dlockss/internal/config"
-	"dlockss/internal/managers/shard"
-	"dlockss/internal/managers/storage"
 	"dlockss/internal/signing"
 	"dlockss/pkg/ipfs"
 	"dlockss/pkg/schema"
@@ -25,14 +26,43 @@ const retryDrainInterval = 10 * time.Second
 
 const recentIngestTTL = 30 * time.Second
 
+// ShardCoordinator abstracts the shard management operations needed by file processing.
+type ShardCoordinator interface {
+	PeerID() peer.ID
+	GetShardInfo() (string, int)
+	AnnouncePinned(manifestCID string)
+	AmIResponsibleFor(key string) bool
+	PinToCluster(ctx context.Context, c cid.Cid) error
+	PublishIngestMessageToCurrentAndChildIfSplit(data []byte, currentShard, payloadCIDStr string)
+	ResolveTargetShardForCustodial(nominalTargetShard, payloadCIDStr string) string
+	JoinShardAsObserver(shardID string) bool
+	LeaveShardAsObserver(shardID string)
+	EnsureClusterForShard(ctx context.Context, shardID string) error
+	PinToShard(ctx context.Context, shardID string, c cid.Cid) error
+	PublishToShardCBOR(data []byte, shardID string)
+}
+
+// StorageTracker abstracts the storage operations needed by file processing.
+type StorageTracker interface {
+	PinFile(manifestCIDStr string) bool
+	AddKnownFile(key string)
+	ProvideFile(ctx context.Context, key string)
+}
+
+// MessageSigner abstracts protocol message signing.
+type MessageSigner interface {
+	SignProtocolMessage(msg interface{}) error
+}
+
 // FileProcessor handles file ingestion and processing.
 type FileProcessor struct {
 	ipfsClient ipfs.IPFSClient
-	shardMgr   *shard.ShardManager
-	storageMgr *storage.StorageManager
+	badBits    *badbits.Filter
+	shardMgr   ShardCoordinator
+	storageMgr StorageTracker
 	privKey    crypto.PrivKey
 	jobQueue   chan string
-	signer     *signing.Signer
+	signer     MessageSigner
 	ctx        context.Context
 	cancel     context.CancelFunc
 
@@ -46,14 +76,16 @@ type FileProcessor struct {
 // NewFileProcessor creates a new FileProcessor with dependencies.
 func NewFileProcessor(
 	client ipfs.IPFSClient,
-	sm *shard.ShardManager,
-	stm *storage.StorageManager,
+	sm ShardCoordinator,
+	stm StorageTracker,
 	key crypto.PrivKey,
-	signer *signing.Signer,
+	signer MessageSigner,
+	badBits *badbits.Filter,
 ) *FileProcessor {
 	ctx, cancel := context.WithCancel(context.Background())
 	fp := &FileProcessor{
 		ipfsClient:    client,
+		badBits:       badBits,
 		shardMgr:      sm,
 		storageMgr:    stm,
 		privKey:       key,
@@ -198,7 +230,7 @@ func (fp *FileProcessor) SignProtocolMessage(msg interface{}) error {
 
 	switch m := msg.(type) {
 	case *schema.IngestMessage:
-		m.SenderID = fp.shardMgr.GetHost().ID()
+		m.SenderID = fp.shardMgr.PeerID()
 		m.Timestamp = ts
 		m.Nonce = nonce
 		m.Sig = nil
@@ -216,7 +248,7 @@ func (fp *FileProcessor) SignProtocolMessage(msg interface{}) error {
 		m.Sig = sig
 		return nil
 	case *schema.ReplicationRequest:
-		m.SenderID = fp.shardMgr.GetHost().ID()
+		m.SenderID = fp.shardMgr.PeerID()
 		m.Timestamp = ts
 		m.Nonce = nonce
 		m.Sig = nil
@@ -234,7 +266,7 @@ func (fp *FileProcessor) SignProtocolMessage(msg interface{}) error {
 		m.Sig = sig
 		return nil
 	case *schema.UnreplicateRequest:
-		m.SenderID = fp.shardMgr.GetHost().ID()
+		m.SenderID = fp.shardMgr.PeerID()
 		m.Timestamp = ts
 		m.Nonce = nonce
 		m.Sig = nil

@@ -2,7 +2,6 @@ package clusters
 
 import (
 	"context"
-	"io"
 	"log"
 	"sync"
 	"time"
@@ -14,19 +13,11 @@ import (
 	"github.com/ipfs/go-cid"
 )
 
-// IPFSClient defines the subset of ipfs.IPFSClient needed for pinning
-type IPFSClient interface {
+// IPFSPinner defines the minimal IPFS operations needed by the pin tracker.
+type IPFSPinner interface {
 	PinRecursive(ctx context.Context, c cid.Cid) error
-	UnpinRecursive(ctx context.Context, c cid.Cid) error
 	IsPinned(ctx context.Context, c cid.Cid) (bool, error)
 	GetBlock(ctx context.Context, c cid.Cid) ([]byte, error)
-	GetFileSize(ctx context.Context, c cid.Cid) (uint64, error)
-	GetPeerID(ctx context.Context) (string, error)
-	ImportFile(ctx context.Context, path string) (cid.Cid, error)
-	ImportReader(ctx context.Context, r io.Reader) (cid.Cid, error)
-	PutDagCBOR(ctx context.Context, data []byte) (cid.Cid, error)
-	// GetShell() interface{} // Removed to avoid interface mismatch if not needed by ClusterManager directly
-	SwarmConnect(ctx context.Context, addrs []string) error
 }
 
 // OnPinSynced is called when a pin is present locally (after sync or already pinned).
@@ -41,7 +32,8 @@ type OnPinRemoved func(cid string)
 // It acts as a bridge between the Cluster Consensus and the actual IPFS Daemon.
 // Tracks which CIDs we pinned from this shard so we can unpin when no longer allocated.
 type LocalPinTracker struct {
-	ipfsClient   IPFSClient
+	ipfsClient   IPFSPinner
+	badBits      *badbits.Filter
 	shardID      string
 	onPinSynced  OnPinSynced
 	onPinRemoved OnPinRemoved
@@ -77,10 +69,11 @@ func (pt *LocalPinTracker) isLegacyManifest(c cid.Cid) bool {
 	return ro.HasLegacyTimestamp
 }
 
-func NewLocalPinTracker(ipfsClient IPFSClient, shardID string, onPinSynced OnPinSynced, onPinRemoved OnPinRemoved) *LocalPinTracker {
+func NewLocalPinTracker(ipfsClient IPFSPinner, shardID string, onPinSynced OnPinSynced, onPinRemoved OnPinRemoved, badBits *badbits.Filter) *LocalPinTracker {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &LocalPinTracker{
 		ipfsClient:   ipfsClient,
+		badBits:      badBits,
 		shardID:      shardID,
 		onPinSynced:  onPinSynced,
 		onPinRemoved: onPinRemoved,
@@ -153,7 +146,7 @@ func (pt *LocalPinTracker) syncState(consensus ConsensusClient) {
 		shouldHave[cStr] = struct{}{}
 
 		// Check BadBits before syncing (Compliance Check)
-		if badbits.IsCIDBlocked(cStr) {
+		if pt.badBits.IsBlocked(cStr) {
 			log.Printf("[PinTracker:%s] Refusing to sync blocked content %s", pt.shardID, c)
 			continue
 		}

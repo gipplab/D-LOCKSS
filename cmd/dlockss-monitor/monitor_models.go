@@ -3,6 +3,7 @@ package main
 
 import (
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -29,8 +30,19 @@ const (
 	unpinGracePeriod             = 30 * time.Second // don't act on pinned=0 until this long after first discovery (avoids stale heartbeats)
 )
 
-var nodeCleanupTimeout = DefaultNodeCleanupTimeout
-var bootstrapShardDepth = DefaultBootstrapShardDepth
+// MonitorConfig holds runtime-configurable settings for the monitor,
+// overridable via environment variables.
+type MonitorConfig struct {
+	NodeCleanupTimeout  time.Duration
+	BootstrapShardDepth int
+}
+
+func DefaultMonitorConfig() MonitorConfig {
+	return MonitorConfig{
+		NodeCleanupTimeout:  DefaultNodeCleanupTimeout,
+		BootstrapShardDepth: DefaultBootstrapShardDepth,
+	}
+}
 
 type StatusResponse struct {
 	PeerID        string            `json:"peer_id"`
@@ -91,6 +103,7 @@ type ShardTreeNode struct {
 
 type Monitor struct {
 	mu                  sync.RWMutex
+	cfg                 MonitorConfig
 	topicPrefixOverride string // if set, overrides config.PubsubTopicPrefix for subscriptions
 	nodes               map[string]*NodeState
 	splitEvents         []ShardSplitEvent
@@ -164,8 +177,33 @@ func (m *Monitor) getTopicPrefixUnlocked() string {
 	return config.PubsubTopicPrefix
 }
 
-func NewMonitor(geoDBPath, geminiAPIKey string) *Monitor {
+// CIDEntry is a manifest CID with its observed shard and replica count.
+// Used by node-files, unique-cids, and replication-cids API responses.
+type CIDEntry struct {
+	CID      string `json:"cid"`
+	Shard    string `json:"shard"`
+	Replicas int    `json:"replicas"`
+}
+
+// buildCIDEntries returns sorted CIDEntries for the given CID→time map.
+// Caller must hold m.mu at least as RLock.
+func (m *Monitor) buildCIDEntriesUnlocked(cids map[string]time.Time) []CIDEntry {
+	entries := make([]CIDEntry, 0, len(cids))
+	for cidStr := range cids {
+		replicas := 0
+		if peers, ok := m.manifestReplication[cidStr]; ok {
+			replicas = len(peers)
+		}
+		shard := m.manifestShard[cidStr]
+		entries = append(entries, CIDEntry{CID: cidStr, Shard: shard, Replicas: replicas})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].CID < entries[j].CID })
+	return entries
+}
+
+func NewMonitor(cfg MonitorConfig, geoDBPath, geminiAPIKey string) *Monitor {
 	m := &Monitor{
+		cfg:                 cfg,
 		nodes:               make(map[string]*NodeState),
 		splitEvents:         make([]ShardSplitEvent, 0, 100),
 		geoDB:               openGeoIPDB(geoDBPath),

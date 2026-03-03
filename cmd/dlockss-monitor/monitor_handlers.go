@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -11,6 +13,13 @@ import (
 
 	"dlockss/pkg/schema"
 )
+
+// writeJSONError writes a JSON {"error":"..."} response with the given status code.
+func writeJSONError(w http.ResponseWriter, msg string, code int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
 
 func (m *Monitor) handleIngestMessage(im *schema.IngestMessage, senderID peer.ID, shardID string, ip string) {
 	now := time.Now()

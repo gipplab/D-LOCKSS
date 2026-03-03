@@ -9,7 +9,9 @@ import (
 	"sync"
 	"time"
 
+	"dlockss/internal/badbits"
 	"dlockss/internal/config"
+	"dlockss/pkg/ipfs"
 
 	"github.com/ipfs-cluster/ipfs-cluster/api"
 	"github.com/ipfs-cluster/ipfs-cluster/consensus/crdt"
@@ -46,7 +48,8 @@ type ShardPeerProvider interface {
 // sharing the same underlying IPFS node.
 type ClusterManager struct {
 	host         host.Host
-	ipfsClient   IPFSClient // Used for PinTracker
+	ipfsClient   ipfs.IPFSClient
+	badBits      *badbits.Filter
 	pubsub       *pubsub.PubSub
 	dht          routing.Routing
 	datastore    datastore.Datastore
@@ -80,9 +83,10 @@ type EmbeddedCluster struct {
 	cancel context.CancelFunc
 }
 
-func NewClusterManager(h host.Host, ps *pubsub.PubSub, dht routing.Routing, ds datastore.Datastore, ipfsClient IPFSClient, trustedPeers []peer.ID, onPinSynced func(cid string), onPinRemoved func(cid string)) *ClusterManager {
+func NewClusterManager(h host.Host, ps *pubsub.PubSub, dht routing.Routing, ds datastore.Datastore, ipfsClient ipfs.IPFSClient, trustedPeers []peer.ID, onPinSynced func(cid string), onPinRemoved func(cid string), badBits *badbits.Filter) *ClusterManager {
 	return &ClusterManager{
 		host:         h,
+		badBits:      badBits,
 		pubsub:       ps,
 		dht:          dht,
 		datastore:    ds,
@@ -160,7 +164,7 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string, bootstr
 	subCtx, cancel := context.WithCancel(context.Background())
 
 	// Start PinTracker (onPinSynced so node registers synced pins with storage and announces PINNED; onPinRemoved so storage/heartbeat stays correct when we unpin)
-	tracker := NewLocalPinTracker(cm.ipfsClient, shardID, cm.onPinSynced, cm.onPinRemoved)
+	tracker := NewLocalPinTracker(cm.ipfsClient, shardID, cm.onPinSynced, cm.onPinRemoved, cm.badBits)
 	tracker.Start(consensus)
 
 	// Start Signal Listener (Event-Driven Updates)

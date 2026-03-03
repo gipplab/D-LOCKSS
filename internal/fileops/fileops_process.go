@@ -11,7 +11,6 @@ import (
 
 	"github.com/ipfs/go-cid"
 
-	"dlockss/internal/badbits"
 	"dlockss/internal/common"
 	"dlockss/internal/config"
 	"dlockss/pkg/schema"
@@ -130,7 +129,7 @@ func (fp *FileProcessor) buildAndStoreManifest(ctx context.Context, path string,
 	metaRef := "file://" + filepath.Base(path)
 	ro := schema.NewResearchObject(
 		metaRef,
-		fp.shardMgr.GetHost().ID(),
+		fp.shardMgr.PeerID(),
 		payloadCID,
 		uint64(info.Size()),
 	)
@@ -179,7 +178,7 @@ func (fp *FileProcessor) signResearchObject(ro *schema.ResearchObject) error {
 }
 
 func (fp *FileProcessor) checkBadBitsAndPin(ctx context.Context, manifestCID cid.Cid, manifestCIDStr, path string, cleanupPayload func()) bool {
-	if badbits.IsCIDBlocked(manifestCIDStr) {
+	if fp.badBits.IsBlocked(manifestCIDStr) {
 		log.Printf("[FileOps] Refused to process file %s (blocked ManifestCID: %s)", path, manifestCIDStr)
 		cleanupPayload()
 		_ = fp.ipfsClient.UnpinRecursive(ctx, manifestCID)

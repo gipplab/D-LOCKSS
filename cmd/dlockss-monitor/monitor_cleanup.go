@@ -24,11 +24,11 @@ func (m *Monitor) PruneStaleNodes() {
 	changed := false
 	prunedCount := 0
 	for id, node := range m.nodes {
-		timeout := nodeCleanupTimeout
+		timeout := m.cfg.NodeCleanupTimeout
 		// Nodes in transition (CurrentShard == "" after LEAVE) get 2x grace: JOIN on new shard
 		// can be delayed by discovery, gossip-sub mesh formation, or slow networks.
 		if node.CurrentShard == "" {
-			timeout = nodeCleanupTimeout * 2
+			timeout = m.cfg.NodeCleanupTimeout * 2
 		}
 		if now.Sub(node.LastSeen) > timeout {
 			delete(m.nodes, id)
@@ -48,7 +48,7 @@ func (m *Monitor) PruneStaleNodes() {
 		}
 	}
 	if prunedCount > 0 {
-		log.Printf("[Monitor] Pruned %d stale nodes (no message for > %s). Consider DLOCKSS_MONITOR_NODE_CLEANUP_TIMEOUT for remote/Pi networks.", prunedCount, nodeCleanupTimeout)
+		log.Printf("[Monitor] Pruned %d stale nodes (no message for > %s). Consider DLOCKSS_MONITOR_NODE_CLEANUP_TIMEOUT for remote/Pi networks.", prunedCount, m.cfg.NodeCleanupTimeout)
 		m.treeDirty = true
 	}
 	if changed {

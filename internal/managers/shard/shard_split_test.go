@@ -110,7 +110,7 @@ func TestSplitShard_NoDeadlock(t *testing.T) {
 	// Setup Dependencies
 	metrics := telemetry.NewMetricsManager()
 	dht := &MockDHTProvider{}
-	storageMgr := storage.NewStorageManager(dht, metrics)
+	storageMgr := storage.NewStorageManager(dht, metrics, nil)
 	ipfsClient := &MockIPFSClient{}
 
 	// Create ShardManager with nil signer (safe because storage is empty, so RunReshardPass returns early)

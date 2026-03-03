@@ -89,7 +89,8 @@ func main() {
 	defer cancel()
 
 	// Config and BadBits
-	if err := badbits.LoadBadBits(config.BadBitsPath); err != nil {
+	badBitsFilter, err := badbits.NewFilter(config.BadBitsPath)
+	if err != nil {
 		log.Printf("[Warning] Failed to load bad bits list: %v", err)
 	}
 	config.LogConfiguration()
@@ -229,7 +230,7 @@ func main() {
 	nonceStore := common.NewNonceStore()
 	rateLimiter := common.NewRateLimiter()
 	metrics := telemetry.NewMetricsManager()
-	storageMgr := storage.NewStorageManager(dht, metrics)
+	storageMgr := storage.NewStorageManager(dht, metrics, badBitsFilter)
 	signer := signing.NewSigner(h, privKey, h.ID(), nonceStore, trustMgr, dht)
 
 	// Shard manager (replication set later to break cycle).
@@ -285,7 +286,7 @@ func main() {
 	onPinRemoved := func(cid string) {
 		storageMgr.UnpinFile(cid)
 	}
-	clusterMgr := clusters.NewClusterManager(h, ps, dht, dstore, ipfsClient, trustMgr.GetTrustedPeers(), onPinSynced, onPinRemoved)
+	clusterMgr := clusters.NewClusterManager(h, ps, dht, dstore, ipfsClient, trustMgr.GetTrustedPeers(), onPinSynced, onPinRemoved, badBitsFilter)
 	shardMgr := shard.NewShardManager(ctx, h, ps, ipfsClient, storageMgr, metrics, signer, rateLimiter, clusterMgr, "", nodeName)
 	clusterMgr.SetShardPeerProvider(shardMgr) // CRDT Peers() and allocations use real shard membership
 	announcePinned = shardMgr.AnnouncePinned
@@ -304,7 +305,7 @@ func main() {
 	apiServer.Start()
 
 	// File processor and watcher
-	fp := fileops.NewFileProcessor(ipfsClient, shardMgr, storageMgr, privKey, signer)
+	fp := fileops.NewFileProcessor(ipfsClient, shardMgr, storageMgr, privKey, signer, badBitsFilter)
 	go fp.WatchFolder(ctx)
 
 	// Run managers — must start before scanning existing files so the node

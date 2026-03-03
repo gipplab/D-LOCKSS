@@ -333,8 +333,8 @@ func (m *Monitor) SwitchTopicPrefix(ctx context.Context, newPrefix string) {
 	m.mu.Unlock()
 
 	// Re-subscribe to bootstrap shards with new prefix
-	for _, shardID := range shardIDsUpToDepth(bootstrapShardDepth) {
+	for _, shardID := range shardIDsUpToDepth(m.cfg.BootstrapShardDepth) {
 		m.ensureShardSubscription(ctx, shardID)
 	}
-	log.Printf("[Monitor] Switched to topic prefix %q, subscribed to %d shards", effectivePrefix, 1<<(bootstrapShardDepth+1)-1)
+	log.Printf("[Monitor] Switched to topic prefix %q, subscribed to %d shards", effectivePrefix, 1<<(m.cfg.BootstrapShardDepth+1)-1)
 }

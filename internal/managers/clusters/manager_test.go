@@ -18,7 +18,7 @@ import (
 	"github.com/multiformats/go-multihash"
 )
 
-// MockIPFSClient is a placeholder for the IPFS client interface
+// MockIPFSClient implements ipfs.IPFSClient for testing.
 type MockIPFSClient struct{}
 
 func (m *MockIPFSClient) PinRecursive(ctx context.Context, c cid.Cid) error          { return nil }
@@ -84,7 +84,7 @@ func TestClusterManager_Lifecycle(t *testing.T) {
 	dht := &MockRouting{}
 
 	// 2. Initialize ClusterManager
-	cm := clusters.NewClusterManager(h, ps, dht, ds, &MockIPFSClient{}, nil, nil, nil)
+	cm := clusters.NewClusterManager(h, ps, dht, ds, &MockIPFSClient{}, nil, nil, nil, nil)
 
 	// 3. Test JoinShard (Primary Shard "1")
 	shard1 := "1"

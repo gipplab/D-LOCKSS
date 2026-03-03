@@ -14,11 +14,30 @@ import (
 	"dlockss/internal/common"
 	"dlockss/internal/config"
 	"dlockss/internal/managers/clusters"
-	"dlockss/internal/managers/storage"
-	"dlockss/internal/signing"
 	"dlockss/internal/telemetry"
 	"dlockss/pkg/ipfs"
 )
+
+// MessageAuthenticator abstracts protocol message signing and verification.
+type MessageAuthenticator interface {
+	SignProtocolMessage(msg interface{}) error
+	ShouldDropMessage(receivedFrom peer.ID, senderID peer.ID, timestamp int64, nonce []byte, sig []byte, marshalForSigning func() ([]byte, error), logContext string) bool
+}
+
+// StorageProvider abstracts the storage operations needed by the shard manager.
+type StorageProvider interface {
+	CanAcceptCustodialFile() bool
+	IsPinned(key string) bool
+	PinFile(manifestCIDStr string) bool
+	UnpinFile(key string)
+	AddKnownFile(key string)
+	GetAllKnownFiles() map[string]bool
+	GetPinTime(key string) time.Time
+	GetPinnedManifests() []string
+	GetPinnedCount() int
+	GetNextFileToAnnounce() string
+	ProvideFile(ctx context.Context, key string)
+}
 
 const migratePinsFlushDelay = 250 * time.Millisecond
 const rootPeerCheckInterval = 30 * time.Second
@@ -60,10 +79,10 @@ type ShardManager struct {
 	h              host.Host
 	ps             *pubsub.PubSub
 	ipfsClient     ipfs.IPFSClient
-	storageMgr     *storage.StorageManager
+	storageMgr     StorageProvider
 	clusterMgr     clusters.ClusterManagerInterface
 	metrics        *telemetry.MetricsManager
-	signer         *signing.Signer
+	signer         MessageAuthenticator
 	reshardedFiles *common.KnownFiles
 	rateLimiter    *common.RateLimiter
 	nodeName       string
@@ -106,9 +125,9 @@ func NewShardManager(
 	h host.Host,
 	ps *pubsub.PubSub,
 	ipfsClient ipfs.IPFSClient,
-	stm *storage.StorageManager,
+	stm StorageProvider,
 	metrics *telemetry.MetricsManager,
-	signer *signing.Signer,
+	signer MessageAuthenticator,
 	rateLimiter *common.RateLimiter,
 	clusterMgr clusters.ClusterManagerInterface,
 	startShard string,

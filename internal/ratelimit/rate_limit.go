@@ -7,19 +7,26 @@ import (
 
 	"dlockss/internal/common"
 	"dlockss/internal/config"
-	"dlockss/internal/managers/storage"
 
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 type RateLimiter struct {
-	rl *common.RateLimiter
+	rl                 *common.RateLimiter
+	canAcceptCustodial func() bool
 }
 
 func NewRateLimiter() *RateLimiter {
 	return &RateLimiter{
-		rl: common.NewRateLimiter(),
+		rl:                 common.NewRateLimiter(),
+		canAcceptCustodial: func() bool { return true },
 	}
+}
+
+// SetCustodialCheck registers the function used to decide whether the node can
+// accept delegated (custodial) files. Typically wired to StorageManager.CanAcceptCustodialFile.
+func (r *RateLimiter) SetCustodialCheck(fn func() bool) {
+	r.canAcceptCustodial = fn
 }
 
 func (r *RateLimiter) Check(peerID peer.ID) bool {
@@ -27,7 +34,7 @@ func (r *RateLimiter) Check(peerID peer.ID) bool {
 }
 
 func (r *RateLimiter) CheckForMessage(peerID peer.ID, messageType string) bool {
-	if messageType == "DELEGATE" && !storage.CanAcceptCustodialFile() {
+	if messageType == "DELEGATE" && !r.canAcceptCustodial() {
 		return false
 	}
 

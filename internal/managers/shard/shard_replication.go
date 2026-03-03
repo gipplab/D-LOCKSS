@@ -132,7 +132,7 @@ func (sm *ShardManager) handleIngestMessage(msg *pubsub.Message, im *schema.Inge
 
 // RunReshardPass migrates or unpins files when moving between shards.
 func (sm *ShardManager) RunReshardPass(oldShard, newShard string) {
-	files := sm.storageMgr.GetKnownFiles().All()
+	files := sm.storageMgr.GetAllKnownFiles()
 	if len(files) == 0 {
 		return
 	}
@@ -229,7 +229,7 @@ func (sm *ShardManager) RunOrphanUnpinPass() {
 	currentShard := sm.currentShard
 	sm.mu.RUnlock()
 
-	files := sm.storageMgr.GetKnownFiles().All()
+	files := sm.storageMgr.GetAllKnownFiles()
 	if len(files) == 0 {
 		return
 	}
