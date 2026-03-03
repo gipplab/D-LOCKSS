@@ -139,10 +139,7 @@ func (m *Monitor) replicationNetworkDepthUnlocked() int {
 		if !m.isDisplayableNodeUnlocked(id, node) {
 			continue
 		}
-		shard := node.CurrentShard
-		if shard == "" && len(node.ShardHistory) > 0 {
-			shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
-		}
+		shard := node.EffectiveShard()
 		if len(shard) > maxLen {
 			maxLen = len(shard)
 		}
@@ -159,10 +156,7 @@ func (m *Monitor) getReplicationStats() (distribution [11]int, avgLevel float64,
 		if !m.isDisplayableNodeUnlocked(id, node) {
 			continue
 		}
-		shard := node.CurrentShard
-		if shard == "" && len(node.ShardHistory) > 0 {
-			shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
-		}
+		shard := node.EffectiveShard()
 		shardPeerCount[shard]++
 	}
 
@@ -171,10 +165,7 @@ func (m *Monitor) getReplicationStats() (distribution [11]int, avgLevel float64,
 		if !m.isDisplayableNodeUnlocked(id, n) {
 			continue
 		}
-		shard := n.CurrentShard
-		if shard == "" && len(n.ShardHistory) > 0 {
-			shard = n.ShardHistory[len(n.ShardHistory)-1].ShardID
-		}
+		shard := n.EffectiveShard()
 		if len(shard) > depth {
 			depth = len(shard)
 		}
@@ -201,10 +192,7 @@ func (m *Monitor) getReplicationStats() (distribution [11]int, avgLevel float64,
 			if !ok || !m.isDisplayableNodeUnlocked(peerID, node) {
 				continue
 			}
-			shard := node.CurrentShard
-			if shard == "" && len(node.ShardHistory) > 0 {
-				shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
-			}
+			shard := node.EffectiveShard()
 			if m.peerShardLastSeen[peerID] != nil {
 				if last := m.peerShardLastSeen[peerID][shard]; last.Before(cutoff) {
 					continue
@@ -301,10 +289,7 @@ func (m *Monitor) getReplicationCIDsByLevel(level int) []ReplicationCIDEntry {
 		if !m.isDisplayableNodeUnlocked(id, node) {
 			continue
 		}
-		shard := node.CurrentShard
-		if shard == "" && len(node.ShardHistory) > 0 {
-			shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
-		}
+		shard := node.EffectiveShard()
 		shardPeerCount[shard]++
 	}
 
@@ -313,10 +298,7 @@ func (m *Monitor) getReplicationCIDsByLevel(level int) []ReplicationCIDEntry {
 		if !m.isDisplayableNodeUnlocked(id, n) {
 			continue
 		}
-		shard := n.CurrentShard
-		if shard == "" && len(n.ShardHistory) > 0 {
-			shard = n.ShardHistory[len(n.ShardHistory)-1].ShardID
-		}
+		shard := n.EffectiveShard()
 		if len(shard) > depth {
 			depth = len(shard)
 		}
@@ -338,10 +320,7 @@ func (m *Monitor) getReplicationCIDsByLevel(level int) []ReplicationCIDEntry {
 			if !ok || !m.isDisplayableNodeUnlocked(peerID, node) {
 				continue
 			}
-			shard := node.CurrentShard
-			if shard == "" && len(node.ShardHistory) > 0 {
-				shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
-			}
+			shard := node.EffectiveShard()
 			if m.peerShardLastSeen[peerID] != nil {
 				if last := m.peerShardLastSeen[peerID][shard]; last.Before(cutoff) {
 					continue
@@ -416,10 +395,7 @@ func (m *Monitor) getReplicationByShard() map[string]int {
 		if !m.isDisplayableNodeUnlocked(id, node) {
 			continue
 		}
-		shard := node.CurrentShard
-		if shard == "" && len(node.ShardHistory) > 0 {
-			shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
-		}
+		shard := node.EffectiveShard()
 		shardPeerCount[shard]++
 	}
 
@@ -428,10 +404,7 @@ func (m *Monitor) getReplicationByShard() map[string]int {
 		if !m.isDisplayableNodeUnlocked(id, n) {
 			continue
 		}
-		shard := n.CurrentShard
-		if shard == "" && len(n.ShardHistory) > 0 {
-			shard = n.ShardHistory[len(n.ShardHistory)-1].ShardID
-		}
+		shard := n.EffectiveShard()
 		if len(shard) > depth {
 			depth = len(shard)
 		}
@@ -449,10 +422,7 @@ func (m *Monitor) getReplicationByShard() map[string]int {
 			if !ok || !m.isDisplayableNodeUnlocked(peerID, node) {
 				continue
 			}
-			shard := node.CurrentShard
-			if shard == "" && len(node.ShardHistory) > 0 {
-				shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
-			}
+			shard := node.EffectiveShard()
 			if m.peerShardLastSeen[peerID] != nil {
 				if last := m.peerShardLastSeen[peerID][shard]; last.Before(cutoff) {
 					continue

@@ -26,6 +26,26 @@ const rootReplicationCheckInterval = 20 * time.Second
 const replicationRequestCooldownDuration = 5 * time.Minute
 const maxReplicationRequestsPerCycle = 50
 
+const (
+	msgPrefixHeartbeat = "HEARTBEAT:"
+	msgPrefixPinned    = "PINNED:"
+	msgPrefixJoin      = "JOIN:"
+	msgPrefixLeave     = "LEAVE:"
+	msgPrefixProbe     = "PROBE:"
+	msgPrefixSplit     = "SPLIT:"
+)
+
+func shardTopicName(shardID string) string {
+	return config.PubsubTopicPrefix + "-creative-commons-shard-" + shardID
+}
+
+func childShards(parent string) (child0, child1 string) {
+	if parent == "" {
+		return "0", "1"
+	}
+	return parent + "0", parent + "1"
+}
+
 type shardSubscription struct {
 	topic        *pubsub.Topic
 	sub          *pubsub.Subscription
@@ -191,7 +211,7 @@ func (sm *ShardManager) moveToShard(fromShard, toShard string, isMergeUp bool) {
 	fromSub, fromSubExists := sm.shardSubs[fromShard]
 	sm.mu.RUnlock()
 	if fromSubExists && fromSub.topic != nil && !fromSub.observerOnly {
-		leaveMsg := []byte("LEAVE:" + sm.h.ID().String())
+		leaveMsg := []byte(msgPrefixLeave + sm.h.ID().String())
 		_ = fromSub.topic.Publish(sm.ctx, leaveMsg)
 	}
 

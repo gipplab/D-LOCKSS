@@ -24,13 +24,13 @@ func (sm *ShardManager) JoinShard(shardID string) {
 			topic := sub.topic
 			sm.mu.Unlock()
 			role := sm.getOurRole()
-			joinMsg := []byte("JOIN:" + sm.h.ID().String() + ":" + role + ":" + sm.nodeName)
+			joinMsg := []byte(msgPrefixJoin + sm.h.ID().String() + ":" + string(role) + ":" + sm.nodeName)
 			_ = topic.Publish(sm.ctx, joinMsg)
 			pinnedCount := 0
 			if sm.storageMgr != nil {
 				pinnedCount = sm.storageMgr.GetPinnedCount()
 			}
-			heartbeatMsg := []byte(fmt.Sprintf("HEARTBEAT:%s:%d:%s:%s", sm.h.ID().String(), pinnedCount, role, sm.nodeName))
+			heartbeatMsg := []byte(fmt.Sprintf("%s%s:%d:%s:%s", msgPrefixHeartbeat, sm.h.ID().String(), pinnedCount, role, sm.nodeName))
 			_ = topic.Publish(sm.ctx, heartbeatMsg)
 			log.Printf("[Sharding] Promoted observer to full member in shard %s", shardID)
 			return
@@ -40,7 +40,7 @@ func (sm *ShardManager) JoinShard(shardID string) {
 		return
 	}
 
-	topicName := fmt.Sprintf("%s-creative-commons-shard-%s", config.PubsubTopicPrefix, shardID)
+	topicName := shardTopicName(shardID)
 	var t *pubsub.Topic
 	if cached := sm.probeTopicCache[shardID]; cached != nil {
 		t = cached
@@ -83,13 +83,13 @@ func (sm *ShardManager) JoinShard(shardID string) {
 	log.Printf("[Sharding] Joined shard %s (Topic: %s)", shardID, topicName)
 
 	role := sm.getOurRole()
-	joinMsg := []byte("JOIN:" + sm.h.ID().String() + ":" + role + ":" + sm.nodeName)
+	joinMsg := []byte(msgPrefixJoin + sm.h.ID().String() + ":" + string(role) + ":" + sm.nodeName)
 	_ = newSub.topic.Publish(sm.ctx, joinMsg)
 	pinnedCount := 0
 	if sm.storageMgr != nil {
 		pinnedCount = sm.storageMgr.GetPinnedCount()
 	}
-	heartbeatMsg := []byte(fmt.Sprintf("HEARTBEAT:%s:%d:%s:%s", sm.h.ID().String(), pinnedCount, role, sm.nodeName))
+	heartbeatMsg := []byte(fmt.Sprintf("%s%s:%d:%s:%s", msgPrefixHeartbeat, sm.h.ID().String(), pinnedCount, role, sm.nodeName))
 	_ = newSub.topic.Publish(sm.ctx, heartbeatMsg)
 
 	go sm.readLoop(ctx, newSub)
@@ -206,7 +206,7 @@ func (sm *ShardManager) LeaveShard(shardID string) {
 		delete(sm.observerOnlyShards, shardID)
 		originalSub := sub // save pointer to detect replacement during sleep
 		if !observerOnly {
-			leaveMsg := []byte("LEAVE:" + sm.h.ID().String())
+			leaveMsg := []byte(msgPrefixLeave + sm.h.ID().String())
 			_ = sub.topic.Publish(sm.ctx, leaveMsg)
 			sm.mu.Unlock()
 			time.Sleep(150 * time.Millisecond)

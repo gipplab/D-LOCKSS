@@ -349,10 +349,7 @@ func (m *Monitor) getShardMembership() map[string][]string {
 		if !m.isDisplayableNodeUnlocked(peerIDStr, node) {
 			continue
 		}
-		shard := node.CurrentShard
-		if shard == "" && len(node.ShardHistory) > 0 {
-			shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
-		}
+		shard := node.EffectiveShard()
 		short := peerIDStr
 		shardToPeers[shard] = append(shardToPeers[shard], short)
 	}

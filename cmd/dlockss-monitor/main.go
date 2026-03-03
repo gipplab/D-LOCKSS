@@ -50,8 +50,9 @@ func main() {
 	if geoDBPath == "" {
 		geoDBPath = os.Getenv("DLOCKSS_MONITOR_GEOIP_DB")
 	}
+	geminiAPIKey := os.Getenv("GEMINI_API_KEY")
 
-	monitor := NewMonitor(geoDBPath)
+	monitor := NewMonitor(geoDBPath, geminiAPIKey)
 	h, err := startLibP2P(ctx, monitor)
 	if err != nil {
 		log.Fatalf("P2P error: %v", err)
@@ -63,12 +64,13 @@ func main() {
 	mux.HandleFunc("/api/nodes", func(w http.ResponseWriter, r *http.Request) {
 		monitor.PruneStaleNodes()
 		monitor.mu.RLock()
-		shardCounts := make(map[string]int)
+		activeShardCounts := make(map[string]int)
 		type nodeSnap struct {
 			id            string
 			peerID        string
 			nodeName      string
 			currentShard  string
+			role          string
 			knownFiles    int
 			lastSeen      int64
 			shard         string
@@ -81,11 +83,10 @@ func main() {
 			if !monitor.isDisplayableNodeUnlocked(id, node) {
 				continue
 			}
-			shard := node.CurrentShard
-			if shard == "" && len(node.ShardHistory) > 0 {
-				shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
+			shard := node.EffectiveShard()
+			if node.Role != "PASSIVE" {
+				activeShardCounts[shard]++
 			}
-			shardCounts[shard]++
 		}
 		query := strings.ToLower(r.URL.Query().Get("q"))
 		for id, node := range monitor.nodes {
@@ -100,11 +101,8 @@ func main() {
 					continue
 				}
 			}
-			shard := node.CurrentShard
-			if shard == "" && len(node.ShardHistory) > 0 {
-				shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
-			}
-			peersInShard := shardCounts[shard]
+			shard := node.EffectiveShard()
+			peersInShard := activeShardCounts[shard]
 			if peersInShard < 1 {
 				peersInShard = 1
 			}
@@ -117,10 +115,14 @@ func main() {
 			if pinnedFiles < 0 {
 				pinnedFiles = 0
 			}
+			role := node.Role
+			if role == "" {
+				role = "ACTIVE"
+			}
 			snapshot = append(snapshot, nodeSnap{
-				id: id, peerID: node.PeerID, nodeName: node.NodeName, currentShard: node.CurrentShard, knownFiles: node.KnownFiles,
+				id: id, peerID: node.PeerID, nodeName: node.NodeName, currentShard: node.CurrentShard, role: role, knownFiles: node.KnownFiles,
 				lastSeen: node.LastSeen.Unix(),
-				shard: shard, peersInShard: peersInShard, uptimeSeconds: uptimeSeconds, pinnedFiles: pinnedFiles,
+				shard:    shard, peersInShard: peersInShard, uptimeSeconds: uptimeSeconds, pinnedFiles: pinnedFiles,
 			})
 		}
 		monitor.mu.RUnlock()
@@ -132,6 +134,7 @@ func main() {
 				PeerID:        s.peerID,
 				Version:       "1.0.0",
 				CurrentShard:  s.currentShard,
+				Role:          s.role,
 				PeersInShard:  s.peersInShard,
 				Storage:       StorageStatus{PinnedFiles: s.pinnedFiles, PinnedInShard: pinnedInShard, KnownFiles: s.knownFiles, KnownCIDs: []string{}},
 				Replication:   ReplicationStatus{},
@@ -157,12 +160,13 @@ func main() {
 		shardFilter := r.URL.Query().Get("shard")
 		monitor.PruneStaleNodes()
 		monitor.mu.RLock()
-		shardCounts := make(map[string]int)
+		activeShardCounts := make(map[string]int)
 		type nodeSnap struct {
 			id            string
 			peerID        string
 			nodeName      string
 			currentShard  string
+			role          string
 			knownFiles    int
 			lastSeen      int64
 			shard         string
@@ -175,24 +179,20 @@ func main() {
 			if !monitor.isDisplayableNodeUnlocked(id, node) {
 				continue
 			}
-			shard := node.CurrentShard
-			if shard == "" && len(node.ShardHistory) > 0 {
-				shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
+			shard := node.EffectiveShard()
+			if node.Role != "PASSIVE" {
+				activeShardCounts[shard]++
 			}
-			shardCounts[shard]++
 		}
 		for id, node := range monitor.nodes {
 			if !monitor.isDisplayableNodeUnlocked(id, node) {
 				continue
 			}
-			shard := node.CurrentShard
-			if shard == "" && len(node.ShardHistory) > 0 {
-				shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
-			}
+			shard := node.EffectiveShard()
 			if shard != shardFilter {
 				continue
 			}
-			peersInShard := shardCounts[shard]
+			peersInShard := activeShardCounts[shard]
 			if peersInShard < 1 {
 				peersInShard = 1
 			}
@@ -205,10 +205,14 @@ func main() {
 			if pinnedFiles < 0 {
 				pinnedFiles = 0
 			}
+			role := node.Role
+			if role == "" {
+				role = "ACTIVE"
+			}
 			snapshot = append(snapshot, nodeSnap{
-				id: id, peerID: node.PeerID, nodeName: node.NodeName, currentShard: node.CurrentShard, knownFiles: node.KnownFiles,
+				id: id, peerID: node.PeerID, nodeName: node.NodeName, currentShard: node.CurrentShard, role: role, knownFiles: node.KnownFiles,
 				lastSeen: node.LastSeen.Unix(),
-				shard: shard, peersInShard: peersInShard, uptimeSeconds: uptimeSeconds, pinnedFiles: pinnedFiles,
+				shard:    shard, peersInShard: peersInShard, uptimeSeconds: uptimeSeconds, pinnedFiles: pinnedFiles,
 			})
 		}
 		monitor.mu.RUnlock()
@@ -220,6 +224,7 @@ func main() {
 				PeerID:        s.peerID,
 				Version:       "1.0.0",
 				CurrentShard:  s.currentShard,
+				Role:          s.role,
 				PeersInShard:  s.peersInShard,
 				Storage:       StorageStatus{PinnedFiles: s.pinnedFiles, PinnedInShard: pinnedInShard, KnownFiles: s.knownFiles, KnownCIDs: []string{}},
 				Replication:   ReplicationStatus{},
@@ -440,6 +445,72 @@ func main() {
 		json.NewEncoder(w).Encode(result)
 	})
 
+	mux.HandleFunc("/api/keyword-search", func(w http.ResponseWriter, r *http.Request) {
+		query := strings.TrimSpace(r.URL.Query().Get("q"))
+		if query == "" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"results": []struct{}{}, "count": 0})
+			return
+		}
+		results := monitor.keywords.Search(query)
+		if results == nil {
+			results = []CIDKeywordEntry{}
+		}
+
+		monitor.mu.RLock()
+		type enrichedResult struct {
+			CIDKeywordEntry
+			Shard    string `json:"shard"`
+			Replicas int    `json:"replicas"`
+		}
+		enriched := make([]enrichedResult, 0, len(results))
+		for _, res := range results {
+			replicas := 0
+			if peers, ok := monitor.manifestReplication[res.ManifestCID]; ok {
+				replicas = len(peers)
+			}
+			shard := monitor.manifestShard[res.ManifestCID]
+			enriched = append(enriched, enrichedResult{
+				CIDKeywordEntry: res,
+				Shard:           shard,
+				Replicas:        replicas,
+			})
+		}
+		monitor.mu.RUnlock()
+
+		monitor.keywords.RecordSearch(query, len(enriched))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"query": query, "results": enriched, "count": len(enriched)})
+	})
+
+	mux.HandleFunc("/api/keyword-suggest", func(w http.ResponseWriter, r *http.Request) {
+		prefix := strings.TrimSpace(r.URL.Query().Get("q"))
+		suggestions := monitor.keywords.Suggest(prefix)
+		if suggestions == nil {
+			suggestions = []KeywordSuggestion{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"suggestions": suggestions})
+	})
+
+	mux.HandleFunc("/api/recent-searches", func(w http.ResponseWriter, r *http.Request) {
+		recent := monitor.keywords.GetRecentSearches()
+		if recent == nil {
+			recent = []RecentSearch{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"searches": recent})
+	})
+
+	mux.HandleFunc("/api/keyword-stats", func(w http.ResponseWriter, r *http.Request) {
+		monitor.mu.RLock()
+		totalCIDs := len(monitor.uniqueCIDs)
+		monitor.mu.RUnlock()
+		stats := monitor.keywords.GetStats(totalCIDs)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(stats)
+	})
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write([]byte(dashboardHTML))
@@ -470,10 +541,7 @@ func main() {
 						continue
 					}
 					nodeCount++
-					shard := node.CurrentShard
-					if shard == "" && len(node.ShardHistory) > 0 {
-						shard = node.ShardHistory[len(node.ShardHistory)-1].ShardID
-					}
+					shard := node.EffectiveShard()
 					shardCounts[shard]++
 					if node.PinnedFiles > 0 {
 						totalPinned += node.PinnedFiles

@@ -2,14 +2,12 @@ package shard
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"time"
 
 	"github.com/ipfs/go-cid"
 
 	"dlockss/internal/common"
-	"dlockss/internal/config"
 )
 
 func (sm *ShardManager) AnnouncePinned(manifestCID string) {
@@ -23,7 +21,7 @@ func (sm *ShardManager) AnnouncePinned(manifestCID string) {
 	if !exists || sub.topic == nil {
 		return
 	}
-	msg := []byte(fmt.Sprintf("PINNED:%s", manifestCID))
+	msg := []byte(msgPrefixPinned + manifestCID)
 	_ = sub.topic.Publish(sm.ctx, msg)
 }
 
@@ -38,7 +36,7 @@ func (sm *ShardManager) PublishToShard(shardID, msg string) {
 	if sub.topic != nil {
 		_ = sub.topic.Publish(sm.ctx, []byte(msg))
 	} else {
-		topicName := fmt.Sprintf("%s-creative-commons-shard-%s", config.PubsubTopicPrefix, shardID)
+		topicName := shardTopicName(shardID)
 		_ = sm.ps.Publish(topicName, []byte(msg))
 	}
 }
@@ -54,7 +52,7 @@ func (sm *ShardManager) PublishToShardCBOR(data []byte, shardID string) {
 	if sub.topic != nil {
 		_ = sub.topic.Publish(sm.ctx, data)
 	} else {
-		topicName := fmt.Sprintf("%s-creative-commons-shard-%s", config.PubsubTopicPrefix, shardID)
+		topicName := shardTopicName(shardID)
 		_ = sm.ps.Publish(topicName, data)
 	}
 }
@@ -63,12 +61,7 @@ func (sm *ShardManager) PublishToShardCBOR(data []byte, shardID string) {
 func (sm *ShardManager) PublishIngestMessageToCurrentAndChildIfSplit(data []byte, currentShard string, payloadCIDStr string) {
 	sm.PublishToShardCBOR(data, currentShard)
 
-	child0 := currentShard + "0"
-	child1 := currentShard + "1"
-	if currentShard == "" {
-		child0 = "0"
-		child1 = "1"
-	}
+	child0, child1 := childShards(currentShard)
 	const probeTimeout = 2 * time.Second
 	n0 := sm.probeShard(child0, probeTimeout)
 	n1 := sm.probeShard(child1, probeTimeout)
@@ -91,12 +84,7 @@ func (sm *ShardManager) PublishIngestMessageToCurrentAndChildIfSplit(data []byte
 
 // ResolveTargetShardForCustodial returns child shard if parent has active children, else nominalTargetShard.
 func (sm *ShardManager) ResolveTargetShardForCustodial(nominalTargetShard string, payloadCIDStr string) string {
-	child0 := nominalTargetShard + "0"
-	child1 := nominalTargetShard + "1"
-	if nominalTargetShard == "" {
-		child0 = "0"
-		child1 = "1"
-	}
+	child0, child1 := childShards(nominalTargetShard)
 	const probeTimeout = 2 * time.Second
 	n0 := sm.probeShard(child0, probeTimeout)
 	n1 := sm.probeShard(child1, probeTimeout)

@@ -38,6 +38,9 @@ const dashboardHTML = `<!DOCTYPE html>
         td { padding: 10px; border-bottom: 1px solid #ddd; }
         .status-text { font-weight: bold; font-size: 0.8em; }
         .status-online { color: green; }
+        .status-full { color: #999; }
+        tr.node-passive { opacity: 0.45; }
+        tr.node-passive td { color: #999; }
         .btn-text { background: none; border: 1px solid #999; cursor: pointer; font-family: inherit; font-size: 0.8em; padding: 2px 6px; text-transform: uppercase; color: #333; }
         .btn-text:hover { background: #eee; color: #000; border-color: #333; }
         .btn-save { border-color: green; color: green; }
@@ -57,6 +60,36 @@ const dashboardHTML = `<!DOCTYPE html>
         .cid-payload { margin-top: 4px; font-size: 0.8em; color: #06A77D; }
         .load-spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #ccc; border-top-color: #06A77D; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; }
         @keyframes spin { to { transform: rotate(360deg); } }
+        .keyword-search-section { background: white; padding: 20px; margin: 20px 0; border: 1px solid #333; }
+        .kw-search-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+        .kw-input-wrap { position: relative; flex: 1; max-width: 500px; }
+        .kw-input-wrap input { width: 100%; padding: 10px 12px; border: 1px solid #333; font-family: inherit; font-size: 0.95em; box-sizing: border-box; }
+        .kw-input-wrap input:focus { outline: none; border-color: #06A77D; }
+        .kw-ac { position: absolute; top: 100%; left: 0; right: 0; background: white; border: 1px solid #333; border-top: none; max-height: 220px; overflow-y: auto; z-index: 100; display: none; }
+        .kw-ac-item { padding: 8px 12px; cursor: pointer; display: flex; justify-content: space-between; font-size: 0.85em; }
+        .kw-ac-item:hover, .kw-ac-item.active { background: #f0f0f0; }
+        .kw-ac-count { color: #999; font-size: 0.85em; }
+        .kw-search-btn { padding: 10px 20px !important; font-size: 0.95em !important; }
+        .kw-stats-lbl { font-size: 0.75em; color: #999; white-space: nowrap; }
+        .kw-recent { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+        .kw-recent-label { font-size: 0.75em; color: #999; text-transform: uppercase; margin-right: 4px; }
+        .kw-tag-btn { background: #eee; border: 1px solid #ccc; padding: 3px 10px; font-size: 0.8em; cursor: pointer; text-transform: lowercase; font-family: inherit; }
+        .kw-tag-btn:hover { background: #ddd; border-color: #999; }
+        .kw-results { margin-top: 15px; }
+        .kw-results-hdr { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid #ddd; }
+        .kw-result-item { display: flex; flex-direction: column; gap: 4px; padding: 10px 0; border-bottom: 1px solid #eee; font-size: 0.85em; }
+        .kw-result-top { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+        .kw-result-cid { font-family: monospace; word-break: break-all; flex: 1; min-width: 200px; }
+        .kw-result-meta { color: #666; font-size: 0.9em; }
+        .kw-result-kws { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
+        .kw-kw-tag { background: #e8f5e9; border: 1px solid #a5d6a7; padding: 1px 6px; font-size: 0.8em; border-radius: 2px; cursor: pointer; }
+        .kw-kw-tag:hover { background: #c8e6c9; }
+        .kw-class { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
+        .kw-class-tag { padding: 1px 8px; font-size: 0.8em; border-radius: 2px; cursor: pointer; border: 1px solid; }
+        .kw-class-tag:hover { filter: brightness(0.92); }
+        .kw-field { background: #e3f2fd; border-color: #90caf9; color: #1565c0; }
+        .kw-subtopic { background: #f3e5f5; border-color: #ce93d8; color: #7b1fa2; }
+        .kw-niche { background: #fff3e0; border-color: #ffcc80; color: #e65100; }
     </style>
 </head>
 <body>
@@ -81,6 +114,21 @@ const dashboardHTML = `<!DOCTYPE html>
             <div class="stat-card"><div class="stat-value" id="total-pinned">--</div><div class="stat-label">Total Pinned</div></div>
             <div class="stat-card clickable" id="unique-cids-card" title="Click to view all CIDs"><div class="stat-value" id="unique-files">--</div><div class="stat-label">Unique CIDs</div></div>
             <div class="stat-card clickable" id="total-shards-card" title="Click to jump to Shard Topology"><div class="stat-value" id="total-shards">--</div><div class="stat-label">Active Shards</div></div>
+        </div>
+        <div class="keyword-search-section">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <h3 style="margin:0; text-transform:uppercase; font-size:1em;">Keyword Search</h3>
+                <span id="kwStatsLbl" class="kw-stats-lbl"></span>
+            </div>
+            <div class="kw-search-row">
+                <div class="kw-input-wrap">
+                    <input type="text" id="kwInput" placeholder="Search documents by keyword..." autocomplete="off">
+                    <div id="kwAC" class="kw-ac"></div>
+                </div>
+                <button class="btn-text kw-search-btn" id="kwSearchBtn">SEARCH</button>
+            </div>
+            <div id="kwRecent" class="kw-recent"></div>
+            <div id="kwResults" class="kw-results" style="display:none;"></div>
         </div>
         <div class="charts">
             <div class="chart-container" style="cursor: pointer;"><h3 style="margin-top:0; text-transform:uppercase; font-size:1em;">Replication Status</h3><p style="font-size:0.75em; color:#666; margin:0 0 10px 0;">Network-wide (all shards). Nodes unpin files that no longer belong to their shard after a split.</p><canvas id="replicationChart"></canvas><div id="replicationByShard" style="font-size:0.8em; margin-top:10px; color:#555;"></div></div>
@@ -176,7 +224,9 @@ const dashboardHTML = `<!DOCTYPE html>
                 const nodes = Object.values(data).map(n => n.data).sort((a, b) => a.peer_id.localeCompare(b.peer_id));
                 const meta = data;
                 const nodeNames = {}; Object.entries(data).forEach(([pid, m]) => { if (m.node_name) nodeNames[m.data.peer_id] = m.node_name; }); window._nodeNames = nodeNames;
-                document.getElementById('total-nodes').textContent = nodes.length;
+                const activeNodes = nodes.filter(n => n.role !== 'PASSIVE');
+                const fullNodes = nodes.filter(n => n.role === 'PASSIVE');
+                document.getElementById('total-nodes').textContent = fullNodes.length > 0 ? activeNodes.length + ' (' + fullNodes.length + ' full)' : nodes.length;
                 const pinnedVal = n => (n.storage.pinned_in_shard != null) ? n.storage.pinned_in_shard : n.storage.pinned_files;
                 document.getElementById('total-pinned').textContent = nodes.reduce((s,n) => s + (pinnedVal(n)||0), 0).toLocaleString();
                 fetch('/api/unique-cids').then(r=>r.json()).then(data => { document.getElementById('unique-files').textContent = (data.count || 0).toLocaleString(); }).catch(() => { const uCids = new Set(); nodes.forEach(n => (n.storage.known_cids||[]).forEach(c => uCids.add(c))); document.getElementById('unique-files').textContent = uCids.size.toLocaleString(); });
@@ -185,6 +235,7 @@ const dashboardHTML = `<!DOCTYPE html>
                 window._chartNodeOrder = nodes.map(n => n.peer_id);
                 filesChart.data.labels = nodes.map(n => aliases[n.peer_id] || nodeNames[n.peer_id] || n.peer_id.slice(-6));
                 filesChart.data.datasets[0].data = nodes.map(n => pinnedVal(n) || 0);
+                filesChart.data.datasets[0].backgroundColor = nodes.map(n => n.role === 'PASSIVE' ? '#ccc' : '#333');
                 filesChart.update();
                 const sCounts = {}; nodes.forEach(n => sCounts[n.current_shard] = (sCounts[n.current_shard]||0)+1); shardChart.data.labels = Object.keys(sCounts); shardChart.data.datasets[0].data = Object.values(sCounts);
                 const colorPalette = ['#FF6B6B','#4ECDC4','#45B7D1','#FFA07A','#98D8C8','#F7DC6F','#BB8FCE','#85C1E2','#F8B739','#52BE80','#EC7063','#5DADE2','#58D68D','#F4D03F','#AF7AC5','#85C1E9','#F1948A','#73C6B6','#F9E79F','#A569BD'];
@@ -195,7 +246,10 @@ const dashboardHTML = `<!DOCTYPE html>
                     const peerIdEscaped = escapeJs(n.peer_id); const aliasEscaped = escapeJs(alias); const peerIdHtml = escapeHtml(n.peer_id); const aliasHtml = escapeHtml(alias); const serverNameHtml = escapeHtml(serverName); const shardHtml = escapeHtml(n.current_shard);
                     const displayName = aliasHtml || serverNameHtml || (peerIdHtml.slice(0,12) + '...');
                     const pinned = (n.storage.pinned_in_shard != null) ? n.storage.pinned_in_shard : n.storage.pinned_files;
-                    return '<tr data-peer-id="' + escapeHtml(n.peer_id.toLowerCase()) + '"><td><button class="btn-text alias-edit-btn" onclick="editAlias(\'' + peerIdEscaped + '\', \'' + aliasEscaped + '\', this)">EDIT</button></td><td class="peer-id-cell"><div class="alias-display-container"><div style="font-weight:600;">' + displayName + '</div><div style="font-size:0.8em; color:#4af; cursor:pointer; text-decoration:underline;" onclick="event.stopPropagation(); showIdentifyModal(\'' + peerIdEscaped + '\')">' + peerIdHtml + '</div></div></td><td><span class="shard-badge">' + shardHtml + '</span></td><td>' + n.peers_in_shard + '</td><td>' + pinned + '</td><td>' + n.storage.known_files + '</td><td>' + Math.floor(n.uptime_seconds/60) + 'm</td><td><span class="status-text status-online">[ACTIVE]</span> ' + lastSeen + 's ago</td></tr>';
+                    const isPassive = n.role === 'PASSIVE';
+                    const rowClass = isPassive ? 'node-passive' : '';
+                    const statusTag = isPassive ? '<span class="status-text status-full">[FULL]</span>' : '<span class="status-text status-online">[ACTIVE]</span>';
+                    return '<tr class="' + rowClass + '" data-peer-id="' + escapeHtml(n.peer_id.toLowerCase()) + '"><td><button class="btn-text alias-edit-btn" onclick="editAlias(\'' + peerIdEscaped + '\', \'' + aliasEscaped + '\', this)">EDIT</button></td><td class="peer-id-cell"><div class="alias-display-container"><div style="font-weight:600;">' + displayName + '</div><div style="font-size:0.8em; color:#4af; cursor:pointer; text-decoration:underline;" onclick="event.stopPropagation(); showIdentifyModal(\'' + peerIdEscaped + '\')">' + peerIdHtml + '</div></div></td><td><span class="shard-badge">' + shardHtml + '</span></td><td>' + n.peers_in_shard + '</td><td>' + pinned + '</td><td>' + n.storage.known_files + '</td><td>' + Math.floor(n.uptime_seconds/60) + 'm</td><td>' + statusTag + ' ' + lastSeen + 's ago</td></tr>';
                 }).join('');
                 restoreEditingState();
             });
@@ -379,6 +433,118 @@ const dashboardHTML = `<!DOCTYPE html>
                 row.style.display = (!q || search.includes(q)) ? '' : 'none';
             });
         };
+        // --- Keyword Search ---
+        let kwACIndex = -1;
+        let kwACTimeout;
+        const kwInput = document.getElementById('kwInput');
+        const kwAC = document.getElementById('kwAC');
+        const kwSearchBtn = document.getElementById('kwSearchBtn');
+
+        function kwDoSearch(query) {
+            if (!query || !query.trim()) return;
+            query = query.trim();
+            kwInput.value = query;
+            kwHideAC();
+            document.getElementById('kwResults').style.display = 'block';
+            document.getElementById('kwResults').innerHTML = '<p style="color:#999;">Searching...</p>';
+            fetch('/api/keyword-search?q=' + encodeURIComponent(query) + '&t=' + Date.now()).then(r => r.json()).then(data => {
+                const el = document.getElementById('kwResults');
+                const results = data.results || [];
+                if (results.length === 0) {
+                    el.innerHTML = '<p style="color:#666;">No documents found for "' + escapeHtml(query) + '".</p>';
+                    return;
+                }
+                let html = '<div class="kw-results-hdr"><span>' + results.length + ' document' + (results.length !== 1 ? 's' : '') + ' matching "' + escapeHtml(query) + '"</span><button class="btn-text" onclick="document.getElementById(\'kwResults\').style.display=\'none\'">CLOSE</button></div>';
+                html += results.map(r => {
+                    const shard = (r.shard || '') === '' ? 'root' : escapeHtml(r.shard);
+                    const kws = (r.keywords || []).map(k => '<span class="kw-kw-tag" onclick="kwDoSearch(\'' + escapeJs(k) + '\')">' + escapeHtml(k) + '</span>').join('');
+                    const title = r.title || '';
+                    const payloadUrl = GATEWAY + '/ipfs/' + (r.payload_cid || '') + '/';
+                    const titleHtml = title ? '<div style="font-weight:600; margin-bottom:2px;">' + escapeHtml(title) + '</div>' : '';
+                    let classHtml = '';
+                    const bf = r.broad_field || ''; const st = r.sub_topic || ''; const rn = r.research_niche || '';
+                    if (bf || st || rn) {
+                        classHtml = '<div class="kw-class">';
+                        if (bf) classHtml += '<span class="kw-class-tag kw-field" onclick="kwDoSearch(\'' + escapeJs(bf) + '\')">' + escapeHtml(bf) + '</span>';
+                        if (st) classHtml += '<span class="kw-class-tag kw-subtopic" onclick="kwDoSearch(\'' + escapeJs(st) + '\')">' + escapeHtml(st) + '</span>';
+                        if (rn) classHtml += '<span class="kw-class-tag kw-niche" onclick="kwDoSearch(\'' + escapeJs(rn) + '\')">' + escapeHtml(rn) + '</span>';
+                        classHtml += '</div>';
+                    }
+                    return '<div class="kw-result-item">' + titleHtml + classHtml + '<div class="kw-result-top"><div class="kw-result-cid">' + escapeHtml(r.manifest_cid) + '</div><div class="kw-result-meta">Shard: ' + shard + ' | Replicas: ' + (r.replicas || 0) + '</div><a href="' + payloadUrl + '" target="_blank" rel="noopener" class="btn-text">VIEW</a></div><div class="kw-result-kws">' + kws + '</div></div>';
+                }).join('');
+                el.innerHTML = html;
+                kwLoadRecent();
+            }).catch(() => {
+                document.getElementById('kwResults').innerHTML = '<p style="color:#ff6b6b;">Search failed.</p>';
+            });
+        }
+
+        function kwShowAC(suggestions) {
+            if (!suggestions || suggestions.length === 0) { kwHideAC(); return; }
+            kwACIndex = -1;
+            kwAC.innerHTML = suggestions.map((s, i) => '<div class="kw-ac-item" data-idx="' + i + '" onmousedown="kwDoSearch(\'' + escapeJs(s.keyword) + '\')">' + escapeHtml(s.keyword) + '<span class="kw-ac-count">' + s.cid_count + ' doc' + (s.cid_count !== 1 ? 's' : '') + '</span></div>').join('');
+            kwAC.style.display = 'block';
+        }
+
+        function kwHideAC() { kwAC.style.display = 'none'; kwACIndex = -1; }
+
+        function kwFetchSuggestions() {
+            const q = kwInput.value.trim();
+            if (q.length < 1) { kwHideAC(); return; }
+            fetch('/api/keyword-suggest?q=' + encodeURIComponent(q) + '&t=' + Date.now()).then(r => r.json()).then(data => {
+                kwShowAC(data.suggestions || []);
+            }).catch(() => kwHideAC());
+        }
+
+        kwInput.addEventListener('input', function() {
+            clearTimeout(kwACTimeout);
+            kwACTimeout = setTimeout(kwFetchSuggestions, 200);
+        });
+
+        kwInput.addEventListener('keydown', function(e) {
+            const items = kwAC.querySelectorAll('.kw-ac-item');
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                kwACIndex = Math.min(kwACIndex + 1, items.length - 1);
+                items.forEach((el, i) => el.classList.toggle('active', i === kwACIndex));
+                if (kwACIndex >= 0) kwInput.value = items[kwACIndex].textContent.replace(/\d+ docs?$/, '').trim();
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                kwACIndex = Math.max(kwACIndex - 1, -1);
+                items.forEach((el, i) => el.classList.toggle('active', i === kwACIndex));
+                if (kwACIndex >= 0) kwInput.value = items[kwACIndex].textContent.replace(/\d+ docs?$/, '').trim();
+            } else if (e.key === 'Enter') {
+                kwHideAC();
+                kwDoSearch(kwInput.value);
+            } else if (e.key === 'Escape') {
+                kwHideAC();
+            }
+        });
+
+        kwInput.addEventListener('blur', function() { setTimeout(kwHideAC, 150); });
+        kwSearchBtn.addEventListener('click', function() { kwDoSearch(kwInput.value); });
+
+        function kwLoadRecent() {
+            fetch('/api/recent-searches?t=' + Date.now()).then(r => r.json()).then(data => {
+                const el = document.getElementById('kwRecent');
+                const searches = data.searches || [];
+                if (searches.length === 0) { el.innerHTML = ''; return; }
+                el.innerHTML = '<span class="kw-recent-label">Recent:</span>' + searches.slice(0, 5).map(s => '<button class="kw-tag-btn" onclick="kwDoSearch(\'' + escapeJs(s.keyword) + '\')">' + escapeHtml(s.keyword) + ' (' + s.result_count + ')</button>').join('');
+            }).catch(() => {});
+        }
+
+        function kwLoadStats() {
+            fetch('/api/keyword-stats?t=' + Date.now()).then(r => r.json()).then(data => {
+                const el = document.getElementById('kwStatsLbl');
+                if (!data.enabled) { el.textContent = 'GEMINI_API_KEY not set'; return; }
+                el.textContent = 'Indexed: ' + data.indexed + '/' + data.total_cids + ' | Keywords: ' + data.unique_keywords + ' | Daily quota: ' + data.daily_remaining + '/' + 1000;
+            }).catch(() => {});
+        }
+
+        kwLoadRecent();
+        kwLoadStats();
+        setInterval(kwLoadStats, 10000);
+
         initCharts(); updateDashboard(); updateShardTree(); loadRootTopic();
         // Refresh every 1s so UI stays close to monitor state (monitor itself updates when nodes send heartbeats).
         setInterval(() => { if(!document.getElementById('nodeSearch').value && currentlyEditingPeerID === null) { updateDashboard(); updateShardTree(); } }, 1000);

@@ -21,12 +21,8 @@ func (m *Monitor) GetShardTree() *ShardTreeNode {
 		if !m.isDisplayableNodeUnlocked(id, n) {
 			continue
 		}
-		var sid string
-		if len(n.ShardHistory) > 0 {
-			sid = n.ShardHistory[len(n.ShardHistory)-1].ShardID
-		} else if n.CurrentShard != "" {
-			sid = n.CurrentShard
-		} else {
+		sid := n.EffectiveShard()
+		if sid == "" {
 			continue
 		}
 		// Collapse deep shards into their prefix for display

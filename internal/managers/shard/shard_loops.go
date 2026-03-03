@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -264,7 +265,7 @@ func (sm *ShardManager) sendHeartbeat() {
 
 	pinnedCount := sm.storageMgr.GetPinnedCount()
 	role := sm.getOurRole()
-	heartbeatMsg := []byte(fmt.Sprintf("HEARTBEAT:%s:%d:%s:%s", sm.h.ID().String(), pinnedCount, role, sm.nodeName))
+	heartbeatMsg := []byte(fmt.Sprintf("%s%s:%d:%s:%s", msgPrefixHeartbeat, sm.h.ID().String(), pinnedCount, role, sm.nodeName))
 	if err := sub.topic.Publish(sm.ctx, heartbeatMsg); err != nil {
 		return
 	}
@@ -353,7 +354,7 @@ func (sm *ShardManager) announcePinnedFilesBatch(topic *pubsub.Topic, batchSize 
 		if key == "" {
 			return
 		}
-		msg := []byte(fmt.Sprintf("PINNED:%s", key))
+		msg := []byte(msgPrefixPinned + key)
 		_ = topic.Publish(sm.ctx, msg)
 	}
 }
@@ -378,7 +379,7 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 		if msg.Data[0] == '{' {
 			return
 		}
-		if len(msg.Data) >= 10 && string(msg.Data[:10]) == "HEARTBEAT:" {
+		if bytes.HasPrefix(msg.Data, []byte(msgPrefixHeartbeat)) {
 			role := parseHeartbeatRole(msg.Data)
 			sm.mu.Lock()
 			if sm.seenPeerRoles[shardID] == nil {
@@ -388,12 +389,12 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 			sm.mu.Unlock()
 			return
 		}
-		if len(msg.Data) > 7 && string(msg.Data[:7]) == "PINNED:" {
-			key := string(msg.Data[7:])
+		if bytes.HasPrefix(msg.Data, []byte(msgPrefixPinned)) {
+			key := string(msg.Data[len(msgPrefixPinned):])
 			sm.storageMgr.AddKnownFile(key)
 			return
 		}
-		if len(msg.Data) >= 5 && string(msg.Data[:5]) == "JOIN:" {
+		if bytes.HasPrefix(msg.Data, []byte(msgPrefixJoin)) {
 			role := parseJoinRole(msg.Data)
 			sm.mu.Lock()
 			if sm.seenPeerRoles[shardID] == nil {
@@ -403,7 +404,7 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 			sm.mu.Unlock()
 			return
 		}
-		if len(msg.Data) >= 6 && string(msg.Data[:6]) == "LEAVE:" {
+		if bytes.HasPrefix(msg.Data, []byte(msgPrefixLeave)) {
 			sm.mu.Lock()
 			if sm.seenPeerRoles[shardID] != nil {
 				delete(sm.seenPeerRoles[shardID], from)
@@ -411,7 +412,7 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 			sm.mu.Unlock()
 			return
 		}
-		if len(msg.Data) >= 6 && string(msg.Data[:6]) == "PROBE:" {
+		if bytes.HasPrefix(msg.Data, []byte(msgPrefixProbe)) {
 			sm.mu.Lock()
 			if sm.seenPeerRoles[shardID] == nil {
 				sm.seenPeerRoles[shardID] = make(map[peer.ID]PeerRoleInfo)
@@ -450,8 +451,8 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 			}
 			return
 		}
-		if len(msg.Data) > 6 && string(msg.Data[:6]) == "SPLIT:" {
-			sm.handleSplitAnnouncement(string(msg.Data[6:]))
+		if bytes.HasPrefix(msg.Data, []byte(msgPrefixSplit)) {
+			sm.handleSplitAnnouncement(string(msg.Data[len(msgPrefixSplit):]))
 			return
 		}
 	}
@@ -491,18 +492,11 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 
 // handleSplitAnnouncement parses SPLIT:child0:child1 and records child shards.
 func (sm *ShardManager) handleSplitAnnouncement(payload string) {
-	sep := -1
-	for i := 0; i < len(payload); i++ {
-		if payload[i] == ':' {
-			sep = i
-			break
-		}
-	}
-	if sep < 1 || sep >= len(payload)-1 {
+	parts := strings.SplitN(payload, ":", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return
 	}
-	child0 := payload[:sep]
-	child1 := payload[sep+1:]
+	child0, child1 := parts[0], parts[1]
 	now := time.Now()
 	sm.mu.Lock()
 	sm.knownChildShards[child0] = now

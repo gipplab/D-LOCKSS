@@ -36,6 +36,7 @@ type StatusResponse struct {
 	PeerID        string            `json:"peer_id"`
 	Version       string            `json:"version"`
 	CurrentShard  string            `json:"current_shard"`
+	Role          string            `json:"role"`
 	PeersInShard  int               `json:"peers_in_shard"`
 	Storage       StorageStatus     `json:"storage"`
 	Replication   ReplicationStatus `json:"replication"`
@@ -108,6 +109,7 @@ type Monitor struct {
 	manifestShard       map[string]string // manifest CID → observed shard (from PINNED/IngestMessage announcements)
 	lastSplitTime       time.Time         // when we last detected a split; used to avoid pruning during mesh formation
 	peerLastSiblingMove map[string]siblingMoveRecord
+	keywords            *KeywordStore
 	done                chan struct{} // closed on shutdown to stop background goroutines
 }
 
@@ -116,6 +118,16 @@ type siblingMoveRecord struct {
 	from string
 	to   string
 	when time.Time
+}
+
+func (n *NodeState) EffectiveShard() string {
+	if n.CurrentShard != "" {
+		return n.CurrentShard
+	}
+	if len(n.ShardHistory) > 0 {
+		return n.ShardHistory[len(n.ShardHistory)-1].ShardID
+	}
+	return ""
 }
 
 func shardLogLabel(shardID string) string {
@@ -152,7 +164,7 @@ func (m *Monitor) getTopicPrefixUnlocked() string {
 	return config.PubsubTopicPrefix
 }
 
-func NewMonitor(geoDBPath string) *Monitor {
+func NewMonitor(geoDBPath, geminiAPIKey string) *Monitor {
 	m := &Monitor{
 		nodes:               make(map[string]*NodeState),
 		splitEvents:         make([]ShardSplitEvent, 0, 100),
@@ -164,6 +176,7 @@ func NewMonitor(geoDBPath string) *Monitor {
 		peerShardLastSeen:   make(map[string]map[string]time.Time),
 		manifestShard:       make(map[string]string),
 		peerLastSiblingMove: make(map[string]siblingMoveRecord),
+		keywords:            NewKeywordStore(geminiAPIKey),
 		done:                make(chan struct{}),
 	}
 	if m.geoDB != nil {
@@ -172,5 +185,6 @@ func NewMonitor(geoDBPath string) *Monitor {
 		log.Println("[Monitor] GeoIP: using ip-api.com API (on-demand via identify)")
 	}
 	go m.runReplicationCleanup()
+	go m.keywords.Run(m.done, m)
 	return m
 }

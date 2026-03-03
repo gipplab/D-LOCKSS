@@ -73,50 +73,18 @@ func (tc *TelemetryClient) runLoop(ctx context.Context) {
 	}
 }
 
+// pushTelemetry gathers and logs local node status.
+// Publishing over pubsub is disabled: JSON telemetry causes CBOR decoding
+// errors on other nodes and is not currently parsed by the monitor.
 func (tc *TelemetryClient) pushTelemetry() {
 	if tc.metrics == nil {
 		return
 	}
 
-	// 1. Gather Data (Reuse StatusResponse)
 	status := tc.metrics.GetStatus()
-	// status.PeerID = tc.host.ID().String() // Unused write
 
-	// Log telemetry data for debugging
 	if config.VerboseLogging {
 		log.Printf("[Telemetry] Sending status: pinned=%d, known=%d, shard=%s, peers=%d",
 			status.Storage.PinnedFiles, status.Storage.KnownFiles, status.CurrentShard, status.PeersInShard)
 	}
-
-	// 2. Marshal
-	/*
-	data, err := json.Marshal(status)
-	if err != nil {
-		log.Printf("[Telemetry] Marshal error: %v", err)
-		return
-	}
-	*/
-
-	// 3. Broadcast on current shard topic (monitor listens on all shards)
-	// DISABLED: JSON telemetry causes CBOR decoding errors on other nodes and is not
-	// currently parsed by the monitor (which uses heartbeats/ingests).
-	// Re-enable only if using a separate topic or if monitor parses JSON.
-	/*
-	if tc.publisher == nil {
-		log.Printf("[Telemetry] ShardPublisher not available, cannot broadcast telemetry")
-		return
-	}
-
-	// Get current shard and publish telemetry on that shard's topic
-	currentShard := status.CurrentShard
-	if tc.shardInfo != nil {
-		// Use fresh shard info if available, though metrics.GetStatus() should have it
-		currentShard, _ = tc.shardInfo.GetShardInfo()
-	}
-
-	// Publish to current shard topic - monitor listens on all shard topics
-	tc.publisher.PublishToShardCBOR(data, currentShard)
-
-	log.Printf("[Telemetry] Successfully broadcasted status on shard %s (monitor-agnostic)", currentShard)
-	*/
 }

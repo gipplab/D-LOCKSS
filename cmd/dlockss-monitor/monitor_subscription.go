@@ -18,6 +18,16 @@ import (
 	"dlockss/pkg/schema"
 )
 
+func decodePeerIDWithFallback(s string) (peer.ID, error) {
+	pid, err := peer.Decode(s)
+	if err != nil {
+		if mhBytes, mhErr := mh.FromB58String(s); mhErr == nil {
+			pid, err = peer.IDFromBytes(mhBytes)
+		}
+	}
+	return pid, err
+}
+
 // shardIDsUpToDepth returns all shard IDs in the binary tree up to the given depth.
 // Depth 0: [""]. Depth 1: ["", "0", "1"]. Depth 2: ["", "0", "1", "00", "01", "10", "11"]. etc.
 // This allows the monitor to bootstrap-subscribe to all potentially populated shards
@@ -132,14 +142,9 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 					nodeName = parts[4]
 				}
 				if len(parts) >= 2 && parts[1] != "" {
-					authorID, err := peer.Decode(parts[1])
+					authorID, err := decodePeerIDWithFallback(parts[1])
 					if err != nil {
-						if mhBytes, mhErr := mh.FromB58String(parts[1]); mhErr == nil {
-							authorID, err = peer.IDFromBytes(mhBytes)
-						}
-						if err != nil {
-							authorID = senderID
-						}
+						authorID = senderID
 					}
 					pinnedCount := -1
 					if len(parts) >= 3 {
@@ -172,12 +177,7 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 			if len(msg.Data) > 6 && string(msg.Data[:6]) == "LEAVE:" {
 				peerIDStr := strings.TrimSpace(string(msg.Data[6:]))
 				if peerIDStr != "" {
-					leaveID, err := peer.Decode(peerIDStr)
-					if err != nil {
-						if mhBytes, mhErr := mh.FromB58String(peerIDStr); mhErr == nil {
-							leaveID, err = peer.IDFromBytes(mhBytes)
-						}
-					}
+					leaveID, err := decodePeerIDWithFallback(peerIDStr)
 					if err == nil {
 						m.handleLeaveShard(leaveID, shardID)
 						log.Printf("[Monitor] SHARD_LEAVE peer=%s shard=%s", leaveID.String(), shardLogLabel(shardID))
@@ -198,12 +198,7 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 					nodeName = parts[2]
 				}
 				if peerIDStr != "" {
-					joinID, err := peer.Decode(peerIDStr)
-					if err != nil {
-						if mhBytes, mhErr := mh.FromB58String(peerIDStr); mhErr == nil {
-							joinID, err = peer.IDFromBytes(mhBytes)
-						}
-					}
+					joinID, err := decodePeerIDWithFallback(peerIDStr)
 					if err == nil {
 						if m.handleHeartbeatWithRole(joinID, shardID, ip, -1, role, nodeName) {
 							logLabel := joinID.String()

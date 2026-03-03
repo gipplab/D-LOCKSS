@@ -4,11 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"sync"
 	"time"
 
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p/core/peer"
+
+	"dlockss/internal/syncmap"
 )
 
 func NonceKey(sender peer.ID, nonce []byte) string {
@@ -30,116 +31,42 @@ type DHTProvider interface {
 
 // PinnedSet tracks which files/manifests are currently pinned.
 type PinnedSet struct {
-	mu sync.RWMutex
-	m  map[string]time.Time
+	m *syncmap.Map[string, time.Time]
 }
 
 func NewPinnedSet() *PinnedSet {
-	return &PinnedSet{m: make(map[string]time.Time)}
+	return &PinnedSet{m: syncmap.New[string, time.Time]()}
 }
 
-func (ps *PinnedSet) Add(key string) bool {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	if _, exists := ps.m[key]; !exists {
-		ps.m[key] = time.Now()
-		return true
-	}
-	ps.m[key] = time.Now()
-	return false
-}
-
-func (ps *PinnedSet) Remove(key string) {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	delete(ps.m, key)
-}
-
-func (ps *PinnedSet) Has(key string) bool {
-	ps.mu.RLock()
-	defer ps.mu.RUnlock()
-	_, exists := ps.m[key]
-	return exists
-}
+// Add pins a key (always refreshes timestamp). Returns true if key was new.
+func (ps *PinnedSet) Add(key string) bool { return ps.m.Upsert(key, time.Now()) }
+func (ps *PinnedSet) Remove(key string)   { ps.m.Delete(key) }
+func (ps *PinnedSet) Has(key string) bool { return ps.m.Has(key) }
+func (ps *PinnedSet) Size() int           { return ps.m.Len() }
+func (ps *PinnedSet) Keys() []string      { return ps.m.Keys() }
 
 func (ps *PinnedSet) GetPinTime(key string) time.Time {
-	ps.mu.RLock()
-	defer ps.mu.RUnlock()
-	return ps.m[key]
+	v, _ := ps.m.Get(key)
+	return v
 }
 
 // RemoveIfPresent atomically checks, removes, and returns the pin time.
-// Returns (pinTime, true) if the key was present, or (zero, false) if not.
 func (ps *PinnedSet) RemoveIfPresent(key string) (time.Time, bool) {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	t, exists := ps.m[key]
-	if exists {
-		delete(ps.m, key)
-	}
-	return t, exists
-}
-
-func (ps *PinnedSet) Size() int {
-	ps.mu.RLock()
-	defer ps.mu.RUnlock()
-	return len(ps.m)
-}
-
-func (ps *PinnedSet) All() map[string]bool {
-	ps.mu.RLock()
-	defer ps.mu.RUnlock()
-	result := make(map[string]bool, len(ps.m))
-	for k := range ps.m {
-		result[k] = true
-	}
-	return result
+	return ps.m.DeleteAndGet(key)
 }
 
 // KnownFiles tracks which files/manifests are known to the system.
 type KnownFiles struct {
-	mu sync.RWMutex
-	m  map[string]bool
+	m *syncmap.Map[string, bool]
 }
 
 func NewKnownFiles() *KnownFiles {
-	return &KnownFiles{m: make(map[string]bool)}
+	return &KnownFiles{m: syncmap.New[string, bool]()}
 }
 
-func (kf *KnownFiles) Add(key string) bool {
-	kf.mu.Lock()
-	defer kf.mu.Unlock()
-	if kf.m[key] {
-		return false
-	}
-	kf.m[key] = true
-	return true
-}
-
-func (kf *KnownFiles) Remove(key string) {
-	kf.mu.Lock()
-	defer kf.mu.Unlock()
-	delete(kf.m, key)
-}
-
-func (kf *KnownFiles) Has(key string) bool {
-	kf.mu.RLock()
-	defer kf.mu.RUnlock()
-	return kf.m[key]
-}
-
-func (kf *KnownFiles) Size() int {
-	kf.mu.RLock()
-	defer kf.mu.RUnlock()
-	return len(kf.m)
-}
-
-func (kf *KnownFiles) All() map[string]bool {
-	kf.mu.RLock()
-	defer kf.mu.RUnlock()
-	result := make(map[string]bool, len(kf.m))
-	for k, v := range kf.m {
-		result[k] = v
-	}
-	return result
-}
+// Add returns true if the key was new.
+func (kf *KnownFiles) Add(key string) bool  { return kf.m.SetIfAbsent(key, true) }
+func (kf *KnownFiles) Remove(key string)    { kf.m.Delete(key) }
+func (kf *KnownFiles) Has(key string) bool  { return kf.m.Has(key) }
+func (kf *KnownFiles) Size() int            { return kf.m.Len() }
+func (kf *KnownFiles) All() map[string]bool { return kf.m.Snapshot() }

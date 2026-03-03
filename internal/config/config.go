@@ -123,7 +123,42 @@ func ValidatePathSafety() string {
 		FileWatchFolder, strings.Join(problems, "\n"))
 }
 
+// ValidateConfiguration checks and corrects invalid configuration values.
+// Call before LogConfiguration.
+func ValidateConfiguration() {
+	if SignatureMode != "off" && SignatureMode != "warn" && SignatureMode != "strict" {
+		log.Printf("[Config] Unknown SignatureMode %q; defaulting to strict", SignatureMode)
+		SignatureMode = "strict"
+	}
+	if MaxConcurrentFileProcessing < 1 {
+		log.Printf("[Config] MaxConcurrentFileProcessing=%d is invalid; defaulting to 5", MaxConcurrentFileProcessing)
+		MaxConcurrentFileProcessing = 5
+	}
+	if NonceSize < 1 {
+		log.Printf("[Config] NonceSize=%d is invalid; defaulting to 16", NonceSize)
+		NonceSize = 16
+	}
+	if MinNonceSize < 1 {
+		log.Printf("[Config] MinNonceSize=%d is invalid; defaulting to 8", MinNonceSize)
+		MinNonceSize = 8
+	}
+	if MinReplication > MaxReplication {
+		log.Printf("[Config] MinReplication (%d) > MaxReplication (%d); swapping", MinReplication, MaxReplication)
+		MinReplication, MaxReplication = MaxReplication, MinReplication
+	}
+	if MaxConcurrentReplicationChecks < 1 {
+		log.Printf("[Config] MaxConcurrentReplicationChecks=%d is invalid; defaulting to 5", MaxConcurrentReplicationChecks)
+		MaxConcurrentReplicationChecks = 5
+	}
+	if DiskUsageHighWaterMark <= 0 || DiskUsageHighWaterMark > 100 {
+		log.Printf("[Config] DiskUsageHighWaterMark=%.1f is out of range (0,100]; defaulting to 90.0", DiskUsageHighWaterMark)
+		DiskUsageHighWaterMark = 90.0
+	}
+}
+
 func LogConfiguration() {
+	ValidateConfiguration()
+
 	log.Printf("[Config] Discovery Tag: %s", DiscoveryServiceTag)
 	log.Printf("[Config] Pubsub Topic Prefix: %s", PubsubTopicPrefix)
 	log.Printf("[Config] Data Directory: %s", FileWatchFolder)
@@ -157,57 +192,21 @@ func LogConfiguration() {
 	log.Printf("[Config] Trust Mode: %s", TrustMode)
 	log.Printf("[Config] Trust Store Path: %s", TrustStorePath)
 	log.Printf("[Config] Signature Mode: %s", SignatureMode)
-	if SignatureMode != "off" && SignatureMode != "warn" && SignatureMode != "strict" {
-		log.Printf("[Config] Unknown SignatureMode %q; defaulting to strict", SignatureMode)
-		SignatureMode = "strict"
-	}
-	if MaxConcurrentFileProcessing < 1 {
-		log.Printf("[Config] MaxConcurrentFileProcessing=%d is invalid; defaulting to 5", MaxConcurrentFileProcessing)
-		MaxConcurrentFileProcessing = 5
-	}
-	if NonceSize < 1 {
-		log.Printf("[Config] NonceSize=%d is invalid; defaulting to 16", NonceSize)
-		NonceSize = 16
-	}
-	if MinNonceSize < 1 {
-		log.Printf("[Config] MinNonceSize=%d is invalid; defaulting to 8", MinNonceSize)
-		MinNonceSize = 8
-	}
-	if MinReplication > MaxReplication {
-		log.Printf("[Config] MinReplication (%d) > MaxReplication (%d); swapping", MinReplication, MaxReplication)
-		MinReplication, MaxReplication = MaxReplication, MinReplication
-	}
-	if MaxConcurrentReplicationChecks < 1 {
-		log.Printf("[Config] MaxConcurrentReplicationChecks=%d is invalid; defaulting to 5", MaxConcurrentReplicationChecks)
-		MaxConcurrentReplicationChecks = 5
-	}
-	if DiskUsageHighWaterMark <= 0 || DiskUsageHighWaterMark > 100 {
-		log.Printf("[Config] DiskUsageHighWaterMark=%.1f is out of range (0,100]; defaulting to 90.0", DiskUsageHighWaterMark)
-		DiskUsageHighWaterMark = 90.0
-	}
 	log.Printf("[Config] Signature Max Age: %v", SignatureMaxAge)
 	log.Printf("[Config] Use PubSub for Replication: %v (min shard peers: %d)", UsePubsubForReplication, MinShardPeersForPubsubOnly)
 	log.Printf("[Config] Replication Cache TTL: %v", ReplicationCacheTTL)
 	log.Printf("[Config] Auto Replication Enabled: %v", AutoReplicationEnabled)
 	log.Printf("[Config] Auto Replication Timeout: %v", AutoReplicationTimeout)
 	log.Printf("[Config] CRDT Op Timeout: %v", CRDTOpTimeout)
-
-	// File operation configuration
 	log.Printf("[Config] File Import Timeout: %v", FileImportTimeout)
 	log.Printf("[Config] DHT Provide Timeout: %v", DHTProvideTimeout)
 	log.Printf("[Config] File Processing Delay: %v", FileProcessingDelay)
 	log.Printf("[Config] File Stability Delay: %v (wait for file size to settle before ingest)", FileStabilityDelay)
 	log.Printf("[Config] Max Concurrent File Processing: %d", MaxConcurrentFileProcessing)
-
-	// Replication timeouts
 	log.Printf("[Config] DHT Query Timeout: %v", DHTQueryTimeout)
-
-	// Cryptographic parameters
 	log.Printf("[Config] Nonce Size: %d bytes", NonceSize)
 	log.Printf("[Config] Min Nonce Size: %d bytes", MinNonceSize)
 	log.Printf("[Config] Future Skew Tolerance: %v", FutureSkewTolerance)
-
-	// Reshard configuration
 	log.Printf("[Config] Reshard Delay After Split: %v", ReshardDelay)
 	log.Printf("[Config] Reshard Handoff Delay: %v", ReshardHandoffDelay)
 	log.Printf("[Config] Telemetry Interval: %v", TelemetryInterval)

@@ -38,7 +38,6 @@ import (
 	kaddht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
@@ -86,7 +85,7 @@ func persistNodeName(name string) {
 }
 
 func main() {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	// Config and BadBits
@@ -174,13 +173,14 @@ func main() {
 	// Connect to default bootstrap peers (non-blocking: proceed after timeout if some fail)
 	var wg sync.WaitGroup
 	for _, peerAddr := range kaddht.DefaultBootstrapPeers {
-		peerinfo, _ := peer.AddrInfoFromP2pAddr(peerAddr)
+		peerinfo, err := peer.AddrInfoFromP2pAddr(peerAddr)
+		if err != nil {
+			continue
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := h.Connect(ctx, *peerinfo); err != nil {
-				// log.Printf("Bootstrap warning: %s", err)
-			}
+			h.Connect(ctx, *peerinfo)
 		}()
 	}
 	// Proceed after BootstrapTimeout or when all connects finish (whichever first)
@@ -207,26 +207,7 @@ func main() {
 		log.Printf("[Config] mDNS start failed: %v (peer/monitor discovery limited)", err)
 	}
 
-	// Find peers (e.g. monitor)
-	go func() {
-		for {
-			peerChan, err := routingDiscovery.FindPeers(ctx, config.DiscoveryServiceTag)
-			if err != nil {
-				log.Printf("[Discovery] FindPeers error: %v", err)
-				time.Sleep(10 * time.Second)
-				continue
-			}
-			for peer := range peerChan {
-				if peer.ID == h.ID() {
-					continue
-				}
-				if h.Network().Connectedness(peer.ID) != network.Connected {
-					h.Connect(ctx, peer)
-				}
-			}
-			time.Sleep(30 * time.Second)
-		}
-	}()
+	go discovery.RunPeerFinder(ctx, h, routingDiscovery, config.DiscoveryServiceTag)
 
 	// Trust (optional: load peers if file exists)
 	trustMgr := trust.NewTrustManager(config.TrustMode)
@@ -341,12 +322,8 @@ func main() {
 		fp.ScanExistingFiles()
 	}()
 
-	// Graceful shutdown
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
+	<-ctx.Done()
 	log.Printf("[System] Shutting down...")
-	cancel()
 	shardMgr.Close()
 	_ = apiServer.Shutdown(context.Background())
 }

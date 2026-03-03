@@ -65,15 +65,11 @@ func (sm *StorageManager) GetNextFileToAnnounce() string {
 }
 
 func (sm *StorageManager) rebuildAnnounceKeys() {
-	files := sm.pinnedFiles.All()
-	if len(files) == 0 {
+	keys := sm.pinnedFiles.Keys()
+	if len(keys) == 0 {
 		sm.announceKeys = nil
 		sm.announceKeysDirty = false
 		return
-	}
-	keys := make([]string, 0, len(files))
-	for k := range files {
-		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	sm.announceKeys = keys
@@ -86,12 +82,7 @@ func (sm *StorageManager) rebuildAnnounceKeys() {
 
 // GetPinnedManifests returns all manifest CID strings currently pinned (for replication check).
 func (sm *StorageManager) GetPinnedManifests() []string {
-	files := sm.pinnedFiles.All()
-	out := make([]string, 0, len(files))
-	for k := range files {
-		out = append(out, k)
-	}
-	return out
+	return sm.pinnedFiles.Keys()
 }
 
 // PinFile pins a file using its ManifestCID string.
@@ -170,7 +161,7 @@ func (sm *StorageManager) RemoveKnownFile(key string) {
 		sm.metrics.SetKnownFilesCount(sm.knownFiles.Size())
 	}
 
-	sm.fileReplicationLevels.Remove(key)
+	sm.fileReplicationLevels.Delete(key)
 
 	sm.recentlyRemoved.Record(key)
 }
@@ -205,7 +196,7 @@ func (sm *StorageManager) SetReplicationLevel(key string, count int) {
 }
 
 func (sm *StorageManager) GetReplicationLevels() map[string]int {
-	return sm.fileReplicationLevels.All()
+	return sm.fileReplicationLevels.Snapshot()
 }
 
 func (sm *StorageManager) GetKnownFiles() *common.KnownFiles {

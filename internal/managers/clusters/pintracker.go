@@ -27,7 +27,6 @@ type IPFSClient interface {
 	PutDagCBOR(ctx context.Context, data []byte) (cid.Cid, error)
 	// GetShell() interface{} // Removed to avoid interface mismatch if not needed by ClusterManager directly
 	SwarmConnect(ctx context.Context, addrs []string) error
-	VerifyDAGCompleteness(ctx context.Context, c cid.Cid) (bool, error)
 }
 
 // OnPinSynced is called when a pin is present locally (after sync or already pinned).

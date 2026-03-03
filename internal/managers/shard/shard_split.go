@@ -3,50 +3,11 @@ package shard
 import (
 	"fmt"
 	"log"
-	"math/big"
 	"time"
-
-	"github.com/ipfs/go-cid"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/multiformats/go-multihash"
 
 	"dlockss/internal/common"
 	"dlockss/internal/config"
 )
-
-func calculateXORDistance(peerID peer.ID, contentCID cid.Cid) (*big.Int, error) {
-	peerIDBytes := []byte(peerID)
-	var peerHash []byte
-	peerMh, err := multihash.Decode(peerIDBytes)
-	if err != nil {
-		peerHash = peerIDBytes
-	} else {
-		peerHash = peerMh.Digest
-	}
-
-	cidMh := contentCID.Hash()
-	cidMhDecoded, err := multihash.Decode(cidMh)
-	if err != nil {
-		return nil, fmt.Errorf("decode CID multihash: %w", err)
-	}
-	contentHash := cidMhDecoded.Digest
-
-	maxLen := len(peerHash)
-	if len(contentHash) > maxLen {
-		maxLen = len(contentHash)
-	}
-
-	peerPadded := make([]byte, maxLen)
-	copy(peerPadded[maxLen-len(peerHash):], peerHash)
-	contentPadded := make([]byte, maxLen)
-	copy(contentPadded[maxLen-len(contentHash):], contentHash)
-
-	xorResult := make([]byte, maxLen)
-	for i := 0; i < maxLen; i++ {
-		xorResult[i] = peerPadded[i] ^ contentPadded[i]
-	}
-	return new(big.Int).SetBytes(xorResult), nil
-}
 
 const probeTimeoutForSplitChild = 6 * time.Second
 
@@ -137,7 +98,7 @@ func (sm *ShardManager) announceSplit(parentShard string, targetChild string) {
 	if !exists || sub.topic == nil {
 		return
 	}
-	msg := []byte(fmt.Sprintf("SPLIT:%s:%s", targetChild, sibling))
+	msg := []byte(fmt.Sprintf("%s%s:%s", msgPrefixSplit, targetChild, sibling))
 	_ = sub.topic.Publish(sm.ctx, msg)
 	log.Printf("[Sharding] Announced split on shard %s: children %s, %s", parentShard, targetChild, sibling)
 }
@@ -145,18 +106,13 @@ func (sm *ShardManager) announceSplit(parentShard string, targetChild string) {
 // publishSplitToAncestor joins the ancestor shard as observer, publishes SPLIT:child0:child1, then leaves.
 // This lets late-joining nodes in the ancestor discover existing children.
 func (sm *ShardManager) publishSplitToAncestor(ancestorShard string) {
-	child0 := ancestorShard + "0"
-	child1 := ancestorShard + "1"
-	if ancestorShard == "" {
-		child0 = "0"
-		child1 = "1"
-	}
+	child0, child1 := childShards(ancestorShard)
 	if !sm.JoinShardAsObserver(ancestorShard) {
 		return // already full member (we're in this shard) or failed to join
 	}
 	defer sm.LeaveShardAsObserver(ancestorShard)
 
-	msg := []byte(fmt.Sprintf("SPLIT:%s:%s", child0, child1))
+	msg := []byte(fmt.Sprintf("%s%s:%s", msgPrefixSplit, child0, child1))
 	sm.mu.RLock()
 	sub, exists := sm.shardSubs[ancestorShard]
 	sm.mu.RUnlock()
@@ -164,7 +120,7 @@ func (sm *ShardManager) publishSplitToAncestor(ancestorShard string) {
 		_ = sub.topic.Publish(sm.ctx, msg)
 	} else {
 		// Fallback when topic is nil (e.g. "topic already exists" path in JoinShardAsObserver)
-		topicName := fmt.Sprintf("%s-creative-commons-shard-%s", config.PubsubTopicPrefix, ancestorShard)
+		topicName := shardTopicName(ancestorShard)
 		_ = sm.ps.Publish(topicName, msg)
 	}
 	log.Printf("[Sharding] Re-broadcast SPLIT to ancestor %q: children %s, %s", ancestorShard, child0, child1)

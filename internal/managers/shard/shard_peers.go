@@ -2,7 +2,6 @@ package shard
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
@@ -99,7 +98,7 @@ func (sm *ShardManager) GetPeersForShard(shardID string) []peer.ID {
 	// Return only ACTIVE peers (exclude PASSIVE and PROBE for replication)
 	sm.mu.RLock()
 	roles, ok := sm.seenPeerRoles[shardID]
-	cutoff := time.Now().Add(-350 * time.Second)
+	cutoff := time.Now().Add(-config.SeenPeersWindow)
 	sm.mu.RUnlock()
 
 	if ok {
@@ -148,7 +147,7 @@ func (sm *ShardManager) GetShardPeerCount(shardID string) int {
 		return 0
 	}
 	includeSelf := (shardID == currentShard)
-	activeCount := sm.countActivePeers(shardID, includeSelf, 350*time.Second)
+	activeCount := sm.countActivePeers(shardID, includeSelf, config.SeenPeersWindow)
 	if activeCount > 0 {
 		return activeCount
 	}
@@ -203,7 +202,7 @@ func (sm *ShardManager) probeShard(shardID string, probeTimeout time.Duration) i
 	sm.mu.RUnlock()
 
 	if alreadyJoined && sub.topic != nil {
-		return sm.getProbePeerCount(shardID, 350*time.Second)
+		return sm.getProbePeerCount(shardID, config.SeenPeersWindow)
 	}
 	return sm.probeShardSilently(shardID, probeTimeout)
 }
@@ -217,7 +216,7 @@ func (sm *ShardManager) probeShardSilently(shardID string, probeTimeout time.Dur
 	sm.mu.Unlock()
 
 	if !fromCache {
-		topicName := fmt.Sprintf("%s-creative-commons-shard-%s", config.PubsubTopicPrefix, shardID)
+		topicName := shardTopicName(shardID)
 		var err error
 		t, err = sm.ps.Join(topicName)
 		if err != nil {
@@ -235,7 +234,7 @@ func (sm *ShardManager) probeShardSilently(shardID string, probeTimeout time.Dur
 	defer psSub.Cancel()
 
 	// Publish PROBE so others know we're a prober (not counted)
-	probeMsg := []byte("PROBE:" + sm.h.ID().String())
+	probeMsg := []byte(msgPrefixProbe + sm.h.ID().String())
 	_ = t.Publish(sm.ctx, probeMsg)
 
 	// Process incoming messages to collect HEARTBEAT/JOIN/PROBE role info
@@ -256,7 +255,7 @@ func (sm *ShardManager) probeShardSilently(shardID string, probeTimeout time.Dur
 		sm.processTextProtocolForProbe(msg, shardID)
 	}
 
-	activeCount := sm.countActivePeers(shardID, false, 350*time.Second)
+	activeCount := sm.countActivePeers(shardID, false, config.SeenPeersWindow)
 	if activeCount > 0 {
 		sm.mu.Lock()
 		if old := sm.probeTopicCache[shardID]; old != nil && old != t {

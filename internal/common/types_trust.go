@@ -9,55 +9,23 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"dlockss/internal/config"
+	"dlockss/internal/syncmap"
 )
 
 // TrustedPeers tracks which peers are trusted (for allowlist mode).
 type TrustedPeers struct {
-	mu sync.RWMutex
-	m  map[peer.ID]bool
+	m *syncmap.Map[peer.ID, bool]
 }
 
 func NewTrustedPeers() *TrustedPeers {
-	return &TrustedPeers{m: make(map[peer.ID]bool)}
+	return &TrustedPeers{m: syncmap.New[peer.ID, bool]()}
 }
 
-func (tp *TrustedPeers) Add(pid peer.ID) {
-	tp.mu.Lock()
-	defer tp.mu.Unlock()
-	tp.m[pid] = true
-}
-
-func (tp *TrustedPeers) Remove(pid peer.ID) {
-	tp.mu.Lock()
-	defer tp.mu.Unlock()
-	delete(tp.m, pid)
-}
-
-func (tp *TrustedPeers) Has(pid peer.ID) bool {
-	tp.mu.RLock()
-	defer tp.mu.RUnlock()
-	return tp.m[pid]
-}
-
-func (tp *TrustedPeers) SetAll(peers map[peer.ID]bool) {
-	tp.mu.Lock()
-	defer tp.mu.Unlock()
-	cp := make(map[peer.ID]bool, len(peers))
-	for k, v := range peers {
-		cp[k] = v
-	}
-	tp.m = cp
-}
-
-func (tp *TrustedPeers) All() []peer.ID {
-	tp.mu.RLock()
-	defer tp.mu.RUnlock()
-	peers := make([]peer.ID, 0, len(tp.m))
-	for pid := range tp.m {
-		peers = append(peers, pid)
-	}
-	return peers
-}
+func (tp *TrustedPeers) Add(pid peer.ID)               { tp.m.Set(pid, true) }
+func (tp *TrustedPeers) Remove(pid peer.ID)            { tp.m.Delete(pid) }
+func (tp *TrustedPeers) Has(pid peer.ID) bool          { return tp.m.Has(pid) }
+func (tp *TrustedPeers) SetAll(peers map[peer.ID]bool) { tp.m.ReplaceAll(peers) }
+func (tp *TrustedPeers) All() []peer.ID                { return tp.m.Keys() }
 
 // NonceStore tracks seen nonces for replay protection.
 type NonceStore struct {
@@ -85,8 +53,9 @@ func (ns *NonceStore) SeenBefore(sender peer.ID, nonce []byte) bool {
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
 
+	const cleanupEveryN = 256
 	ns.cleanupCounter++
-	if ns.cleanupCounter&0xFF == 0 {
+	if ns.cleanupCounter%cleanupEveryN == 0 {
 		for k, exp := range ns.entries {
 			if now.After(exp) {
 				delete(ns.entries, k)
@@ -231,7 +200,8 @@ func (bt *BackoffTable) RecordFailure(key string) {
 		backoff.delay = config.MaxBackoffDelay
 	}
 
-	jitterRange := float64(backoff.delay) * 0.25
+	const backoffJitterFraction = 0.25
+	jitterRange := float64(backoff.delay) * backoffJitterFraction
 	jitterRangeInt := int64(jitterRange * 2)
 	if jitterRangeInt > 0 {
 		jitterVal, err := rand.Int(rand.Reader, big.NewInt(jitterRangeInt))

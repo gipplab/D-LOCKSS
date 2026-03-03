@@ -37,9 +37,6 @@ func (m *MockIPFSClient) PutDagCBOR(ctx context.Context, data []byte) (cid.Cid, 
 	return cid.Cid{}, nil
 }
 func (m *MockIPFSClient) SwarmConnect(ctx context.Context, addrs []string) error { return nil }
-func (m *MockIPFSClient) VerifyDAGCompleteness(ctx context.Context, c cid.Cid) (bool, error) {
-	return true, nil
-}
 
 // MockRouting implements routing.Routing
 type MockRouting struct{}

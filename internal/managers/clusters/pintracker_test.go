@@ -97,10 +97,6 @@ func (m *mockIPFSForTracker) PutDagCBOR(ctx context.Context, data []byte) (cid.C
 func (m *mockIPFSForTracker) SwarmConnect(ctx context.Context, addrs []string) error {
 	return nil
 }
-func (m *mockIPFSForTracker) VerifyDAGCompleteness(ctx context.Context, c cid.Cid) (bool, error) {
-	return true, nil
-}
-
 func mustPeerIDFromSeed(t *testing.T, seed string) peer.ID {
 	t.Helper()
 	mh, err := multihash.Sum([]byte(seed), multihash.SHA2_256, -1)

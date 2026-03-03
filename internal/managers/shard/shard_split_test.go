@@ -38,11 +38,8 @@ func (m *MockIPFSClient) PinRecursive(ctx context.Context, cid cid.Cid) error   
 func (m *MockIPFSClient) UnpinRecursive(ctx context.Context, cid cid.Cid) error        { return nil }
 func (m *MockIPFSClient) IsPinned(ctx context.Context, cid cid.Cid) (bool, error)      { return false, nil }
 func (m *MockIPFSClient) GetFileSize(ctx context.Context, cid cid.Cid) (uint64, error) { return 0, nil }
-func (m *MockIPFSClient) VerifyDAGCompleteness(ctx context.Context, rootCID cid.Cid) (bool, error) {
-	return true, nil
-}
-func (m *MockIPFSClient) GetPeerID(ctx context.Context) (string, error)          { return "mock-peer-id", nil }
-func (m *MockIPFSClient) SwarmConnect(ctx context.Context, addrs []string) error { return nil }
+func (m *MockIPFSClient) GetPeerID(ctx context.Context) (string, error)                { return "mock-peer-id", nil }
+func (m *MockIPFSClient) SwarmConnect(ctx context.Context, addrs []string) error       { return nil }
 
 // MockDHTProvider implements common.DHTProvider and routing.Routing
 type MockDHTProvider struct{}

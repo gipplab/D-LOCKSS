@@ -7,29 +7,19 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
+
+	"dlockss/internal/discovery"
 
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 )
-
-type discoveryNotifee struct{ h host.Host }
-
-func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
-	if n.h.Network().Connectedness(pi.ID) != network.Connected {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = n.h.Connect(ctx, pi)
-	}
-}
 
 func getMonitorIdentityPath() string {
 	if cwd, err := os.Getwd(); err == nil {
@@ -115,12 +105,14 @@ func startLibP2P(ctx context.Context, monitor *Monitor) (host.Host, error) {
 
 	var wg sync.WaitGroup
 	for _, peerAddr := range dht.DefaultBootstrapPeers {
-		peerinfo, _ := peer.AddrInfoFromP2pAddr(peerAddr)
+		peerinfo, err := peer.AddrInfoFromP2pAddr(peerAddr)
+		if err != nil {
+			continue
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := h.Connect(ctx, *peerinfo); err != nil {
-			}
+			h.Connect(ctx, *peerinfo)
 		}()
 	}
 	wg.Wait()
@@ -129,31 +121,13 @@ func startLibP2P(ctx context.Context, monitor *Monitor) (host.Host, error) {
 	dutil.Advertise(ctx, routingDiscovery, DiscoveryServiceTag)
 	log.Printf("[Monitor] Advertising service: %s", DiscoveryServiceTag)
 
-	notifee := &discoveryNotifee{h: h}
+	notifee := &discovery.DiscoveryNotifee{H: h, Ctx: ctx}
 	mdnsSvc := mdns.NewMdnsService(h, DiscoveryServiceTag, notifee)
 	if err := mdnsSvc.Start(); err != nil {
 		log.Printf("[Monitor] mDNS start failed: %v", err)
 	}
 
-	go func() {
-		for {
-			peerChan, err := routingDiscovery.FindPeers(ctx, DiscoveryServiceTag)
-			if err != nil {
-				log.Printf("[Monitor] FindPeers error: %v", err)
-				time.Sleep(10 * time.Second)
-				continue
-			}
-			for p := range peerChan {
-				if p.ID == h.ID() {
-					continue
-				}
-				if h.Network().Connectedness(p.ID) != network.Connected {
-					h.Connect(ctx, p)
-				}
-			}
-			time.Sleep(30 * time.Second)
-		}
-	}()
+	go discovery.RunPeerFinder(ctx, h, routingDiscovery, DiscoveryServiceTag)
 
 	return h, nil
 }

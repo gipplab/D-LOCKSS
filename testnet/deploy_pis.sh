@@ -15,6 +15,8 @@ IPFS_REPO="/home/crnls/pi_data/ipfs_repo"
 LOG_DIR="/home/crnls/pi_data"
 LOG_ROTATE_HOURS=48
 KUBO_VERSION="0.39.0"
+# File swap size on Pi (GB). 4G gives good OOM headroom on a 64GB SD card.
+PI_SWAP_GB="${PI_SWAP_GB:-4}"
 
 if [ $# -gt 0 ]; then PI_HOSTS=("$@"); fi
 
@@ -58,7 +60,7 @@ for HOST in "${PI_HOSTS[@]}"; do
     echo "=== ${NODE_NAME} (${CONN_HOST}) ==="
 
     echo "  Stopping old processes..."
-    ssh "${PI_USER}@${CONN_HOST}" "tmux kill-session -t dlockss 2>/dev/null; tmux kill-session -t ipfs 2>/dev/null; pkill -f dlockss-linux-arm64 2>/dev/null; pkill -f 'ipfs daemon' 2>/dev/null; sleep 2; pkill -9 -f dlockss-linux-arm64 2>/dev/null; pkill -9 -f 'ipfs daemon' 2>/dev/null; rm -f ${IPFS_REPO}/repo.lock 2>/dev/null; true" || true
+    ssh "${PI_USER}@${CONN_HOST}" "sudo systemctl stop dlockss.service 2>/dev/null; sudo systemctl stop ipfs.service 2>/dev/null; tmux kill-session -t dlockss 2>/dev/null; tmux kill-session -t ipfs 2>/dev/null; pkill -f dlockss-linux-arm64 2>/dev/null; pkill -f 'ipfs daemon' 2>/dev/null; sleep 2; pkill -9 -f dlockss-linux-arm64 2>/dev/null; pkill -9 -f 'ipfs daemon' 2>/dev/null; rm -f ${IPFS_REPO}/repo.lock 2>/dev/null; true" || true
 
     echo "  Copying D-LOCKSS binary..."
     scp -q "$BIN" "${PI_USER}@${CONN_HOST}:${REMOTE_BIN}"
@@ -85,7 +87,7 @@ for HOST in "${PI_HOSTS[@]}"; do
     ssh "${PI_USER}@${CONN_HOST}" "test -f '${IPFS_REPO}/config' && IPFS_PATH='${IPFS_REPO}' ipfs config --json Swarm.Transports.Network.WebRTCDirect false 2>/dev/null || true"
 
     echo "  Applying low-memory Kubo settings for 1GB Pi (reduce OOM risk)..."
-    ssh "${PI_USER}@${CONN_HOST}" "test -f '${IPFS_REPO}/config' && IPFS_PATH='${IPFS_REPO}' ipfs config --json Swarm.ConnMgr.HighWater 60 2>/dev/null; IPFS_PATH='${IPFS_REPO}' ipfs config --json Swarm.ConnMgr.LowWater 30 2>/dev/null; IPFS_PATH='${IPFS_REPO}' ipfs config --json Swarm.ResourceMgr.Enabled true 2>/dev/null; IPFS_PATH='${IPFS_REPO}' ipfs config --json Swarm.ResourceMgr.MaxMemory '150MB' 2>/dev/null; true" || true
+    ssh "${PI_USER}@${CONN_HOST}" "test -f '${IPFS_REPO}/config' && IPFS_PATH='${IPFS_REPO}' ipfs config --json Swarm.ConnMgr.HighWater 40 2>/dev/null; IPFS_PATH='${IPFS_REPO}' ipfs config --json Swarm.ConnMgr.LowWater 20 2>/dev/null; IPFS_PATH='${IPFS_REPO}' ipfs config --json Swarm.ConnMgr.GracePeriod '\"30s\"' 2>/dev/null; IPFS_PATH='${IPFS_REPO}' ipfs config --json Swarm.ResourceMgr.Enabled true 2>/dev/null; IPFS_PATH='${IPFS_REPO}' ipfs config --json Swarm.ResourceMgr.MaxMemory '\"120MB\"' 2>/dev/null; true" || true
 
     echo "  Configuring Kubo reprovider (pinned strategy, 6h DHT refresh interval)..."
     ssh "${PI_USER}@${CONN_HOST}" "test -f '${IPFS_REPO}/config' && IPFS_PATH='${IPFS_REPO}' ipfs config Provide.Strategy pinned 2>/dev/null; IPFS_PATH='${IPFS_REPO}' ipfs config Provide.DHT.Interval '\"6h\"' 2>/dev/null; true" || true
@@ -105,8 +107,36 @@ else:
     echo "  Enabling Kubo relay client (so Pis behind NAT are reachable via relay)..."
     ssh "${PI_USER}@${CONN_HOST}" "test -f '${IPFS_REPO}/config' && IPFS_PATH='${IPFS_REPO}' ipfs config --json Swarm.RelayClient.Enabled true 2>/dev/null; true" || true
 
+    echo "  Enabling cgroup memory controller (needed for systemd MemoryMax)..."
+    ssh "${PI_USER}@${CONN_HOST}" "sudo bash -s" << 'CGROUP_EOF'
+CMDLINE=/boot/firmware/cmdline.txt
+if [ ! -f "$CMDLINE" ]; then CMDLINE=/boot/cmdline.txt; fi
+if [ -f "$CMDLINE" ] && grep -q 'cgroup_disable=memory' "$CMDLINE"; then
+  sed -i 's/ cgroup_disable=memory//g' "$CMDLINE"
+  echo "    Removed cgroup_disable=memory from $CMDLINE (reboot needed for MemoryMax to work)"
+else
+  echo "    cgroup memory already enabled (OK)"
+fi
+CGROUP_EOF
+
     echo "  Ensuring zram (compressed swap) for 1GB Pi..."
     ssh "${PI_USER}@${CONN_HOST}" "command -v zramctl &>/dev/null || (sudo apt-get update -qq 2>/dev/null && sudo apt-get install -y zram-tools 2>/dev/null); (sudo systemctl enable zram-tools 2>/dev/null; sudo systemctl start zram-tools 2>/dev/null); true" || true
+
+    echo "  Ensuring file swap /swapfile (${PI_SWAP_GB}G) for extra OOM headroom..."
+    ssh "${PI_USER}@${CONN_HOST}" "sudo bash -s" << SWAP_EOF
+SWAPFILE=/swapfile
+SIZE=${PI_SWAP_GB}G
+DD_MB=$(( PI_SWAP_GB * 1024 ))
+if [ ! -f "\$SWAPFILE" ]; then
+  fallocate -l \$SIZE "\$SWAPFILE" 2>/dev/null || dd if=/dev/zero of="\$SWAPFILE" bs=1M count=\$DD_MB status=none
+  chmod 600 "\$SWAPFILE"
+  mkswap "\$SWAPFILE" >/dev/null
+  swapon "\$SWAPFILE" && echo "    Created and enabled \$SWAPFILE (\$SIZE)"
+  grep -q "^\${SWAPFILE} " /etc/fstab 2>/dev/null || echo "\$SWAPFILE none swap defaults 0 0" | tee -a /etc/fstab >/dev/null
+elif ! swapon --show 2>/dev/null | grep -q "\$SWAPFILE"; then
+  swapon "\$SWAPFILE" 2>/dev/null && echo "    Enabled existing \$SWAPFILE" || true
+fi
+SWAP_EOF
 
     echo "  Disabling unneeded services to free RAM (ModemManager, Bluetooth)..."
     ssh "${PI_USER}@${CONN_HOST}" "sudo systemctl stop ModemManager bluetooth 2>/dev/null; sudo systemctl disable ModemManager bluetooth 2>/dev/null; true" || true
@@ -129,8 +159,75 @@ ROTATE_EOF
 chmod +x '${LOG_DIR}/rotate_logs.sh'"
     ssh "${PI_USER}@${CONN_HOST}" "(crontab -l 2>/dev/null | grep -v rotate_logs.sh; echo '0 */12 * * * ${LOG_DIR}/rotate_logs.sh') | crontab -" 2>/dev/null || true
 
-    echo "  Starting IPFS..."
-    ssh "${PI_USER}@${CONN_HOST}" "tmux new-session -d -s ipfs 'IPFS_PATH=${IPFS_REPO} ipfs daemon --enable-gc 2>&1 | tee -a ${LOG_DIR}/ipfs.log'"
+    echo "  Installing systemd services (auto-start on boot)..."
+    ssh "${PI_USER}@${CONN_HOST}" "sudo bash -s" << SYSTEMD_EOF
+cat > /etc/systemd/system/ipfs.service << 'UNIT'
+[Unit]
+Description=IPFS Daemon (Kubo)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${PI_USER}
+Environment=IPFS_PATH=${IPFS_REPO}
+Environment=GOMEMLIMIT=180MiB
+Environment=GOGC=50
+ExecStart=/usr/local/bin/ipfs daemon --enable-gc
+Restart=on-failure
+RestartSec=10
+MemoryMax=300M
+MemoryHigh=250M
+StandardOutput=append:${LOG_DIR}/ipfs.log
+StandardError=append:${LOG_DIR}/ipfs.log
+OOMScoreAdjust=200
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat > /etc/systemd/system/dlockss.service << 'UNIT'
+[Unit]
+Description=D-LOCKSS Node
+After=ipfs.service
+Requires=ipfs.service
+
+[Service]
+Type=simple
+User=${PI_USER}
+WorkingDirectory=/home/${PI_USER}
+Environment=GODEBUG=madvdontneed=1
+Environment=GOMEMLIMIT=220MiB
+Environment=GOGC=50
+Environment=DLOCKSS_MAX_CONCURRENT_FILE_PROCESSING=2
+Environment=DLOCKSS_MAX_CONCURRENT_CHECKS=2
+Environment=DLOCKSS_NODE_NAME=${NODE_NAME}
+Environment=DLOCKSS_DATA_DIR=./data
+Environment=IPFS_PATH=${IPFS_REPO}
+Environment=DLOCKSS_IPFS_NODE=/ip4/127.0.0.1/tcp/5001
+ExecStartPre=/bin/bash -c 'for i in \$(seq 1 30); do IPFS_PATH=${IPFS_REPO} /usr/local/bin/ipfs swarm peers >/dev/null 2>&1 && exit 0; sleep 3; done; exit 1'
+ExecStart=${REMOTE_BIN}
+Restart=on-failure
+RestartSec=15
+MemoryMax=280M
+MemoryHigh=230M
+StandardOutput=append:${LOG_DIR}/dlockss.log
+StandardError=append:${LOG_DIR}/dlockss.log
+OOMScoreAdjust=-200
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable ipfs.service dlockss.service
+SYSTEMD_EOF
+
+    echo "  Stopping old tmux sessions (migrating to systemd)..."
+    ssh "${PI_USER}@${CONN_HOST}" "tmux kill-session -t dlockss 2>/dev/null; tmux kill-session -t ipfs 2>/dev/null; true"
+
+    echo "  Starting IPFS via systemd..."
+    ssh "${PI_USER}@${CONN_HOST}" "sudo systemctl restart ipfs.service"
     echo "  Waiting for IPFS API to become ready (up to 90s)..."
     IPFS_READY=false
     for attempt in $(seq 1 30); do
@@ -148,8 +245,8 @@ chmod +x '${LOG_DIR}/rotate_logs.sh'"
         continue
     fi
 
-    echo "  Starting D-LOCKSS..."
-    ssh "${PI_USER}@${CONN_HOST}" "tmux new-session -d -s dlockss 'GODEBUG=madvdontneed=1 GOMEMLIMIT=280MiB GOGC=50 DLOCKSS_MAX_CONCURRENT_FILE_PROCESSING=2 DLOCKSS_MAX_CONCURRENT_CHECKS=2 DLOCKSS_NODE_NAME=${NODE_NAME} DLOCKSS_DATA_DIR=./data IPFS_PATH=${IPFS_REPO} DLOCKSS_IPFS_NODE=/ip4/127.0.0.1/tcp/5001 ${REMOTE_BIN} 2>&1 | tee -a ${LOG_DIR}/dlockss.log'"
+    echo "  Starting D-LOCKSS via systemd..."
+    ssh "${PI_USER}@${CONN_HOST}" "sudo systemctl restart dlockss.service"
     sleep 3
 
     # Verify D-LOCKSS
@@ -172,6 +269,7 @@ done
 echo ""
 echo "  Logs (persistent, truncated every ${LOG_ROTATE_HOURS}h):"
 echo "    ${LOG_DIR}/dlockss.log   ${LOG_DIR}/ipfs.log"
-echo "  Attach to tmux:"
-echo "    ssh ${PI_USER}@<host> 'tmux attach -t dlockss'   # D-LOCKSS"
-echo "    ssh ${PI_USER}@<host> 'tmux attach -t ipfs'     # IPFS"
+echo "  Manage services:"
+echo "    ssh ${PI_USER}@<host> 'sudo systemctl status dlockss'   # D-LOCKSS status"
+echo "    ssh ${PI_USER}@<host> 'sudo systemctl status ipfs'      # IPFS status"
+echo "    ssh ${PI_USER}@<host> 'sudo journalctl -u dlockss -f'   # live D-LOCKSS logs"

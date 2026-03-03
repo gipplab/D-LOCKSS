@@ -232,12 +232,7 @@ func (sm *ShardManager) RunOrphanUnpinPass() {
 		return
 	}
 
-	child0 := currentShard + "0"
-	child1 := currentShard + "1"
-	if currentShard == "" {
-		child0 = "0"
-		child1 = "1"
-	}
+	child0, child1 := childShards(currentShard)
 	probeTimeout := 4 * time.Second
 	n0 := sm.probeShard(child0, probeTimeout)
 	n1 := sm.probeShard(child1, probeTimeout)

@@ -1,6 +1,7 @@
 package shard
 
 import (
+	"bytes"
 	"strings"
 	"time"
 
@@ -11,28 +12,30 @@ import (
 )
 
 // PeerRole indicates whether a peer is actively contributing to replication.
+type PeerRole string
+
 const (
-	RoleActive  = "ACTIVE"  // Normal node, can pin new files
-	RolePassive = "PASSIVE" // At storage limit, cannot pin; not counted for replication
-	RoleProbe   = "PROBE"   // Transient viewer, not counted
+	RoleActive  PeerRole = "ACTIVE"  // Normal node, can pin new files
+	RolePassive PeerRole = "PASSIVE" // At storage limit, cannot pin; not counted for replication
+	RoleProbe   PeerRole = "PROBE"   // Transient viewer, not counted
 )
 
 // PeerRoleInfo holds a peer's role and last-seen time.
 type PeerRoleInfo struct {
-	Role     string
+	Role     PeerRole
 	LastSeen time.Time
 }
 
 // parseHeartbeatRole extracts role from HEARTBEAT:pid:count or HEARTBEAT:pid:count:ROLE.
 // Returns "ACTIVE" if no role (backward compat).
-func parseHeartbeatRole(data []byte) string {
+func parseHeartbeatRole(data []byte) PeerRole {
 	s := string(data)
-	if len(s) < 10 || s[:10] != "HEARTBEAT:" {
+	if !strings.HasPrefix(s, msgPrefixHeartbeat) {
 		return RoleActive
 	}
 	parts := strings.SplitN(s, ":", 4)
 	if len(parts) >= 4 {
-		r := strings.ToUpper(parts[3])
+		r := PeerRole(strings.ToUpper(parts[3]))
 		if r == RolePassive {
 			return RolePassive
 		}
@@ -44,7 +47,7 @@ func parseHeartbeatRole(data []byte) string {
 }
 
 // getOurRole returns ACTIVE if we can accept custodial files, PASSIVE otherwise.
-func (sm *ShardManager) getOurRole() string {
+func (sm *ShardManager) getOurRole() PeerRole {
 	if storage.CanAcceptCustodialFile() {
 		return RoleActive
 	}
@@ -67,7 +70,7 @@ func (sm *ShardManager) processTextProtocolForProbe(msg *pubsub.Message, shardID
 	sm.seenPeers[shardID][from] = now
 	sm.mu.Unlock()
 
-	if len(data) >= 10 && string(data[:10]) == "HEARTBEAT:" {
+	if bytes.HasPrefix(data, []byte(msgPrefixHeartbeat)) {
 		role := parseHeartbeatRole(data)
 		sm.mu.Lock()
 		if sm.seenPeerRoles[shardID] == nil {
@@ -77,7 +80,7 @@ func (sm *ShardManager) processTextProtocolForProbe(msg *pubsub.Message, shardID
 		sm.mu.Unlock()
 		return true
 	}
-	if len(data) >= 5 && string(data[:5]) == "JOIN:" {
+	if bytes.HasPrefix(data, []byte(msgPrefixJoin)) {
 		role := parseJoinRole(data)
 		sm.mu.Lock()
 		if sm.seenPeerRoles[shardID] == nil {
@@ -87,7 +90,7 @@ func (sm *ShardManager) processTextProtocolForProbe(msg *pubsub.Message, shardID
 		sm.mu.Unlock()
 		return true
 	}
-	if len(data) >= 6 && string(data[:6]) == "LEAVE:" {
+	if bytes.HasPrefix(data, []byte(msgPrefixLeave)) {
 		sm.mu.Lock()
 		if sm.seenPeerRoles[shardID] != nil {
 			delete(sm.seenPeerRoles[shardID], from)
@@ -95,7 +98,7 @@ func (sm *ShardManager) processTextProtocolForProbe(msg *pubsub.Message, shardID
 		sm.mu.Unlock()
 		return true
 	}
-	if len(data) >= 6 && string(data[:6]) == "PROBE:" {
+	if bytes.HasPrefix(data, []byte(msgPrefixProbe)) {
 		sm.mu.Lock()
 		if sm.seenPeerRoles[shardID] == nil {
 			sm.seenPeerRoles[shardID] = make(map[peer.ID]PeerRoleInfo)
@@ -108,15 +111,14 @@ func (sm *ShardManager) processTextProtocolForProbe(msg *pubsub.Message, shardID
 }
 
 // parseJoinRole extracts role from JOIN:pid or JOIN:pid:ROLE.
-func parseJoinRole(data []byte) string {
+func parseJoinRole(data []byte) PeerRole {
 	s := string(data)
-	if len(s) < 5 || s[:5] != "JOIN:" {
+	if !strings.HasPrefix(s, msgPrefixJoin) {
 		return RoleActive
 	}
 	parts := strings.SplitN(s, ":", 3)
 	if len(parts) >= 3 {
-		r := strings.ToUpper(parts[2])
-		if r == RolePassive {
+		if PeerRole(strings.ToUpper(parts[2])) == RolePassive {
 			return RolePassive
 		}
 	}
