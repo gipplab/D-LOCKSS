@@ -217,8 +217,8 @@ A node's **Peer ID** is derived from its Ed25519 private key. This key is used f
 
 | Priority | Source | When used | Storage location |
 |----------|--------|-----------|------------------|
-| 1 | IPFS repo | `IPFS_PATH` is set and repo is accessible | `$IPFS_PATH/config` (`Identity.PrivKey`) |
-| 2 | Persistent key file | `IPFS_PATH` unset or repo inaccessible | `DLOCKSS_IDENTITY_PATH` (default: `{DLOCKSS_DATA_DIR}/../dlockss.key`) |
+| 1 | IPFS config | `DLOCKSS_IPFS_CONFIG` is set | Kubo config JSON at that path (`Identity.PrivKey`) |
+| 2 | Persistent key file | `DLOCKSS_IPFS_CONFIG` unset | `DLOCKSS_IDENTITY_PATH` (default: `{DLOCKSS_DATA_DIR}/../dlockss.key`) |
 | 3 | Auto-generated | No existing key found | Saved to the path from priority 2 |
 
 **Default file layout** (with `DLOCKSS_DATA_DIR=./data`):
@@ -233,7 +233,29 @@ A node's **Peer ID** is derived from its Ed25519 private key. This key is used f
 
 State files are placed in the **parent** of the data directory so the file watcher does not ingest them. The node validates this at startup and refuses to start if any state file resolves inside the ingest directory.
 
-**Docker / remote Kubo:** When running D-LOCKSS in a container that connects to an external Kubo node via API (no `IPFS_PATH` access), mount a persistent volume and point `DLOCKSS_DATA_DIR` to a subdirectory on it. The identity key will be saved alongside the data directory on the volume and survive container rebuilds. Optionally set `DLOCKSS_IDENTITY_PATH` explicitly.
+**Docker / remote Kubo:** Mount the Kubo config JSON read-only and set `DLOCKSS_IPFS_CONFIG` to its path inside the container. This lets D-LOCKSS derive its identity from the IPFS daemon without mounting the entire repo. Alternatively, mount a persistent volume, point `DLOCKSS_DATA_DIR` to a subdirectory on it, and optionally set `DLOCKSS_IDENTITY_PATH` explicitly.
+
+```yaml
+# Minimal Docker Compose — D-LOCKSS sharing identity with Kubo
+services:
+  ipfs:
+    image: ipfs/kubo:latest
+    volumes:
+      - ipfs-data:/data/ipfs
+  dlockss:
+    image: dlockss:latest
+    depends_on: [ipfs]
+    volumes:
+      - ipfs-data:/ipfs-repo:ro
+      - dlockss-data:/data
+    environment:
+      DLOCKSS_IPFS_CONFIG: /ipfs-repo/config
+      DLOCKSS_IPFS_NODE: /dns4/ipfs/tcp/5001
+      DLOCKSS_DATA_DIR: /data/ingest
+volumes:
+  ipfs-data:
+  dlockss-data:
+```
 
 **Legacy migration:** If a `dlockss.key` exists in the working directory but not at the configured identity path (e.g. after upgrading), it is automatically copied to the new location so the node retains its Peer ID.
 

@@ -195,8 +195,8 @@ if [ ! -f "$IPFS_REPO/config" ]; then
     # 2. Run the node in background with testnet-optimized settings
     # See docs/TIMEOUTS_AND_DELAYS_ANALYSIS.md for rationale
     # Shard 12/6 avoids over-splitting for ~15 nodes (code enforces min 4 per child, merge-up when understaffed)
-    # Export IPFS_PATH so D-LOCKSS can load IPFS identity (use absolute path)
-    IPFS_PATH="$IPFS_REPO_ABS" \
+    # Point D-LOCKSS at the Kubo config to derive its identity
+    DLOCKSS_IPFS_CONFIG="$IPFS_REPO_ABS/config" \
     DLOCKSS_NODE_NAME="testnet_$i" \
     DLOCKSS_METRICS_EXPORT="metrics.csv" \
     DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/$IPFS_API_PORT" \

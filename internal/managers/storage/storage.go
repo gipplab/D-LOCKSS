@@ -180,8 +180,9 @@ func (sm *StorageManager) RemoveKnownFile(key string) {
 }
 
 // ProvideFile announces a file/manifest to the DHT.
-// Concurrency is bounded by MaxConcurrentDHTProvides to prevent overwhelming
-// the DHT during bulk syncs (e.g. when a new node joins a shard with many pins).
+// Concurrency is bounded by MaxConcurrentDHTProvides. If all slots are busy
+// the call returns immediately — the heartbeat re-provide loop will pick up
+// any files that were skipped during bulk syncs.
 func (sm *StorageManager) ProvideFile(ctx context.Context, key string) {
 	if sm.dht == nil {
 		return
@@ -194,8 +195,8 @@ func (sm *StorageManager) ProvideFile(ctx context.Context, key string) {
 
 	select {
 	case sm.provideSem <- struct{}{}:
-	case <-ctx.Done():
-		slog.Debug("DHT provide skipped, context cancelled while waiting", "key", key)
+	default:
+		slog.Debug("DHT provide skipped, all slots busy", "key", key)
 		return
 	}
 	defer func() { <-sm.provideSem }()

@@ -203,7 +203,7 @@ Environment=DLOCKSS_MAX_CONCURRENT_FILE_PROCESSING=2
 Environment=DLOCKSS_MAX_CONCURRENT_CHECKS=2
 Environment=DLOCKSS_NODE_NAME=${NODE_NAME}
 Environment=DLOCKSS_DATA_DIR=./data
-Environment=IPFS_PATH=${IPFS_REPO}
+Environment=DLOCKSS_IPFS_CONFIG=${IPFS_REPO}/config
 Environment=DLOCKSS_IPFS_NODE=/ip4/127.0.0.1/tcp/5001
 ExecStartPre=/bin/bash -c 'for i in \$(seq 1 30); do IPFS_PATH=${IPFS_REPO} /usr/local/bin/ipfs swarm peers >/dev/null 2>&1 && exit 0; sleep 3; done; exit 1'
 ExecStart=${REMOTE_BIN}

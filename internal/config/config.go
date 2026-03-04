@@ -150,6 +150,7 @@ type Config struct {
 	NodeName                       string
 	IdentityPath                   string
 	NodeNamePath                   string
+	IPFSConfigPath                 string
 }
 
 // DefaultConfig returns a Config with all hardcoded defaults (no env reads).
@@ -226,6 +227,7 @@ func DefaultConfig() *Config {
 		NodeName:                       "",
 		IdentityPath:                   filepath.Join(filepath.Dir(dataDir), "dlockss.key"),
 		NodeNamePath:                   filepath.Join(filepath.Dir(dataDir), "node_name"),
+		IPFSConfigPath:                 "",
 	}
 }
 
@@ -303,6 +305,7 @@ func LoadFromEnv() *Config {
 		NodeName:                       getEnvString("DLOCKSS_NODE_NAME", ""),
 		IdentityPath:                   identityPath(dataDir),
 		NodeNamePath:                   nodeNamePath(dataDir),
+		IPFSConfigPath:                 getEnvString("DLOCKSS_IPFS_CONFIG", ""),
 	}
 }
 
@@ -347,6 +350,7 @@ func (c *Config) ValidatePathSafetyCheck() string {
 	}{
 		{"IdentityPath (DLOCKSS_IDENTITY_PATH)", c.IdentityPath},
 		{"NodeNamePath", c.NodeNamePath},
+		{"IPFSConfigPath (DLOCKSS_IPFS_CONFIG)", c.IPFSConfigPath},
 		{"ClusterStorePath (DLOCKSS_CLUSTER_STORE)", c.ClusterStorePath},
 	}
 	var problems []string

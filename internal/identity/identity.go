@@ -27,25 +27,23 @@ type ipfsConfig struct {
 }
 
 // LoadKey returns the node's private key. It tries, in order:
-//  1. The IPFS repo identity (IPFS_PATH/config) so the node shares one peer ID with its IPFS daemon.
+//  1. DLOCKSS_IPFS_CONFIG — read Identity.PrivKey from the Kubo config JSON.
 //  2. A persisted key at config.IdentityPath.
 //  3. A legacy key at ./dlockss.key (migrated to config.IdentityPath).
 //  4. A freshly generated Ed25519 key (persisted to config.IdentityPath).
 func LoadKey(cfg *config.Config) (crypto.PrivKey, error) {
-	priv, err := loadFromIPFSRepo()
-	if err == nil {
-		slog.Info("using ipfs repo identity")
+	if cfg.IPFSConfigPath != "" {
+		priv, err := loadFromIPFSConfig(cfg.IPFSConfigPath)
+		if err != nil {
+			return nil, fmt.Errorf("DLOCKSS_IPFS_CONFIG set but failed: %w", err)
+		}
+		slog.Info("using IPFS config identity", "path", cfg.IPFSConfigPath)
 		return priv, nil
 	}
 	return loadOrCreate(cfg)
 }
 
-func loadFromIPFSRepo() (crypto.PrivKey, error) {
-	ipfsPath := os.Getenv("IPFS_PATH")
-	if ipfsPath == "" {
-		return nil, fmt.Errorf("IPFS_PATH not set")
-	}
-	configPath := filepath.Join(ipfsPath, "config")
+func loadFromIPFSConfig(configPath string) (crypto.PrivKey, error) {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("read IPFS config: %w", err)
