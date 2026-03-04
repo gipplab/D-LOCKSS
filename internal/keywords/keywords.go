@@ -27,7 +27,10 @@ import (
 	"dlockss/pkg/schema"
 )
 
-const indexFileName = "keyword_index.json"
+const (
+	indexFileName    = "keyword_index.json"
+	failuresFileName = "keyword_failures.json"
+)
 
 const (
 	defaultModel = "llama-3.3-70b-instruct"
@@ -47,14 +50,15 @@ Example: {"title":"Attention Is All You Need","broad_field":"Computer Science","
 Document text:
 `
 
-	dailyLimit     = 20_000
-	requestSpacing = 3 * time.Second
+	dailyLimit     = 50_000
+	requestSpacing = 100 * time.Millisecond
 
 	manifestFetchTimeout = 30 * time.Second
 	pdfFetchTimeout      = 90 * time.Second
-	convertTimeout       = 120 * time.Second
+	convertTimeout       = 30 * time.Second
 	llmTimeout           = 120 * time.Second
 
+	numWorkers     = 4
 	maxRetries     = 3
 	retryCooldown  = 10 * time.Minute
 	maxRecentItems = 30
@@ -76,6 +80,7 @@ type Store struct {
 	keywordCIDs map[string]map[string]struct{}
 	processed   map[string]bool
 	failures    map[string]*failureRecord
+	inflight    map[string]bool
 	recent      []RecentSearch
 
 	dailyCount int
@@ -102,8 +107,9 @@ type CIDKeywordEntry struct {
 }
 
 type failureRecord struct {
-	count   int
-	lastTry time.Time
+	Count   int       `json:"count"`
+	LastTry time.Time `json:"last_try"`
+	Reason  string    `json:"reason,omitempty"`
 }
 
 type RecentSearch struct {
@@ -173,12 +179,14 @@ func NewStore(apiKey, dataDir string) *Store {
 		keywordCIDs: make(map[string]map[string]struct{}),
 		processed:   make(map[string]bool),
 		failures:    make(map[string]*failureRecord),
+		inflight:    make(map[string]bool),
 		recent:      make([]RecentSearch, 0, maxRecentItems),
 		dayStart:    startOfDay(time.Now()),
 		apiKey:      apiKey,
 		dataDir:     dataDir,
 	}
 	s.loadIndex()
+	s.loadFailures()
 	return s
 }
 
@@ -256,16 +264,90 @@ func (s *Store) saveIndex() {
 	}
 }
 
+func (s *Store) failuresPath() string {
+	return filepath.Join(s.dataDir, failuresFileName)
+}
+
+func (s *Store) loadFailures() {
+	if s.dataDir == "" {
+		return
+	}
+	data, err := os.ReadFile(s.failuresPath())
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("failed to read failures index", "path", s.failuresPath(), "error", err)
+		}
+		return
+	}
+
+	var entries map[string]*failureRecord
+	if err := json.Unmarshal(data, &entries); err != nil {
+		slog.Warn("failed to parse failures index", "path", s.failuresPath(), "error", err)
+		return
+	}
+
+	for cid, f := range entries {
+		s.failures[cid] = f
+	}
+	slog.Info("loaded failure records", "entries", len(entries))
+}
+
+// saveFailures persists permanently failed CIDs so they aren't retried.
+func (s *Store) saveFailures() {
+	if s.dataDir == "" {
+		return
+	}
+
+	permanent := make(map[string]*failureRecord)
+	for cid, f := range s.failures {
+		if f.Count >= maxRetries {
+			permanent[cid] = f
+		}
+	}
+	if len(permanent) == 0 {
+		return
+	}
+
+	data, err := json.Marshal(permanent)
+	if err != nil {
+		slog.Error("failed to marshal failures index", "error", err)
+		return
+	}
+
+	tmpPath := s.failuresPath() + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		slog.Error("failed to write failures index", "path", tmpPath, "error", err)
+		return
+	}
+	if err := os.Rename(tmpPath, s.failuresPath()); err != nil {
+		slog.Error("failed to rename failures index", "error", err)
+	}
+}
+
 // Run is the background loop that discovers new CIDs and extracts keywords.
 func (s *Store) Run(done <-chan struct{}, source CIDSource) {
 	if s.apiKey == "" {
 		slog.Warn("SAIA API key not set, keyword extraction disabled")
 		return
 	}
-	slog.Info("background extraction enabled", "model", defaultModel, "spacing", requestSpacing)
+	slog.Info("background extraction enabled", "model", defaultModel, "workers", numWorkers, "spacing", requestSpacing, "convert_timeout", convertTimeout)
+
+	work := make(chan string, numWorkers)
+
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for cid := range work {
+				s.processCID(cid)
+			}
+		}()
+	}
 
 	ticker := time.NewTicker(requestSpacing)
 	defer ticker.Stop()
+	defer func() { close(work); wg.Wait() }()
 
 	for {
 		select {
@@ -276,45 +358,54 @@ func (s *Store) Run(done <-chan struct{}, source CIDSource) {
 			if cid == "" {
 				continue
 			}
-			s.processCID(cid)
+			select {
+			case work <- cid:
+			case <-done:
+				return
+			}
 		}
 	}
 }
 
 func (s *Store) pickNextCID(source CIDSource) string {
-	s.mu.Lock()
-	s.resetDayIfNeeded()
-	if s.dailyCount >= dailyLimit {
-		s.mu.Unlock()
-		return ""
-	}
-	s.mu.Unlock()
-
 	candidates := source.UniqueCIDList()
 	sort.Strings(candidates)
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.resetDayIfNeeded()
+	if s.dailyCount >= dailyLimit {
+		return ""
+	}
 
 	now := time.Now()
 	for _, c := range candidates {
-		if s.processed[c] {
+		if s.processed[c] || s.inflight[c] {
 			continue
 		}
 		if f, ok := s.failures[c]; ok {
-			if f.count >= maxRetries {
+			if f.Count >= maxRetries {
 				continue
 			}
-			if now.Sub(f.lastTry) < retryCooldown {
+			if now.Sub(f.LastTry) < retryCooldown {
 				continue
 			}
 		}
+		s.inflight[c] = true
 		return c
 	}
 	return ""
 }
 
+func (s *Store) clearInflight(manifestCID string) {
+	s.mu.Lock()
+	delete(s.inflight, manifestCID)
+	s.mu.Unlock()
+}
+
 func (s *Store) processCID(manifestCID string) {
+	defer s.clearInflight(manifestCID)
 	slog.Info("processing cid", "manifest", manifestCID, "step", "resolve-manifest")
 	payloadCID, metaRef, err := s.resolveManifest(manifestCID)
 	if err != nil {
@@ -748,7 +839,7 @@ func (s *Store) GetStats(totalUniqueCIDs int) Stats {
 
 	permanentFails := 0
 	for _, f := range s.failures {
-		if f.count >= maxRetries {
+		if f.Count >= maxRetries {
 			permanentFails++
 		}
 	}
@@ -778,9 +869,12 @@ func (s *Store) recordFailure(manifestCID string) {
 		f = &failureRecord{}
 		s.failures[manifestCID] = f
 	}
-	f.count++
-	f.lastTry = time.Now()
+	f.Count++
+	f.LastTry = time.Now()
 	s.totalFail++
+	if f.Count >= maxRetries {
+		s.saveFailures()
+	}
 }
 
 func (s *Store) markSkipped(manifestCID string) {

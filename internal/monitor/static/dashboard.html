@@ -112,7 +112,7 @@
                 </div>
             </div>
         </div>
-        <div class="keyword-search-section">
+        <div class="keyword-search-section" style="display:none;">
             <div style="display:flex; justify-content:space-between; align-items:center;">
                 <h3 style="margin:0; text-transform:uppercase; font-size:1em;">Keyword Search</h3>
                 <span id="kwStatsLbl" class="kw-stats-lbl"></span>
@@ -575,9 +575,10 @@
 
         function kwLoadStats() {
             fetch('/api/keyword-stats?t=' + Date.now()).then(r => r.json()).then(data => {
-                const el = document.getElementById('kwStatsLbl');
-                if (!data.enabled) { el.textContent = 'SAIA_API_KEY not set'; return; }
-                el.textContent = 'Indexed: ' + data.indexed + '/' + data.total_cids + ' | Keywords: ' + data.unique_keywords;
+                const section = document.querySelector('.keyword-search-section');
+                if (!data.enabled) { section.style.display = 'none'; return; }
+                section.style.display = '';
+                document.getElementById('kwStatsLbl').textContent = 'Indexed: ' + data.indexed + '/' + data.total_cids + ' | Keywords: ' + data.unique_keywords;
             }).catch(() => {});
         }
 
