@@ -12,7 +12,7 @@ note over A, CRDT: Each shard has its own CRDT (dlockss-shard-<id>)
 A -> CRDT: LogPin(pin) on shard's cluster
 CRDT -> B: Sync (PubSub)
 CRDT -> C: Sync (PubSub)
-B -> B: LocalPinTracker sees new CID\n(allocation-aware: pin if we are in Allocations)
+B -> B: LocalPinTracker sees new CID\n(all nodes in shard pin everything in CRDT)
 B -> IPFS: PinRecursive(ManifestCID)
 B -> IPFS: PinRecursive(PayloadCID) as own root\n(so Kubo reprovider announces it)
 C -> C: LocalPinTracker sees new CID

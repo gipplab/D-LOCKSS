@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	"log"
+	"log/slog"
 	"sort"
 	"sync"
 	"time"
 
+	"dlockss/internal/badbits"
 	"dlockss/internal/config"
+	"dlockss/pkg/ipfs"
 
 	"github.com/ipfs-cluster/ipfs-cluster/api"
 	"github.com/ipfs-cluster/ipfs-cluster/consensus/crdt"
@@ -45,15 +47,17 @@ type ShardPeerProvider interface {
 // ClusterManager manages multiple embedded IPFS Cluster instances (Consensus/PinTracker)
 // sharing the same underlying IPFS node.
 type ClusterManager struct {
+	cfg          *config.Config
 	host         host.Host
-	ipfsClient   IPFSClient // Used for PinTracker
+	ipfsClient   ipfs.IPFSClient
+	badBits      *badbits.Filter
 	pubsub       *pubsub.PubSub
 	dht          routing.Routing
 	datastore    datastore.Datastore
 	trustedPeers []peer.ID
-	onPinSynced  func(cid string)  // optional: notify when a pin is synced so storage/monitor can count replication
-	onPinRemoved func(cid string)  // optional: notify when we unpin (no longer allocated) so storage/heartbeat stays correct
-	peerProvider ShardPeerProvider // optional: when set, CRDT Peers() returns real shard peers for allocations
+	onPinSynced  func(cid string)
+	onPinRemoved func(cid string)
+	peerProvider ShardPeerProvider
 
 	mu       sync.RWMutex
 	clusters map[string]*EmbeddedCluster
@@ -80,16 +84,32 @@ type EmbeddedCluster struct {
 	cancel context.CancelFunc
 }
 
-func NewClusterManager(h host.Host, ps *pubsub.PubSub, dht routing.Routing, ds datastore.Datastore, ipfsClient IPFSClient, trustedPeers []peer.ID, onPinSynced func(cid string), onPinRemoved func(cid string)) *ClusterManager {
+// ClusterManagerConfig holds all dependencies for a ClusterManager.
+type ClusterManagerConfig struct {
+	Cfg          *config.Config
+	Host         host.Host
+	PubSub       *pubsub.PubSub
+	DHT          routing.Routing
+	Datastore    datastore.Datastore
+	IPFSClient   ipfs.IPFSClient
+	TrustedPeers []peer.ID
+	BadBits      *badbits.Filter
+	OnPinSynced  func(cid string)
+	OnPinRemoved func(cid string)
+}
+
+func NewClusterManager(cfg ClusterManagerConfig) *ClusterManager {
 	return &ClusterManager{
-		host:         h,
-		pubsub:       ps,
-		dht:          dht,
-		datastore:    ds,
-		ipfsClient:   ipfsClient,
-		trustedPeers: trustedPeers,
-		onPinSynced:  onPinSynced,
-		onPinRemoved: onPinRemoved,
+		cfg:          cfg.Cfg,
+		host:         cfg.Host,
+		badBits:      cfg.BadBits,
+		pubsub:       cfg.PubSub,
+		dht:          cfg.DHT,
+		datastore:    cfg.Datastore,
+		ipfsClient:   cfg.IPFSClient,
+		trustedPeers: cfg.TrustedPeers,
+		onPinSynced:  cfg.OnPinSynced,
+		onPinRemoved: cfg.OnPinRemoved,
 		clusters:     make(map[string]*EmbeddedCluster),
 	}
 }
@@ -116,12 +136,12 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string, bootstr
 
 	// Configure CRDT
 	trustAll := true
-	if config.TrustMode == "allowlist" {
+	if cm.cfg.TrustMode == "allowlist" {
 		trustAll = false
 	}
 
 	cfg := &crdt.Config{
-		ClusterName:         config.PubsubTopicPrefix + "-shard-" + shardID,
+		ClusterName:         cm.cfg.PubsubTopicPrefix + "-shard-" + shardID,
 		PeersetMetric:       "ping",
 		RebroadcastInterval: 30 * time.Second,
 		DatastoreNamespace:  datastore.NewKey("consensus").String(),
@@ -157,44 +177,42 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string, bootstr
 	onTrack := func(s string) { cm.TriggerSync(s) }
 	setConsensusRPCClient(consensus, cm.host, shardID, getPeers, onTrack)
 
-	subCtx, cancel := context.WithCancel(context.Background())
-
-	// Start PinTracker (onPinSynced so node registers synced pins with storage and announces PINNED; onPinRemoved so storage/heartbeat stays correct when we unpin)
-	tracker := NewLocalPinTracker(cm.ipfsClient, shardID, cm.onPinSynced, cm.onPinRemoved)
-	tracker.Start(consensus)
-
-	// Start Signal Listener (Event-Driven Updates)
-	// We subscribe to the same topic that CRDT uses to detect activity.
-	// When we see a message, we trigger the tracker to sync immediately.
+	// Subscribe to the signal topic before starting the tracker so we can
+	// clean up everything on failure.
 	topicName := cfg.ClusterName
 	topic, err := cm.pubsub.Join(topicName)
-	if err == nil {
-		sub, err := topic.Subscribe()
-		if err == nil {
-			go func() {
-				defer sub.Cancel()
-				defer topic.Close()
-				for {
-					select {
-					case <-subCtx.Done():
-						return
-					default:
-						_, err := sub.Next(subCtx)
-						if err != nil {
-							return
-						}
-						// Trigger sync on any message
-						tracker.TriggerSync()
-					}
-				}
-			}()
-		} else {
-			_ = topic.Close()
-			log.Printf("[Cluster] Warning: Failed to subscribe to signal topic %s: %v", topicName, err)
-		}
-	} else {
-		log.Printf("[Cluster] Warning: Failed to join signal topic %s: %v", topicName, err)
+	if err != nil {
+		_ = consensus.Shutdown(context.Background())
+		return fmt.Errorf("failed to join signal topic %s: %w", topicName, err)
 	}
+	sub, err := topic.Subscribe()
+	if err != nil {
+		_ = topic.Close()
+		_ = consensus.Shutdown(context.Background())
+		return fmt.Errorf("failed to subscribe to signal topic %s: %w", topicName, err)
+	}
+
+	subCtx, cancel := context.WithCancel(context.Background())
+
+	tracker := NewLocalPinTracker(cm.ipfsClient, shardID, cm.onPinSynced, cm.onPinRemoved, cm.badBits)
+	tracker.Start(consensus)
+
+	go func() {
+		defer sub.Cancel()
+		defer topic.Close()
+		for {
+			select {
+			case <-subCtx.Done():
+				return
+			default:
+				_, err := sub.Next(subCtx)
+				if err != nil {
+					return
+				}
+				tracker.TriggerSync()
+			}
+		}
+	}()
 
 	cm.clusters[shardID] = &EmbeddedCluster{
 		ShardID:    shardID,
@@ -218,21 +236,22 @@ func (cm *ClusterManager) LeaveShard(shardID string) error {
 	delete(cm.clusters, shardID)
 	cm.mu.Unlock()
 
-	log.Printf("[Cluster] Shutting down embedded cluster for shard %s...", shardID)
+	slog.Info("shutting down embedded cluster", "shard", shardID)
 	if cluster.PinTracker != nil {
 		cluster.PinTracker.Stop()
 	}
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer shutCancel()
+	var shutdownErr error
 	if err := cluster.Consensus.Shutdown(shutCtx); err != nil {
-		log.Printf("[Cluster] Error shutting down consensus for shard %s: %v", shardID, err)
+		shutdownErr = fmt.Errorf("consensus shutdown for shard %s: %w", shardID, err)
 	}
 	cluster.cancel()
-	return nil
+	return shutdownErr
 }
 
 // Shutdown gracefully shuts down all embedded clusters.
-func (cm *ClusterManager) Shutdown() {
+func (cm *ClusterManager) Shutdown() error {
 	cm.mu.Lock()
 	shards := make([]string, 0, len(cm.clusters))
 	for shardID := range cm.clusters {
@@ -240,11 +259,16 @@ func (cm *ClusterManager) Shutdown() {
 	}
 	cm.mu.Unlock()
 
+	var firstErr error
 	for _, shardID := range shards {
 		if err := cm.LeaveShard(shardID); err != nil {
-			log.Printf("[Cluster] Error leaving shard %s during shutdown: %v", shardID, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			slog.Error("failed to leave shard during shutdown", "shard", shardID, "error", err)
 		}
 	}
+	return firstErr
 }
 
 // SelectAllocations deterministically chooses n peers from sorted list for the given CID (same CID → same set on all nodes).
@@ -284,18 +308,17 @@ func (cm *ClusterManager) Pin(ctx context.Context, shardID string, c cid.Cid, re
 	repMin := replicationFactorMin
 	repMax := replicationFactorMax
 	if repMin < 0 {
-		repMin = config.MinReplication
+		repMin = cm.cfg.MinReplication
 	}
 	if repMax < 0 {
-		repMax = config.MaxReplication
+		repMax = cm.cfg.MaxReplication
 	}
 
 	var allocations []peer.ID
 	if repMin > 0 || repMax > 0 {
 		peers, err := cluster.Consensus.Peers(ctx)
 		if err != nil {
-			log.Printf("[Cluster] Warning: failed to get peers for shard %s: %v (using full replication)", shardID, err)
-			// nil peers → full replication
+			slog.Warn("failed to get peers, using full replication", "shard", shardID, "error", err)
 		}
 		// Cap replication at shard size: a shard with 4 nodes can only replicate 4x.
 		peerCount := len(peers)
@@ -314,8 +337,8 @@ func (cm *ClusterManager) Pin(ctx context.Context, shardID string, c cid.Cid, re
 	} else {
 		// repMin=0 && repMax=0: full replication mode (used during migration).
 		// Store config defaults as metadata but leave Allocations empty so all nodes pin.
-		repMin = config.MinReplication
-		repMax = config.MaxReplication
+		repMin = cm.cfg.MinReplication
+		repMax = cm.cfg.MaxReplication
 	}
 
 	pin := api.Pin{
@@ -331,7 +354,7 @@ func (cm *ClusterManager) Pin(ctx context.Context, shardID string, c cid.Cid, re
 		return fmt.Errorf("failed to log pin to CRDT: %w", err)
 	}
 
-	log.Printf("[Cluster] Pinning %s to shard %s (Rep: %d-%d, Alloc: %d)", c, shardID, repMin, repMax, len(allocations))
+	slog.Info("pinning to shard", "cid", c, "shard", shardID, "rep_min", repMin, "rep_max", repMax, "allocations", len(allocations))
 	return nil
 }
 
@@ -365,7 +388,7 @@ func (cm *ClusterManager) Unpin(ctx context.Context, shardID string, c cid.Cid) 
 		return fmt.Errorf("failed to log unpin to CRDT: %w", err)
 	}
 
-	log.Printf("[Cluster] Unpinning %s from shard %s", c, shardID)
+	slog.Info("unpinning from shard", "cid", c, "shard", shardID)
 	return nil
 }
 

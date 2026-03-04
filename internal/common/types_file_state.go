@@ -1,100 +1,51 @@
 package common
 
 import (
-	"sync"
 	"time"
+
+	"dlockss/internal/syncmap"
 )
 
 // CheckingFiles tracks files currently being checked for replication.
 type CheckingFiles struct {
-	mu sync.RWMutex
-	m  map[string]bool
+	m *syncmap.Map[string, bool]
 }
 
 func NewCheckingFiles() *CheckingFiles {
-	return &CheckingFiles{m: make(map[string]bool)}
+	return &CheckingFiles{m: syncmap.New[string, bool]()}
 }
 
-func (cf *CheckingFiles) TryLock(key string) bool {
-	cf.mu.Lock()
-	defer cf.mu.Unlock()
-	if cf.m[key] {
-		return false
-	}
-	cf.m[key] = true
-	return true
-}
-
-func (cf *CheckingFiles) Unlock(key string) {
-	cf.mu.Lock()
-	defer cf.mu.Unlock()
-	delete(cf.m, key)
-}
-
-func (cf *CheckingFiles) Size() int {
-	cf.mu.RLock()
-	defer cf.mu.RUnlock()
-	return len(cf.m)
-}
+func (cf *CheckingFiles) TryLock(key string) bool { return cf.m.SetIfAbsent(key, true) }
+func (cf *CheckingFiles) Unlock(key string)       { cf.m.Delete(key) }
+func (cf *CheckingFiles) Size() int               { return cf.m.Len() }
 
 // LastCheckTime tracks when files were last checked for replication.
-type LastCheckTime struct {
-	mu sync.RWMutex
-	m  map[string]time.Time
-}
+type LastCheckTime = syncmap.Map[string, time.Time]
 
 func NewLastCheckTime() *LastCheckTime {
-	return &LastCheckTime{m: make(map[string]time.Time)}
-}
-
-func (lct *LastCheckTime) Get(key string) (time.Time, bool) {
-	lct.mu.RLock()
-	defer lct.mu.RUnlock()
-	t, ok := lct.m[key]
-	return t, ok
-}
-
-func (lct *LastCheckTime) Set(key string, t time.Time) {
-	lct.mu.Lock()
-	defer lct.mu.Unlock()
-	lct.m[key] = t
+	return syncmap.New[string, time.Time]()
 }
 
 // RecentlyRemoved tracks files that were recently removed (for cooldown).
 type RecentlyRemoved struct {
-	mu sync.RWMutex
-	m  map[string]time.Time
+	m     *syncmap.Map[string, time.Time]
+	count int
 }
 
 func NewRecentlyRemoved() *RecentlyRemoved {
-	return &RecentlyRemoved{m: make(map[string]time.Time)}
+	return &RecentlyRemoved{m: syncmap.New[string, time.Time]()}
 }
 
-func (rr *RecentlyRemoved) WasRemoved(key string) (time.Time, bool) {
-	rr.mu.RLock()
-	defer rr.mu.RUnlock()
-	t, ok := rr.m[key]
-	return t, ok
-}
+func (rr *RecentlyRemoved) WasRemoved(key string) (time.Time, bool) { return rr.m.Get(key) }
+func (rr *RecentlyRemoved) Remove(key string)                       { rr.m.Delete(key) }
 
 func (rr *RecentlyRemoved) Record(key string) {
-	rr.mu.Lock()
-	defer rr.mu.Unlock()
-	now := time.Now()
-	rr.m[key] = now
-	// Prune entries older than 10 minutes every 64 records
-	if len(rr.m)&0x3F == 0 {
-		cutoff := now.Add(-10 * time.Minute)
-		for k, t := range rr.m {
-			if t.Before(cutoff) {
-				delete(rr.m, k)
-			}
-		}
+	rr.m.Set(key, time.Now())
+	rr.count++
+	const pruneEveryN = 64
+	const recentlyRemovedTTL = 10 * time.Minute
+	if rr.count%pruneEveryN == 0 {
+		cutoff := time.Now().Add(-recentlyRemovedTTL)
+		rr.m.Prune(func(_ string, t time.Time) bool { return t.Before(cutoff) })
 	}
-}
-
-func (rr *RecentlyRemoved) Remove(key string) {
-	rr.mu.Lock()
-	defer rr.mu.Unlock()
-	delete(rr.m, key)
 }

@@ -2,13 +2,10 @@ package shard
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
-
-	"dlockss/internal/config"
 )
 
 func (sm *ShardManager) getShardPeerCount() int {
@@ -18,11 +15,10 @@ func (sm *ShardManager) getShardPeerCount() int {
 	sm.mu.RUnlock()
 
 	if exists && sub.topic != nil {
-		activeCount := sm.countActivePeers(currentShard, true, config.SeenPeersWindow)
+		activeCount := sm.peers.CountActive(currentShard, true, currentShard, sm.cfg.SeenPeersWindow)
 		if activeCount > 0 {
 			return activeCount
 		}
-		// Fallback: no role data yet, use mesh as lower bound (may overcount PASSIVE/PROBE)
 		meshPeers := sub.topic.ListPeers()
 		return len(meshPeers) + 1
 	}
@@ -47,12 +43,10 @@ func (sm *ShardManager) getShardPeerCountForSplit() int {
 	sm.mu.RUnlock()
 
 	if exists && sub.topic != nil {
-		activeCount := sm.countActivePeers(currentShard, true, config.SeenPeersWindow)
+		activeCount := sm.peers.CountActive(currentShard, true, currentShard, sm.cfg.SeenPeersWindow)
 		if activeCount > 0 {
 			return activeCount
 		}
-		// No role data yet: return 0 to avoid splitting on phantom peers (monitor in mesh).
-		// Split will proceed once HEARTBEATs establish accurate ACTIVE counts.
 		return 0
 	}
 	if sm.clusterMgr != nil {
@@ -73,6 +67,11 @@ func (sm *ShardManager) GetShardInfo() (string, int) {
 
 func (sm *ShardManager) GetHost() host.Host {
 	return sm.h
+}
+
+// PeerID returns the local peer's ID.
+func (sm *ShardManager) PeerID() peer.ID {
+	return sm.h.ID()
 }
 
 func (sm *ShardManager) GetShardPeers() []peer.ID {
@@ -96,44 +95,24 @@ func (sm *ShardManager) GetPeersForShard(shardID string) []peer.ID {
 		return nil
 	}
 
-	// Return only ACTIVE peers (exclude PASSIVE and PROBE for replication)
-	sm.mu.RLock()
-	roles, ok := sm.seenPeerRoles[shardID]
-	cutoff := time.Now().Add(-350 * time.Second)
-	sm.mu.RUnlock()
-
-	if ok {
-		var active []peer.ID
-		sm.mu.RLock()
-		for p, info := range roles {
-			if info.Role == RoleActive && info.LastSeen.After(cutoff) && p != sm.h.ID() {
-				active = append(active, p)
-			}
-		}
-		sm.mu.RUnlock()
-		return active
+	if sm.peers.HasRoles(shardID) {
+		return sm.peers.GetActiveForShard(shardID, sm.cfg.SeenPeersWindow)
 	}
 
 	// Fallback: no role data, use mesh+seen (may include PASSIVE/PROBE)
 	meshPeers := sub.topic.ListPeers()
 	seen := make(map[peer.ID]struct{}, len(meshPeers))
 	for _, p := range meshPeers {
+		if p != sm.h.ID() {
+			seen[p] = struct{}{}
+		}
+	}
+	for p := range sm.peers.GetSeenPeers(shardID, sm.cfg.SeenPeersWindow) {
 		seen[p] = struct{}{}
 	}
-	sm.mu.RLock()
-	if seenMap, ok := sm.seenPeers[shardID]; ok {
-		for p, lastSeen := range seenMap {
-			if lastSeen.After(cutoff) {
-				seen[p] = struct{}{}
-			}
-		}
-	}
-	sm.mu.RUnlock()
 	all := make([]peer.ID, 0, len(seen))
 	for p := range seen {
-		if p != sm.h.ID() {
-			all = append(all, p)
-		}
+		all = append(all, p)
 	}
 	return all
 }
@@ -148,7 +127,7 @@ func (sm *ShardManager) GetShardPeerCount(shardID string) int {
 		return 0
 	}
 	includeSelf := (shardID == currentShard)
-	activeCount := sm.countActivePeers(shardID, includeSelf, 350*time.Second)
+	activeCount := sm.peers.CountActive(shardID, includeSelf, currentShard, sm.cfg.SeenPeersWindow)
 	if activeCount > 0 {
 		return activeCount
 	}
@@ -203,7 +182,7 @@ func (sm *ShardManager) probeShard(shardID string, probeTimeout time.Duration) i
 	sm.mu.RUnlock()
 
 	if alreadyJoined && sub.topic != nil {
-		return sm.getProbePeerCount(shardID, 350*time.Second)
+		return sm.getProbePeerCount(shardID, sm.cfg.SeenPeersWindow)
 	}
 	return sm.probeShardSilently(shardID, probeTimeout)
 }
@@ -217,7 +196,7 @@ func (sm *ShardManager) probeShardSilently(shardID string, probeTimeout time.Dur
 	sm.mu.Unlock()
 
 	if !fromCache {
-		topicName := fmt.Sprintf("%s-creative-commons-shard-%s", config.PubsubTopicPrefix, shardID)
+		topicName := sm.shardTopicName(shardID)
 		var err error
 		t, err = sm.ps.Join(topicName)
 		if err != nil {
@@ -235,7 +214,7 @@ func (sm *ShardManager) probeShardSilently(shardID string, probeTimeout time.Dur
 	defer psSub.Cancel()
 
 	// Publish PROBE so others know we're a prober (not counted)
-	probeMsg := []byte("PROBE:" + sm.h.ID().String())
+	probeMsg := []byte(msgPrefixProbe + sm.h.ID().String())
 	_ = t.Publish(sm.ctx, probeMsg)
 
 	// Process incoming messages to collect HEARTBEAT/JOIN/PROBE role info
@@ -256,7 +235,7 @@ func (sm *ShardManager) probeShardSilently(shardID string, probeTimeout time.Dur
 		sm.processTextProtocolForProbe(msg, shardID)
 	}
 
-	activeCount := sm.countActivePeers(shardID, false, 350*time.Second)
+	activeCount := sm.peers.CountActive(shardID, false, "", sm.cfg.SeenPeersWindow)
 	if activeCount > 0 {
 		sm.mu.Lock()
 		if old := sm.probeTopicCache[shardID]; old != nil && old != t {
@@ -297,13 +276,12 @@ func (sm *ShardManager) probeShardSilently(shardID string, probeTimeout time.Dur
 
 func (sm *ShardManager) getProbePeerCount(shardID string, activeWindow time.Duration) int {
 	sm.mu.RLock()
+	currentShard := sm.currentShard
 	_, observerOnly := sm.observerOnlyShards[shardID]
 	sm.mu.RUnlock()
-	activeCount := sm.countActivePeers(shardID, !observerOnly, activeWindow)
+	activeCount := sm.peers.CountActive(shardID, !observerOnly, currentShard, activeWindow)
 	if activeCount > 0 {
 		return activeCount
 	}
-	// No ACTIVE peers: return 0 instead of mesh count. The mesh can include the monitor
-	// or other non-ACTIVE subscribers; trusting it would allow phantom "join existing".
 	return 0
 }

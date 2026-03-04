@@ -2,42 +2,41 @@ package shard
 
 import (
 	"encoding/json"
-	"log"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
-
-	"dlockss/internal/config"
 )
 
 const reshardedFilesSaveInterval = 2 * time.Minute
 
-func reshardedFilesPath() string {
-	return filepath.Join(filepath.Dir(config.ClusterStorePath), "resharded_files.json")
+func (sm *ShardManager) reshardedFilesPath() string {
+	return filepath.Join(filepath.Dir(sm.cfg.ClusterStorePath), "resharded_files.json")
 }
 
-func (sm *ShardManager) loadReshardedFiles() {
-	path := reshardedFilesPath()
+func (sm *ShardManager) loadReshardedFiles() error {
+	path := sm.reshardedFilesPath()
 	data, err := os.ReadFile(path)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Printf("[Shard] Failed to load resharded files from %s: %v", path, err)
+		if os.IsNotExist(err) {
+			return nil
 		}
-		return
+		return fmt.Errorf("load resharded files %s: %w", path, err)
 	}
 	var keys []string
 	if err := json.Unmarshal(data, &keys); err != nil {
-		log.Printf("[Shard] Failed to parse resharded files: %v", err)
-		return
+		return fmt.Errorf("parse resharded files: %w", err)
 	}
 	for _, k := range keys {
 		sm.reshardedFiles.Add(k)
 	}
-	log.Printf("[Shard] Loaded %d resharded files from %s", len(keys), path)
+	slog.Info("loaded resharded files", "count", len(keys), "path", path)
+	return nil
 }
 
-func (sm *ShardManager) saveReshardedFiles() {
-	path := reshardedFilesPath()
+func (sm *ShardManager) saveReshardedFiles() error {
+	path := sm.reshardedFilesPath()
 	keys := sm.reshardedFiles.All()
 	arr := make([]string, 0, len(keys))
 	for k := range keys {
@@ -45,17 +44,16 @@ func (sm *ShardManager) saveReshardedFiles() {
 	}
 	data, err := json.Marshal(arr)
 	if err != nil {
-		log.Printf("[Shard] Failed to marshal resharded files: %v", err)
-		return
+		return fmt.Errorf("marshal resharded files: %w", err)
 	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		log.Printf("[Shard] Failed to create dir for resharded files: %v", err)
-		return
+		return fmt.Errorf("create directory for resharded files: %w", err)
 	}
 	if err := os.WriteFile(path, data, 0600); err != nil {
-		log.Printf("[Shard] Failed to save resharded files to %s: %v", path, err)
+		return fmt.Errorf("save resharded files %s: %w", path, err)
 	}
+	return nil
 }
 
 func (sm *ShardManager) runReshardedFilesSaveLoop() {
@@ -64,10 +62,11 @@ func (sm *ShardManager) runReshardedFilesSaveLoop() {
 	for {
 		select {
 		case <-sm.ctx.Done():
-			sm.saveReshardedFiles()
 			return
 		case <-ticker.C:
-			sm.saveReshardedFiles()
+			if err := sm.saveReshardedFiles(); err != nil {
+				slog.Error("failed to save resharded files", "error", err)
+			}
 		}
 	}
 }

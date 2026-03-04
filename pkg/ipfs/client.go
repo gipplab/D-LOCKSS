@@ -21,7 +21,6 @@ type IPFSClient interface {
 	UnpinRecursive(ctx context.Context, cid cid.Cid) error
 	IsPinned(ctx context.Context, cid cid.Cid) (bool, error)
 	GetFileSize(ctx context.Context, cid cid.Cid) (uint64, error)
-	VerifyDAGCompleteness(ctx context.Context, rootCID cid.Cid) (bool, error)
 	GetPeerID(ctx context.Context) (string, error)
 	SwarmConnect(ctx context.Context, addrs []string) error
 }
@@ -31,8 +30,10 @@ type Client struct {
 	api *ipfsapi.Shell
 }
 
-// GetShell returns the underlying IPFS Shell for advanced operations
-func (c *Client) GetShell() *ipfsapi.Shell {
+// shell returns the underlying API handle. Package-internal only; callers
+// outside this package should use NewIPFSDHTAdapterFromClient instead of
+// reaching for the raw shell.
+func (c *Client) shell() *ipfsapi.Shell {
 	return c.api
 }
 
@@ -143,19 +144,6 @@ func (c *Client) GetFileSize(ctx context.Context, cid cid.Cid) (uint64, error) {
 	}
 
 	return uint64(stat.Size), nil
-}
-
-// VerifyDAGCompleteness returns true if root is pinned (stub; no full DAG walk).
-func (c *Client) VerifyDAGCompleteness(ctx context.Context, rootCID cid.Cid) (bool, error) {
-	isPinned, err := c.IsPinned(ctx, rootCID)
-	if err != nil {
-		return false, err
-	}
-	if !isPinned {
-		return false, nil
-	}
-
-	return true, nil
 }
 
 func (c *Client) GetPeerID(ctx context.Context) (string, error) {

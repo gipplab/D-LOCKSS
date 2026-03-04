@@ -42,6 +42,12 @@ type IPFSDHTAdapter struct {
 
 var _ routing.Routing = (*IPFSDHTAdapter)(nil)
 
+// NewIPFSDHTAdapterFromClient creates a DHT adapter from an ipfs.Client,
+// avoiding the need for callers to access the raw Shell.
+func NewIPFSDHTAdapterFromClient(c *Client) *IPFSDHTAdapter {
+	return NewIPFSDHTAdapter(c.shell())
+}
+
 // NewIPFSDHTAdapter creates a new DHT adapter that uses IPFS's DHT
 func NewIPFSDHTAdapter(api *ipfsapi.Shell) *IPFSDHTAdapter {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -314,10 +320,10 @@ func (a *IPFSDHTAdapter) provideInternal(ctx context.Context, key cid.Cid, broad
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 				return err
 			}
-			return fmt.Errorf("both routing/provide and dht/provide failed: routing=%v, dht=%v", err, err2)
+			return fmt.Errorf("both routing/provide and dht/provide failed: routing=%w, dht=%w", err, err2)
 		}
 	}
-	return fmt.Errorf("both routing/provide and dht/provide failed after %d retries: routing=%v, dht=%v", a.retryAttempts, lastErr, lastErr2)
+	return fmt.Errorf("both routing/provide and dht/provide failed after %d retries: routing=%w, dht=%w", a.retryAttempts, lastErr, lastErr2)
 }
 
 // FindPeer finds a peer by ID using IPFS DHT
@@ -334,7 +340,7 @@ func (a *IPFSDHTAdapter) FindPeer(ctx context.Context, id peer.ID) (peer.AddrInf
 	if err := req.Exec(ctx, &result); err != nil {
 		req2 := a.api.Request("dht/findpeer", id.String())
 		if err2 := req2.Exec(ctx, &result); err2 != nil {
-			return peer.AddrInfo{}, fmt.Errorf("peer lookup failed: %w (routing: %v)", err2, err)
+			return peer.AddrInfo{}, fmt.Errorf("peer lookup failed: %w (routing: %w)", err2, err)
 		}
 	}
 

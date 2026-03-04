@@ -20,28 +20,29 @@ PinTracker -> CRDT: State() (poll 10s or on trigger)
 CRDT -> PinTracker: List(pins)
 
 loop For each Pin in State
-    PinTracker -> PinTracker: We in Allocations? (or Allocations empty)
-    alt We are allocated for this CID
-        PinTracker -> IPFS: IsPinned(CID)?
-        alt Not Pinned Locally
-            PinTracker -> IPFS: PinRecursive(ManifestCID)
-            PinTracker -> Storage: onPinSynced(manifestCID)
-            Note over PinTracker, Storage: onPinSynced: PinFile, AnnouncePinned,\nPinRecursive(PayloadCID) as own root\n(so Kubo reprovider announces it),\nProvideFile(ManifestCID), ProvideFile(PayloadCID)
-        end
+    Note over PinTracker: All nodes in a shard pin everything\nin the shard's CRDT (allocations are informational only)
+    PinTracker -> IPFS: IsPinned(CID)?
+    alt Not Pinned Locally
+        PinTracker -> IPFS: PinRecursive(ManifestCID)
+    end
+    alt First sync for this CID
+        PinTracker -> Storage: onPinSynced(manifestCID)
+        Note over PinTracker, Storage: onPinSynced: PinFile, AnnouncePinned,\nPinRecursive(PayloadCID) as own root,\nProvideFile(ManifestCID), ProvideFile(PayloadCID)\n(bounded by MaxConcurrentDHTProvides)
     end
 end
 
-== Unpinning (no longer allocated) ==
+== Tracking removal (no longer in CRDT) ==
 
-PinTracker -> PinTracker: CID in pinnedByUs but not in shouldHave
-PinTracker -> IPFS: UnpinRecursive(CID)
+PinTracker -> PinTracker: CID in pinnedByUs but not in CRDT state
 PinTracker -> Storage: onPinRemoved(cid)
+Note over PinTracker: Does NOT call UnpinRecursive.\nActual IPFS unpin is handled by the\nreshard pass (shard_reshard.go) which\nis migration-aware.
 
 == Unpin from cluster ==
 
 ClusterMgr -> CRDT: LogUnpin(pin)
 CRDT -> Peers: Sync State
 Peers -> PinTracker: State() on next sync
-PinTracker -> IPFS: UnpinRecursive (if we were holding it)
+PinTracker -> Storage: onPinRemoved(cid)
+Note over PinTracker: Releases tracking only.\nActual IPFS UnpinRecursive is called\nby the reshard/orphan unpin passes\n(shard_reshard.go, shard_maintenance.go).
 
 @enduml

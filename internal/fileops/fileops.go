@@ -3,19 +3,19 @@ package fileops
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
 
+	"dlockss/internal/badbits"
 	"dlockss/internal/common"
 	"dlockss/internal/config"
-	"dlockss/internal/managers/shard"
-	"dlockss/internal/managers/storage"
-	"dlockss/internal/signing"
 	"dlockss/pkg/ipfs"
 	"dlockss/pkg/schema"
 )
@@ -25,14 +25,59 @@ const retryDrainInterval = 10 * time.Second
 
 const recentIngestTTL = 30 * time.Second
 
+// ShardIdentity provides the node's identity and shard membership queries.
+type ShardIdentity interface {
+	PeerID() peer.ID
+	GetShardInfo() (string, int)
+	AnnouncePinned(manifestCID string)
+	AmIResponsibleFor(key string) bool
+}
+
+// ShardPublisher handles ingest publishing and cluster pinning within the node's own shard.
+type ShardPublisher interface {
+	PinToCluster(ctx context.Context, c cid.Cid) error
+	PublishIngestMessageToCurrentAndChildIfSplit(data []byte, currentShard, payloadCIDStr string)
+}
+
+// CustodialInjector handles cross-shard file injection for files the node is not responsible for.
+type CustodialInjector interface {
+	ResolveTargetShardForCustodial(nominalTargetShard, payloadCIDStr string) string
+	JoinShardAsObserver(shardID string) bool
+	LeaveShardAsObserver(shardID string)
+	EnsureClusterForShard(ctx context.Context, shardID string) error
+	PinToShard(ctx context.Context, shardID string, c cid.Cid) error
+	PublishToShardCBOR(data []byte, shardID string)
+}
+
+// ShardCoordinator composes all shard-management capabilities needed by file processing.
+type ShardCoordinator interface {
+	ShardIdentity
+	ShardPublisher
+	CustodialInjector
+}
+
+// StorageTracker abstracts the storage operations needed by file processing.
+type StorageTracker interface {
+	PinFile(manifestCIDStr string) bool
+	AddKnownFile(key string)
+	ProvideFile(ctx context.Context, key string)
+}
+
+// MessageSigner abstracts protocol message signing.
+type MessageSigner interface {
+	SignProtocolMessage(msg schema.Signable) error
+}
+
 // FileProcessor handles file ingestion and processing.
 type FileProcessor struct {
+	cfg        *config.Config
 	ipfsClient ipfs.IPFSClient
-	shardMgr   *shard.ShardManager
-	storageMgr *storage.StorageManager
+	badBits    *badbits.Filter
+	shardMgr   ShardCoordinator
+	storageMgr StorageTracker
 	privKey    crypto.PrivKey
 	jobQueue   chan string
-	signer     *signing.Signer
+	signer     MessageSigner
 	ctx        context.Context
 	cancel     context.CancelFunc
 
@@ -40,28 +85,47 @@ type FileProcessor struct {
 	retryMu    sync.Mutex
 
 	recentIngestMu sync.Mutex
-	recentIngests  map[string]time.Time // PayloadCID → last ingest time
+	recentIngests  map[string]time.Time
+
+	// File event deduplication (watcher)
+	deduperMu   sync.Mutex
+	deduperInfo map[string]fileEventInfo
+
+	// Stability tracking: files waiting for size to settle before ingest
+	stabilityMu    sync.Mutex
+	stabilityPath  map[string]int64
+	stabilityTimer map[string]*time.Timer
+}
+
+// FileProcessorConfig holds all dependencies for a FileProcessor.
+type FileProcessorConfig struct {
+	Cfg        *config.Config
+	IPFSClient ipfs.IPFSClient
+	Shard      ShardCoordinator
+	Storage    StorageTracker
+	PrivKey    crypto.PrivKey
+	Signer     MessageSigner
+	BadBits    *badbits.Filter
 }
 
 // NewFileProcessor creates a new FileProcessor with dependencies.
-func NewFileProcessor(
-	client ipfs.IPFSClient,
-	sm *shard.ShardManager,
-	stm *storage.StorageManager,
-	key crypto.PrivKey,
-	signer *signing.Signer,
-) *FileProcessor {
+func NewFileProcessor(cfg FileProcessorConfig) *FileProcessor {
 	ctx, cancel := context.WithCancel(context.Background())
 	fp := &FileProcessor{
-		ipfsClient:    client,
-		shardMgr:      sm,
-		storageMgr:    stm,
-		privKey:       key,
-		signer:        signer,
-		jobQueue:      make(chan string, config.MaxConcurrentFileProcessing*100),
-		ctx:           ctx,
-		cancel:        cancel,
-		recentIngests: make(map[string]time.Time),
+		cfg:            cfg.Cfg,
+		ipfsClient:     cfg.IPFSClient,
+		badBits:        cfg.BadBits,
+		shardMgr:       cfg.Shard,
+		storageMgr:     cfg.Storage,
+		privKey:        cfg.PrivKey,
+		signer:         cfg.Signer,
+		jobQueue:       make(chan string, cfg.Cfg.MaxConcurrentFileProcessing*100),
+		ctx:            ctx,
+		cancel:         cancel,
+		recentIngests:  make(map[string]time.Time),
+		deduperInfo:    make(map[string]fileEventInfo),
+		stabilityPath:  make(map[string]int64),
+		stabilityTimer: make(map[string]*time.Timer),
 	}
 	fp.startWorkers()
 	go fp.retryLoop()
@@ -69,7 +133,7 @@ func NewFileProcessor(
 }
 
 func (fp *FileProcessor) startWorkers() {
-	for i := 0; i < config.MaxConcurrentFileProcessing; i++ {
+	for i := 0; i < fp.cfg.MaxConcurrentFileProcessing; i++ {
 		go fp.workerLoop()
 	}
 }
@@ -124,7 +188,7 @@ func (fp *FileProcessor) drainRetryQueue() {
 		add := len(stillPending)
 		if add > space {
 			add = space
-			log.Printf("[FileOps] Retry queue full, dropping %d paths", len(stillPending)-space)
+			slog.Warn("retry queue full, dropping paths", "dropped", len(stillPending)-space)
 		}
 		fp.retryQueue = append(fp.retryQueue, stillPending[:add]...)
 		fp.retryMu.Unlock()
@@ -134,9 +198,9 @@ func (fp *FileProcessor) drainRetryQueue() {
 // ScanExistingFiles walks the data directory and processes any existing files.
 func (fp *FileProcessor) ScanExistingFiles() {
 	var fileCount int
-	err := filepath.Walk(config.FileWatchFolder, func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(fp.cfg.FileWatchFolder, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			log.Printf("[Warning] Error accessing %s: %v", path, err)
+			slog.Warn("error accessing path", "path", path, "error", err)
 			return nil
 		}
 		if info.IsDir() {
@@ -147,10 +211,10 @@ func (fp *FileProcessor) ScanExistingFiles() {
 		return nil
 	})
 	if err != nil {
-		log.Printf("[Error] Error scanning existing files: %v", err)
+		slog.Error("error scanning existing files", "error", err)
 		return
 	}
-	log.Printf("[System] Found %d existing files (recursive scan).", fileCount)
+	slog.Info("found existing files", "count", fileCount)
 }
 
 // TryEnqueue attempts to add a file to the processing queue.
@@ -172,86 +236,44 @@ func (fp *FileProcessor) EnqueueOrRetry(path string) bool {
 	if len(fp.retryQueue) < maxRetryQueueSize {
 		fp.retryQueue = append(fp.retryQueue, path)
 		fp.retryMu.Unlock()
-		log.Printf("[FileOps] Queue full, queued for retry: %s", path)
+		slog.Warn("queue full, queued for retry", "path", path)
 		return true
 	}
 	fp.retryMu.Unlock()
-	log.Printf("[FileOps] Queue and retry full, dropping file: %s", path)
+	slog.Warn("queue and retry full, dropping file", "path", path)
 	return false
 }
 
 // SignProtocolMessage signs a message with the node's private key.
-func (fp *FileProcessor) SignProtocolMessage(msg interface{}) error {
+func (fp *FileProcessor) SignProtocolMessage(msg schema.Signable) error {
 	if fp.signer != nil {
 		return fp.signer.SignProtocolMessage(msg)
 	}
 	if msg == nil {
 		return fmt.Errorf("message is nil")
 	}
-	nonceSize := signing.EffectiveNonceSizeForSigning()
+	nonceSize := fp.cfg.NonceSize
+	if nonceSize < 1 {
+		nonceSize = 16
+	}
 	nonce, err := common.NewNonce(nonceSize)
 	if err != nil {
 		return err
 	}
+	env := msg.GetEnvelope()
+	env.SenderID = fp.shardMgr.PeerID()
+	env.Timestamp = time.Now().Unix()
+	env.Nonce = nonce
+	env.Sig = nil
 
-	ts := time.Now().Unix()
-
-	switch m := msg.(type) {
-	case *schema.IngestMessage:
-		m.SenderID = fp.shardMgr.GetHost().ID()
-		m.Timestamp = ts
-		m.Nonce = nonce
-		m.Sig = nil
-
-		unsigned, err := m.MarshalCBORForSigning()
-		if err != nil {
-			return err
-		}
-
-		sig, err := fp.privKey.Sign(unsigned)
-		if err != nil {
-			return err
-		}
-
-		m.Sig = sig
-		return nil
-	case *schema.ReplicationRequest:
-		m.SenderID = fp.shardMgr.GetHost().ID()
-		m.Timestamp = ts
-		m.Nonce = nonce
-		m.Sig = nil
-
-		unsigned, err := m.MarshalCBORForSigning()
-		if err != nil {
-			return err
-		}
-
-		sig, err := fp.privKey.Sign(unsigned)
-		if err != nil {
-			return err
-		}
-
-		m.Sig = sig
-		return nil
-	case *schema.UnreplicateRequest:
-		m.SenderID = fp.shardMgr.GetHost().ID()
-		m.Timestamp = ts
-		m.Nonce = nonce
-		m.Sig = nil
-
-		unsigned, err := m.MarshalCBORForSigning()
-		if err != nil {
-			return err
-		}
-
-		sig, err := fp.privKey.Sign(unsigned)
-		if err != nil {
-			return err
-		}
-
-		m.Sig = sig
-		return nil
-	default:
-		return fmt.Errorf("unsupported message type for signing: %T", msg)
+	unsigned, err := msg.MarshalCBORForSigning()
+	if err != nil {
+		return err
 	}
+	sig, err := fp.privKey.Sign(unsigned)
+	if err != nil {
+		return err
+	}
+	env.Sig = sig
+	return nil
 }

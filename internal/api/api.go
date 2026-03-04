@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 
 	"dlockss/internal/telemetry"
@@ -50,9 +50,9 @@ func NewAPIServer(port int, metrics *telemetry.MetricsManager) *APIServer {
 
 func (s *APIServer) Start() {
 	go func() {
-		log.Printf("[API] Starting observability server on %s", s.server.Addr)
+		slog.Info("starting observability server", "addr", s.server.Addr)
 		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("[Error] API server failed: %v", err)
+			slog.Error("api server failed", "error", err)
 		}
 	}()
 }

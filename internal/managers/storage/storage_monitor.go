@@ -2,61 +2,61 @@ package storage
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
-
-	"dlockss/internal/config"
 )
 
-// getDiskUsagePercent is implemented in storage_monitor_linux.go (Linux) and storage_monitor_stub.go (!linux).
+const diskUsageCacheTTL = 10 * time.Second
 
-var (
-	diskUsage = struct {
-		sync.RWMutex
-		usagePercent float64
-		lastCheck    time.Time
-	}{
-		usagePercent: 0.0,
-		lastCheck:    time.Time{},
+// DiskMonitor tracks disk usage for the data directory and provides
+// high-water-mark checks. Safe for concurrent use.
+type DiskMonitor struct {
+	mu            sync.RWMutex
+	usagePercent  float64
+	lastCheck     time.Time
+	path          string
+	highWaterMark float64
+}
+
+// NewDiskMonitor creates a DiskMonitor for the given directory path.
+func NewDiskMonitor(path string, highWaterMark float64) *DiskMonitor {
+	return &DiskMonitor{path: path, highWaterMark: highWaterMark}
+}
+
+func (dm *DiskMonitor) CheckDiskUsage() float64 {
+	dm.mu.RLock()
+	lastCheck := dm.lastCheck
+	usage := dm.usagePercent
+	dm.mu.RUnlock()
+
+	if time.Since(lastCheck) < diskUsageCacheTTL {
+		return usage
 	}
-)
 
-func CheckDiskUsage() float64 {
-	diskUsage.RLock()
-	lastCheck := diskUsage.lastCheck
-	usagePercent := diskUsage.usagePercent
-	diskUsage.RUnlock()
-
-	if time.Since(lastCheck) < 10*time.Second {
-		return usagePercent
-	}
-
-	// Use the data directory path directly; Statfs operates on the mount point.
-	usage, err := getDiskUsagePercent(config.FileWatchFolder)
+	newUsage, err := getDiskUsagePercent(dm.path)
 	if err != nil {
-		log.Printf("[Warning] Failed to check disk usage: %v", err)
-		return usagePercent
+		slog.Warn("failed to check disk usage", "error", err)
+		return usage
 	}
 
-	diskUsage.Lock()
-	diskUsage.usagePercent = usage
-	diskUsage.lastCheck = time.Now()
-	diskUsage.Unlock()
+	dm.mu.Lock()
+	dm.usagePercent = newUsage
+	dm.lastCheck = time.Now()
+	dm.mu.Unlock()
 
-	return usage
+	return newUsage
 }
 
-func IsDiskUsageHigh() bool {
-	usage := CheckDiskUsage()
-	return usage >= config.DiskUsageHighWaterMark
+func (dm *DiskMonitor) IsDiskUsageHigh() bool {
+	return dm.CheckDiskUsage() >= dm.highWaterMark
 }
 
-func CanAcceptCustodialFile() bool {
-	return !IsDiskUsageHigh()
+func (dm *DiskMonitor) CanAcceptCustodialFile() bool {
+	return !dm.IsDiskUsageHigh()
 }
 
-func RunDiskUsageMonitor(ctx context.Context) {
+func (dm *DiskMonitor) RunMonitor(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -65,9 +65,9 @@ func RunDiskUsageMonitor(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			usage := CheckDiskUsage()
-			if usage >= config.DiskUsageHighWaterMark {
-				log.Printf("[Storage] Disk usage high: %.1f%% (high water mark: %.1f%%) - rejecting custodial files", usage, config.DiskUsageHighWaterMark)
+			usage := dm.CheckDiskUsage()
+			if usage >= dm.highWaterMark {
+				slog.Warn("disk usage high, rejecting custodial files", "usage_pct", usage, "high_water_mark", dm.highWaterMark)
 			}
 		}
 	}

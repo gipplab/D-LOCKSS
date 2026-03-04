@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"log"
+	"fmt"
 	"strings"
 
 	"dlockss/pkg/ipfs"
@@ -26,13 +26,12 @@ func GetBinaryPrefix(s string, depth int) string {
 	return bytesToBinaryString(h[:], depth)
 }
 
-func GetHexBinaryPrefix(hexStr string, depth int) string {
+func GetHexBinaryPrefix(hexStr string, depth int) (string, error) {
 	b, err := hex.DecodeString(hexStr)
 	if err != nil {
-		LogError("Utils", "decode hex string", hexStr, err)
-		return ""
+		return "", fmt.Errorf("decode hex %q: %w", hexStr, err)
 	}
-	return bytesToBinaryString(b, depth)
+	return bytesToBinaryString(b, depth), nil
 }
 
 func KeyToCID(key string) (cid.Cid, error) {
@@ -44,7 +43,7 @@ func KeyToStableHex(key string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func TargetShardForPayload(payloadCIDStr string, depth int) string {
+func TargetShardForPayload(payloadCIDStr string, depth int) (string, error) {
 	if depth < 1 {
 		depth = 1
 	}
@@ -69,25 +68,26 @@ func bytesToBinaryString(b []byte, length int) string {
 	return sb.String()
 }
 
-func GetPayloadCIDForShardAssignment(ctx context.Context, client ipfs.IPFSClient, manifestCIDStr string) string {
+// GetPayloadCIDForShardAssignment resolves the payload CID from a manifest.
+// Returns (payloadCID, nil) on success, or (manifestCIDStr, error) as a
+// fallback when the payload cannot be resolved.
+func GetPayloadCIDForShardAssignment(ctx context.Context, client ipfs.IPFSClient, manifestCIDStr string) (string, error) {
 	if client == nil {
-		return manifestCIDStr
+		return manifestCIDStr, fmt.Errorf("IPFS client is nil")
 	}
 	manifestCID, err := cid.Decode(manifestCIDStr)
 	if err != nil {
-		return manifestCIDStr
+		return manifestCIDStr, fmt.Errorf("decode manifest CID %s: %w", manifestCIDStr, err)
 	}
 	manifestBytes, err := client.GetBlock(ctx, manifestCID)
 	if err != nil {
-		log.Printf("[Shard] GetBlock %s: %v", manifestCIDStr, err)
-		return manifestCIDStr
+		return manifestCIDStr, fmt.Errorf("getblock %s: %w", manifestCIDStr, err)
 	}
 	var ro schema.ResearchObject
 	if err := ro.UnmarshalCBOR(manifestBytes); err != nil {
-		log.Printf("[Shard] UnmarshalCBOR %s: %v", manifestCIDStr, err)
-		return manifestCIDStr
+		return manifestCIDStr, fmt.Errorf("unmarshal cbor %s: %w", manifestCIDStr, err)
 	}
-	return ro.Payload.String()
+	return ro.Payload.String(), nil
 }
 
 // IsLegacyManifest returns true if the manifest at the given CID contains a
@@ -111,20 +111,4 @@ func IsLegacyManifest(ctx context.Context, client ipfs.IPFSClient, manifestCIDSt
 		return false
 	}
 	return ro.HasLegacyTimestamp
-}
-
-func LogError(component, operation, identifier string, err error) {
-	log.Printf("[Error] %s: Failed to %s %s: %v", component, operation, identifier, err)
-}
-
-func LogErrorWithContext(component, operation, identifier string, context string, err error) {
-	log.Printf("[Error] %s: Failed to %s %s (%s): %v", component, operation, identifier, context, err)
-}
-
-func LogWarning(component, message, identifier string) {
-	log.Printf("[Warning] %s: %s %s", component, message, identifier)
-}
-
-func LogWarningWithContext(component, message, identifier, context string) {
-	log.Printf("[Warning] %s: %s %s (%s)", component, message, identifier, context)
 }

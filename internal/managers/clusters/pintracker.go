@@ -2,8 +2,7 @@ package clusters
 
 import (
 	"context"
-	"io"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -14,20 +13,11 @@ import (
 	"github.com/ipfs/go-cid"
 )
 
-// IPFSClient defines the subset of ipfs.IPFSClient needed for pinning
-type IPFSClient interface {
+// IPFSPinner defines the minimal IPFS operations needed by the pin tracker.
+type IPFSPinner interface {
 	PinRecursive(ctx context.Context, c cid.Cid) error
-	UnpinRecursive(ctx context.Context, c cid.Cid) error
 	IsPinned(ctx context.Context, c cid.Cid) (bool, error)
 	GetBlock(ctx context.Context, c cid.Cid) ([]byte, error)
-	GetFileSize(ctx context.Context, c cid.Cid) (uint64, error)
-	GetPeerID(ctx context.Context) (string, error)
-	ImportFile(ctx context.Context, path string) (cid.Cid, error)
-	ImportReader(ctx context.Context, r io.Reader) (cid.Cid, error)
-	PutDagCBOR(ctx context.Context, data []byte) (cid.Cid, error)
-	// GetShell() interface{} // Removed to avoid interface mismatch if not needed by ClusterManager directly
-	SwarmConnect(ctx context.Context, addrs []string) error
-	VerifyDAGCompleteness(ctx context.Context, c cid.Cid) (bool, error)
 }
 
 // OnPinSynced is called when a pin is present locally (after sync or already pinned).
@@ -42,7 +32,8 @@ type OnPinRemoved func(cid string)
 // It acts as a bridge between the Cluster Consensus and the actual IPFS Daemon.
 // Tracks which CIDs we pinned from this shard so we can unpin when no longer allocated.
 type LocalPinTracker struct {
-	ipfsClient   IPFSClient
+	ipfsClient   IPFSPinner
+	badBits      *badbits.Filter
 	shardID      string
 	onPinSynced  OnPinSynced
 	onPinRemoved OnPinRemoved
@@ -78,10 +69,11 @@ func (pt *LocalPinTracker) isLegacyManifest(c cid.Cid) bool {
 	return ro.HasLegacyTimestamp
 }
 
-func NewLocalPinTracker(ipfsClient IPFSClient, shardID string, onPinSynced OnPinSynced, onPinRemoved OnPinRemoved) *LocalPinTracker {
+func NewLocalPinTracker(ipfsClient IPFSPinner, shardID string, onPinSynced OnPinSynced, onPinRemoved OnPinRemoved, badBits *badbits.Filter) *LocalPinTracker {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &LocalPinTracker{
 		ipfsClient:   ipfsClient,
+		badBits:      badBits,
 		shardID:      shardID,
 		onPinSynced:  onPinSynced,
 		onPinRemoved: onPinRemoved,
@@ -131,7 +123,7 @@ func (pt *LocalPinTracker) syncState(consensus ConsensusClient) {
 	// 1. Get Global State
 	state, err := consensus.State(pt.ctx)
 	if err != nil {
-		log.Printf("[PinTracker:%s] Failed to get consensus state: %v", pt.shardID, err)
+		slog.Error("failed to get consensus state", "shard", pt.shardID, "error", err)
 		return
 	}
 
@@ -154,8 +146,8 @@ func (pt *LocalPinTracker) syncState(consensus ConsensusClient) {
 		shouldHave[cStr] = struct{}{}
 
 		// Check BadBits before syncing (Compliance Check)
-		if badbits.IsCIDBlocked(cStr) {
-			log.Printf("[PinTracker:%s] Refusing to sync blocked content %s", pt.shardID, c)
+		if pt.badBits.IsBlocked(cStr) {
+			slog.Warn("refusing to sync blocked content", "shard", pt.shardID, "cid", c)
 			continue
 		}
 
@@ -166,13 +158,13 @@ func (pt *LocalPinTracker) syncState(consensus ConsensusClient) {
 
 		isPinned, err := pt.ipfsClient.IsPinned(pt.ctx, c)
 		if err != nil {
-			log.Printf("[PinTracker:%s] Error checking pin status for %s: %v", pt.shardID, c, err)
+			slog.Error("failed to check pin status", "shard", pt.shardID, "cid", c, "error", err)
 			continue
 		}
 		if !isPinned {
-			log.Printf("[PinTracker:%s] Syncing pin %s to local IPFS", pt.shardID, c)
+			slog.Info("syncing pin to local ipfs", "shard", pt.shardID, "cid", c)
 			if err := pt.ipfsClient.PinRecursive(pt.ctx, c); err != nil {
-				log.Printf("[PinTracker:%s] Failed to pin %s: %v", pt.shardID, c, err)
+				slog.Error("failed to pin", "shard", pt.shardID, "cid", c, "error", err)
 				continue
 			}
 		}
@@ -203,7 +195,7 @@ func (pt *LocalPinTracker) syncState(consensus ConsensusClient) {
 	pt.mu.RUnlock()
 
 	for _, cidStr := range toUnpin {
-		log.Printf("[PinTracker:%s] Releasing tracking for %s (no longer in CRDT)", pt.shardID, cidStr)
+		slog.Info("releasing tracking, no longer in crdt", "shard", pt.shardID, "cid", cidStr)
 		if pt.onPinRemoved != nil {
 			pt.onPinRemoved(cidStr)
 		}

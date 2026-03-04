@@ -2,48 +2,43 @@ package badbits
 
 import (
 	"encoding/csv"
-	"log"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
 )
 
-var (
-	badBits = struct {
-		mu     sync.RWMutex
-		cids   map[string]bool
-		loaded bool
-	}{
-		cids: make(map[string]bool),
-	}
-)
+// Filter holds a set of blocked CIDs loaded from a CSV file.
+type Filter struct {
+	mu     sync.RWMutex
+	cids   map[string]bool
+	loaded bool
+}
 
-func LoadBadBits(path string) error {
-	badBits.mu.Lock()
-	defer badBits.mu.Unlock()
-
-	badBits.cids = make(map[string]bool)
-	badBits.loaded = false
+// NewFilter loads a bad-bits list from path and returns a Filter.
+// If the file does not exist, blocking is disabled (no error).
+func NewFilter(path string) (*Filter, error) {
+	f := &Filter{cids: make(map[string]bool)}
 
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.Printf("[BadBits] File not found: %s (Content blocking disabled)", path)
-			return nil
+			slog.Info("badbits file not found, content blocking disabled", "path", path)
+			return f, nil
 		}
-		return err
+		return f, err
 	}
 	defer file.Close()
 
 	reader := csv.NewReader(file)
 	records, err := reader.ReadAll()
 	if err != nil {
-		return err
+		return f, err
 	}
 
 	if len(records) < 1 {
-		log.Printf("[BadBits] Empty file: %s", path)
-		return nil
+		slog.Info("badbits file empty", "path", path)
+		return f, nil
 	}
 
 	for i, record := range records {
@@ -57,23 +52,24 @@ func LoadBadBits(path string) error {
 		if i == 0 && !strings.HasPrefix(val, "bafy") && !strings.HasPrefix(val, "Qm") && !strings.HasPrefix(val, "bafk") {
 			continue
 		}
-
-		badBits.cids[val] = true
+		f.cids[val] = true
 	}
 
-	badBits.loaded = true
-	log.Printf("[BadBits] Loaded %d blocked CIDs from %s", len(badBits.cids), path)
-	return nil
+	f.loaded = true
+	slog.Info("loaded blocked cids", "count", len(f.cids), "path", path)
+	return f, nil
 }
 
-func IsCIDBlocked(cid string) bool {
-	badBits.mu.RLock()
-	defer badBits.mu.RUnlock()
-
-	if !badBits.loaded {
+// IsBlocked returns true if the given CID is in the block list.
+// Returns false when the filter is nil or was not loaded.
+func (f *Filter) IsBlocked(cid string) bool {
+	if f == nil {
 		return false
 	}
-
-	cid = strings.TrimSpace(cid)
-	return badBits.cids[cid]
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if !f.loaded {
+		return false
+	}
+	return f.cids[strings.TrimSpace(cid)]
 }
