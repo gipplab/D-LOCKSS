@@ -83,6 +83,53 @@ For Docker deployments: mount a persistent volume and set `DLOCKSS_DATA_DIR` to 
 
 See [docs/DLOCKSS_PROTOCOL.md](docs/DLOCKSS_PROTOCOL.md) for protocol details.
 
+### Docker-compose
+```yaml
+services:
+  dlockss-node:
+    image: ghcr.io/gipplab/dlockss-single-node:latest
+    environment:
+      DLOCKSS_IPFS_NODE: "/dns4/ipfs/tcp/5001" # ipfs is the name of the ipfs serive
+      # DLOCKSS_NODE_NAME: dlockss.example.tld # human readable globally unique name
+      # to identify node in the dlockss monitor. If empty the nodes cid will be displayed.
+    volumes:
+    - dlockss-data:/data
+    - ipfs-data:/data/ipfs:ro #share config with IPFS node
+    depends_on:
+    - ipfs
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
+  # see https://github.com/ipfs/kubo/blob/master/docker-compose.yaml
+  ipfs:
+    image: ipfs/kubo
+    restart: unless-stopped
+    # ports: # (if you have a public IP and the possibilty to get the port 4001 (TCP+UDP) opened enable this)
+    #  - 4001:4001/tcp
+    #  - 4001:4001/udp
+    volumes:
+      - ipfs-staging:/export
+      - ipfs-data:/data/ipfs
+    environment:
+      - IPFS_PROFILE=server
+
+### Optional services
+  # Watchtower provides automatic updates for all containers
+  # until the first stable release of dlockss was published we recommend
+  # using watchtower, to keep the dlockss software up tp date
+  # see https://containrrr.github.io/watchtower/arguments/
+  watchtower:
+    image: containrrr/watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --label-enable --include-stopped --revive-stopped
+    restart: always
+
+volumes:
+  ipfs-staging: # IPFS data on /export cf https://docs.ipfs.tech/install/run-ipfs-inside-docker/#set-up
+  ipfs-data: # IPFS data on /data/ipfs
+  dlockss-data: # persistent dlockss data
+```
+
 ---
 
 ## 3. Architecture
