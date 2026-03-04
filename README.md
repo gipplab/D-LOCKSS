@@ -111,6 +111,11 @@ services:
       - ipfs-data:/data/ipfs
     environment:
       - IPFS_PROFILE=server
+    healthcheck:
+      test: ["CMD-SHELL", "ipfs id || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 ### Optional services
   # Watchtower provides automatic updates for all containers
