@@ -86,6 +86,12 @@
         .kw-class-tag:hover { filter: brightness(0.92); }
         .kw-field { background: #e3f2fd; border-color: #90caf9; color: #1565c0; }
         .kw-subtopic { background: #f3e5f5; border-color: #ce93d8; color: #7b1fa2; }
+        .kw-pagination { display: flex; justify-content: center; align-items: center; gap: 6px; margin-top: 12px; padding-top: 10px; border-top: 1px solid #eee; }
+        .kw-page-btn { background: #eee; border: 1px solid #ccc; padding: 4px 12px; font-size: 0.85em; cursor: pointer; font-family: inherit; }
+        .kw-page-btn:hover { background: #ddd; border-color: #999; }
+        .kw-page-btn.active { background: #333; color: white; border-color: #333; }
+        .kw-page-btn:disabled { opacity: 0.4; cursor: default; }
+        .kw-page-info { font-size: 0.8em; color: #666; }
         .kw-niche { background: #fff3e0; border-color: #ffcc80; color: #e65100; }
     </style>
 </head>
@@ -106,12 +112,6 @@
                 </div>
             </div>
         </div>
-        <div class="stats">
-            <div class="stat-card clickable" id="total-nodes-card" title="Click to jump to Network Nodes"><div class="stat-value" id="total-nodes">--</div><div class="stat-label">Total Nodes</div></div>
-            <div class="stat-card"><div class="stat-value" id="total-pinned">--</div><div class="stat-label">Total Pinned</div></div>
-            <div class="stat-card clickable" id="unique-cids-card" title="Click to view all CIDs"><div class="stat-value" id="unique-files">--</div><div class="stat-label">Unique CIDs</div></div>
-            <div class="stat-card clickable" id="total-shards-card" title="Click to jump to Shard Topology"><div class="stat-value" id="total-shards">--</div><div class="stat-label">Active Shards</div></div>
-        </div>
         <div class="keyword-search-section">
             <div style="display:flex; justify-content:space-between; align-items:center;">
                 <h3 style="margin:0; text-transform:uppercase; font-size:1em;">Keyword Search</h3>
@@ -126,6 +126,12 @@
             </div>
             <div id="kwRecent" class="kw-recent"></div>
             <div id="kwResults" class="kw-results" style="display:none;"></div>
+        </div>
+        <div class="stats">
+            <div class="stat-card clickable" id="total-nodes-card" title="Click to jump to Network Nodes"><div class="stat-value" id="total-nodes">--</div><div class="stat-label">Total Nodes</div></div>
+            <div class="stat-card"><div class="stat-value" id="total-pinned">--</div><div class="stat-label">Total Pinned</div></div>
+            <div class="stat-card clickable" id="unique-cids-card" title="Click to view all CIDs"><div class="stat-value" id="unique-files">--</div><div class="stat-label">Unique CIDs</div></div>
+            <div class="stat-card clickable" id="total-shards-card" title="Click to jump to Shard Topology"><div class="stat-value" id="total-shards">--</div><div class="stat-label">Active Shards</div></div>
         </div>
         <div class="charts">
             <div class="chart-container" style="cursor: pointer;"><h3 style="margin-top:0; text-transform:uppercase; font-size:1em;">Replication Status</h3><p style="font-size:0.75em; color:#666; margin:0 0 10px 0;">Network-wide (all shards). Nodes unpin files that no longer belong to their shard after a split.</p><canvas id="replicationChart"></canvas><div id="replicationByShard" style="font-size:0.8em; margin-top:10px; color:#555;"></div></div>
@@ -437,43 +443,80 @@
         const kwAC = document.getElementById('kwAC');
         const kwSearchBtn = document.getElementById('kwSearchBtn');
 
+        var kwAllResults = [];
+        var kwCurrentQuery = '';
+        var kwPage = 0;
+        var kwPerPage = 20;
+
         function kwDoSearch(query) {
             if (!query || !query.trim()) return;
             query = query.trim();
             kwInput.value = query;
             kwHideAC();
+            kwCurrentQuery = query;
+            kwPage = 0;
             document.getElementById('kwResults').style.display = 'block';
             document.getElementById('kwResults').innerHTML = '<p style="color:#999;">Searching...</p>';
             fetch('/api/keyword-search?q=' + encodeURIComponent(query) + '&t=' + Date.now()).then(r => r.json()).then(data => {
-                const el = document.getElementById('kwResults');
-                const results = data.results || [];
-                if (results.length === 0) {
-                    el.innerHTML = '<p style="color:#666;">No documents found for "' + escapeHtml(query) + '".</p>';
+                kwAllResults = data.results || [];
+                if (kwAllResults.length === 0) {
+                    document.getElementById('kwResults').innerHTML = '<p style="color:#666;">No documents found for "' + escapeHtml(query) + '".</p>';
                     return;
                 }
-                let html = '<div class="kw-results-hdr"><span>' + results.length + ' document' + (results.length !== 1 ? 's' : '') + ' matching "' + escapeHtml(query) + '"</span><button class="btn-text" onclick="document.getElementById(\'kwResults\').style.display=\'none\'">CLOSE</button></div>';
-                html += results.map(r => {
-                    const shard = (r.shard || '') === '' ? 'root' : escapeHtml(r.shard);
-                    const kws = (r.keywords || []).map(k => '<span class="kw-kw-tag" onclick="kwDoSearch(\'' + escapeJs(k) + '\')">' + escapeHtml(k) + '</span>').join('');
-                    const title = r.title || '';
-                    const payloadUrl = GATEWAY + '/ipfs/' + (r.payload_cid || '') + '/';
-                    const titleHtml = title ? '<div style="font-weight:600; margin-bottom:2px;">' + escapeHtml(title) + '</div>' : '';
-                    let classHtml = '';
-                    const bf = r.broad_field || ''; const st = r.sub_topic || ''; const rn = r.research_niche || '';
-                    if (bf || st || rn) {
-                        classHtml = '<div class="kw-class">';
-                        if (bf) classHtml += '<span class="kw-class-tag kw-field" onclick="kwDoSearch(\'' + escapeJs(bf) + '\')">' + escapeHtml(bf) + '</span>';
-                        if (st) classHtml += '<span class="kw-class-tag kw-subtopic" onclick="kwDoSearch(\'' + escapeJs(st) + '\')">' + escapeHtml(st) + '</span>';
-                        if (rn) classHtml += '<span class="kw-class-tag kw-niche" onclick="kwDoSearch(\'' + escapeJs(rn) + '\')">' + escapeHtml(rn) + '</span>';
-                        classHtml += '</div>';
-                    }
-                    return '<div class="kw-result-item">' + titleHtml + classHtml + '<div class="kw-result-top"><div class="kw-result-cid">' + escapeHtml(r.manifest_cid) + '</div><div class="kw-result-meta">Shard: ' + shard + ' | Replicas: ' + (r.replicas || 0) + '</div><a href="' + payloadUrl + '" target="_blank" rel="noopener" class="btn-text">VIEW</a></div><div class="kw-result-kws">' + kws + '</div></div>';
-                }).join('');
-                el.innerHTML = html;
+                kwRenderPage();
+                document.getElementById('kwResults').scrollIntoView({ behavior: 'smooth', block: 'start' });
                 kwLoadRecent();
             }).catch(() => {
                 document.getElementById('kwResults').innerHTML = '<p style="color:#ff6b6b;">Search failed.</p>';
             });
+        }
+
+        function kwRenderPage() {
+            var total = kwAllResults.length;
+            var totalPages = Math.ceil(total / kwPerPage);
+            var start = kwPage * kwPerPage;
+            var end = Math.min(start + kwPerPage, total);
+            var pageResults = kwAllResults.slice(start, end);
+
+            var html = '<div class="kw-results-hdr"><span>' + total + ' document' + (total !== 1 ? 's' : '') + ' matching "' + escapeHtml(kwCurrentQuery) + '"</span><button class="btn-text" onclick="document.getElementById(\'kwResults\').style.display=\'none\'">CLOSE</button></div>';
+            html += pageResults.map(function(r) {
+                var shard = (r.shard || '') === '' ? 'root' : escapeHtml(r.shard);
+                var kws = (r.keywords || []).map(function(k) { return '<span class="kw-kw-tag" onclick="kwDoSearch(\'' + escapeJs(k) + '\')">' + escapeHtml(k) + '</span>'; }).join('');
+                var title = r.title || '';
+                var payloadUrl = GATEWAY + '/ipfs/' + (r.payload_cid || '') + '/';
+                var titleHtml = title ? '<div style="font-weight:600; margin-bottom:2px;">' + escapeHtml(title) + '</div>' : '';
+                var classHtml = '';
+                var bf = r.broad_field || '', st = r.sub_topic || '', rn = r.research_niche || '';
+                if (bf || st || rn) {
+                    classHtml = '<div class="kw-class">';
+                    if (bf) classHtml += '<span class="kw-class-tag kw-field" onclick="kwDoSearch(\'' + escapeJs(bf) + '\')">' + escapeHtml(bf) + '</span>';
+                    if (st) classHtml += '<span class="kw-class-tag kw-subtopic" onclick="kwDoSearch(\'' + escapeJs(st) + '\')">' + escapeHtml(st) + '</span>';
+                    if (rn) classHtml += '<span class="kw-class-tag kw-niche" onclick="kwDoSearch(\'' + escapeJs(rn) + '\')">' + escapeHtml(rn) + '</span>';
+                    classHtml += '</div>';
+                }
+                return '<div class="kw-result-item">' + titleHtml + classHtml + '<div class="kw-result-top"><div class="kw-result-cid">' + escapeHtml(r.manifest_cid) + '</div><div class="kw-result-meta">Shard: ' + shard + ' | Replicas: ' + (r.replicas || 0) + '</div><a href="' + payloadUrl + '" target="_blank" rel="noopener" class="btn-text">VIEW</a></div><div class="kw-result-kws">' + kws + '</div></div>';
+            }).join('');
+
+            if (totalPages > 1) {
+                html += '<div class="kw-pagination">';
+                html += '<button class="kw-page-btn" onclick="kwGoPage(' + (kwPage - 1) + ')"' + (kwPage === 0 ? ' disabled' : '') + '>&laquo;</button>';
+                for (var p = 0; p < totalPages; p++) {
+                    html += '<button class="kw-page-btn' + (p === kwPage ? ' active' : '') + '" onclick="kwGoPage(' + p + ')">' + (p + 1) + '</button>';
+                }
+                html += '<button class="kw-page-btn" onclick="kwGoPage(' + (kwPage + 1) + ')"' + (kwPage >= totalPages - 1 ? ' disabled' : '') + '>&raquo;</button>';
+                html += '<span class="kw-page-info">' + (start + 1) + '–' + end + ' of ' + total + '</span>';
+                html += '</div>';
+            }
+
+            document.getElementById('kwResults').innerHTML = html;
+        }
+
+        function kwGoPage(p) {
+            var totalPages = Math.ceil(kwAllResults.length / kwPerPage);
+            if (p < 0 || p >= totalPages) return;
+            kwPage = p;
+            kwRenderPage();
+            document.getElementById('kwResults').scrollIntoView({ behavior: 'smooth', block: 'start' });
         }
 
         function kwShowAC(suggestions) {
