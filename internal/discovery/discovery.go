@@ -2,7 +2,7 @@ package discovery
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
@@ -19,7 +19,7 @@ type DiscoveryNotifee struct {
 func (n *DiscoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	if n.H.Network().Connectedness(pi.ID) != network.Connected {
 		if err := n.H.Connect(n.Ctx, pi); err != nil {
-			log.Printf("[Discovery] Failed to connect to peer %s: %v", pi.ID.String(), err)
+			slog.Warn("failed to connect to peer", "peer", pi.ID.String(), "error", err)
 		}
 	}
 }
@@ -33,7 +33,7 @@ func RunPeerFinder(ctx context.Context, h host.Host, rd *routing.RoutingDiscover
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("[Discovery] FindPeers error: %v", err)
+			slog.Warn("find peers error", "error", err)
 			time.Sleep(10 * time.Second)
 			continue
 		}

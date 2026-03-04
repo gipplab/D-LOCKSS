@@ -2,9 +2,11 @@ package shard
 
 import (
 	"context"
-	"log"
+	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
@@ -16,27 +18,38 @@ import (
 	"dlockss/internal/managers/clusters"
 	"dlockss/internal/telemetry"
 	"dlockss/pkg/ipfs"
+	"dlockss/pkg/schema"
 )
 
 // MessageAuthenticator abstracts protocol message signing and verification.
 type MessageAuthenticator interface {
-	SignProtocolMessage(msg interface{}) error
+	SignProtocolMessage(msg schema.Signable) error
 	ShouldDropMessage(receivedFrom peer.ID, senderID peer.ID, timestamp int64, nonce []byte, sig []byte, marshalForSigning func() ([]byte, error), logContext string) bool
 }
 
-// StorageProvider abstracts the storage operations needed by the shard manager.
-type StorageProvider interface {
+// StorageReader provides read-only queries over the local pin/file state.
+type StorageReader interface {
 	CanAcceptCustodialFile() bool
 	IsPinned(key string) bool
-	PinFile(manifestCIDStr string) bool
-	UnpinFile(key string)
-	AddKnownFile(key string)
 	GetAllKnownFiles() map[string]bool
 	GetPinTime(key string) time.Time
 	GetPinnedManifests() []string
 	GetPinnedCount() int
 	GetNextFileToAnnounce() string
+}
+
+// StorageWriter provides mutating operations on the local pin/file state.
+type StorageWriter interface {
+	PinFile(manifestCIDStr string) bool
+	UnpinFile(key string)
+	AddKnownFile(key string)
 	ProvideFile(ctx context.Context, key string)
+}
+
+// StorageProvider composes all storage operations needed by the shard manager.
+type StorageProvider interface {
+	StorageReader
+	StorageWriter
 }
 
 const migratePinsFlushDelay = 250 * time.Millisecond
@@ -54,8 +67,8 @@ const (
 	msgPrefixSplit     = "SPLIT:"
 )
 
-func shardTopicName(shardID string) string {
-	return config.PubsubTopicPrefix + "-creative-commons-shard-" + shardID
+func (sm *ShardManager) shardTopicName(shardID string) string {
+	return sm.cfg.PubsubTopicPrefix + "-creative-commons-shard-" + shardID
 }
 
 func childShards(parent string) (child0, child1 string) {
@@ -75,44 +88,51 @@ type shardSubscription struct {
 }
 
 type ShardManager struct {
-	ctx            context.Context
-	h              host.Host
-	ps             *pubsub.PubSub
-	ipfsClient     ipfs.IPFSClient
-	storageMgr     StorageProvider
-	clusterMgr     clusters.ClusterManagerInterface
-	metrics        *telemetry.MetricsManager
-	signer         MessageAuthenticator
-	reshardedFiles *common.KnownFiles
-	rateLimiter    *common.RateLimiter
-	nodeName       string
+	// Dependencies
+	ctx         context.Context
+	cfg         *config.Config
+	h           host.Host
+	ps          *pubsub.PubSub
+	ipfsClient  ipfs.IPFSClient
+	storageMgr  StorageProvider
+	clusterMgr  clusters.ClusterManagerInterface
+	metrics     *telemetry.MetricsManager
+	signer      MessageAuthenticator
+	rateLimiter *common.RateLimiter
+	nodeName    string
 
+	// Peer tracking
+	peers *PeerTracker
+
+	// Shard membership (protected by mu)
 	mu           sync.RWMutex
 	currentShard string
 
-	shardSubs       map[string]*shardSubscription
-	probeTopicCache map[string]*pubsub.Topic
+	// PubSub topic management (protected by mu)
+	shardSubs          map[string]*shardSubscription
+	probeTopicCache    map[string]*pubsub.Topic
+	observerOnlyShards map[string]struct{}
 
-	msgCounter            int
-	lastPeerCheck         time.Time
-	lastDiscoveryCheck    time.Time
-	lastMessageTime       time.Time
+	// Shard transition timestamps (protected by mu)
 	lastMoveToDeeperShard time.Time
 	lastMergeUpTime       time.Time
 	lastShardMove         time.Time // set on ANY shard transition (split, merge, discovery)
-	lastProbeResponseTime time.Time // rate-limits heartbeat responses to PROBE messages
 
-	seenPeers                map[string]map[peer.ID]time.Time
-	seenPeerRoles            map[string]map[peer.ID]PeerRoleInfo
-	observerOnlyShards       map[string]struct{}
-	splitAboveThresholdCount int // consecutive checks where peerCount >= MaxPeersPerShard
-	knownChildShards         map[string]time.Time
-	orphanHandoffSent        map[string]map[string]*orphanHandoffInfo
+	// Message handling (protected by mu)
+	msgCounter            int
+	lastMessageTime       time.Time
+	lastProbeResponseTime time.Time
 
+	// Replication state
+	reshardedFiles             *common.KnownFiles
+	orphanHandoffSent          map[string]map[string]*orphanHandoffInfo
 	replicationRequestMu       sync.Mutex
 	replicationRequestLastSent map[string]time.Time
+	autoReplicationSem         chan struct{}
+	reprovideInFlight          atomic.Bool
 
-	autoReplicationSem chan struct{} // bounds concurrent auto-replication fetches
+	// Lifecycle: split/merge/discovery (delegated)
+	lifecycle *lifecycleManager
 }
 
 type orphanHandoffInfo struct {
@@ -120,58 +140,66 @@ type orphanHandoffInfo struct {
 	count    int
 }
 
-func NewShardManager(
-	ctx context.Context,
-	h host.Host,
-	ps *pubsub.PubSub,
-	ipfsClient ipfs.IPFSClient,
-	stm StorageProvider,
-	metrics *telemetry.MetricsManager,
-	signer MessageAuthenticator,
-	rateLimiter *common.RateLimiter,
-	clusterMgr clusters.ClusterManagerInterface,
-	startShard string,
-	nodeName string,
-) *ShardManager {
+// ShardManagerConfig holds all dependencies for a ShardManager.
+type ShardManagerConfig struct {
+	Cfg         *config.Config
+	Ctx         context.Context
+	Host        host.Host
+	PubSub      *pubsub.PubSub
+	IPFSClient  ipfs.IPFSClient
+	Storage     StorageProvider
+	Metrics     *telemetry.MetricsManager
+	Signer      MessageAuthenticator
+	RateLimiter *common.RateLimiter
+	Cluster     clusters.ClusterManagerInterface
+	StartShard  string
+	NodeName    string
+}
+
+func NewShardManager(cfg ShardManagerConfig) (*ShardManager, error) {
 	sm := &ShardManager{
-		ctx:                        ctx,
-		h:                          h,
-		ps:                         ps,
-		ipfsClient:                 ipfsClient,
-		storageMgr:                 stm,
-		clusterMgr:                 clusterMgr,
-		metrics:                    metrics,
-		signer:                     signer,
-		rateLimiter:                rateLimiter,
-		nodeName:                   nodeName,
+		ctx:                        cfg.Ctx,
+		cfg:                        cfg.Cfg,
+		h:                          cfg.Host,
+		ps:                         cfg.PubSub,
+		ipfsClient:                 cfg.IPFSClient,
+		storageMgr:                 cfg.Storage,
+		clusterMgr:                 cfg.Cluster,
+		metrics:                    cfg.Metrics,
+		signer:                     cfg.Signer,
+		rateLimiter:                cfg.RateLimiter,
+		nodeName:                   cfg.NodeName,
+		peers:                      NewPeerTracker(cfg.Host.ID()),
 		reshardedFiles:             common.NewKnownFiles(),
-		currentShard:               startShard,
+		currentShard:               cfg.StartShard,
 		shardSubs:                  make(map[string]*shardSubscription),
 		probeTopicCache:            make(map[string]*pubsub.Topic),
-		seenPeers:                  make(map[string]map[peer.ID]time.Time),
-		seenPeerRoles:              make(map[string]map[peer.ID]PeerRoleInfo),
 		observerOnlyShards:         make(map[string]struct{}),
-		knownChildShards:           make(map[string]time.Time),
 		orphanHandoffSent:          make(map[string]map[string]*orphanHandoffInfo),
 		replicationRequestLastSent: make(map[string]time.Time),
-		autoReplicationSem:         make(chan struct{}, config.MaxConcurrentReplicationChecks),
+		autoReplicationSem:         make(chan struct{}, cfg.Cfg.MaxConcurrentReplicationChecks),
+	}
+	sm.lifecycle = newLifecycleManager(func() context.Context { return sm.ctx }, cfg.Cfg, sm)
+
+	if err := sm.clusterMgr.JoinShard(cfg.Ctx, cfg.StartShard, nil); err != nil {
+		return nil, fmt.Errorf("join cluster for start shard %s: %w", cfg.StartShard, err)
 	}
 
-	if err := sm.clusterMgr.JoinShard(ctx, startShard, nil); err != nil {
-		log.Printf("[Sharding] Failed to join cluster for start shard %s: %v", startShard, err)
+	if err := sm.JoinShard(cfg.StartShard); err != nil {
+		return nil, fmt.Errorf("join shard topic %s: %w", cfg.StartShard, err)
+	}
+	if err := sm.loadReshardedFiles(); err != nil {
+		slog.Warn("failed to load resharded files, starting fresh", "error", err)
 	}
 
-	sm.JoinShard(startShard)
-	sm.loadReshardedFiles()
-
-	return sm
+	return sm, nil
 }
 
 func (sm *ShardManager) Run() {
-	go sm.runPeerCountChecker()
+	go sm.lifecycle.runPeerCountChecker()
+	go sm.lifecycle.runShardDiscovery()
+	go sm.lifecycle.runSplitRebroadcast()
 	go sm.runHeartbeat()
-	go sm.runSplitRebroadcast()
-	go sm.runShardDiscovery()
 	go sm.runOrphanUnpinLoop()
 	go sm.runReplicationChecker()
 	go sm.runReannouncePinsLoop()
@@ -179,8 +207,12 @@ func (sm *ShardManager) Run() {
 	go sm.runLegacyManifestCleanup()
 }
 
-func (sm *ShardManager) Close() {
-	sm.saveReshardedFiles()
+func (sm *ShardManager) Close() error {
+	var firstErr error
+	if err := sm.saveReshardedFiles(); err != nil {
+		firstErr = err
+	}
+
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -197,6 +229,51 @@ func (sm *ShardManager) Close() {
 		_ = t.Close()
 	}
 	sm.probeTopicCache = make(map[string]*pubsub.Topic)
+	return firstErr
+}
+
+// --- lifecycleOps implementation ---
+
+func (sm *ShardManager) getCurrentShard() string {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.currentShard
+}
+
+func (sm *ShardManager) getLastShardMove() time.Time {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.lastShardMove
+}
+
+func (sm *ShardManager) getLastMergeUpTime() time.Time {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.lastMergeUpTime
+}
+
+func (sm *ShardManager) getLastMoveToDeeperShard() time.Time {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.lastMoveToDeeperShard
+}
+
+func (sm *ShardManager) getLastMessageTime() time.Time {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.lastMessageTime
+}
+
+func (sm *ShardManager) localPeerID() peer.ID {
+	return sm.h.ID()
+}
+
+func (sm *ShardManager) incrementShardSplits() {
+	sm.metrics.IncrementShardSplits()
+}
+
+func (sm *ShardManager) pruneStaleSeenPeers() {
+	sm.peers.PruneStale(sm.cfg.PruneStalePeersInterval)
 }
 
 // moveToShard switches shard: join new, migrate pins, leave old. Used by split, discovery, merge.
@@ -208,9 +285,6 @@ func (sm *ShardManager) moveToShard(fromShard, toShard string, isMergeUp bool) {
 	}
 	sm.currentShard = toShard
 	sm.msgCounter = 0
-	sm.knownChildShards = make(map[string]time.Time)
-	sm.lastPeerCheck = time.Now()
-	sm.splitAboveThresholdCount = 0
 	sm.reshardedFiles = common.NewKnownFiles()
 	sm.lastShardMove = time.Now()
 	if isMergeUp {
@@ -219,6 +293,7 @@ func (sm *ShardManager) moveToShard(fromShard, toShard string, isMergeUp bool) {
 		sm.lastMoveToDeeperShard = sm.lastShardMove
 	}
 	sm.mu.Unlock()
+	sm.lifecycle.onShardTransition()
 
 	// Immediately announce departure from the old shard so other peers stop
 	// counting us as ACTIVE.  The actual topic unsubscription happens later
@@ -234,9 +309,11 @@ func (sm *ShardManager) moveToShard(fromShard, toShard string, isMergeUp bool) {
 		_ = fromSub.topic.Publish(sm.ctx, leaveMsg)
 	}
 
-	sm.JoinShard(toShard)
+	if err := sm.JoinShard(toShard); err != nil {
+		slog.Error("failed to join shard topic", "shard", toShard, "error", err)
+	}
 	if err := sm.clusterMgr.JoinShard(sm.ctx, toShard, nil); err != nil {
-		log.Printf("[Sharding] Failed to join cluster for shard %s: %v", toShard, err)
+		slog.Error("failed to join cluster for shard", "shard", toShard, "error", err)
 	}
 	go func() {
 		select {
@@ -249,22 +326,22 @@ func (sm *ShardManager) moveToShard(fromShard, toShard string, isMergeUp bool) {
 		sm.mu.RUnlock()
 		if current != toShard {
 			if strings.HasPrefix(current, toShard) {
-				log.Printf("[Sharding] Migration redirect: %s → %s (current shard moved past %s)", fromShard, current, toShard)
+				slog.Info("migration redirect", "from", fromShard, "to", current, "intermediate", toShard)
 				if err := sm.clusterMgr.MigratePins(sm.ctx, fromShard, current); err != nil {
-					log.Printf("[Sharding] Migration failed %s → %s: %v", fromShard, current, err)
+					slog.Error("migration failed", "from", fromShard, "to", current, "error", err)
 				}
 			}
 			return
 		}
 		if err := sm.clusterMgr.MigratePins(sm.ctx, fromShard, toShard); err != nil {
-			log.Printf("[Sharding] Migration failed %s → %s: %v", fromShard, toShard, err)
+			slog.Error("migration failed", "from", fromShard, "to", toShard, "error", err)
 		}
 	}()
 	go func() {
 		select {
 		case <-sm.ctx.Done():
 			return
-		case <-time.After(config.ShardOverlapDuration):
+		case <-time.After(sm.cfg.ShardOverlapDuration):
 		}
 		sm.mu.RLock()
 		current := sm.currentShard
@@ -274,14 +351,14 @@ func (sm *ShardManager) moveToShard(fromShard, toShard string, isMergeUp bool) {
 		}
 		sm.LeaveShard(fromShard)
 		if err := sm.clusterMgr.LeaveShard(fromShard); err != nil {
-			log.Printf("[Sharding] Failed to leave cluster %s: %v", fromShard, err)
+			slog.Error("failed to leave cluster", "shard", fromShard, "error", err)
 		}
 	}()
 	go func() {
 		select {
 		case <-sm.ctx.Done():
 			return
-		case <-time.After(config.ReshardDelay):
+		case <-time.After(sm.cfg.ReshardDelay):
 		}
 		sm.mu.RLock()
 		current := sm.currentShard

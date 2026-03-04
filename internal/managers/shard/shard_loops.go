@@ -4,9 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"log"
-	"math/rand"
-	"strings"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,75 +15,10 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/peer"
 
-	"dlockss/internal/config"
 	"dlockss/pkg/schema"
 )
 
 const probeResponseCooldown = 5 * time.Second
-
-// runSplitRebroadcast periodically re-broadcasts SPLIT to all ancestor shards so late-joining
-// nodes (e.g. in root or parent) can discover existing children. Each node in a child shard
-// publishes to its ancestors; no central coordinator needed.
-func (sm *ShardManager) runSplitRebroadcast() {
-	jitterRange := config.ShardSplitRebroadcastInterval / 2
-	if jitterRange < time.Second {
-		jitterRange = time.Second
-	}
-	for {
-		delay := config.ShardSplitRebroadcastInterval + time.Duration(rand.Int63n(int64(jitterRange)))
-		t := time.NewTimer(delay)
-		select {
-		case <-sm.ctx.Done():
-			t.Stop()
-			return
-		case <-t.C:
-			sm.rebroadcastSplitToAncestors()
-		}
-	}
-}
-
-// runPeerCountChecker checks peer count in the current shard and triggers splits when at limit.
-func (sm *ShardManager) runPeerCountChecker() {
-	ticker := time.NewTicker(rootPeerCheckInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-sm.ctx.Done():
-			return
-		case <-ticker.C:
-			sm.checkAndSplitIfNeeded()
-			sm.pruneStaleSeenPeers()
-		}
-	}
-}
-
-// pruneStaleSeenPeers drops peers not seen within PruneStalePeersInterval.
-func (sm *ShardManager) pruneStaleSeenPeers() {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	cutoff := time.Now().Add(-config.PruneStalePeersInterval)
-	for shardID, peers := range sm.seenPeers {
-		for peerID, lastSeen := range peers {
-			if lastSeen.Before(cutoff) {
-				delete(peers, peerID)
-			}
-		}
-		if len(peers) == 0 {
-			delete(sm.seenPeers, shardID)
-		}
-	}
-	for shardID, roles := range sm.seenPeerRoles {
-		for peerID, info := range roles {
-			if info.LastSeen.Before(cutoff) {
-				delete(roles, peerID)
-			}
-		}
-		if len(roles) == 0 {
-			delete(sm.seenPeerRoles, shardID)
-		}
-	}
-}
 
 // pruneReplicationRequestCooldown removes stale entries from the cooldown map.
 func (sm *ShardManager) pruneReplicationRequestCooldown() {
@@ -101,7 +34,7 @@ func (sm *ShardManager) pruneReplicationRequestCooldown() {
 
 // runReplicationChecker sends ReplicationRequest for pinned files below target replication.
 func (sm *ShardManager) runReplicationChecker() {
-	if config.CheckInterval <= 0 {
+	if sm.cfg.CheckInterval <= 0 {
 		return
 	}
 	ticker := time.NewTicker(rootReplicationCheckInterval)
@@ -117,7 +50,7 @@ func (sm *ShardManager) runReplicationChecker() {
 			currentShard := sm.currentShard
 			sm.mu.RUnlock()
 
-			interval := config.CheckInterval
+			interval := sm.cfg.CheckInterval
 			if currentShard == "" {
 				interval = rootReplicationCheckInterval
 			}
@@ -133,7 +66,7 @@ func (sm *ShardManager) runReplicationChecker() {
 
 			sm.pruneReplicationRequestCooldown()
 
-			maxConc := config.MaxConcurrentReplicationChecks
+			maxConc := sm.cfg.MaxConcurrentReplicationChecks
 			if maxConc < 1 {
 				maxConc = 1
 			}
@@ -165,7 +98,7 @@ func (sm *ShardManager) runReplicationChecker() {
 						allocations = nil
 					}
 					peerCount := sm.getShardPeerCount()
-					targetRep := config.MaxReplication
+					targetRep := sm.cfg.MaxReplication
 					if peerCount > 0 && targetRep > peerCount {
 						targetRep = peerCount
 					}
@@ -199,13 +132,10 @@ func (sm *ShardManager) runReplicationChecker() {
 						return
 					}
 					rr := &schema.ReplicationRequest{
-						Type:        schema.MessageTypeReplicationRequest,
-						ManifestCID: c,
-						Priority:    0,
-						Deadline:    0,
+						SignedEnvelope: schema.SignedEnvelope{Type: schema.MessageTypeReplicationRequest, ManifestCID: c},
 					}
 					if err := sm.signer.SignProtocolMessage(rr); err != nil {
-						log.Printf("[Shard] Failed to sign ReplicationRequest for %s: %v", manifestCIDStr, err)
+						slog.Error("failed to sign ReplicationRequest", "manifest", manifestCIDStr, "error", err)
 						return
 					}
 					b, err := rr.MarshalCBOR()
@@ -214,10 +144,7 @@ func (sm *ShardManager) runReplicationChecker() {
 					}
 					sm.PublishToShardCBOR(b, currentShard)
 					atomic.AddInt32(&sentThisCycle, 1)
-					if config.VerboseLogging {
-						log.Printf("[Shard] ReplicationRequest sent for %s (shard %s, active_alloc=%d, total_alloc=%d, target=%d, peers=%d)",
-							manifestCIDStr, currentShard, activeAllocations, len(allocations), targetRep, peerCount)
-					}
+					slog.Debug("ReplicationRequest sent", "manifest", manifestCIDStr, "shard", currentShard, "active_alloc", activeAllocations, "total_alloc", len(allocations), "target", targetRep, "peers", peerCount)
 				}(manifestCIDStr)
 			}
 			wg.Wait()
@@ -228,10 +155,10 @@ func (sm *ShardManager) runReplicationChecker() {
 // runHeartbeat periodically sends heartbeat messages to the current shard topic.
 func (sm *ShardManager) runHeartbeat() {
 	var heartbeatInterval time.Duration
-	if config.HeartbeatInterval > 0 {
-		heartbeatInterval = config.HeartbeatInterval
+	if sm.cfg.HeartbeatInterval > 0 {
+		heartbeatInterval = sm.cfg.HeartbeatInterval
 	} else {
-		heartbeatInterval = config.ShardPeerCheckInterval / 3
+		heartbeatInterval = sm.cfg.ShardPeerCheckInterval / 3
 		if heartbeatInterval < 10*time.Second {
 			heartbeatInterval = 10 * time.Second
 		}
@@ -269,9 +196,7 @@ func (sm *ShardManager) sendHeartbeat() {
 	if err := sub.topic.Publish(sm.ctx, heartbeatMsg); err != nil {
 		return
 	}
-	if config.VerboseLogging {
-		log.Printf("[Heartbeat] sent to shard %s (pinned: %d)", currentShard, pinnedCount)
-	}
+	slog.Debug("heartbeat sent", "shard", currentShard, "pinned", pinnedCount)
 
 	sm.announcePinnedFilesBatch(sub.topic, 20)
 
@@ -283,19 +208,17 @@ func (sm *ShardManager) sendHeartbeat() {
 // This gradually completes incomplete DAGs on resource-constrained nodes
 // and keeps DHT provider records fresh (~24h expiry).
 // A CAS guard prevents concurrent iterations from piling up.
-var reprovideInFlight atomic.Bool
-
 func (sm *ShardManager) reprovideNextPinnedFile() {
-	if !reprovideInFlight.CompareAndSwap(false, true) {
+	if !sm.reprovideInFlight.CompareAndSwap(false, true) {
 		return
 	}
 	manifestCIDStr := sm.storageMgr.GetNextFileToAnnounce()
 	if manifestCIDStr == "" {
-		reprovideInFlight.Store(false)
+		sm.reprovideInFlight.Store(false)
 		return
 	}
 	go func() {
-		defer reprovideInFlight.Store(false)
+		defer sm.reprovideInFlight.Store(false)
 
 		manifestCID, err := cid.Decode(manifestCIDStr)
 		if err != nil {
@@ -305,17 +228,15 @@ func (sm *ShardManager) reprovideNextPinnedFile() {
 		// Re-pin to fetch any blocks missed by the initial PinRecursive
 		// (e.g. OOM/timeout on low-memory Pis). Idempotent: returns
 		// quickly when the DAG is already complete locally.
-		pinCtx, pinCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		pinCtx, pinCancel := context.WithTimeout(sm.ctx, 2*time.Minute)
 		if err := sm.ipfsClient.PinRecursive(pinCtx, manifestCID); err != nil {
 			pinCancel()
-			if config.VerboseLogging {
-				log.Printf("[Reprovide] PinRecursive %s: %v (will retry next cycle)", manifestCIDStr, err)
-			}
+			slog.Debug("reprovide pin failed, will retry", "manifest", manifestCIDStr, "error", err)
 			return
 		}
 		pinCancel()
 
-		pctx, pcancel := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
+		pctx, pcancel := context.WithTimeout(sm.ctx, sm.cfg.DHTProvideTimeout)
 		defer pcancel()
 		sm.storageMgr.ProvideFile(pctx, manifestCIDStr)
 
@@ -334,15 +255,10 @@ func (sm *ShardManager) reprovideNextPinnedFile() {
 		if !payloadCID.Defined() {
 			return
 		}
-		// Pin payload as its own root so Kubo's reprovider ("pinned"
-		// strategy) announces it.  Blocks are already local from the
-		// manifest's recursive pin, so this returns quickly.
-		if err := sm.ipfsClient.PinRecursive(context.Background(), payloadCID); err != nil {
-			if config.VerboseLogging {
-				log.Printf("[Reprovide] PinRecursive payload %s: %v", payloadCID, err)
-			}
+		if err := sm.ipfsClient.PinRecursive(sm.ctx, payloadCID); err != nil {
+			slog.Debug("reprovide pin payload failed", "payload", payloadCID, "error", err)
 		}
-		pctx2, pcancel2 := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
+		pctx2, pcancel2 := context.WithTimeout(sm.ctx, sm.cfg.DHTProvideTimeout)
 		defer pcancel2()
 		sm.storageMgr.ProvideFile(pctx2, payloadCID.String())
 	}()
@@ -367,11 +283,8 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 
 	from := msg.GetFrom()
 	now := time.Now()
+	sm.peers.RecordSeen(shardID, from)
 	sm.mu.Lock()
-	if sm.seenPeers[shardID] == nil {
-		sm.seenPeers[shardID] = make(map[peer.ID]time.Time)
-	}
-	sm.seenPeers[shardID][from] = now
 	sm.lastMessageTime = now
 	sm.mu.Unlock()
 
@@ -380,13 +293,7 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 			return
 		}
 		if bytes.HasPrefix(msg.Data, []byte(msgPrefixHeartbeat)) {
-			role := parseHeartbeatRole(msg.Data)
-			sm.mu.Lock()
-			if sm.seenPeerRoles[shardID] == nil {
-				sm.seenPeerRoles[shardID] = make(map[peer.ID]PeerRoleInfo)
-			}
-			sm.seenPeerRoles[shardID][from] = PeerRoleInfo{Role: role, LastSeen: now}
-			sm.mu.Unlock()
+			sm.peers.RecordRole(shardID, from, parseHeartbeatRole(msg.Data))
 			return
 		}
 		if bytes.HasPrefix(msg.Data, []byte(msgPrefixPinned)) {
@@ -395,36 +302,18 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 			return
 		}
 		if bytes.HasPrefix(msg.Data, []byte(msgPrefixJoin)) {
-			role := parseJoinRole(msg.Data)
-			sm.mu.Lock()
-			if sm.seenPeerRoles[shardID] == nil {
-				sm.seenPeerRoles[shardID] = make(map[peer.ID]PeerRoleInfo)
-			}
-			sm.seenPeerRoles[shardID][from] = PeerRoleInfo{Role: role, LastSeen: now}
-			sm.mu.Unlock()
+			sm.peers.RecordRole(shardID, from, parseJoinRole(msg.Data))
 			return
 		}
 		if bytes.HasPrefix(msg.Data, []byte(msgPrefixLeave)) {
-			sm.mu.Lock()
-			if sm.seenPeerRoles[shardID] != nil {
-				delete(sm.seenPeerRoles[shardID], from)
-			}
-			sm.mu.Unlock()
+			sm.peers.RemoveRole(shardID, from)
 			return
 		}
 		if bytes.HasPrefix(msg.Data, []byte(msgPrefixProbe)) {
-			sm.mu.Lock()
-			if sm.seenPeerRoles[shardID] == nil {
-				sm.seenPeerRoles[shardID] = make(map[peer.ID]PeerRoleInfo)
-			}
-			sm.seenPeerRoles[shardID][from] = PeerRoleInfo{Role: RoleProbe, LastSeen: now}
+			sm.peers.RecordRole(shardID, from, RoleProbe)
 
-			// Rate-limit heartbeat responses to PROBEs.  When multiple nodes
-			// probe at once (e.g. after synchronized MergeUpCooldown expiry),
-			// every probe triggers an immediate heartbeat from every peer.
-			// With N probers and M responders this creates N*M messages in a
-			// short window — a "heartbeat storm".  Limit responses to at most
-			// one per probeResponseCooldown (5 s) to keep traffic bounded.
+			// Rate-limit heartbeat responses to PROBEs to avoid "heartbeat storms".
+			sm.mu.Lock()
 			probeRateLimited := !sm.lastProbeResponseTime.IsZero() && now.Sub(sm.lastProbeResponseTime) < probeResponseCooldown
 			if !probeRateLimited {
 				sm.lastProbeResponseTime = now
@@ -435,7 +324,6 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 				return
 			}
 
-			// Respond with an immediate heartbeat if this is our current shard.
 			sm.mu.RLock()
 			cs := sm.currentShard
 			probeSub, probeSubExists := sm.shardSubs[shardID]
@@ -452,7 +340,7 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 			return
 		}
 		if bytes.HasPrefix(msg.Data, []byte(msgPrefixSplit)) {
-			sm.handleSplitAnnouncement(string(msg.Data[len(msgPrefixSplit):]))
+			sm.lifecycle.recordSplitAnnouncement(string(msg.Data[len(msgPrefixSplit):]))
 			return
 		}
 	}
@@ -468,7 +356,7 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 
 	msgType, err := decodeCBORMessageType(msg.Data)
 	if err != nil {
-		log.Printf("[Shard] Failed to decode message type from %s in shard %s: %v", msg.GetFrom().String(), shardID, err)
+		slog.Error("failed to decode message type", "from", msg.GetFrom().String(), "shard", shardID, "error", err)
 		return
 	}
 
@@ -476,33 +364,18 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 	case schema.MessageTypeIngest:
 		var im schema.IngestMessage
 		if err := im.UnmarshalCBOR(msg.Data); err != nil {
-			log.Printf("[Shard] Failed to unmarshal IngestMessage from %s in shard %s: %v", msg.GetFrom().String(), shardID, err)
+			slog.Error("failed to unmarshal IngestMessage", "from", msg.GetFrom().String(), "shard", shardID, "error", err)
 			return
 		}
 		sm.handleIngestMessage(msg, &im, shardID)
 	case schema.MessageTypeReplicationRequest:
 		var rr schema.ReplicationRequest
 		if err := rr.UnmarshalCBOR(msg.Data); err != nil {
-			log.Printf("[Shard] Failed to unmarshal ReplicationRequest from %s in shard %s: %v", msg.GetFrom().String(), shardID, err)
+			slog.Error("failed to unmarshal ReplicationRequest", "from", msg.GetFrom().String(), "shard", shardID, "error", err)
 			return
 		}
 		sm.handleReplicationRequest(msg, &rr, shardID)
 	}
-}
-
-// handleSplitAnnouncement parses SPLIT:child0:child1 and records child shards.
-func (sm *ShardManager) handleSplitAnnouncement(payload string) {
-	parts := strings.SplitN(payload, ":", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return
-	}
-	child0, child1 := parts[0], parts[1]
-	now := time.Now()
-	sm.mu.Lock()
-	sm.knownChildShards[child0] = now
-	sm.knownChildShards[child1] = now
-	sm.mu.Unlock()
-	log.Printf("[Shard] Received split announcement: children %s and %s", child0, child1)
 }
 
 func decodeCBORMessageType(data []byte) (schema.MessageType, error) {

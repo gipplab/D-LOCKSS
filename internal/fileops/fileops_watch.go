@@ -3,15 +3,13 @@ package fileops
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-
-	"dlockss/internal/config"
 )
 
 // fileEventInfo tracks file metadata to detect actual content changes.
@@ -21,24 +19,7 @@ type fileEventInfo struct {
 	lastSeen time.Time
 }
 
-var fileEventDeduper = struct {
-	mu   sync.Mutex
-	info map[string]fileEventInfo
-}{
-	info: make(map[string]fileEventInfo),
-}
-
-// pendingStability tracks files waiting for size to settle before ingest.
-var pendingStability = struct {
-	mu    sync.Mutex
-	path  map[string]int64
-	timer map[string]*time.Timer
-}{
-	path:  make(map[string]int64),
-	timer: make(map[string]*time.Timer),
-}
-
-func shouldProcessFileEvent(path string) bool {
+func (fp *FileProcessor) shouldProcessFileEvent(path string) bool {
 	const window = 2 * time.Second
 	now := time.Now()
 
@@ -53,10 +34,10 @@ func shouldProcessFileEvent(path string) bool {
 	currentSize := info.Size()
 	currentModTime := info.ModTime()
 
-	fileEventDeduper.mu.Lock()
-	defer fileEventDeduper.mu.Unlock()
+	fp.deduperMu.Lock()
+	defer fp.deduperMu.Unlock()
 
-	if last, ok := fileEventDeduper.info[path]; ok {
+	if last, ok := fp.deduperInfo[path]; ok {
 		if last.size == currentSize &&
 			last.modTime.Equal(currentModTime) &&
 			now.Sub(last.lastSeen) < window {
@@ -64,16 +45,16 @@ func shouldProcessFileEvent(path string) bool {
 		}
 	}
 
-	fileEventDeduper.info[path] = fileEventInfo{
+	fp.deduperInfo[path] = fileEventInfo{
 		size:     currentSize,
 		modTime:  currentModTime,
 		lastSeen: now,
 	}
 
 	cutoff := now.Add(-10 * window)
-	for k, v := range fileEventDeduper.info {
+	for k, v := range fp.deduperInfo {
 		if v.lastSeen.Before(cutoff) {
-			delete(fileEventDeduper.info, k)
+			delete(fp.deduperInfo, k)
 		}
 	}
 
@@ -84,7 +65,7 @@ func shouldProcessFileEvent(path string) bool {
 // waits for the file size to be unchanged for that duration before enqueueing,
 // to avoid ingesting files still being written (e.g. downloads).
 func (fp *FileProcessor) enqueueWithStabilityCheck(path string) {
-	if config.FileStabilityDelay <= 0 {
+	if fp.cfg.FileStabilityDelay <= 0 {
 		_ = fp.EnqueueOrRetry(path)
 		return
 	}
@@ -95,21 +76,21 @@ func (fp *FileProcessor) enqueueWithStabilityCheck(path string) {
 	}
 	currentSize := info.Size()
 
-	pendingStability.mu.Lock()
-	if t, ok := pendingStability.timer[path]; ok {
+	fp.stabilityMu.Lock()
+	if t, ok := fp.stabilityTimer[path]; ok {
 		t.Stop()
 	}
-	pendingStability.path[path] = currentSize
-	pendingStability.timer[path] = time.AfterFunc(config.FileStabilityDelay, func() {
+	fp.stabilityPath[path] = currentSize
+	fp.stabilityTimer[path] = time.AfterFunc(fp.cfg.FileStabilityDelay, func() {
 		if fp.ctx.Err() != nil {
 			return
 		}
 
-		pendingStability.mu.Lock()
-		expectedSize := pendingStability.path[path]
-		delete(pendingStability.path, path)
-		delete(pendingStability.timer, path)
-		pendingStability.mu.Unlock()
+		fp.stabilityMu.Lock()
+		expectedSize := fp.stabilityPath[path]
+		delete(fp.stabilityPath, path)
+		delete(fp.stabilityTimer, path)
+		fp.stabilityMu.Unlock()
 
 		info2, err2 := os.Stat(path)
 		if err2 != nil || info2.IsDir() {
@@ -118,12 +99,11 @@ func (fp *FileProcessor) enqueueWithStabilityCheck(path string) {
 		if info2.Size() == expectedSize {
 			_ = fp.EnqueueOrRetry(path)
 		} else {
-			log.Printf("[FileWatcher] File still changing size (was %d, now %d), re-scheduling stability check: %s",
-				expectedSize, info2.Size(), path)
+			slog.Debug("file still changing size, re-scheduling stability check", "expected_size", expectedSize, "current_size", info2.Size(), "path", path)
 			fp.enqueueWithStabilityCheck(path)
 		}
 	})
-	pendingStability.mu.Unlock()
+	fp.stabilityMu.Unlock()
 }
 
 // WatchFolder watches the data directory for new files.
@@ -131,24 +111,24 @@ func (fp *FileProcessor) WatchFolder(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[FileWatcher] Context cancelled, stopping file watcher")
+			slog.Info("context cancelled, stopping file watcher")
 			return
 		default:
 			if err := fp.runWatcher(ctx); err != nil {
-				log.Printf("[FileWatcher] Watcher exited with error: %v. Restarting in 5 seconds...", err)
+				slog.Error("watcher exited with error, restarting in 5s", "error", err)
 				select {
 				case <-ctx.Done():
 					return
 				case <-time.After(5 * time.Second):
-					log.Printf("[FileWatcher] Restarting file watcher...")
+					slog.Info("restarting file watcher")
 				}
 			} else {
-				log.Printf("[FileWatcher] Watcher exited normally. Restarting in 5 seconds...")
+				slog.Info("watcher exited normally, restarting in 5s")
 				select {
 				case <-ctx.Done():
 					return
 				case <-time.After(5 * time.Second):
-					log.Printf("[FileWatcher] Restarting file watcher...")
+					slog.Info("restarting file watcher")
 				}
 			}
 		}
@@ -163,25 +143,25 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 	}
 	defer watcher.Close()
 
-	if err := os.MkdirAll(config.FileWatchFolder, 0755); err != nil {
+	if err := os.MkdirAll(fp.cfg.FileWatchFolder, 0755); err != nil {
 		return fmt.Errorf("failed to create data directory: %w", err)
 	}
 
-	if err := watcher.Add(config.FileWatchFolder); err != nil {
+	if err := watcher.Add(fp.cfg.FileWatchFolder); err != nil {
 		return fmt.Errorf("failed to watch data directory: %w", err)
 	}
 
 	watchedDirs := make(map[string]bool)
-	watchedDirs[config.FileWatchFolder] = true
+	watchedDirs[fp.cfg.FileWatchFolder] = true
 
-	err = filepath.Walk(config.FileWatchFolder, func(path string, info os.FileInfo, err error) error {
+	err = filepath.Walk(fp.cfg.FileWatchFolder, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if info.IsDir() {
 			if !watchedDirs[path] {
 				if err := watcher.Add(path); err != nil {
-					log.Printf("[Error] Failed to watch subdirectory %s: %v", path, err)
+					slog.Error("failed to watch subdirectory", "path", path, "error", err)
 				} else {
 					watchedDirs[path] = true
 				}
@@ -190,17 +170,17 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 		return nil
 	})
 	if err != nil {
-		log.Printf("[Error] Failed to walk directory for watching: %v", err)
+		slog.Error("failed to walk directory for watching", "error", err)
 	}
 
-	log.Printf("[FileWatcher] Watching %s (and subdirectories) for new files...", config.FileWatchFolder)
+	slog.Info("watching for new files", "dir", fp.cfg.FileWatchFolder)
 
 	var watchedDirsMu sync.RWMutex
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[FileWatcher] Context cancelled, stopping file watcher")
+			slog.Info("context cancelled, stopping file watcher")
 			return nil
 		case event, ok := <-watcher.Events:
 			if !ok {
@@ -216,23 +196,23 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 
 					if !alreadyWatched {
 						if err := watcher.Add(event.Name); err != nil {
-							log.Printf("[Error] Failed to watch new directory %s: %v", event.Name, err)
+							slog.Error("failed to watch new directory", "path", event.Name, "error", err)
 						} else {
 							watchedDirsMu.Lock()
 							watchedDirs[event.Name] = true
 							watchedDirsMu.Unlock()
-							log.Printf("[FileWatcher] Added watch for new directory: %s", event.Name)
+							slog.Debug("added watch for new directory", "path", event.Name)
 						}
 					}
 					go func(dirPath string) {
-						time.Sleep(config.FileProcessingDelay)
+						time.Sleep(fp.cfg.FileProcessingDelay)
 
 						fileCount := 0
 						dirCount := 0
 
 						err := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
 							if err != nil {
-								log.Printf("[Warning] Error accessing %s during directory scan: %v", path, err)
+								slog.Warn("error accessing path during directory scan", "path", path, "error", err)
 								return nil
 							}
 							if info.IsDir() {
@@ -243,20 +223,20 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 
 									if !alreadyWatched {
 										if err := watcher.Add(path); err != nil {
-											log.Printf("[Error] Failed to watch nested directory %s: %v", path, err)
+											slog.Error("failed to watch nested directory", "path", path, "error", err)
 										} else {
 											watchedDirsMu.Lock()
 											watchedDirs[path] = true
 											watchedDirsMu.Unlock()
-											log.Printf("[FileWatcher] Added watch for nested directory: %s", path)
+											slog.Debug("added watch for nested directory", "path", path)
 											dirCount++
 										}
 									}
 								}
 								return nil
 							}
-							if !validateFilePath(path) {
-								log.Printf("[FileWatcher] File filtered by validation: %s", path)
+							if !fp.validateFilePath(path) {
+								slog.Debug("file filtered by validation", "path", path)
 								return nil
 							}
 							fileCount++
@@ -265,9 +245,9 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 							return nil
 						})
 						if err != nil {
-							log.Printf("[Error] Failed to scan new directory %s: %v", dirPath, err)
+							slog.Error("failed to scan new directory", "path", dirPath, "error", err)
 						} else {
-							log.Printf("[FileWatcher] Scanned directory %s: found %d files, %d nested directories", dirPath, fileCount, dirCount)
+							slog.Info("scanned directory", "path", dirPath, "files", fileCount, "nested_dirs", dirCount)
 						}
 					}(event.Name)
 					continue
@@ -277,7 +257,7 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 			if event.Op&fsnotify.Create == fsnotify.Create || event.Op&fsnotify.Write == fsnotify.Write {
 				path := event.Name
 
-				if !validateFilePath(path) {
+				if !fp.validateFilePath(path) {
 					continue
 				}
 
@@ -286,7 +266,7 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 					continue
 				}
 
-				if shouldProcessFileEvent(path) {
+				if fp.shouldProcessFileEvent(path) {
 					fp.enqueueWithStabilityCheck(path)
 				}
 			}
@@ -294,7 +274,7 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 			if !ok {
 				return fmt.Errorf("errors channel closed unexpectedly")
 			}
-			log.Printf("[FileWatcher] ERROR: Watcher error: %v", err)
+			slog.Error("watcher error", "error", err)
 		}
 	}
 }

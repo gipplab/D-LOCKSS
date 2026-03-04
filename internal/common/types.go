@@ -3,7 +3,6 @@ package common
 import (
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"time"
 
 	"github.com/ipfs/go-cid"
@@ -11,10 +10,6 @@ import (
 
 	"dlockss/internal/syncmap"
 )
-
-func NonceKey(sender peer.ID, nonce []byte) string {
-	return sender.String() + ":" + hex.EncodeToString(nonce)
-}
 
 func NewNonce(n int) ([]byte, error) {
 	b := make([]byte, n)

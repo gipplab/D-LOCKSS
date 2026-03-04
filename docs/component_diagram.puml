@@ -18,11 +18,11 @@ Metrics --> StorageManager : reads stats
 Metrics --> ClusterManager : GetClusterMetrics (pins/peers per shard)
 
 note right of ShardManager
-    Manages shard assignment
-    and PubSub topics.
-    Splits when overcrowded (≥12 peers).
-    Discovery: join existing deeper shards.
-    Rebroadcast SPLIT to ancestors for late joiners.
+    Manages shard assignment and PubSub topics.
+    Lifecycle decisions (split/merge/discovery) delegated
+    to internal lifecycleManager.
+    Replication logic split into focused files:
+    shard_msg_handlers, shard_reshard, shard_maintenance.
     Stability (v0.0.3):
     - Move cooldown (30s) after any transition
     - Jittered discovery timers
@@ -35,12 +35,16 @@ note right of ClusterManager
     (CRDT Consensus).
     Syncs state between peers
     and drives local pinning.
+    Shutdown() returns error.
 end note
 
 note right of StorageManager
     Owns local state:
     - PinnedFiles
     - KnownFiles
+    DHT provides bounded by
+    MaxConcurrentDHTProvides (default 8)
+    to prevent overwhelming DHT on bulk sync.
 end note
 
 note right of FileProcessor

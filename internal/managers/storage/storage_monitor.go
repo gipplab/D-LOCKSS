@@ -2,29 +2,26 @@ package storage
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
-
-	"dlockss/internal/config"
 )
-
-// getDiskUsagePercent is implemented in storage_monitor_linux.go (Linux) and storage_monitor_stub.go (!linux).
 
 const diskUsageCacheTTL = 10 * time.Second
 
 // DiskMonitor tracks disk usage for the data directory and provides
 // high-water-mark checks. Safe for concurrent use.
 type DiskMonitor struct {
-	mu           sync.RWMutex
-	usagePercent float64
-	lastCheck    time.Time
-	path         string
+	mu            sync.RWMutex
+	usagePercent  float64
+	lastCheck     time.Time
+	path          string
+	highWaterMark float64
 }
 
 // NewDiskMonitor creates a DiskMonitor for the given directory path.
-func NewDiskMonitor(path string) *DiskMonitor {
-	return &DiskMonitor{path: path}
+func NewDiskMonitor(path string, highWaterMark float64) *DiskMonitor {
+	return &DiskMonitor{path: path, highWaterMark: highWaterMark}
 }
 
 func (dm *DiskMonitor) CheckDiskUsage() float64 {
@@ -39,7 +36,7 @@ func (dm *DiskMonitor) CheckDiskUsage() float64 {
 
 	newUsage, err := getDiskUsagePercent(dm.path)
 	if err != nil {
-		log.Printf("[Warning] Failed to check disk usage: %v", err)
+		slog.Warn("failed to check disk usage", "error", err)
 		return usage
 	}
 
@@ -52,7 +49,7 @@ func (dm *DiskMonitor) CheckDiskUsage() float64 {
 }
 
 func (dm *DiskMonitor) IsDiskUsageHigh() bool {
-	return dm.CheckDiskUsage() >= config.DiskUsageHighWaterMark
+	return dm.CheckDiskUsage() >= dm.highWaterMark
 }
 
 func (dm *DiskMonitor) CanAcceptCustodialFile() bool {
@@ -69,8 +66,8 @@ func (dm *DiskMonitor) RunMonitor(ctx context.Context) {
 			return
 		case <-ticker.C:
 			usage := dm.CheckDiskUsage()
-			if usage >= config.DiskUsageHighWaterMark {
-				log.Printf("[Storage] Disk usage high: %.1f%% (high water mark: %.1f%%) - rejecting custodial files", usage, config.DiskUsageHighWaterMark)
+			if usage >= dm.highWaterMark {
+				slog.Warn("disk usage high, rejecting custodial files", "usage_pct", usage, "high_water_mark", dm.highWaterMark)
 			}
 		}
 	}

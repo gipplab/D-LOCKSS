@@ -41,7 +41,7 @@ alt Node is responsible
     FileOps -> FileOps: announceResponsibleFile()
     FileOps -> ShardMgr: PublishToShardCBOR(IngestMessage)\n(current shard topic)
     ShardMgr -> PubSub: Publish IngestMessage
-    FileOps -> Storage: ProvideFile(ManifestCID)\nProvideFile(PayloadCID)
+    FileOps -> Storage: ProvideFile(ManifestCID)\nProvideFile(PayloadCID)\n(bounded by MaxConcurrentDHTProvides)
     Storage -> DHT: Provide(ManifestCID)\nProvide(PayloadCID)
 else Node is NOT responsible (Custodial)
     FileOps -> Storage: AddKnownFile(ManifestCID)

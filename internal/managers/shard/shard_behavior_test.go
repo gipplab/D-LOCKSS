@@ -14,6 +14,7 @@ import (
 	"dlockss/internal/config"
 	"dlockss/internal/managers/storage"
 	"dlockss/internal/telemetry"
+	"dlockss/internal/testutil"
 )
 
 // newTestShardManager creates a ShardManager for tests.
@@ -31,26 +32,35 @@ func newTestShardManager(t *testing.T, ctx context.Context, startShard string) *
 		t.Fatal(err)
 	}
 
-	metrics := telemetry.NewMetricsManager()
-	dht := &MockDHTProvider{}
-	storageMgr := storage.NewStorageManager(dht, metrics, nil)
-	clusterMgr := &MockClusterManager{}
+	metrics := telemetry.NewMetricsManager(config.DefaultConfig())
+	dht := &testutil.MockDHTProvider{}
+	cfg := config.DefaultConfig()
+	storageMgr := storage.NewStorageManager(cfg, dht, metrics, nil)
+	clusterMgr := &testutil.MockClusterManager{}
 
-	sm := NewShardManager(ctx, h, ps, &MockIPFSClient{}, storageMgr, metrics, nil, nil, clusterMgr, startShard, "")
+	sm, err := NewShardManager(ShardManagerConfig{
+		Cfg:        cfg,
+		Ctx:        ctx,
+		Host:       h,
+		PubSub:     ps,
+		IPFSClient: &testutil.MockIPFSClient{},
+		Storage:    storageMgr,
+		Metrics:    metrics,
+		Cluster:    clusterMgr,
+		StartShard: startShard,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	return sm
 }
 
-// populateFakeActivePeers injects fake ACTIVE peer entries into seenPeerRoles.
+// populateFakeActivePeers injects fake ACTIVE peer entries via PeerTracker.
 func populateFakeActivePeers(sm *ShardManager, shardID string, count int) []peer.ID {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	if sm.seenPeerRoles[shardID] == nil {
-		sm.seenPeerRoles[shardID] = make(map[peer.ID]PeerRoleInfo)
-	}
 	var peers []peer.ID
 	for i := 0; i < count; i++ {
 		pid := peer.ID(fmt.Sprintf("fake-active-peer-%d", i))
-		sm.seenPeerRoles[shardID][pid] = PeerRoleInfo{Role: RoleActive, LastSeen: time.Now()}
+		sm.peers.RecordRole(shardID, pid, RoleActive)
 		peers = append(peers, pid)
 	}
 	return peers
@@ -64,24 +74,19 @@ func TestCountActivePeers_OnlyCountsActive(t *testing.T) {
 	sm := newTestShardManager(t, ctx, "0")
 
 	shard := "0"
-	now := time.Now()
-	sm.mu.Lock()
-	sm.seenPeerRoles[shard] = map[peer.ID]PeerRoleInfo{
-		"peer-active-1":  {Role: RoleActive, LastSeen: now},
-		"peer-active-2":  {Role: RoleActive, LastSeen: now},
-		"peer-passive-1": {Role: RolePassive, LastSeen: now},
-		"peer-probe-1":   {Role: RoleProbe, LastSeen: now},
-	}
-	sm.mu.Unlock()
+	sm.peers.RecordRole(shard, "peer-active-1", RoleActive)
+	sm.peers.RecordRole(shard, "peer-active-2", RoleActive)
+	sm.peers.RecordRole(shard, "peer-passive-1", RolePassive)
+	sm.peers.RecordRole(shard, "peer-probe-1", RoleProbe)
 
 	// includeSelf=true: should count 2 active peers + self = 3
-	count := sm.countActivePeers(shard, true, config.SeenPeersWindow)
+	count := sm.peers.CountActive(shard, true, "0", sm.cfg.SeenPeersWindow)
 	if count != 3 {
 		t.Errorf("expected 3 (2 active + self), got %d", count)
 	}
 
 	// includeSelf=false: should count only 2 active peers
-	count = sm.countActivePeers(shard, false, config.SeenPeersWindow)
+	count = sm.peers.CountActive(shard, false, "0", sm.cfg.SeenPeersWindow)
 	if count != 2 {
 		t.Errorf("expected 2 active peers, got %d", count)
 	}
@@ -94,21 +99,20 @@ func TestCountActivePeers_ExcludesStaleEntries(t *testing.T) {
 
 	shard := "0"
 	now := time.Now()
-	sm.mu.Lock()
-	sm.seenPeerRoles[shard] = map[peer.ID]PeerRoleInfo{
-		"peer-fresh": {Role: RoleActive, LastSeen: now},
-		"peer-stale": {Role: RoleActive, LastSeen: now.Add(-10 * time.Minute)},
-	}
-	sm.mu.Unlock()
+	sm.peers.RecordRole(shard, "peer-fresh", RoleActive)
+	// Inject a stale entry by writing directly (RecordRole always uses time.Now())
+	sm.peers.mu.Lock()
+	sm.peers.roles[shard]["peer-stale"] = PeerRoleInfo{Role: RoleActive, LastSeen: now.Add(-10 * time.Minute)}
+	sm.peers.mu.Unlock()
 
 	// With a 5-minute window, only the fresh peer should count
-	count := sm.countActivePeers(shard, false, 5*time.Minute)
+	count := sm.peers.CountActive(shard, false, "0", 5*time.Minute)
 	if count != 1 {
 		t.Errorf("expected 1 (only fresh peer), got %d", count)
 	}
 
 	// With a 15-minute window, both should count
-	count = sm.countActivePeers(shard, false, 15*time.Minute)
+	count = sm.peers.CountActive(shard, false, "0", 15*time.Minute)
 	if count != 2 {
 		t.Errorf("expected 2 (both within window), got %d", count)
 	}
@@ -121,22 +125,17 @@ func TestCountActivePeers_ExcludesSelf(t *testing.T) {
 
 	shard := "0"
 	selfID := sm.h.ID()
-	now := time.Now()
-	sm.mu.Lock()
-	sm.seenPeerRoles[shard] = map[peer.ID]PeerRoleInfo{
-		selfID:       {Role: RoleActive, LastSeen: now},
-		"other-peer": {Role: RoleActive, LastSeen: now},
-	}
-	sm.mu.Unlock()
+	sm.peers.RecordRole(shard, selfID, RoleActive)
+	sm.peers.RecordRole(shard, "other-peer", RoleActive)
 
 	// Self should not be double-counted. With includeSelf=true, self is added once
 	// by the function, not counted from the map.
-	count := sm.countActivePeers(shard, true, config.SeenPeersWindow)
+	count := sm.peers.CountActive(shard, true, "0", sm.cfg.SeenPeersWindow)
 	if count != 2 {
 		t.Errorf("expected 2 (1 other + 1 self), got %d", count)
 	}
 
-	count = sm.countActivePeers(shard, false, config.SeenPeersWindow)
+	count = sm.peers.CountActive(shard, false, "0", sm.cfg.SeenPeersWindow)
 	if count != 1 {
 		t.Errorf("expected 1 (only other peer), got %d", count)
 	}
@@ -145,32 +144,22 @@ func TestCountActivePeers_ExcludesSelf(t *testing.T) {
 // --- Merge behavior tests ---
 
 func TestMergeRefusal_HealthyShardEmptySibling(t *testing.T) {
-	// Override config for fast probe timeouts so the test doesn't block
-	origProbeTimeout := config.ProbeTimeoutMerge
-	origMergeCooldown := config.MergeUpCooldown
-	origSiblingEmpty := config.SiblingEmptyMergeAfter
-	config.ProbeTimeoutMerge = 100 * time.Millisecond
-	config.MergeUpCooldown = 50 * time.Millisecond
-	config.SiblingEmptyMergeAfter = 50 * time.Millisecond
-	defer func() {
-		config.ProbeTimeoutMerge = origProbeTimeout
-		config.MergeUpCooldown = origMergeCooldown
-		config.SiblingEmptyMergeAfter = origSiblingEmpty
-	}()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sm := newTestShardManager(t, ctx, "00")
 
-	// Populate enough ACTIVE peers to be "healthy" (>= MinPeersPerShard)
-	populateFakeActivePeers(sm, "00", config.MinPeersPerShard+2)
+	sm.cfg.ProbeTimeoutMerge = 100 * time.Millisecond
+	sm.cfg.MergeUpCooldown = 50 * time.Millisecond
+	sm.cfg.SiblingEmptyMergeAfter = 50 * time.Millisecond
+
+	populateFakeActivePeers(sm, "00", sm.cfg.MinPeersPerShard+2)
 
 	// Set lastMoveToDeeperShard far enough in the past to pass both cooldown and siblingEmptyMergeAfter
 	sm.mu.Lock()
 	sm.lastMoveToDeeperShard = time.Now().Add(-1 * time.Minute)
 	sm.mu.Unlock()
 
-	sm.checkAndMergeUpIfAlone()
+	sm.lifecycle.checkAndMergeUpIfAlone()
 
 	sm.mu.RLock()
 	current := sm.currentShard
@@ -181,25 +170,16 @@ func TestMergeRefusal_HealthyShardEmptySibling(t *testing.T) {
 }
 
 func TestMergeAllowed_UnderstaffedShardEmptySibling(t *testing.T) {
-	origProbeTimeout := config.ProbeTimeoutMerge
-	origMergeCooldown := config.MergeUpCooldown
-	origSiblingEmpty := config.SiblingEmptyMergeAfter
-	config.ProbeTimeoutMerge = 100 * time.Millisecond
-	config.MergeUpCooldown = 50 * time.Millisecond
-	config.SiblingEmptyMergeAfter = 50 * time.Millisecond
-	defer func() {
-		config.ProbeTimeoutMerge = origProbeTimeout
-		config.MergeUpCooldown = origMergeCooldown
-		config.SiblingEmptyMergeAfter = origSiblingEmpty
-	}()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sm := newTestShardManager(t, ctx, "00")
 
-	// Populate fewer ACTIVE peers than MinPeersPerShard (understaffed)
-	if config.MinPeersPerShard > 2 {
-		populateFakeActivePeers(sm, "00", config.MinPeersPerShard-2)
+	sm.cfg.ProbeTimeoutMerge = 100 * time.Millisecond
+	sm.cfg.MergeUpCooldown = 50 * time.Millisecond
+	sm.cfg.SiblingEmptyMergeAfter = 50 * time.Millisecond
+
+	if sm.cfg.MinPeersPerShard > 2 {
+		populateFakeActivePeers(sm, "00", sm.cfg.MinPeersPerShard-2)
 	}
 
 	// Set lastMoveToDeeperShard far enough in the past
@@ -207,7 +187,7 @@ func TestMergeAllowed_UnderstaffedShardEmptySibling(t *testing.T) {
 	sm.lastMoveToDeeperShard = time.Now().Add(-1 * time.Minute)
 	sm.mu.Unlock()
 
-	sm.checkAndMergeUpIfAlone()
+	sm.lifecycle.checkAndMergeUpIfAlone()
 
 	sm.mu.RLock()
 	current := sm.currentShard
@@ -218,25 +198,19 @@ func TestMergeAllowed_UnderstaffedShardEmptySibling(t *testing.T) {
 }
 
 func TestMergeRefusal_CooldownPreventsEarlyMerge(t *testing.T) {
-	origProbeTimeout := config.ProbeTimeoutMerge
-	origMergeCooldown := config.MergeUpCooldown
-	config.ProbeTimeoutMerge = 100 * time.Millisecond
-	config.MergeUpCooldown = 10 * time.Minute // long cooldown
-	defer func() {
-		config.ProbeTimeoutMerge = origProbeTimeout
-		config.MergeUpCooldown = origMergeCooldown
-	}()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sm := newTestShardManager(t, ctx, "00")
+
+	sm.cfg.ProbeTimeoutMerge = 100 * time.Millisecond
+	sm.cfg.MergeUpCooldown = 10 * time.Minute
 
 	// Set lastMoveToDeeperShard to very recently (within cooldown)
 	sm.mu.Lock()
 	sm.lastMoveToDeeperShard = time.Now().Add(-1 * time.Second)
 	sm.mu.Unlock()
 
-	sm.checkAndMergeUpIfAlone()
+	sm.lifecycle.checkAndMergeUpIfAlone()
 
 	sm.mu.RLock()
 	current := sm.currentShard
@@ -281,15 +255,29 @@ func TestMoveToShard_PublishesLeave(t *testing.T) {
 	}
 
 	// Set up ShardManager on h1 starting in shard "0"
-	metrics := telemetry.NewMetricsManager()
-	dht := &MockDHTProvider{}
-	storageMgr := storage.NewStorageManager(dht, metrics, nil)
-	clusterMgr := &MockClusterManager{}
-	sm := NewShardManager(ctx, h1, ps1, &MockIPFSClient{}, storageMgr, metrics, nil, nil, clusterMgr, "0", "")
+	metrics := telemetry.NewMetricsManager(config.DefaultConfig())
+	dht := &testutil.MockDHTProvider{}
+	cfg1 := config.DefaultConfig()
+	storageMgr := storage.NewStorageManager(cfg1, dht, metrics, nil)
+	clusterMgr := &testutil.MockClusterManager{}
+	sm, err := NewShardManager(ShardManagerConfig{
+		Cfg:        cfg1,
+		Ctx:        ctx,
+		Host:       h1,
+		PubSub:     ps1,
+		IPFSClient: &testutil.MockIPFSClient{},
+		Storage:    storageMgr,
+		Metrics:    metrics,
+		Cluster:    clusterMgr,
+		StartShard: "0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	_ = sm
 
 	// h2 subscribes to shard "0" topic to catch the LEAVE
-	topicName := fmt.Sprintf("%s-creative-commons-shard-%s", config.PubsubTopicPrefix, "0")
+	topicName := fmt.Sprintf("%s-creative-commons-shard-%s", cfg1.PubsubTopicPrefix, "0")
 	topic2, err := ps2.Join(topicName)
 	if err != nil {
 		t.Fatal(err)
@@ -367,15 +355,29 @@ func TestProcessMessage_ProbeTriggersHeartbeat(t *testing.T) {
 	}
 
 	// Set up ShardManager on h1 in shard "0"
-	metrics := telemetry.NewMetricsManager()
-	dht := &MockDHTProvider{}
-	storageMgr := storage.NewStorageManager(dht, metrics, nil)
-	clusterMgr := &MockClusterManager{}
-	sm := NewShardManager(ctx, h1, ps1, &MockIPFSClient{}, storageMgr, metrics, nil, nil, clusterMgr, "0", "")
+	metrics := telemetry.NewMetricsManager(config.DefaultConfig())
+	dht := &testutil.MockDHTProvider{}
+	cfg2 := config.DefaultConfig()
+	storageMgr := storage.NewStorageManager(cfg2, dht, metrics, nil)
+	clusterMgr := &testutil.MockClusterManager{}
+	sm, err := NewShardManager(ShardManagerConfig{
+		Cfg:        cfg2,
+		Ctx:        ctx,
+		Host:       h1,
+		PubSub:     ps1,
+		IPFSClient: &testutil.MockIPFSClient{},
+		Storage:    storageMgr,
+		Metrics:    metrics,
+		Cluster:    clusterMgr,
+		StartShard: "0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	_ = sm
 
 	// h2 subscribes to shard "0"
-	topicName := fmt.Sprintf("%s-creative-commons-shard-%s", config.PubsubTopicPrefix, "0")
+	topicName := fmt.Sprintf("%s-creative-commons-shard-%s", cfg2.PubsubTopicPrefix, "0")
 	topic2, err := ps2.Join(topicName)
 	if err != nil {
 		t.Fatal(err)

@@ -2,7 +2,7 @@ package telemetry
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"time"
 
 	"dlockss/internal/config"
@@ -14,6 +14,7 @@ import (
 // No dedicated telemetry topic - nodes broadcast on their shard topics
 
 type TelemetryClient struct {
+	cfg       *config.Config
 	host      host.Host
 	ps        *pubsub.PubSub
 	metrics   *MetricsManager
@@ -25,22 +26,20 @@ type ShardPublisher interface {
 	PublishToShardCBOR(data []byte, shardID string)
 }
 
-func NewTelemetryClient(h host.Host, ps *pubsub.PubSub, metrics *MetricsManager) *TelemetryClient {
-	// monitorIDStr is ignored - nodes are agnostic of monitor
-	// Nodes broadcast telemetry on their current shard topic, monitor listens on all shards
-
+func NewTelemetryClient(cfg *config.Config, h host.Host, ps *pubsub.PubSub, metrics *MetricsManager) *TelemetryClient {
 	if ps == nil {
-		log.Printf("[Telemetry] PubSub not available, telemetry disabled")
+		slog.Warn("pubsub not available, telemetry disabled")
 		return nil
 	}
 
 	tc := &TelemetryClient{
+		cfg:     cfg,
 		host:    h,
 		ps:      ps,
 		metrics: metrics,
 	}
 
-	log.Printf("[Telemetry] Telemetry client initialized (will broadcast on shard topics)")
+	slog.Info("telemetry client initialized")
 
 	return tc
 }
@@ -52,12 +51,12 @@ func (tc *TelemetryClient) SetShardPublisher(sp ShardPublisher, sip ShardInfoPro
 }
 
 func (tc *TelemetryClient) Start(ctx context.Context) {
-	log.Printf("[Telemetry] Starting telemetry client (pubsub-based, monitor-agnostic)")
+	slog.Info("starting telemetry client")
 	go tc.runLoop(ctx)
 }
 
 func (tc *TelemetryClient) runLoop(ctx context.Context) {
-	ticker := time.NewTicker(config.TelemetryInterval) // Report at configured interval (default: 2 minutes)
+	ticker := time.NewTicker(tc.cfg.TelemetryInterval)
 	defer ticker.Stop()
 
 	// Try to discover monitor immediately on startup
@@ -83,8 +82,7 @@ func (tc *TelemetryClient) pushTelemetry() {
 
 	status := tc.metrics.GetStatus()
 
-	if config.VerboseLogging {
-		log.Printf("[Telemetry] Sending status: pinned=%d, known=%d, shard=%s, peers=%d",
-			status.Storage.PinnedFiles, status.Storage.KnownFiles, status.CurrentShard, status.PeersInShard)
-	}
+	slog.Debug("sending telemetry status",
+		"pinned", status.Storage.PinnedFiles, "known", status.Storage.KnownFiles,
+		"shard", status.CurrentShard, "peers", status.PeersInShard)
 }

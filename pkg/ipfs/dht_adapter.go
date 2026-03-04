@@ -42,6 +42,12 @@ type IPFSDHTAdapter struct {
 
 var _ routing.Routing = (*IPFSDHTAdapter)(nil)
 
+// NewIPFSDHTAdapterFromClient creates a DHT adapter from an ipfs.Client,
+// avoiding the need for callers to access the raw Shell.
+func NewIPFSDHTAdapterFromClient(c *Client) *IPFSDHTAdapter {
+	return NewIPFSDHTAdapter(c.shell())
+}
+
 // NewIPFSDHTAdapter creates a new DHT adapter that uses IPFS's DHT
 func NewIPFSDHTAdapter(api *ipfsapi.Shell) *IPFSDHTAdapter {
 	ctx, cancel := context.WithCancel(context.Background())

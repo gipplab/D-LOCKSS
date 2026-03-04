@@ -2,7 +2,7 @@ package shard
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/ipfs/go-cid"
@@ -36,7 +36,7 @@ func (sm *ShardManager) PublishToShard(shardID, msg string) {
 	if sub.topic != nil {
 		_ = sub.topic.Publish(sm.ctx, []byte(msg))
 	} else {
-		topicName := shardTopicName(shardID)
+		topicName := sm.shardTopicName(shardID)
 		_ = sm.ps.Publish(topicName, []byte(msg))
 	}
 }
@@ -52,7 +52,7 @@ func (sm *ShardManager) PublishToShardCBOR(data []byte, shardID string) {
 	if sub.topic != nil {
 		_ = sub.topic.Publish(sm.ctx, data)
 	} else {
-		topicName := shardTopicName(shardID)
+		topicName := sm.shardTopicName(shardID)
 		_ = sm.ps.Publish(topicName, data)
 	}
 }
@@ -72,13 +72,17 @@ func (sm *ShardManager) PublishIngestMessageToCurrentAndChildIfSplit(data []byte
 	if depth < 1 {
 		depth = 1
 	}
-	childShard := common.TargetShardForPayload(payloadCIDStr, depth)
+	childShard, err := common.TargetShardForPayload(payloadCIDStr, depth)
+	if err != nil {
+		slog.Error("failed to compute target shard for child", "payload", payloadCIDStr, "error", err)
+		return
+	}
 	if sm.JoinShardAsObserver(childShard) {
 		sm.PublishToShardCBOR(data, childShard)
 		sm.LeaveShardAsObserver(childShard)
-		log.Printf("[Shard] IngestMessage also published to child %s (split in progress)", childShard)
+		slog.Info("ingest message also published to child shard", "child", childShard)
 	} else {
-		log.Printf("[Shard] Warning: could not join child %s as observer to forward IngestMessage during split", childShard)
+		slog.Warn("could not join child as observer to forward ingest message during split", "child", childShard)
 	}
 }
 
@@ -95,15 +99,23 @@ func (sm *ShardManager) ResolveTargetShardForCustodial(nominalTargetShard string
 	if depth < 1 {
 		depth = 1
 	}
-	childShard := common.TargetShardForPayload(payloadCIDStr, depth)
-	log.Printf("[Shard] Custodial target resolved: parent %s has active children → using child %s", nominalTargetShard, childShard)
+	childShard, err := common.TargetShardForPayload(payloadCIDStr, depth)
+	if err != nil {
+		slog.Error("failed to compute custodial target shard", "payload", payloadCIDStr, "error", err)
+		return nominalTargetShard
+	}
+	slog.Info("custodial target resolved to child shard", "parent", nominalTargetShard, "child", childShard)
 	return childShard
 }
 
 func (sm *ShardManager) AmIResponsibleFor(key string) bool {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-	prefix := common.GetHexBinaryPrefix(common.KeyToStableHex(key), len(sm.currentShard))
+	prefix, err := common.GetHexBinaryPrefix(common.KeyToStableHex(key), len(sm.currentShard))
+	if err != nil {
+		slog.Error("failed to compute shard prefix", "key", key, "error", err)
+		return false
+	}
 	return prefix == sm.currentShard
 }
 

@@ -44,7 +44,7 @@ class LocalPinTracker {
     + TriggerSync()
     + Stop()
     + syncLoop(consensus)
-    + syncState(consensus)  ' allocation-aware: pin only if we are in Allocations
+    + syncState(consensus)  ' pins everything in shard CRDT (allocations are informational only)
 }
 
 ShardManager --> ClusterManager : manages
@@ -53,61 +53,72 @@ EmbeddedCluster --> LocalPinTracker : owns
 
 class ShardManager {
     - ctx: context.Context
+    - cfg: *config.Config
     - h: host.Host
     - ps: *pubsub.PubSub
     - ipfsClient: ipfs.IPFSClient
-    - storageMgr: *StorageManager
+    - storageMgr: StorageProvider
     - clusterMgr: ClusterManagerInterface
     - metrics: *telemetry.MetricsManager
-    - signer: *signing.Signer
+    - signer: MessageAuthenticator
     - rateLimiter: *common.RateLimiter
+    - peers: *PeerTracker
     - mu: sync.RWMutex
     - currentShard: string
     - shardSubs: map[string]*shardSubscription
     - probeTopicCache: map[string]*pubsub.Topic
-    - seenPeers: map[string]map[peer.ID]time.Time
     - observerOnlyShards: map[string]struct{}
-    - lastPeerCheck: time.Time
-    - lastDiscoveryCheck: time.Time
-    - lastMoveToDeeperShard: time.Time
-    - lastMergeUpTime: time.Time
-    - lastShardMove: time.Time
-    - lastProbeResponseTime: time.Time
+    - reshardedFiles: *common.KnownFiles
+    - orphanHandoffSent: map[...]
+    - autoReplicationSem: chan struct{}
+    - reprovideInFlight: atomic.Bool
+    - lifecycle: *lifecycleManager
     --
-    + NewShardManager(...): *ShardManager
+    + NewShardManager(cfg ShardManagerConfig): (*ShardManager, error)
     + Run()
-    + JoinShard(shardID)
+    + Close(): error
+    + JoinShard(shardID): error
     + LeaveShard(shardID)
     + JoinShardAsObserver(shardID): bool
     + LeaveShardAsObserver(shardID)
-    + AmIResponsibleFor(key): bool  ' PayloadCID string -> shard prefix match
+    + AmIResponsibleFor(key): bool
     + PublishToShardCBOR(bytes, shardID)
-    + PinToCluster(ctx, cid)
-    + EnsureClusterForShard(ctx, shardID)
-    + GetPeersForShard(shardID): []peer.ID  ' ShardPeerProvider for CRDT
-    + splitShard()
-    + getShardPeerCount(): int
-    + checkAndSplitIfNeeded()
-    + runPeerCountChecker()
-    + runShardDiscovery()
-    + checkAndMergeUpIfAlone()
-    + discoverAndMoveToDeeperShard()
-    + probeShard(shardID, timeout): int
+    + PinToCluster(ctx, cid): error
+    + EnsureClusterForShard(ctx, shardID): error
+    + GetPeersForShard(shardID): []peer.ID
     + RunReshardPass(oldShard, newShard)
     + RunOrphanUnpinPass()
     + AnnouncePinned(manifestCID)
-    + Close()
 }
+
+class lifecycleManager {
+    - ops: lifecycleOps
+    - cfg: *config.Config
+    - mu: sync.Mutex
+    - splitAboveThresholdCount: int
+    - knownChildShards: map[string]time.Time
+    - lastPeerCheck: time.Time
+    --
+    + runPeerCountChecker()
+    + runShardDiscovery()
+    + runSplitRebroadcast()
+    - checkAndSplitIfNeeded()
+    - checkAndMergeUpIfAlone()
+    - discoverAndMoveToDeeperShard()
+    - recordSplitAnnouncement(child0, child1)
+}
+
+ShardManager --> lifecycleManager : delegates split/merge/discovery
 
 note right of ShardManager
   PubSub topics: dlockss-creative-commons-shard-<id>.
   One subscription per shard (refCount); observer mode for probing.
-  Merge up: understaffed in deep shard, parent has room.
-  Discovery: all shards; 10s root, 2m default, 45s when SPLIT known.
-  Split rebroadcast: nodes in children rebroadcast SPLIT to ancestors (60s).
+  Lifecycle decisions (split/merge/discovery) delegated to lifecycleManager.
+  Replication code split into shard_msg_handlers.go, shard_reshard.go,
+  shard_maintenance.go.
   Stability (v0.0.3):
-  - lastShardMove: general cooldown (30s) after ANY transition
-  - lastProbeResponseTime: rate-limits PROBE heartbeat responses (5s)
+  - ShardMoveCooldown (30s) after ANY transition
+  - PROBE response rate limiting (5s)
   - Jittered discovery timers (0-25% random)
   - Immediate LEAVE on departure
 end note
@@ -148,13 +159,15 @@ class ReplicationRequest {
 }
 
 class StorageManager {
+    - cfg: *config.Config
     - dht: DHTProvider
     - pinnedFiles: *common.PinnedSet
     - knownFiles: *common.KnownFiles
     - recentlyRemoved: *common.RecentlyRemoved
     - fileReplicationLevels: *common.FileReplicationLevels
-    - failedOperations: *common.BackoffTable
+    - failedOperations: *BackoffTable
     - metrics: *telemetry.MetricsManager
+    - provideSem: chan struct{}
     --
     + PinFile(manifestCIDStr)
     + UnpinFile(key)
@@ -163,7 +176,7 @@ class StorageManager {
     + GetPinnedManifests(): []string
     + GetKnownFiles(): *KnownFiles
     + GetNextFileToAnnounce(): string
-    + ProvideFile(ctx, cidStr)  ' manifest & payload (both ingester and replicas)
+    + ProvideFile(ctx, cidStr)  ' bounded by MaxConcurrentDHTProvides semaphore
 }
 
 class cachedReplication {

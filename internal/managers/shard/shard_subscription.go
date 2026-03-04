@@ -3,17 +3,15 @@ package shard
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
-
-	"dlockss/internal/config"
 )
 
 // JoinShard subscribes to the shard topic (or increments refcount). Promotes observer to full member if already subscribed.
-func (sm *ShardManager) JoinShard(shardID string) {
+func (sm *ShardManager) JoinShard(shardID string) error {
 	sm.mu.Lock()
 
 	sub, exists := sm.shardSubs[shardID]
@@ -32,15 +30,15 @@ func (sm *ShardManager) JoinShard(shardID string) {
 			}
 			heartbeatMsg := []byte(fmt.Sprintf("%s%s:%d:%s:%s", msgPrefixHeartbeat, sm.h.ID().String(), pinnedCount, role, sm.nodeName))
 			_ = topic.Publish(sm.ctx, heartbeatMsg)
-			log.Printf("[Sharding] Promoted observer to full member in shard %s", shardID)
-			return
+			slog.Info("promoted observer to full member", "shard", shardID)
+			return nil
 		}
 		sub.refCount++
 		sm.mu.Unlock()
-		return
+		return nil
 	}
 
-	topicName := shardTopicName(shardID)
+	topicName := sm.shardTopicName(shardID)
 	var t *pubsub.Topic
 	if cached := sm.probeTopicCache[shardID]; cached != nil {
 		t = cached
@@ -53,20 +51,18 @@ func (sm *ShardManager) JoinShard(shardID string) {
 				if sub, exists := sm.shardSubs[shardID]; exists {
 					sub.refCount++
 					sm.mu.Unlock()
-					return
+					return nil
 				}
 			}
 			sm.mu.Unlock()
-			log.Printf("[Error] Failed to join shard topic %s: %v", topicName, err)
-			return
+			return fmt.Errorf("join shard topic %s: %w", topicName, err)
 		}
 	}
 
 	psSub, err := t.Subscribe()
 	if err != nil {
 		sm.mu.Unlock()
-		log.Printf("[Error] Failed to subscribe to shard topic %s: %v", topicName, err)
-		return
+		return fmt.Errorf("subscribe to shard topic %s: %w", topicName, err)
 	}
 
 	ctx, cancel := context.WithCancel(sm.ctx)
@@ -80,7 +76,7 @@ func (sm *ShardManager) JoinShard(shardID string) {
 	sm.shardSubs[shardID] = newSub
 	sm.mu.Unlock()
 
-	log.Printf("[Sharding] Joined shard %s (Topic: %s)", shardID, topicName)
+	slog.Info("joined shard", "shard", shardID, "topic", topicName)
 
 	role := sm.getOurRole()
 	joinMsg := []byte(msgPrefixJoin + sm.h.ID().String() + ":" + string(role) + ":" + sm.nodeName)
@@ -93,6 +89,7 @@ func (sm *ShardManager) JoinShard(shardID string) {
 	_ = newSub.topic.Publish(sm.ctx, heartbeatMsg)
 
 	go sm.readLoop(ctx, newSub)
+	return nil
 }
 
 // JoinShardAsObserver subscribes to a shard topic without publishing JOIN/HEARTBEAT (peek only, like the monitor).
@@ -111,7 +108,7 @@ func (sm *ShardManager) JoinShardAsObserver(shardID string) bool {
 		return false
 	}
 
-	topicName := fmt.Sprintf("%s-creative-commons-shard-%s", config.PubsubTopicPrefix, shardID)
+	topicName := fmt.Sprintf("%s-creative-commons-shard-%s", sm.cfg.PubsubTopicPrefix, shardID)
 	var t *pubsub.Topic
 	var psSub *pubsub.Subscription
 	if cached := sm.probeTopicCache[shardID]; cached != nil {
@@ -120,7 +117,7 @@ func (sm *ShardManager) JoinShardAsObserver(shardID string) bool {
 		var err error
 		psSub, err = t.Subscribe()
 		if err != nil {
-			log.Printf("[Sharding] JoinShardAsObserver: failed to subscribe to %s: %v", topicName, err)
+			slog.Error("observer join: failed to subscribe", "topic", topicName, "error", err)
 			return false
 		}
 	} else {
@@ -132,18 +129,18 @@ func (sm *ShardManager) JoinShardAsObserver(shardID string) bool {
 				// tryJoin and returns the existing topic's subscription.
 				psSub, err = sm.ps.Subscribe(topicName)
 				if err != nil {
-					log.Printf("[Sharding] JoinShardAsObserver: failed to subscribe to %s (after topic exists): %v", topicName, err)
+					slog.Error("observer join: failed to subscribe after topic exists", "topic", topicName, "error", err)
 					return false
 				}
 				t = nil // no topic handle; use ps.Publish for publishing
 			} else {
-				log.Printf("[Sharding] JoinShardAsObserver: failed to join topic %s: %v", topicName, err)
+				slog.Error("observer join: failed to join topic", "topic", topicName, "error", err)
 				return false
 			}
 		} else {
 			psSub, err = t.Subscribe()
 			if err != nil {
-				log.Printf("[Sharding] JoinShardAsObserver: failed to subscribe to %s: %v", topicName, err)
+				slog.Error("observer join: failed to subscribe", "topic", topicName, "error", err)
 				return false
 			}
 		}
@@ -161,7 +158,7 @@ func (sm *ShardManager) JoinShardAsObserver(shardID string) bool {
 	sm.shardSubs[shardID] = newSub
 	sm.observerOnlyShards[shardID] = struct{}{}
 
-	log.Printf("[Sharding] Joined shard %s as observer (peek only, no JOIN/HEARTBEAT)", shardID)
+	slog.Info("joined shard as observer", "shard", shardID)
 	go sm.readLoop(ctx, newSub)
 	return true
 }
@@ -186,7 +183,7 @@ func (sm *ShardManager) LeaveShardAsObserver(shardID string) {
 		sub.topic.Close()
 	}
 	delete(sm.shardSubs, shardID)
-	log.Printf("[Sharding] Left shard %s (observer)", shardID)
+	slog.Info("left shard", "shard", shardID, "observer", true)
 }
 
 // LeaveShard decrements refcount; unsubscribes and closes topic when zero.
@@ -217,7 +214,7 @@ func (sm *ShardManager) LeaveShard(shardID string) {
 				originalSub.cancel()
 				originalSub.sub.Cancel()
 				_ = originalSub.topic.Close()
-				log.Printf("[Sharding] Left shard %s (cleaned up after concurrent removal)", shardID)
+				slog.Info("left shard, cleaned up after concurrent removal", "shard", shardID)
 				return
 			}
 			if currentSub != originalSub {
@@ -225,7 +222,7 @@ func (sm *ShardManager) LeaveShard(shardID string) {
 				originalSub.cancel()
 				originalSub.sub.Cancel()
 				_ = originalSub.topic.Close()
-				log.Printf("[Sharding] Left shard %s (cleaned up replaced subscription)", shardID)
+				slog.Info("left shard, cleaned up replaced subscription", "shard", shardID)
 				return
 			}
 			if currentSub.refCount > 0 {
@@ -248,11 +245,7 @@ func (sm *ShardManager) LeaveShard(shardID string) {
 			}
 		}
 		sm.probeTopicCache[shardID] = topic
-		if observerOnly {
-			log.Printf("[Sharding] Left shard %s (observer)", shardID)
-		} else {
-			log.Printf("[Sharding] Left shard %s", shardID)
-		}
+		slog.Info("left shard", "shard", shardID, "observer", observerOnly)
 	}
 }
 

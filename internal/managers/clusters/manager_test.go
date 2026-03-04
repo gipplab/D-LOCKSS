@@ -2,11 +2,12 @@ package clusters_test
 
 import (
 	"context"
-	"io"
 	"testing"
 	"time"
 
+	"dlockss/internal/config"
 	"dlockss/internal/managers/clusters"
+	"dlockss/internal/testutil"
 
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-datastore"
@@ -14,48 +15,7 @@ import (
 	"github.com/libp2p/go-libp2p"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/routing"
-	"github.com/multiformats/go-multihash"
 )
-
-// MockIPFSClient implements ipfs.IPFSClient for testing.
-type MockIPFSClient struct{}
-
-func (m *MockIPFSClient) PinRecursive(ctx context.Context, c cid.Cid) error          { return nil }
-func (m *MockIPFSClient) UnpinRecursive(ctx context.Context, c cid.Cid) error        { return nil }
-func (m *MockIPFSClient) IsPinned(ctx context.Context, c cid.Cid) (bool, error)      { return false, nil }
-func (m *MockIPFSClient) GetBlock(ctx context.Context, c cid.Cid) ([]byte, error)    { return nil, nil }
-func (m *MockIPFSClient) GetFileSize(ctx context.Context, c cid.Cid) (uint64, error) { return 0, nil }
-func (m *MockIPFSClient) GetPeerID(ctx context.Context) (string, error)              { return "mock-peer", nil }
-func (m *MockIPFSClient) ImportFile(ctx context.Context, path string) (cid.Cid, error) {
-	return cid.Cid{}, nil
-}
-func (m *MockIPFSClient) ImportReader(ctx context.Context, r io.Reader) (cid.Cid, error) {
-	return cid.Cid{}, nil
-}
-func (m *MockIPFSClient) PutDagCBOR(ctx context.Context, data []byte) (cid.Cid, error) {
-	return cid.Cid{}, nil
-}
-func (m *MockIPFSClient) SwarmConnect(ctx context.Context, addrs []string) error { return nil }
-
-// MockRouting implements routing.Routing
-type MockRouting struct{}
-
-func (m *MockRouting) Provide(context.Context, cid.Cid, bool) error { return nil }
-func (m *MockRouting) FindProvidersAsync(context.Context, cid.Cid, int) <-chan peer.AddrInfo {
-	return nil
-}
-func (m *MockRouting) FindPeer(context.Context, peer.ID) (peer.AddrInfo, error) {
-	return peer.AddrInfo{}, nil
-}
-func (m *MockRouting) PutValue(context.Context, string, []byte, ...routing.Option) error { return nil }
-func (m *MockRouting) GetValue(context.Context, string, ...routing.Option) ([]byte, error) {
-	return nil, nil
-}
-func (m *MockRouting) SearchValue(context.Context, string, ...routing.Option) (<-chan []byte, error) {
-	return nil, nil
-}
-func (m *MockRouting) Bootstrap(context.Context) error { return nil }
 
 func TestClusterManager_Lifecycle(t *testing.T) {
 	if testing.Short() {
@@ -81,10 +41,17 @@ func TestClusterManager_Lifecycle(t *testing.T) {
 	ds := dssync.MutexWrap(datastore.NewMapDatastore())
 
 	// Setup Routing
-	dht := &MockRouting{}
+	dht := &testutil.MockDHTProvider{}
 
 	// 2. Initialize ClusterManager
-	cm := clusters.NewClusterManager(h, ps, dht, ds, &MockIPFSClient{}, nil, nil, nil, nil)
+	cm := clusters.NewClusterManager(clusters.ClusterManagerConfig{
+		Cfg:        config.DefaultConfig(),
+		Host:       h,
+		PubSub:     ps,
+		DHT:        dht,
+		Datastore:  ds,
+		IPFSClient: &testutil.MockIPFSClient{},
+	})
 
 	// 3. Test JoinShard (Primary Shard "1")
 	shard1 := "1"
@@ -114,6 +81,12 @@ func TestClusterManager_Lifecycle(t *testing.T) {
 	if err != nil {
 		t.Errorf("MigratePins failed: %v", err)
 	}
+
+	// Allow the CRDT batch worker to finish processing before we shut down
+	// the shard. The ipfs-cluster library's batch worker panics on nil
+	// context if a batch item is still in-flight when Consensus.Shutdown
+	// races with context cancellation.
+	time.Sleep(500 * time.Millisecond)
 
 	// 7. Test LeaveShard (Cleanup old shard)
 	err = cm.LeaveShard(shard1)
@@ -147,26 +120,12 @@ func TestDeterministicSecrets(t *testing.T) {
 	}
 }
 
-// mustPeerID creates a peer.ID from a seed string for deterministic tests.
-func mustPeerID(t *testing.T, seed string) peer.ID {
-	t.Helper()
-	mh, err := multihash.Sum([]byte(seed), multihash.SHA2_256, -1)
-	if err != nil {
-		t.Fatalf("multihash.Sum: %v", err)
-	}
-	pid, err := peer.IDFromBytes(mh)
-	if err != nil {
-		t.Fatalf("peer.IDFromBytes: %v", err)
-	}
-	return pid
-}
-
 func TestSelectAllocations(t *testing.T) {
 	// Build deterministic peer list (order will be sorted by peer ID string).
-	pA := mustPeerID(t, "peerA")
-	pB := mustPeerID(t, "peerB")
-	pC := mustPeerID(t, "peerC")
-	pD := mustPeerID(t, "peerD")
+	pA := testutil.MustPeerID(t, "peerA")
+	pB := testutil.MustPeerID(t, "peerB")
+	pC := testutil.MustPeerID(t, "peerC")
+	pD := testutil.MustPeerID(t, "peerD")
 	peers := []peer.ID{pD, pA, pC, pB} // unsorted
 
 	c1, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")

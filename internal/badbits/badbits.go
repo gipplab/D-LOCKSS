@@ -2,7 +2,7 @@ package badbits
 
 import (
 	"encoding/csv"
-	"log"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -23,7 +23,7 @@ func NewFilter(path string) (*Filter, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.Printf("[BadBits] File not found: %s (Content blocking disabled)", path)
+			slog.Info("badbits file not found, content blocking disabled", "path", path)
 			return f, nil
 		}
 		return f, err
@@ -37,7 +37,7 @@ func NewFilter(path string) (*Filter, error) {
 	}
 
 	if len(records) < 1 {
-		log.Printf("[BadBits] Empty file: %s", path)
+		slog.Info("badbits file empty", "path", path)
 		return f, nil
 	}
 
@@ -56,7 +56,7 @@ func NewFilter(path string) (*Filter, error) {
 	}
 
 	f.loaded = true
-	log.Printf("[BadBits] Loaded %d blocked CIDs from %s", len(f.cids), path)
+	slog.Info("loaded blocked cids", "count", len(f.cids), "path", path)
 	return f, nil
 }
 

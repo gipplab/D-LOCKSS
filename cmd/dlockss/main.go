@@ -2,17 +2,11 @@
 package main
 
 import (
-	"bufio"
 	"context"
-	"crypto/rand"
-	"encoding/base64"
-	"encoding/json"
-	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -23,6 +17,7 @@ import (
 	"dlockss/internal/config"
 	"dlockss/internal/discovery"
 	"dlockss/internal/fileops"
+	"dlockss/internal/identity"
 	"dlockss/internal/managers/clusters"
 	"dlockss/internal/managers/shard"
 	"dlockss/internal/managers/storage"
@@ -37,7 +32,6 @@ import (
 	"github.com/libp2p/go-libp2p"
 	kaddht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
-	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
@@ -47,73 +41,42 @@ import (
 	"github.com/pbnjay/memory"
 )
 
-// resolveNodeName determines the node's human-readable name. Priority:
-// 1. DLOCKSS_NODE_NAME env var  2. Persisted file  3. Interactive prompt
-func resolveNodeName() string {
-	if config.NodeName != "" {
-		persistNodeName(config.NodeName)
-		return config.NodeName
-	}
-	nameFile := config.NodeNamePath
-	if data, err := os.ReadFile(nameFile); err == nil {
-		if name := strings.TrimSpace(string(data)); name != "" {
-			log.Printf("[Config] Loaded node name from %s: %s", nameFile, name)
-			return name
-		}
-	}
-	fmt.Print("Enter a name for this node (or press Enter to skip): ")
-	scanner := bufio.NewScanner(os.Stdin)
-	if scanner.Scan() {
-		if name := strings.TrimSpace(scanner.Text()); name != "" {
-			persistNodeName(name)
-			return name
-		}
-	}
-	return ""
-}
-
-func persistNodeName(name string) {
-	nameFile := config.NodeNamePath
-	if dir := filepath.Dir(nameFile); dir != "." {
-		_ = os.MkdirAll(dir, 0755)
-	}
-	if err := os.WriteFile(nameFile, []byte(name+"\n"), 0644); err != nil {
-		log.Printf("[Config] Warning: could not persist node name to %s: %v", nameFile, err)
-	} else {
-		log.Printf("[Config] Persisted node name to %s: %s", nameFile, name)
-	}
-}
-
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// Config and BadBits
-	badBitsFilter, err := badbits.NewFilter(config.BadBitsPath)
-	if err != nil {
-		log.Printf("[Warning] Failed to load bad bits list: %v", err)
-	}
-	config.LogConfiguration()
+	var logLevel slog.LevelVar
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: &logLevel})))
 
-	if msg := config.ValidatePathSafety(); msg != "" {
+	cfg := config.LoadFromEnv()
+	cfg.Validate()
+	if cfg.VerboseLogging {
+		logLevel.Set(slog.LevelDebug)
+	}
+	cfg.Log()
+
+	if msg := cfg.ValidatePathSafetyCheck(); msg != "" {
 		log.Fatalf("[Fatal] Unsafe path configuration: %s", msg)
 	}
 
-	nodeName := resolveNodeName()
+	badBitsFilter, err := badbits.NewFilter(cfg.BadBitsPath)
+	if err != nil {
+		slog.Warn("failed to load bad bits list", "error", err)
+	}
+
+	nodeName := identity.ResolveNodeName(cfg)
 	if nodeName != "" {
-		log.Printf("--- Node Name: %s ---", nodeName)
+		slog.Info("node name resolved", "name", nodeName)
 	}
 
 	// IPFS client and DHT (required)
-	ipfsClient, err := ipfs.NewClient(config.IPFSNodeAddress)
+	ipfsClient, err := ipfs.NewClient(cfg.IPFSNodeAddress)
 	if err != nil {
 		log.Fatalf("[Fatal] IPFS not available: %v (start IPFS with: ipfs daemon)", err)
 	}
-	shell := ipfsClient.GetShell()
-	dht := ipfs.NewIPFSDHTAdapter(shell)
+	dht := ipfs.NewIPFSDHTAdapterFromClient(ipfsClient)
 
-	// Libp2p identity: use IPFS repo identity when IPFS_PATH is set so D-LOCKSS and IPFS share one peer ID per node.
-	privKey, err := loadIdentity()
+	privKey, err := identity.LoadKey(cfg)
 	if err != nil {
 		log.Fatalf("[Fatal] Failed to load identity: %v", err)
 	}
@@ -157,7 +120,7 @@ func main() {
 	}
 	defer h.Close()
 
-	log.Printf("--- Node ID: %s ---", h.ID().String())
+	slog.Info("libp2p host created", "peer_id", h.ID().String())
 
 	ps, err := pubsub.NewGossipSub(ctx, h)
 	if err != nil {
@@ -194,44 +157,50 @@ func main() {
 	}()
 	select {
 	case <-done:
-	case <-time.After(config.BootstrapTimeout):
-		log.Printf("[Config] Bootstrap timeout after %v, proceeding (some peers may not be connected)", config.BootstrapTimeout)
+	case <-time.After(cfg.BootstrapTimeout):
+		slog.Warn("bootstrap timeout, proceeding with partial connectivity", "timeout", cfg.BootstrapTimeout)
 	}
 
 	// Setup Routing Discovery
 	routingDiscovery := routing.NewRoutingDiscovery(kademliaDHT)
-	dutil.Advertise(ctx, routingDiscovery, config.DiscoveryServiceTag)
-	log.Printf("[Config] Advertising service on DHT: %s", config.DiscoveryServiceTag)
+	dutil.Advertise(ctx, routingDiscovery, cfg.DiscoveryServiceTag)
+	slog.Info("advertising service on DHT", "tag", cfg.DiscoveryServiceTag)
 
 	// mDNS discovery so nodes and monitor find each other on the same LAN (same tag as monitor)
 	notifee := &discovery.DiscoveryNotifee{H: h, Ctx: ctx}
-	mdnsSvc := mdns.NewMdnsService(h, config.DiscoveryServiceTag, notifee)
+	mdnsSvc := mdns.NewMdnsService(h, cfg.DiscoveryServiceTag, notifee)
 	if err := mdnsSvc.Start(); err != nil {
-		log.Printf("[Config] mDNS start failed: %v (peer/monitor discovery limited)", err)
+		slog.Warn("mDNS start failed, peer/monitor discovery limited", "error", err)
 	}
 
-	go discovery.RunPeerFinder(ctx, h, routingDiscovery, config.DiscoveryServiceTag)
+	go discovery.RunPeerFinder(ctx, h, routingDiscovery, cfg.DiscoveryServiceTag)
 
 	// Trust (optional: load peers if file exists)
-	trustMgr := trust.NewTrustManager(config.TrustMode)
-	if err := trustMgr.LoadTrustedPeers(config.TrustStorePath); err != nil && !os.IsNotExist(err) {
-		log.Printf("[Config] Trust store load failed: %v", err)
+	trustMgr := trust.NewTrustManager(cfg.TrustMode)
+	if err := trustMgr.LoadTrustedPeers(cfg.TrustStorePath); err != nil && !os.IsNotExist(err) {
+		slog.Warn("trust store load failed", "error", err)
 	}
 
 	// Initialize persistent datastore for cluster state
 	// We place this OUTSIDE the FileWatchFolder (ingest dir) to avoid the node trying to ingest its own database files.
 	// Path is configurable via DLOCKSS_CLUSTER_STORE; otherwise derived from FileWatchFolder (instance-specific when data dirs differ).
-	dstore, err := leveldb.NewDatastore(config.ClusterStorePath, nil)
+	dstore, err := leveldb.NewDatastore(cfg.ClusterStorePath, nil)
 	if err != nil {
-		log.Fatalf("[Fatal] Failed to create datastore at %s: %v", config.ClusterStorePath, err)
+		log.Fatalf("[Fatal] Failed to create datastore at %s: %v", cfg.ClusterStorePath, err)
 	}
 	defer dstore.Close()
 
-	nonceStore := common.NewNonceStore()
-	rateLimiter := common.NewRateLimiter()
-	metrics := telemetry.NewMetricsManager()
-	storageMgr := storage.NewStorageManager(dht, metrics, badBitsFilter)
-	signer := signing.NewSigner(h, privKey, h.ID(), nonceStore, trustMgr, dht)
+	rateLimiter := common.NewRateLimiter(cfg.RateLimitWindow, cfg.MaxMessagesPerWindow)
+	metrics := telemetry.NewMetricsManager(cfg)
+	storageMgr := storage.NewStorageManager(cfg, dht, metrics, badBitsFilter)
+	signer := signing.NewSigner(signing.SignerConfig{
+		Cfg:      cfg,
+		Host:     h,
+		PrivKey:  privKey,
+		PeerID:   h.ID(),
+		TrustMgr: trustMgr,
+		DHT:      dht,
+	})
 
 	// Shard manager (replication set later to break cycle).
 	// onPinSynced: when PinTracker syncs a pin from CRDT, register with storage and announce PINNED immediately so monitor sees replication right away (not only on next heartbeat batch).
@@ -244,7 +213,7 @@ func main() {
 		}
 		// Provide manifest in its own goroutine with its own timeout.
 		go func() {
-			pctx, pcancel := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
+			pctx, pcancel := context.WithTimeout(ctx, cfg.DHTProvideTimeout)
 			defer pcancel()
 			storageMgr.ProvideFile(pctx, manifestCIDStr)
 		}()
@@ -255,7 +224,7 @@ func main() {
 		// this call adds the missing pin entry.  Blocks are already local
 		// from the manifest's recursive pin so this returns quickly.
 		go func() {
-			pctx, pcancel := context.WithTimeout(context.Background(), config.DHTProvideTimeout)
+			pctx, pcancel := context.WithTimeout(ctx, cfg.DHTProvideTimeout)
 			defer pcancel()
 			manifestCID, err := cid.Decode(manifestCIDStr)
 			if err != nil {
@@ -263,7 +232,7 @@ func main() {
 			}
 			block, err := ipfsClient.GetBlock(pctx, manifestCID)
 			if err != nil {
-				log.Printf("[DHT] Failed to resolve payload from manifest %s: %v", manifestCIDStr, err)
+				slog.Warn("failed to resolve payload from manifest", "manifest", manifestCIDStr, "error", err)
 				return
 			}
 			var ro schema.ResearchObject
@@ -278,7 +247,7 @@ func main() {
 				return
 			}
 			if err := ipfsClient.PinRecursive(pctx, payloadCID); err != nil {
-				log.Printf("[DHT] Failed to pin payload %s: %v", payloadCID, err)
+				slog.Warn("failed to pin payload", "payload", payloadCID, "error", err)
 			}
 			storageMgr.ProvideFile(pctx, payloadCID.String())
 		}()
@@ -286,8 +255,34 @@ func main() {
 	onPinRemoved := func(cid string) {
 		storageMgr.UnpinFile(cid)
 	}
-	clusterMgr := clusters.NewClusterManager(h, ps, dht, dstore, ipfsClient, trustMgr.GetTrustedPeers(), onPinSynced, onPinRemoved, badBitsFilter)
-	shardMgr := shard.NewShardManager(ctx, h, ps, ipfsClient, storageMgr, metrics, signer, rateLimiter, clusterMgr, "", nodeName)
+	clusterMgr := clusters.NewClusterManager(clusters.ClusterManagerConfig{
+		Cfg:          cfg,
+		Host:         h,
+		PubSub:       ps,
+		DHT:          dht,
+		Datastore:    dstore,
+		IPFSClient:   ipfsClient,
+		TrustedPeers: trustMgr.GetTrustedPeers(),
+		BadBits:      badBitsFilter,
+		OnPinSynced:  onPinSynced,
+		OnPinRemoved: onPinRemoved,
+	})
+	shardMgr, err := shard.NewShardManager(shard.ShardManagerConfig{
+		Cfg:         cfg,
+		Ctx:         ctx,
+		Host:        h,
+		PubSub:      ps,
+		IPFSClient:  ipfsClient,
+		Storage:     storageMgr,
+		Metrics:     metrics,
+		Signer:      signer,
+		RateLimiter: rateLimiter,
+		Cluster:     clusterMgr,
+		NodeName:    nodeName,
+	})
+	if err != nil {
+		log.Fatalf("Failed to initialize shard manager: %v", err)
+	}
 	clusterMgr.SetShardPeerProvider(shardMgr) // CRDT Peers() and allocations use real shard membership
 	announcePinned = shardMgr.AnnouncePinned
 
@@ -296,16 +291,24 @@ func main() {
 	metrics.SetPeerID(h.ID().String())
 
 	// Telemetry and API
-	tc := telemetry.NewTelemetryClient(h, ps, metrics)
+	tc := telemetry.NewTelemetryClient(cfg, h, ps, metrics)
 	if tc != nil {
 		tc.SetShardPublisher(shardMgr, shardMgr)
 		tc.Start(ctx)
 	}
-	apiServer := api.NewAPIServer(config.APIPort, metrics)
+	apiServer := api.NewAPIServer(cfg.APIPort, metrics)
 	apiServer.Start()
 
 	// File processor and watcher
-	fp := fileops.NewFileProcessor(ipfsClient, shardMgr, storageMgr, privKey, signer, badBitsFilter)
+	fp := fileops.NewFileProcessor(fileops.FileProcessorConfig{
+		Cfg:        cfg,
+		IPFSClient: ipfsClient,
+		Shard:      shardMgr,
+		Storage:    storageMgr,
+		PrivKey:    privKey,
+		Signer:     signer,
+		BadBits:    badBitsFilter,
+	})
 	go fp.WatchFolder(ctx)
 
 	// Run managers — must start before scanning existing files so the node
@@ -326,115 +329,9 @@ func main() {
 	}()
 
 	<-ctx.Done()
-	log.Printf("[System] Shutting down...")
-	shardMgr.Close()
+	slog.Info("shutting down")
+	if err := shardMgr.Close(); err != nil {
+		slog.Error("shard manager close error", "error", err)
+	}
 	_ = apiServer.Shutdown(context.Background())
-}
-
-// ipfsConfigIdentity is the Identity section of IPFS config (Identity.PrivKey is base64-encoded libp2p key).
-type ipfsConfigIdentity struct {
-	PrivKey string `json:"PrivKey"`
-}
-
-type ipfsConfig struct {
-	Identity ipfsConfigIdentity `json:"Identity"`
-}
-
-// loadIdentityFromIPFSRepo reads the private key from the IPFS repo config ($IPFS_PATH/config).
-// Kubo stores Identity.PrivKey as base64-encoded libp2p protobuf. Returns the key or an error.
-func loadIdentityFromIPFSRepo() (crypto.PrivKey, error) {
-	ipfsPath := os.Getenv("IPFS_PATH")
-	if ipfsPath == "" {
-		return nil, fmt.Errorf("IPFS_PATH not set")
-	}
-	configPath := filepath.Join(ipfsPath, "config")
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("read IPFS config: %w", err)
-	}
-	var cfg ipfsConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parse IPFS config: %w", err)
-	}
-	if cfg.Identity.PrivKey == "" {
-		return nil, fmt.Errorf("IPFS config has no Identity.PrivKey")
-	}
-	raw, err := base64.StdEncoding.DecodeString(cfg.Identity.PrivKey)
-	if err != nil {
-		return nil, fmt.Errorf("decode Identity.PrivKey: %w", err)
-	}
-	priv, err := crypto.UnmarshalPrivateKey(raw)
-	if err != nil {
-		return nil, fmt.Errorf("unmarshal IPFS private key: %w", err)
-	}
-	return priv, nil
-}
-
-// loadIdentity returns the node identity: from IPFS repo when IPFS_PATH is set (one peer ID per node), otherwise from dlockss.key or new key.
-func loadIdentity() (crypto.PrivKey, error) {
-	priv, err := loadIdentityFromIPFSRepo()
-	if err == nil {
-		log.Printf("[Config] Using IPFS repo identity (single peer ID per node)")
-		return priv, nil
-	}
-	// Fallback: dlockss.key or generate (e.g. remote IPFS, or IPFS_PATH not set)
-	return loadOrCreateIdentity()
-}
-
-func loadOrCreateIdentity() (crypto.PrivKey, error) {
-	identityPath := config.IdentityPath
-
-	if _, err := os.Stat(identityPath); err == nil {
-		data, err := os.ReadFile(identityPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read identity file: %w", err)
-		}
-		priv, err := crypto.UnmarshalPrivateKey(data)
-		if err != nil {
-			return nil, fmt.Errorf("failed to unmarshal identity: %w", err)
-		}
-		log.Printf("[Config] Loaded persistent identity from %s", identityPath)
-		return priv, nil
-	}
-
-	// Migrate legacy key from CWD if it exists there but not at the configured path.
-	if legacyPath := "dlockss.key"; legacyPath != identityPath {
-		if _, err := os.Stat(legacyPath); err == nil {
-			data, err := os.ReadFile(legacyPath)
-			if err == nil {
-				if dir := filepath.Dir(identityPath); dir != "." {
-					_ = os.MkdirAll(dir, 0755)
-				}
-				if err := os.WriteFile(identityPath, data, 0600); err == nil {
-					log.Printf("[Config] Migrated legacy identity from %s to %s", legacyPath, identityPath)
-					priv, err := crypto.UnmarshalPrivateKey(data)
-					if err != nil {
-						return nil, fmt.Errorf("failed to unmarshal migrated identity: %w", err)
-					}
-					return priv, nil
-				}
-			}
-		}
-	}
-
-	privKey, _, err := crypto.GenerateEd25519Key(rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate identity: %w", err)
-	}
-
-	data, err := crypto.MarshalPrivateKey(privKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal identity: %w", err)
-	}
-
-	if dir := filepath.Dir(identityPath); dir != "." {
-		_ = os.MkdirAll(dir, 0755)
-	}
-	if err := os.WriteFile(identityPath, data, 0600); err != nil {
-		log.Printf("[Config] Warning: Failed to save identity to %s: %v", identityPath, err)
-	} else {
-		log.Printf("[Config] Saved new persistent identity to %s", identityPath)
-	}
-
-	return privKey, nil
 }

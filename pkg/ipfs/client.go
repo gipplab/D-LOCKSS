@@ -30,8 +30,10 @@ type Client struct {
 	api *ipfsapi.Shell
 }
 
-// GetShell returns the underlying IPFS Shell for advanced operations
-func (c *Client) GetShell() *ipfsapi.Shell {
+// shell returns the underlying API handle. Package-internal only; callers
+// outside this package should use NewIPFSDHTAdapterFromClient instead of
+// reaching for the raw shell.
+func (c *Client) shell() *ipfsapi.Shell {
 	return c.api
 }
 

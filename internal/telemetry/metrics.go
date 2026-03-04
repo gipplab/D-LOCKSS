@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/csv"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -106,7 +106,7 @@ type ShardInfoProvider interface {
 }
 
 type StorageInfoProvider interface {
-	GetStorageStatus() (int, int, []string, int) // pinned, known, cids, backoffCount
+	GetStorageStatus() common.StorageSnapshot
 	GetReplicationLevels() map[string]int
 }
 
@@ -116,9 +116,9 @@ type ClusterInfoProvider interface {
 }
 
 type MetricsManager struct {
-	mu sync.RWMutex
+	mu  sync.RWMutex
+	cfg *config.Config
 
-	// Peer ID (set from host so /status returns it; matches monitor and ipfs id when IPFS_PATH set)
 	peerID string
 
 	// Metrics state
@@ -160,8 +160,9 @@ type MetricsManager struct {
 	rateLimiter *common.RateLimiter
 }
 
-func NewMetricsManager() *MetricsManager {
+func NewMetricsManager(cfg *config.Config) *MetricsManager {
 	return &MetricsManager{
+		cfg:            cfg,
 		lastReportTime: time.Now(),
 		startTime:      time.Now(),
 	}
@@ -278,7 +279,7 @@ func (m *MetricsManager) SetKnownFilesCount(count int) {
 }
 
 func (m *MetricsManager) RunMetricsReporter(ctx context.Context) {
-	ticker := time.NewTicker(config.MetricsReportInterval)
+	ticker := time.NewTicker(m.cfg.MetricsReportInterval)
 	defer ticker.Stop()
 
 	for {
@@ -348,7 +349,7 @@ func (m *MetricsManager) ReportMetrics() {
 	backoffCount := 0
 	levelsMap := make(map[string]int)
 	if m.storageInfo != nil {
-		_, _, _, backoffCount = m.storageInfo.GetStorageStatus()
+		backoffCount = m.storageInfo.GetStorageStatus().BackoffCount
 		levelsMap = m.storageInfo.GetReplicationLevels()
 	}
 
@@ -374,7 +375,7 @@ func (m *MetricsManager) ReportMetrics() {
 
 	filesAtTarget := 0
 	for _, count := range levelsMap {
-		if count >= config.MinReplication && count <= config.MaxReplication {
+		if count >= m.cfg.MinReplication && count <= m.cfg.MaxReplication {
 			filesAtTarget++
 		}
 	}
@@ -382,9 +383,9 @@ func (m *MetricsManager) ReportMetrics() {
 	lowReplication := 0
 	highReplication := 0
 	for _, count := range levelsMap {
-		if count < config.MinReplication {
+		if count < m.cfg.MinReplication {
 			lowReplication++
-		} else if count > config.MaxReplication {
+		} else if count > m.cfg.MaxReplication {
 			highReplication++
 		}
 	}
@@ -397,49 +398,38 @@ func (m *MetricsManager) ReportMetrics() {
 	m.highReplicationFiles = highReplication
 	m.mu.Unlock()
 
-	if config.VerboseLogging {
-		log.Printf("[Metrics] === System Metrics Report ===")
-		log.Printf("[Metrics] Storage: pinned=%d, known=%d", m.pinnedFilesCount, m.knownFilesCount)
-		log.Printf("[Metrics] Replication: checks=%d, success=%d, failures=%d, low=%d, high=%d, at_target=%d",
-			m.replicationChecks, m.replicationSuccess, m.replicationFailures,
-			lowReplication, highReplication, filesAtTarget)
-		log.Printf("[Metrics] Replication Distribution: 0=%d, 1=%d, 2=%d, 3=%d, 4=%d, 5=%d, 6=%d, 7=%d, 8=%d, 9=%d, 10+=%d",
-			distribution[0], distribution[1], distribution[2],
-			distribution[3], distribution[4], distribution[5],
-			distribution[6], distribution[7], distribution[8],
-			distribution[9], distribution[10])
-		log.Printf("[Metrics] Convergence: avg_replication=%.2f (shard peers via pubsub), converged_total=%d, converged_this_period=%d",
-			avgReplication, m.filesConvergedTotal, m.filesConvergedThisPeriod)
-		log.Printf("[Metrics] Network: messages_received=%.1f/min, messages_dropped=%.1f/min, active_peers=%d (shard topic)",
-			msgRate, dropRate, activePeers)
-		// log.Printf("[Metrics] DHT: queries=%d, timeouts=%d", m.dhtQueries, m.dhtQueryTimeouts)
-		// log.Printf("[Metrics] Performance: worker_pool_active=%d/%d, checks_rate=%.1f/min",
-		// 	activeWorkers, maxWorkers, checkRate)
-		log.Printf("[Metrics] System: shard_splits=%d, current_shard=%s, rate_limited_peers=%d, files_in_backoff=%d",
-			m.shardSplits, shardID, rateLimitedPeers, backoffCount)
-		if m.clusterInfo != nil {
-			pins, peers, allocs, err := m.clusterInfo.GetClusterMetrics(context.Background())
-			if err == nil {
-				for shard := range pins {
-					log.Printf("[Metrics] Cluster shard=%s pins=%d peers=%d allocations_total=%d",
-						shard, pins[shard], peers[shard], allocs[shard])
-				}
+	slog.Debug("metrics report: storage", "pinned", m.pinnedFilesCount, "known", m.knownFilesCount)
+	slog.Debug("metrics report: replication",
+		"checks", m.replicationChecks, "success", m.replicationSuccess, "failures", m.replicationFailures,
+		"low", lowReplication, "high", highReplication, "at_target", filesAtTarget)
+	slog.Debug("metrics report: replication distribution",
+		"r0", distribution[0], "r1", distribution[1], "r2", distribution[2],
+		"r3", distribution[3], "r4", distribution[4], "r5", distribution[5],
+		"r6", distribution[6], "r7", distribution[7], "r8", distribution[8],
+		"r9", distribution[9], "r10_plus", distribution[10])
+	slog.Debug("metrics report: convergence",
+		"avg_replication", avgReplication, "converged_total", m.filesConvergedTotal, "converged_this_period", m.filesConvergedThisPeriod)
+	slog.Debug("metrics report: network",
+		"msg_rate_per_min", msgRate, "drop_rate_per_min", dropRate, "active_peers", activePeers)
+	slog.Debug("metrics report: system",
+		"shard_splits", m.shardSplits, "current_shard", shardID, "rate_limited_peers", rateLimitedPeers, "files_in_backoff", backoffCount)
+	if m.clusterInfo != nil {
+		pins, peers, allocs, err := m.clusterInfo.GetClusterMetrics(context.Background())
+		if err == nil {
+			for shard := range pins {
+				slog.Debug("metrics report: cluster shard",
+					"shard", shard, "pins", pins[shard], "peers", peers[shard], "allocations_total", allocs[shard])
 			}
 		}
-
-		uptime := now.Sub(m.startTime)
-		log.Printf("[Metrics] Cumulative (since startup): uptime=%v, msgs=%d (dropped=%d), checks=%d (success=%d, failures=%d), shard_splits=%d",
-			uptime.Round(time.Second),
-			m.cumulativeMessagesReceived,
-			m.cumulativeMessagesDropped,
-			m.cumulativeReplicationChecks,
-			m.cumulativeReplicationSuccess,
-			m.cumulativeReplicationFailures,
-			m.cumulativeShardSplits)
-		log.Printf("[Metrics] ================================")
 	}
+	uptime := now.Sub(m.startTime)
+	slog.Debug("metrics report: cumulative",
+		"uptime", uptime.Round(time.Second),
+		"msgs", m.cumulativeMessagesReceived, "dropped", m.cumulativeMessagesDropped,
+		"checks", m.cumulativeReplicationChecks, "success", m.cumulativeReplicationSuccess,
+		"failures", m.cumulativeReplicationFailures, "shard_splits", m.cumulativeShardSplits)
 
-	if config.MetricsExportPath != "" {
+	if m.cfg.MetricsExportPath != "" {
 		m.ExportMetricsToFile(now)
 	}
 
@@ -473,9 +463,9 @@ func (m *MetricsManager) GetStatus() common.StatusResponse {
 	activeWorkers := 0
 	queueDepth := 0
 
-	knownCIDs := []string(nil)
-	if m.storageInfo != nil && config.TelemetryIncludeCIDs {
-		_, _, knownCIDs, _ = m.storageInfo.GetStorageStatus()
+	var knownCIDs []string
+	if m.storageInfo != nil && m.cfg.TelemetryIncludeCIDs {
+		knownCIDs = m.storageInfo.GetStorageStatus().KnownCIDs
 	}
 
 	m.mu.RLock()
@@ -504,20 +494,20 @@ func (m *MetricsManager) GetStatus() common.StatusResponse {
 }
 
 func (m *MetricsManager) ExportMetricsToFile(timestamp time.Time) {
-	path := config.MetricsExportPath
+	path := m.cfg.MetricsExportPath
 	if path == "" {
 		return
 	}
 
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		log.Printf("[Error] Failed to create metrics export directory: %v", err)
+		slog.Error("failed to create metrics export directory", "error", err)
 		return
 	}
 
 	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		log.Printf("[Error] Failed to open metrics export file: %v", err)
+		slog.Error("failed to open metrics export file", "error", err)
 		return
 	}
 	defer file.Close()

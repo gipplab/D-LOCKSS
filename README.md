@@ -55,6 +55,9 @@ export DLOCKSS_MAX_REPLICATION=10
 # Network
 export DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/5001"
 
+# DHT tuning
+export DLOCKSS_MAX_CONCURRENT_DHT_PROVIDES=8 # Limit concurrent DHT provide operations
+
 # Logging
 export DLOCKSS_VERBOSE_LOGGING=true # Enable detailed metrics and status logs
 ```
@@ -148,7 +151,7 @@ go test ./... -v
 ```
 
 ### Project Status
-*   **Current Phase:** Phase 4 (Architecture & Refactoring)
+*   **Current Phase:** Production — active refactoring for code quality and operational robustness (see [Code Elegance Plan](docs/CODE_ELEGANCE_PLAN.md)).
 
 ---
 

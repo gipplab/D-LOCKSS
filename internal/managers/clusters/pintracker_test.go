@@ -5,11 +5,12 @@ import (
 	"sync"
 	"testing"
 
+	"dlockss/internal/testutil"
+
 	"github.com/ipfs-cluster/ipfs-cluster/api"
 	"github.com/ipfs-cluster/ipfs-cluster/state"
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/multiformats/go-multihash"
 )
 
 // mockState implements state.ReadOnly for tests. List sends pins then closes the channel.
@@ -70,21 +71,8 @@ func (m *mockIPFSForTracker) PinRecursive(ctx context.Context, c cid.Cid) error 
 func (m *mockIPFSForTracker) GetBlock(ctx context.Context, c cid.Cid) ([]byte, error) {
 	return nil, nil
 }
-func mustPeerIDFromSeed(t *testing.T, seed string) peer.ID {
-	t.Helper()
-	mh, err := multihash.Sum([]byte(seed), multihash.SHA2_256, -1)
-	if err != nil {
-		t.Fatalf("multihash.Sum: %v", err)
-	}
-	pid, err := peer.IDFromBytes(mh)
-	if err != nil {
-		t.Fatalf("peer.IDFromBytes: %v", err)
-	}
-	return pid
-}
-
 func TestPinTracker_allocation_pin(t *testing.T) {
-	ourPeer := mustPeerIDFromSeed(t, "our")
+	ourPeer := testutil.MustPeerID(t, "our")
 	c1, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
 	ipfs := &mockIPFSForTracker{}
 	pt := NewLocalPinTracker(ipfs, "1", nil, nil, nil)
@@ -113,7 +101,7 @@ func TestPinTracker_allocation_skip(t *testing.T) {
 	// Since v0.0.3, allocations are ignored — all nodes on a shard pin
 	// everything in the shard's CRDT. This test verifies that a pin
 	// allocated to another peer is still synced locally.
-	otherPeer := mustPeerIDFromSeed(t, "other")
+	otherPeer := testutil.MustPeerID(t, "other")
 	c1, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
 	ipfs := &mockIPFSForTracker{}
 	pt := NewLocalPinTracker(ipfs, "1", nil, nil, nil)
@@ -162,7 +150,7 @@ func TestPinTracker_tracking_released_when_removed_from_CRDT(t *testing.T) {
 	// Since v0.0.3, PinTracker does NOT call UnpinRecursive — it only
 	// releases tracking. Actual IPFS unpins are handled by the reshard
 	// pass which is migration-aware.
-	ourPeer := mustPeerIDFromSeed(t, "our")
+	ourPeer := testutil.MustPeerID(t, "our")
 	c1, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
 	removed := make([]string, 0)
 	onRemoved := func(cidStr string) { removed = append(removed, cidStr) }

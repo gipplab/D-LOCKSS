@@ -2,7 +2,7 @@ package clusters
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -123,7 +123,7 @@ func (pt *LocalPinTracker) syncState(consensus ConsensusClient) {
 	// 1. Get Global State
 	state, err := consensus.State(pt.ctx)
 	if err != nil {
-		log.Printf("[PinTracker:%s] Failed to get consensus state: %v", pt.shardID, err)
+		slog.Error("failed to get consensus state", "shard", pt.shardID, "error", err)
 		return
 	}
 
@@ -147,7 +147,7 @@ func (pt *LocalPinTracker) syncState(consensus ConsensusClient) {
 
 		// Check BadBits before syncing (Compliance Check)
 		if pt.badBits.IsBlocked(cStr) {
-			log.Printf("[PinTracker:%s] Refusing to sync blocked content %s", pt.shardID, c)
+			slog.Warn("refusing to sync blocked content", "shard", pt.shardID, "cid", c)
 			continue
 		}
 
@@ -158,13 +158,13 @@ func (pt *LocalPinTracker) syncState(consensus ConsensusClient) {
 
 		isPinned, err := pt.ipfsClient.IsPinned(pt.ctx, c)
 		if err != nil {
-			log.Printf("[PinTracker:%s] Error checking pin status for %s: %v", pt.shardID, c, err)
+			slog.Error("failed to check pin status", "shard", pt.shardID, "cid", c, "error", err)
 			continue
 		}
 		if !isPinned {
-			log.Printf("[PinTracker:%s] Syncing pin %s to local IPFS", pt.shardID, c)
+			slog.Info("syncing pin to local ipfs", "shard", pt.shardID, "cid", c)
 			if err := pt.ipfsClient.PinRecursive(pt.ctx, c); err != nil {
-				log.Printf("[PinTracker:%s] Failed to pin %s: %v", pt.shardID, c, err)
+				slog.Error("failed to pin", "shard", pt.shardID, "cid", c, "error", err)
 				continue
 			}
 		}
@@ -195,7 +195,7 @@ func (pt *LocalPinTracker) syncState(consensus ConsensusClient) {
 	pt.mu.RUnlock()
 
 	for _, cidStr := range toUnpin {
-		log.Printf("[PinTracker:%s] Releasing tracking for %s (no longer in CRDT)", pt.shardID, cidStr)
+		slog.Info("releasing tracking, no longer in crdt", "shard", pt.shardID, "cid", cidStr)
 		if pt.onPinRemoved != nil {
 			pt.onPinRemoved(cidStr)
 		}

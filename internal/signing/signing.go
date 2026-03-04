@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	"dlockss/internal/common"
@@ -23,8 +23,8 @@ var errReplay = errors.New("replay detected")
 const maxNonceSize = 64
 const minNonceSizeFloor = 1
 
-func effectiveMinNonceSize() int {
-	n := config.MinNonceSize
+func (s *Signer) effectiveMinNonceSize() int {
+	n := s.cfg.MinNonceSize
 	if n < minNonceSizeFloor {
 		n = minNonceSizeFloor
 	}
@@ -34,9 +34,9 @@ func effectiveMinNonceSize() int {
 	return n
 }
 
-func EffectiveNonceSizeForSigning() int {
-	n := config.NonceSize
-	minSize := effectiveMinNonceSize()
+func (s *Signer) effectiveNonceSizeForSigning() int {
+	n := s.cfg.NonceSize
+	minSize := s.effectiveMinNonceSize()
 	if n < minSize {
 		n = minSize
 	}
@@ -46,19 +46,19 @@ func EffectiveNonceSizeForSigning() int {
 	return n
 }
 
-func effectiveSignatureMaxAge() time.Duration {
-	if config.SignatureMaxAge > 0 {
-		return config.SignatureMaxAge
+func (s *Signer) effectiveSignatureMaxAge() time.Duration {
+	if s.cfg.SignatureMaxAge > 0 {
+		return s.cfg.SignatureMaxAge
 	}
 	return 10 * time.Minute
 }
 
 const maxFutureSkewCap = 5 * time.Minute
 
-func effectiveFutureSkewTolerance() time.Duration {
-	d := config.FutureSkewTolerance
+func (s *Signer) effectiveFutureSkewTolerance() time.Duration {
+	d := s.cfg.FutureSkewTolerance
 	if d <= 0 {
-		return 30 * time.Second // default
+		return 30 * time.Second
 	}
 	if d > maxFutureSkewCap {
 		return maxFutureSkewCap
@@ -66,32 +66,52 @@ func effectiveFutureSkewTolerance() time.Duration {
 	return d
 }
 
-type Signer struct {
-	h          host.Host
-	privKey    crypto.PrivKey
-	peerID     peer.ID
-	nonceStore *common.NonceStore
-	trustMgr   *trust.TrustManager
-	dht        common.DHTProvider
+func (s *Signer) effectiveNonceTTL() time.Duration {
+	ttl := s.cfg.SignatureMaxAge
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	return ttl
 }
 
-func NewSigner(h host.Host, privKey crypto.PrivKey, peerID peer.ID, nonceStore *common.NonceStore, trustMgr *trust.TrustManager, dht common.DHTProvider) *Signer {
+type Signer struct {
+	cfg      *config.Config
+	h        host.Host
+	privKey  crypto.PrivKey
+	peerID   peer.ID
+	nonces   *nonceStore
+	trustMgr *trust.TrustManager
+	dht      common.DHTProvider
+}
+
+// SignerConfig holds all dependencies for a Signer.
+type SignerConfig struct {
+	Cfg      *config.Config
+	Host     host.Host
+	PrivKey  crypto.PrivKey
+	PeerID   peer.ID
+	TrustMgr *trust.TrustManager
+	DHT      common.DHTProvider
+}
+
+func NewSigner(cfg SignerConfig) *Signer {
 	return &Signer{
-		h:          h,
-		privKey:    privKey,
-		peerID:     peerID,
-		nonceStore: nonceStore,
-		trustMgr:   trustMgr,
-		dht:        dht,
+		cfg:      cfg.Cfg,
+		h:        cfg.Host,
+		privKey:  cfg.PrivKey,
+		peerID:   cfg.PeerID,
+		nonces:   newNonceStore(),
+		trustMgr: cfg.TrustMgr,
+		dht:      cfg.DHT,
 	}
 }
 
 func (s *Signer) shouldEnforceSignatures() bool {
-	return config.SignatureMode == "strict" ||
-		(config.SignatureMode != "off" && config.SignatureMode != "warn")
+	return s.cfg.SignatureMode == "strict" ||
+		(s.cfg.SignatureMode != "off" && s.cfg.SignatureMode != "warn")
 }
-func (s *Signer) shouldWarnOnBadSignatures() bool { return config.SignatureMode == "warn" }
-func (s *Signer) signaturesDisabled() bool        { return config.SignatureMode == "off" }
+func (s *Signer) shouldWarnOnBadSignatures() bool { return s.cfg.SignatureMode == "warn" }
+func (s *Signer) signaturesDisabled() bool        { return s.cfg.SignatureMode == "off" }
 
 func (s *Signer) signMessageEnvelope(marshalForSigning func() ([]byte, error), setSig func([]byte)) error {
 	if s.privKey == nil {
@@ -110,47 +130,23 @@ func (s *Signer) signMessageEnvelope(marshalForSigning func() ([]byte, error), s
 	return nil
 }
 
-func (s *Signer) SignProtocolMessage(msg interface{}) error {
+func (s *Signer) SignProtocolMessage(msg schema.Signable) error {
 	if msg == nil {
 		return fmt.Errorf("message is nil")
 	}
-	nonce, err := common.NewNonce(EffectiveNonceSizeForSigning())
+	nonce, err := common.NewNonce(s.effectiveNonceSizeForSigning())
 	if err != nil {
 		return err
 	}
-	ts := time.Now().Unix()
-
-	switch m := msg.(type) {
-	case *schema.IngestMessage:
-		m.SenderID = s.peerID
-		m.Timestamp = ts
-		m.Nonce = nonce
-		m.Sig = nil
-		return s.signMessageEnvelope(
-			func() ([]byte, error) { return m.MarshalCBORForSigning() },
-			func(sig []byte) { m.Sig = sig },
-		)
-	case *schema.ReplicationRequest:
-		m.SenderID = s.peerID
-		m.Timestamp = ts
-		m.Nonce = nonce
-		m.Sig = nil
-		return s.signMessageEnvelope(
-			func() ([]byte, error) { return m.MarshalCBORForSigning() },
-			func(sig []byte) { m.Sig = sig },
-		)
-	case *schema.UnreplicateRequest:
-		m.SenderID = s.peerID
-		m.Timestamp = ts
-		m.Nonce = nonce
-		m.Sig = nil
-		return s.signMessageEnvelope(
-			func() ([]byte, error) { return m.MarshalCBORForSigning() },
-			func(sig []byte) { m.Sig = sig },
-		)
-	default:
-		return fmt.Errorf("unsupported message type for signing: %T", msg)
-	}
+	env := msg.GetEnvelope()
+	env.SenderID = s.peerID
+	env.Timestamp = time.Now().Unix()
+	env.Nonce = nonce
+	env.Sig = nil
+	return s.signMessageEnvelope(
+		msg.MarshalCBORForSigning,
+		func(sig []byte) { env.Sig = sig },
+	)
 }
 
 func (s *Signer) verifySignedMessage(receivedFrom peer.ID, sender peer.ID, ts int64, nonce []byte, sig []byte, unsigned []byte) error {
@@ -172,16 +168,16 @@ func (s *Signer) verifySignedMessage(receivedFrom peer.ID, sender peer.ID, ts in
 	if ts == 0 {
 		return fmt.Errorf("missing timestamp")
 	}
-	maxAge := effectiveSignatureMaxAge()
+	maxAge := s.effectiveSignatureMaxAge()
 	now := time.Now()
 	msgTime := time.Unix(ts, 0)
-	if msgTime.After(now.Add(effectiveFutureSkewTolerance())) {
+	if msgTime.After(now.Add(s.effectiveFutureSkewTolerance())) {
 		return fmt.Errorf("timestamp too far in future: %v", msgTime)
 	}
 	if now.Sub(msgTime) > maxAge {
 		return fmt.Errorf("message too old: age=%v", now.Sub(msgTime))
 	}
-	if len(nonce) < effectiveMinNonceSize() {
+	if len(nonce) < s.effectiveMinNonceSize() {
 		return fmt.Errorf("nonce too short")
 	}
 	if len(nonce) > maxNonceSize {
@@ -216,7 +212,7 @@ func (s *Signer) verifySignedMessage(receivedFrom peer.ID, sender peer.ID, ts in
 			return fmt.Errorf("missing public key for sender %s", sender.String())
 		}
 		now = time.Now()
-		if msgTime.After(now.Add(effectiveFutureSkewTolerance())) {
+		if msgTime.After(now.Add(s.effectiveFutureSkewTolerance())) {
 			return fmt.Errorf("timestamp too far in future after key fetch: %v", msgTime)
 		}
 		if now.Sub(msgTime) > maxAge {
@@ -232,12 +228,12 @@ func (s *Signer) verifySignedMessage(receivedFrom peer.ID, sender peer.ID, ts in
 		return fmt.Errorf("invalid signature")
 	}
 
-	if s.nonceStore == nil {
+	if s.nonces == nil {
 		return fmt.Errorf("nonce store missing")
 	}
 	nonceSnapshot := make([]byte, len(nonce))
 	copy(nonceSnapshot, nonce)
-	if s.nonceStore.SeenBefore(sender, nonceSnapshot) {
+	if s.nonces.seenBefore(sender, nonceSnapshot, s.effectiveNonceTTL()) {
 		return errReplay
 	}
 	return nil
@@ -248,15 +244,15 @@ func (s *Signer) handleSignatureError(logContext string, err error) bool {
 		return false
 	}
 	if errors.Is(err, errReplay) {
-		log.Printf("[Sig] Dropped %s: %v", logContext, err)
+		slog.Warn("message dropped", "context", logContext, "error", err)
 		return true
 	}
 	if s.shouldEnforceSignatures() {
-		log.Printf("[Sig] Dropped %s: %v", logContext, err)
+		slog.Warn("message dropped", "context", logContext, "error", err)
 		return true
 	}
 	if s.shouldWarnOnBadSignatures() {
-		log.Printf("[Sig] Warning: %s: %v", logContext, err)
+		slog.Warn("signature verification failed", "context", logContext, "error", err)
 	}
 	return false
 }
@@ -264,11 +260,11 @@ func (s *Signer) handleSignatureError(logContext string, err error) bool {
 // ShouldDropMessage returns true if the message should be dropped (auth/signature failed).
 func (s *Signer) ShouldDropMessage(receivedFrom peer.ID, senderID peer.ID, timestamp int64, nonce []byte, sig []byte, marshalForSigning func() ([]byte, error), logContext string) bool {
 	if s.trustMgr == nil {
-		log.Printf("[Trust] Dropped %s: trust manager missing", logContext)
+		slog.Warn("message dropped: trust manager missing", "context", logContext)
 		return true
 	}
 	if err := s.trustMgr.AuthorizeIncomingSender(receivedFrom, senderID); err != nil {
-		log.Printf("[Trust] Dropped %s: %v", logContext, err)
+		slog.Warn("message dropped", "context", logContext, "error", err)
 		return true
 	}
 
@@ -276,12 +272,12 @@ func (s *Signer) ShouldDropMessage(receivedFrom peer.ID, senderID peer.ID, times
 		return false
 	}
 	if marshalForSigning == nil {
-		log.Printf("[Sig] Dropped %s: marshal function missing", logContext)
+		slog.Warn("message dropped: marshal function missing", "context", logContext)
 		return true
 	}
 	unsigned, err := marshalForSigning()
 	if err != nil {
-		log.Printf("[Sig] Dropped %s (marshal): %v", logContext, err)
+		slog.Warn("message dropped: marshal failed", "context", logContext, "error", err)
 		return true
 	}
 	if s.handleSignatureError(logContext, s.verifySignedMessage(receivedFrom, senderID, timestamp, nonce, sig, unsigned)) {
