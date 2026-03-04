@@ -3,6 +3,8 @@ package monitor
 
 import (
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -187,7 +189,17 @@ func (m *Monitor) buildCIDEntriesUnlocked(cids map[string]time.Time) []CIDEntry 
 	return entries
 }
 
-func NewMonitor(cfg MonitorConfig, geoDBPath, geminiAPIKey string) *Monitor {
+func monitorDataDir() string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	dir := filepath.Join(homeDir, ".dlockss-monitor")
+	os.MkdirAll(dir, 0700)
+	return dir
+}
+
+func NewMonitor(cfg MonitorConfig, geoDBPath, saiaAPIKey string) *Monitor {
 	m := &Monitor{
 		cfg:                 cfg,
 		nodes:               make(map[string]*NodeState),
@@ -200,7 +212,7 @@ func NewMonitor(cfg MonitorConfig, geoDBPath, geminiAPIKey string) *Monitor {
 		peerShardLastSeen:   make(map[string]map[string]time.Time),
 		manifestShard:       make(map[string]string),
 		peerLastSiblingMove: make(map[string]siblingMoveRecord),
-		keywords:            keywords.NewStore(geminiAPIKey),
+		keywords:            keywords.NewStore(saiaAPIKey, monitorDataDir()),
 		done:                make(chan struct{}),
 	}
 	if m.geoDB != nil {

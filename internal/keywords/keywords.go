@@ -1,16 +1,24 @@
-// Package keywords handles PDF keyword extraction via the Gemini API,
+// Package keywords handles PDF keyword extraction via the SAIA Chat AI API,
 // indexing, and full-text search across ingested CIDs.
+//
+// Pipeline per CID:
+//  1. Fetch manifest from IPFS, resolve payload CID.
+//  2. Fetch PDF payload from IPFS.
+//  3. Convert PDF → Markdown via SAIA /v1/documents/convert.
+//  4. Send Markdown to an LLM via /v1/chat/completions to extract metadata.
 package keywords
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -19,26 +27,33 @@ import (
 	"dlockss/pkg/schema"
 )
 
+const indexFileName = "keyword_index.json"
+
 const (
-	geminiModel    = "gemini-2.5-flash-lite"
-	geminiEndpoint = "https://generativelanguage.googleapis.com/v1beta/models/"
+	defaultModel = "llama-3.3-70b-instruct"
+	apiBase      = "https://chat-ai.academiccloud.de/v1"
 
-	maxPDFFetchSize = 20 * 1024 * 1024 // 20 MB (Gemini request limit)
+	maxPDFFetchSize = 20 * 1024 * 1024
+	maxTextLen      = 100_000 // truncate converted markdown to stay within context window
 
-	keywordPrompt = `Analyze this PDF document. Extract the following information and return ONLY a valid JSON object with these fields:
+	keywordPrompt = `Analyze the following academic document text. Extract the following information and return ONLY a valid JSON object with these fields:
 - "title": the document title (string)
 - "broad_field": the broad academic/research field (string, e.g. "Computer Science", "Biology", "Physics", "Economics")
 - "sub_topic": the sub-topic within that field (string, e.g. "Machine Learning", "Genomics", "Quantum Computing")
 - "research_niche": the specific research niche (string, e.g. "Transformer Architectures for NLP", "CRISPR Gene Editing in Plants")
 - "keywords": the 10 most important keywords or key phrases (array of exactly 10 lowercase strings)
-Example: {"title":"Attention Is All You Need","broad_field":"Computer Science","sub_topic":"Machine Learning","research_niche":"Transformer Architectures for Sequence Modeling","keywords":["transformer","attention mechanism","self-attention","neural networks","sequence modeling","encoder-decoder","natural language processing","deep learning","machine translation","positional encoding"]}`
+Example: {"title":"Attention Is All You Need","broad_field":"Computer Science","sub_topic":"Machine Learning","research_niche":"Transformer Architectures for Sequence Modeling","keywords":["transformer","attention mechanism","self-attention","neural networks","sequence modeling","encoder-decoder","natural language processing","deep learning","machine translation","positional encoding"]}
 
-	geminiRPD            = 1000
-	geminiRequestSpacing = 4500 * time.Millisecond // ~13.3 RPM, safe margin under 15 RPM
+Document text:
+`
+
+	dailyLimit     = 20_000
+	requestSpacing = 3 * time.Second
 
 	manifestFetchTimeout = 30 * time.Second
 	pdfFetchTimeout      = 90 * time.Second
-	geminiFetchTimeout   = 120 * time.Second
+	convertTimeout       = 120 * time.Second
+	llmTimeout           = 120 * time.Second
 
 	maxRetries     = 3
 	retryCooldown  = 10 * time.Minute
@@ -70,7 +85,8 @@ type Store struct {
 	totalFail    int
 	totalSkipped int
 
-	apiKey string
+	apiKey  string
+	dataDir string
 }
 
 type CIDKeywordEntry struct {
@@ -109,48 +125,41 @@ type Stats struct {
 	Pending        int  `json:"pending"`
 	UniqueKeywords int  `json:"unique_keywords"`
 	DailyRemaining int  `json:"daily_remaining"`
+	DailyLimit     int  `json:"daily_limit"`
 	Enabled        bool `json:"enabled"`
 }
 
-type geminiRequest struct {
-	Contents         []geminiContent  `json:"contents"`
-	GenerationConfig *geminiGenConfig `json:"generationConfig,omitempty"`
+// OpenAI-compatible request/response types.
+
+type chatRequest struct {
+	Model       string        `json:"model"`
+	Messages    []chatMessage `json:"messages"`
+	Temperature *float64      `json:"temperature,omitempty"`
+	MaxTokens   int           `json:"max_tokens,omitempty"`
 }
 
-type geminiContent struct {
-	Parts []geminiPart `json:"parts"`
+type chatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
 }
 
-type geminiPart struct {
-	Text       string        `json:"text,omitempty"`
-	InlineData *geminiInline `json:"inline_data,omitempty"`
-}
-
-type geminiInline struct {
-	MimeType string `json:"mime_type"`
-	Data     string `json:"data"`
-}
-
-type geminiGenConfig struct {
-	Temperature     float64 `json:"temperature"`
-	MaxOutputTokens int     `json:"maxOutputTokens"`
-}
-
-type geminiResponse struct {
-	Candidates []struct {
-		Content struct {
-			Parts []struct {
-				Text string `json:"text"`
-			} `json:"parts"`
-		} `json:"content"`
-	} `json:"candidates"`
-	Error *struct {
-		Code    int    `json:"code"`
+type chatResponse struct {
+	Choices []chatChoice `json:"choices"`
+	Error   *struct {
 		Message string `json:"message"`
-	} `json:"error"`
+		Type    string `json:"type"`
+	} `json:"error,omitempty"`
 }
 
-type geminiResult struct {
+type chatChoice struct {
+	Message chatMessage `json:"message"`
+}
+
+type convertResponse struct {
+	Markdown string `json:"markdown"`
+}
+
+type extractionResult struct {
 	Title         string   `json:"title"`
 	BroadField    string   `json:"broad_field"`
 	SubTopic      string   `json:"sub_topic"`
@@ -158,27 +167,104 @@ type geminiResult struct {
 	Keywords      []string `json:"keywords"`
 }
 
-func NewStore(apiKey string) *Store {
-	return &Store{
+func NewStore(apiKey, dataDir string) *Store {
+	s := &Store{
 		cidKeywords: make(map[string]*CIDKeywordEntry),
 		keywordCIDs: make(map[string]map[string]struct{}),
 		processed:   make(map[string]bool),
 		failures:    make(map[string]*failureRecord),
 		recent:      make([]RecentSearch, 0, maxRecentItems),
-		dayStart:    startOfDayPT(time.Now()),
+		dayStart:    startOfDay(time.Now()),
 		apiKey:      apiKey,
+		dataDir:     dataDir,
+	}
+	s.loadIndex()
+	return s
+}
+
+func (s *Store) indexPath() string {
+	return filepath.Join(s.dataDir, indexFileName)
+}
+
+// loadIndex reads the persisted keyword index from disk and rebuilds
+// the in-memory maps. Called once at startup.
+func (s *Store) loadIndex() {
+	if s.dataDir == "" {
+		return
+	}
+	data, err := os.ReadFile(s.indexPath())
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("failed to read keyword index", "path", s.indexPath(), "error", err)
+		}
+		return
+	}
+
+	var entries map[string]*CIDKeywordEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		slog.Warn("failed to parse keyword index", "path", s.indexPath(), "error", err)
+		return
+	}
+
+	for cid, entry := range entries {
+		s.cidKeywords[cid] = entry
+		s.processed[cid] = true
+
+		allLabels := make([]string, 0, len(entry.Keywords)+3)
+		allLabels = append(allLabels, entry.Keywords...)
+		for _, label := range []string{entry.BroadField, entry.SubTopic, entry.ResearchNiche} {
+			if label != "" {
+				allLabels = append(allLabels, label)
+			}
+		}
+		for _, kw := range allLabels {
+			kwLower := strings.ToLower(strings.TrimSpace(kw))
+			if kwLower == "" {
+				continue
+			}
+			if s.keywordCIDs[kwLower] == nil {
+				s.keywordCIDs[kwLower] = make(map[string]struct{})
+			}
+			s.keywordCIDs[kwLower][cid] = struct{}{}
+		}
+	}
+	s.totalOK = len(entries)
+	slog.Info("loaded keyword index", "entries", len(entries), "keywords", len(s.keywordCIDs))
+}
+
+// saveIndex persists the keyword index to disk using atomic write.
+func (s *Store) saveIndex() {
+	if s.dataDir == "" {
+		return
+	}
+
+	s.mu.RLock()
+	data, err := json.Marshal(s.cidKeywords)
+	s.mu.RUnlock()
+	if err != nil {
+		slog.Error("failed to marshal keyword index", "error", err)
+		return
+	}
+
+	tmpPath := s.indexPath() + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		slog.Error("failed to write keyword index", "path", tmpPath, "error", err)
+		return
+	}
+	if err := os.Rename(tmpPath, s.indexPath()); err != nil {
+		slog.Error("failed to rename keyword index", "error", err)
 	}
 }
 
 // Run is the background loop that discovers new CIDs and extracts keywords.
 func (s *Store) Run(done <-chan struct{}, source CIDSource) {
 	if s.apiKey == "" {
-		slog.Warn("gemini api key not set, keyword extraction disabled")
+		slog.Warn("SAIA API key not set, keyword extraction disabled")
 		return
 	}
-	slog.Info("background extraction enabled", "model", geminiModel, "spacing", geminiRequestSpacing)
+	slog.Info("background extraction enabled", "model", defaultModel, "spacing", requestSpacing)
 
-	ticker := time.NewTicker(geminiRequestSpacing)
+	ticker := time.NewTicker(requestSpacing)
 	defer ticker.Stop()
 
 	for {
@@ -198,7 +284,7 @@ func (s *Store) Run(done <-chan struct{}, source CIDSource) {
 func (s *Store) pickNextCID(source CIDSource) string {
 	s.mu.Lock()
 	s.resetDayIfNeeded()
-	if s.dailyCount >= geminiRPD {
+	if s.dailyCount >= dailyLimit {
 		s.mu.Unlock()
 		return ""
 	}
@@ -229,6 +315,7 @@ func (s *Store) pickNextCID(source CIDSource) string {
 }
 
 func (s *Store) processCID(manifestCID string) {
+	slog.Info("processing cid", "manifest", manifestCID, "step", "resolve-manifest")
 	payloadCID, metaRef, err := s.resolveManifest(manifestCID)
 	if err != nil {
 		slog.Error("manifest resolve failed", "manifest", manifestCID, "error", err)
@@ -236,6 +323,7 @@ func (s *Store) processCID(manifestCID string) {
 		return
 	}
 
+	slog.Info("processing cid", "manifest", manifestCID, "step", "fetch-pdf", "payload", payloadCID, "meta_ref", metaRef)
 	if !looksLikePDF(metaRef) {
 		pdfData, isPDF, fetchErr := s.fetchAndCheckPDF(payloadCID)
 		if fetchErr != nil {
@@ -263,9 +351,18 @@ func (s *Store) processCID(manifestCID string) {
 }
 
 func (s *Store) extractAndStore(manifestCID, payloadCID, metaRef string, pdfData []byte) {
-	result, err := s.callGemini(pdfData)
+	slog.Info("processing cid", "manifest", manifestCID, "step", "convert-pdf", "pdf_bytes", len(pdfData))
+	markdown, err := s.convertPDFToMarkdown(pdfData)
 	if err != nil {
-		slog.Error("gemini call failed", "manifest", manifestCID, "error", err)
+		slog.Error("pdf conversion failed", "manifest", manifestCID, "error", err)
+		s.recordFailure(manifestCID)
+		return
+	}
+
+	slog.Info("processing cid", "manifest", manifestCID, "step", "extract-keywords", "markdown_len", len(markdown))
+	result, err := s.extractKeywords(markdown)
+	if err != nil {
+		slog.Error("keyword extraction failed", "manifest", manifestCID, "error", err)
 		s.recordFailure(manifestCID)
 		return
 	}
@@ -311,6 +408,8 @@ func (s *Store) extractAndStore(manifestCID, payloadCID, metaRef string, pdfData
 		"manifest", manifestCID, "title", result.Title,
 		"broad_field", result.BroadField, "sub_topic", result.SubTopic,
 		"research_niche", result.ResearchNiche, "keywords", result.Keywords)
+
+	s.saveIndex()
 }
 
 func (s *Store) resolveManifest(manifestCID string) (payloadCID, metaRef string, err error) {
@@ -362,20 +461,74 @@ func (s *Store) fetchAndCheckPDF(payloadCID string) ([]byte, bool, error) {
 	return data, isPDF, nil
 }
 
-func (s *Store) callGemini(pdfData []byte) (*geminiResult, error) {
-	b64 := base64.StdEncoding.EncodeToString(pdfData)
+// convertPDFToMarkdown sends a PDF to the SAIA document conversion endpoint
+// and returns the extracted markdown text.
+func (s *Store) convertPDFToMarkdown(pdfData []byte) (string, error) {
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, err := writer.CreateFormFile("document", "paper.pdf")
+	if err != nil {
+		return "", fmt.Errorf("create form file: %w", err)
+	}
+	if _, err := part.Write(pdfData); err != nil {
+		return "", fmt.Errorf("write pdf data: %w", err)
+	}
+	writer.Close()
 
-	reqBody := geminiRequest{
-		Contents: []geminiContent{{
-			Parts: []geminiPart{
-				{Text: keywordPrompt},
-				{InlineData: &geminiInline{MimeType: "application/pdf", Data: b64}},
-			},
+	req, err := http.NewRequest("POST", apiBase+"/documents/convert", &buf)
+	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+s.apiKey)
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: convertTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("HTTP request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read response: %w", err)
+	}
+
+	if resp.StatusCode == 429 {
+		return "", fmt.Errorf("rate limited (429)")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("convert error %d: %s", resp.StatusCode, string(body))
+	}
+
+	var cr convertResponse
+	if err := json.Unmarshal(body, &cr); err != nil {
+		return "", fmt.Errorf("parse convert response: %w", err)
+	}
+
+	markdown := strings.TrimSpace(cr.Markdown)
+	if markdown == "" {
+		return "", fmt.Errorf("empty markdown from conversion")
+	}
+
+	if len(markdown) > maxTextLen {
+		markdown = markdown[:maxTextLen]
+	}
+	return markdown, nil
+}
+
+// extractKeywords sends document text to the LLM and parses the structured response.
+func (s *Store) extractKeywords(markdownText string) (*extractionResult, error) {
+	temp := 0.1
+	reqBody := chatRequest{
+		Model: defaultModel,
+		Messages: []chatMessage{{
+			Role:    "user",
+			Content: keywordPrompt + markdownText,
 		}},
-		GenerationConfig: &geminiGenConfig{
-			Temperature:     0.1,
-			MaxOutputTokens: 512,
-		},
+		Temperature: &temp,
+		MaxTokens:   512,
 	}
 
 	bodyBytes, err := json.Marshal(reqBody)
@@ -383,9 +536,15 @@ func (s *Store) callGemini(pdfData []byte) (*geminiResult, error) {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	apiURL := geminiEndpoint + geminiModel + ":generateContent?key=" + s.apiKey
-	client := &http.Client{Timeout: geminiFetchTimeout}
-	resp, err := client.Post(apiURL, "application/json", bytes.NewReader(bodyBytes))
+	req, err := http.NewRequest("POST", apiBase+"/chat/completions", bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+s.apiKey)
+
+	client := &http.Client{Timeout: llmTimeout}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("HTTP request: %w", err)
 	}
@@ -403,23 +562,23 @@ func (s *Store) callGemini(pdfData []byte) (*geminiResult, error) {
 		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	var gemResp geminiResponse
-	if err := json.Unmarshal(respBody, &gemResp); err != nil {
+	var chatResp chatResponse
+	if err := json.Unmarshal(respBody, &chatResp); err != nil {
 		return nil, fmt.Errorf("unmarshal response: %w", err)
 	}
-	if gemResp.Error != nil {
-		return nil, fmt.Errorf("API error %d: %s", gemResp.Error.Code, gemResp.Error.Message)
+	if chatResp.Error != nil {
+		return nil, fmt.Errorf("API error: %s", chatResp.Error.Message)
 	}
 
-	if len(gemResp.Candidates) == 0 || len(gemResp.Candidates[0].Content.Parts) == 0 {
-		return nil, fmt.Errorf("empty response from Gemini")
+	if len(chatResp.Choices) == 0 || chatResp.Choices[0].Message.Content == "" {
+		return nil, fmt.Errorf("empty response from LLM")
 	}
 
-	text := strings.TrimSpace(gemResp.Candidates[0].Content.Parts[0].Text)
-	return parseGeminiResponse(text)
+	text := strings.TrimSpace(chatResp.Choices[0].Message.Content)
+	return parseExtractionResponse(text)
 }
 
-func parseGeminiResponse(text string) (*geminiResult, error) {
+func parseExtractionResponse(text string) (*extractionResult, error) {
 	text = strings.TrimPrefix(text, "```json")
 	text = strings.TrimPrefix(text, "```")
 	text = strings.TrimSuffix(text, "```")
@@ -431,7 +590,7 @@ func parseGeminiResponse(text string) (*geminiResult, error) {
 		return nil, fmt.Errorf("no JSON object found in: %s", text)
 	}
 
-	var result geminiResult
+	var result extractionResult
 	if err := json.Unmarshal([]byte(text[start:end+1]), &result); err != nil {
 		return nil, fmt.Errorf("parse JSON object: %w (text: %s)", err, text)
 	}
@@ -605,7 +764,8 @@ func (s *Store) GetStats(totalUniqueCIDs int) Stats {
 		Skipped:        skipped,
 		Pending:        pending,
 		UniqueKeywords: len(s.keywordCIDs),
-		DailyRemaining: geminiRPD - s.dailyCount,
+		DailyRemaining: dailyLimit - s.dailyCount,
+		DailyLimit:     dailyLimit,
 		Enabled:        s.apiKey != "",
 	}
 }
@@ -632,7 +792,7 @@ func (s *Store) markSkipped(manifestCID string) {
 
 func (s *Store) resetDayIfNeeded() {
 	now := time.Now()
-	dayStart := startOfDayPT(now)
+	dayStart := startOfDay(now)
 	if dayStart.After(s.dayStart) {
 		s.dayStart = dayStart
 		s.dailyCount = 0
@@ -644,11 +804,7 @@ func looksLikePDF(metaRef string) bool {
 	return strings.HasSuffix(lower, ".pdf")
 }
 
-func startOfDayPT(t time.Time) time.Time {
-	loc, err := time.LoadLocation("America/Los_Angeles")
-	if err != nil {
-		loc = time.UTC
-	}
-	pt := t.In(loc)
-	return time.Date(pt.Year(), pt.Month(), pt.Day(), 0, 0, 0, 0, loc)
+func startOfDay(t time.Time) time.Time {
+	t = t.UTC()
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 }

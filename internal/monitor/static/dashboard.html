@@ -533,8 +533,8 @@
         function kwLoadStats() {
             fetch('/api/keyword-stats?t=' + Date.now()).then(r => r.json()).then(data => {
                 const el = document.getElementById('kwStatsLbl');
-                if (!data.enabled) { el.textContent = 'GEMINI_API_KEY not set'; return; }
-                el.textContent = 'Indexed: ' + data.indexed + '/' + data.total_cids + ' | Keywords: ' + data.unique_keywords + ' | Daily quota: ' + data.daily_remaining + '/' + 1000;
+                if (!data.enabled) { el.textContent = 'SAIA_API_KEY not set'; return; }
+                el.textContent = 'Indexed: ' + data.indexed + '/' + data.total_cids + ' | Keywords: ' + data.unique_keywords + ' | Daily quota: ' + data.daily_remaining + '/' + data.daily_limit;
             }).catch(() => {});
         }
 

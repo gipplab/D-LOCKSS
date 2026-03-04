@@ -49,9 +49,9 @@ func main() {
 	if geoDBPath == "" {
 		geoDBPath = os.Getenv("DLOCKSS_MONITOR_GEOIP_DB")
 	}
-	geminiAPIKey := os.Getenv("GEMINI_API_KEY")
+	saiaAPIKey := os.Getenv("SAIA_API_KEY")
 
-	m := monitor.NewMonitor(cfg, geoDBPath, geminiAPIKey)
+	m := monitor.NewMonitor(cfg, geoDBPath, saiaAPIKey)
 	defer m.Close()
 
 	h, err := monitor.StartLibP2P(ctx, m)
