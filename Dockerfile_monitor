@@ -1,40 +1,26 @@
-# Use the official Golang image as the base
 FROM golang:1.25-alpine AS builder
 
-# Set environment variables
 ENV CGO_ENABLED=0 \
     GOOS=linux \
     GOARCH=amd64
 
-# Set working directory inside the container
 WORKDIR /build
 
-# Copy go.mod and go.sum files for dependency installation
 COPY go.mod go.sum ./
-
-# Download dependencies
 RUN go mod download
 
-# Copy the entire application source
 COPY . .
+RUN go build -ldflags="-s -w" -o dlockss-monitor ./cmd/dlockss-monitor
 
-# Build the Go binary
-RUN go build -ldflags="-s -w" -o dlockss ./cmd/dlockss-monitor
-
-# Final lightweight stage
 FROM alpine:3.21 AS final
 
-# Copy the compiled binary from the builder stage
-COPY --from=builder /build/dlockss /bin/app
+COPY --from=builder /build/dlockss-monitor /usr/local/bin/dlockss-monitor
 
-# Go runtime: lean memory for long-running container (avoids OOM after days)
-# - return freed memory to OS; cap heap; trigger GC earlier
+# Return freed memory to OS; cap heap; trigger GC earlier
 ENV GODEBUG=madvdontneed=1 \
     GOMEMLIMIT=512MiB \
     GOGC=50
 
-# Expose the application's port
 EXPOSE 8000
 
-# Run the application
-CMD ["bin/app"]
+CMD ["dlockss-monitor"]

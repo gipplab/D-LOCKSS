@@ -22,10 +22,6 @@ func (m *Monitor) GetShardTree() *ShardTreeNode {
 			continue
 		}
 		sid := n.EffectiveShard()
-		if sid == "" {
-			continue
-		}
-		// Collapse deep shards into their prefix for display
 		if len(sid) > maxDepth {
 			sid = sid[:maxDepth]
 		}

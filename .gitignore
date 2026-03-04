@@ -1,32 +1,41 @@
 # Root-level binaries only (do not ignore cmd/dlockss or cmd/dlockss-monitor)
 /dlockss
 /dlockss-monitor
+main
+bin/
 
-context.txt
-
-my-pdfs
-
+# Testnet
 testnet/dlockss-node
+testnet/dlockss-monitor
 testnet/testnet_data
+testnet/deploy_pis.sh
+testnet/active_*.pids
+testnet/TESTNET_OPTIMIZATIONS.md
 
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.cert
+*.crt
+*.p12
+
+# Logs
+*.log
+
+# Data
+my-pdfs
 mardi-pdfs
-
-scripts/__pycache__
-
+context.txt
 charts
 
-/testnet/active_ipfs.pids
-/testnet/active_nodes.pids
+# Python
+scripts/__pycache__
 
+# Docs (generated/private)
 docs/architecture
 docs/development
 docs/project
-
-testnet/TESTNET_OPTIMIZATIONS.md
 docs/README.md
-
-
-# Binaries
-main
-testnet/dlockss-monitor
-
