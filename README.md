@@ -94,7 +94,7 @@ services:
     restart: unless-stopped
     environment:
       DLOCKSS_IPFS_NODE: "/dns4/ipfs/tcp/5001"   # "ipfs" resolves to the Kubo service below
-      DLOCKSS_DATA_DIR: "/data/ingest"           # location that DLOCKSS monitors for igesting files
+      DLOCKSS_DATA_DIR: "/data/ingest"           # location that D-LOCKSS monitors for ingesting files
       DLOCKSS_IPFS_CONFIG: "/ipfs-repo/config"   # derive identity from IPFS node (shared peer ID)
       # DLOCKSS_NODE_NAME: my-node               # human-readable name shown in the monitor;
       #                                          # if empty the peer ID is displayed instead
@@ -196,7 +196,7 @@ export DLOCKSS_MONITOR_GEOIP_DB=/path/to/GeoLite2-City.mmdb
 ```
 Without a local database, the monitor falls back to the ip-api.com batch API with permanent caching.
 
-The monitor bootstrap-subscribes to all shards up to depth 5 (63 shards) so it can see nodes even when started late. Set `DLOCKSS_MONITOR_BOOTSTRAP_SHARD_DEPTH` (0–12) to tune.
+The monitor bootstrap-subscribes to all shards up to depth 6 (127 shards) so it can see nodes even when started late. Set `DLOCKSS_MONITOR_BOOTSTRAP_SHARD_DEPTH` (0–12) to tune.
 
 Alternatively use: https://dlockss-monitor.wmcloud.org.
 
