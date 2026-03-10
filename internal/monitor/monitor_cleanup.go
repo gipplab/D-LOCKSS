@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 // SplitGracePeriod: after a split, don't prune nodes for this duration to allow
@@ -98,6 +99,10 @@ func (m *Monitor) pruneOrphanedSplitEvents() {
 // evictStalePeerstoreEntries removes peers from the libp2p peerstore that are
 // disconnected and not tracked in the monitor's nodes map. Without this, the
 // peerstore grows unbounded from DHT crawls and transient connections.
+//
+// To avoid a death spiral (prune nodes → evict their peerstore entries →
+// GossipSub can't re-graft → no heartbeats → prune more nodes), we also
+// protect peers that GossipSub is actively using across any subscribed topic.
 func (m *Monitor) evictStalePeerstoreEntries() {
 	if m.host == nil {
 		return
@@ -109,6 +114,14 @@ func (m *Monitor) evictStalePeerstoreEntries() {
 	activeNodes := make(map[string]bool, len(m.nodes))
 	for id := range m.nodes {
 		activeNodes[id] = true
+	}
+	// Protect peers in any GossipSub topic so mesh recovery remains possible
+	// even after all tracked nodes have been pruned.
+	topicPeers := make(map[peer.ID]bool)
+	for _, topic := range m.shardTopics {
+		for _, pid := range topic.ListPeers() {
+			topicPeers[pid] = true
+		}
 	}
 	m.mu.RUnlock()
 
@@ -123,11 +136,14 @@ func (m *Monitor) evictStalePeerstoreEntries() {
 		if activeNodes[pid.String()] {
 			continue
 		}
+		if topicPeers[pid] {
+			continue
+		}
 		ps.RemovePeer(pid)
 		evicted++
 	}
 	if evicted > 0 {
-		slog.Info("peerstore gc evicted stale peers", "count", evicted)
+		slog.Info("peerstore gc evicted stale peers", "count", evicted, "protected_topic_peers", len(topicPeers))
 	}
 }
 

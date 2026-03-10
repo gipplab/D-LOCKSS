@@ -46,7 +46,7 @@ export DLOCKSS_DATA_DIR="$HOME/my-data"
 
 # Node Identity
 export DLOCKSS_NODE_NAME="my-node"            # Human-readable name (shown in monitor)
-export DLOCKSS_IDENTITY_PATH="/data/dlockss.key"  # Persistent identity key location
+export DLOCKSS_IDENTITY_PATH="/data/dlockss.key"  # Persistent identity key location (fallback if IPFS node config cannot be read)
 export DLOCKSS_IPFS_CONFIG="/path/to/ipfs/config" # Kubo config JSON (derives identity from IPFS repo)
 
 # Replication Targets
@@ -89,45 +89,14 @@ For Docker deployments: either mount the Kubo config file and set `DLOCKSS_IPFS_
 
 ```yaml
 services:
-  ipfs:
-    image: ipfs/kubo:latest
-    volumes:
-      - ipfs-data:/data/ipfs
-    ports:
-      - "4001:4001"     # Swarm
-      - "5001:5001"     # API
-
-  dlockss:
-    image: dlockss:latest
-    depends_on:
-      - ipfs
-    volumes:
-      - ipfs-data:/ipfs-repo:ro           # read-only access to Kubo config
-      - dlockss-data:/data
-    environment:
-      DLOCKSS_IPFS_CONFIG: /ipfs-repo/config   # derive identity from Kubo
-      DLOCKSS_IPFS_NODE: /dns4/ipfs/tcp/5001   # connect to Kubo API
-      DLOCKSS_DATA_DIR: /data/ingest
-      DLOCKSS_NODE_NAME: my-node
-
-volumes:
-  ipfs-data:
-  dlockss-data:
-```
-
-See [docs/DLOCKSS_PROTOCOL.md](docs/DLOCKSS_PROTOCOL.md) for protocol details.
-
-### Docker-compose
-```yaml
-services:
   dlockss-node:
     image: ghcr.io/gipplab/dlockss-single-node:latest
     restart: unless-stopped
     environment:
-      DLOCKSS_IPFS_NODE: "/dns4/ipfs/tcp/5001"  # "ipfs" resolves to the Kubo service below
-      DLOCKSS_DATA_DIR: "/data/ingest"           # tells DLOCKSS were to scan for ingested data and documents
+      DLOCKSS_IPFS_NODE: "/dns4/ipfs/tcp/5001"   # "ipfs" resolves to the Kubo service below
+      DLOCKSS_DATA_DIR: "/data/ingest"           # location that DLOCKSS monitors for igesting files
       DLOCKSS_IPFS_CONFIG: "/ipfs-repo/config"   # derive identity from IPFS node (shared peer ID)
-      # DLOCKSS_NODE_NAME: dlockss.example.tld   # human-readable name shown in the monitor;
+      # DLOCKSS_NODE_NAME: my-node               # human-readable name shown in the monitor;
       #                                          # if empty the peer ID is displayed instead
     volumes:
       - dlockss-data:/data                       # persistent D-LOCKSS data (identity, cluster state, ingested files)
@@ -138,7 +107,6 @@ services:
     labels:
       - com.centurylinklabs.watchtower.enable=true
 
-  # Kubo IPFS node — see https://github.com/ipfs/kubo/blob/master/docker-compose.yaml
   ipfs:
     image: ipfs/kubo
     restart: unless-stopped
@@ -161,7 +129,6 @@ services:
 
   # Watchtower keeps the D-LOCKSS image up to date automatically.
   # Recommended until a stable release is published.
-  # See https://containrrr.github.io/watchtower/arguments/
   watchtower:
     image: containrrr/watchtower
     restart: always
@@ -170,10 +137,12 @@ services:
     command: --label-enable --include-stopped --revive-stopped
 
 volumes:
-  ipfs-staging:  # IPFS staging area on /export — see https://docs.ipfs.tech/install/run-ipfs-inside-docker/
+  ipfs-staging:  # IPFS staging area on /export
   ipfs-data:     # IPFS repo on /data/ipfs (shared read-only with D-LOCKSS for identity)
-  dlockss-data:  # persistent D-LOCKSS data (identity key, cluster state, ingested files
+  dlockss-data:  # persistent D-LOCKSS data (identity key, cluster state, ingested files)
 ```
+
+See [docs/DLOCKSS_PROTOCOL.md](docs/DLOCKSS_PROTOCOL.md) for protocol details.
 
 ---
 
