@@ -102,8 +102,7 @@ services:
       - dlockss-data:/data                       # persistent D-LOCKSS data (identity, cluster state, ingested files)
       - ipfs-data:/ipfs-repo:ro                  # read-only access to Kubo config for identity
     depends_on:
-      ipfs:
-        condition: service_healthy
+      - ipfs
     labels:
       - com.centurylinklabs.watchtower.enable=true
 
