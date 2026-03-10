@@ -243,7 +243,7 @@ services:
     volumes:
       - ipfs-data:/data/ipfs
   dlockss:
-    image: dlockss:latest
+    image: ghcr.io/gipplab/dlockss-single-node:latest
     depends_on: [ipfs]
     volumes:
       - ipfs-data:/ipfs-repo:ro

@@ -21,6 +21,6 @@ ENV GODEBUG=madvdontneed=1 \
     GOMEMLIMIT=512MiB \
     GOGC=50
 
-EXPOSE 8000
+EXPOSE 8080
 
 CMD ["dlockss-monitor"]
