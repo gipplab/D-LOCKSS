@@ -277,7 +277,7 @@ func TestMoveToShard_PublishesLeave(t *testing.T) {
 	_ = sm
 
 	// h2 subscribes to shard "0" topic to catch the LEAVE
-	topicName := fmt.Sprintf("%s-creative-commons-shard-%s", cfg1.PubsubTopicPrefix, "0")
+	topicName := fmt.Sprintf("%s-%s-shard-%s", cfg1.PubsubTopicPrefix, cfg1.TopicName, "0")
 	topic2, err := ps2.Join(topicName)
 	if err != nil {
 		t.Fatal(err)
@@ -377,7 +377,7 @@ func TestProcessMessage_ProbeTriggersHeartbeat(t *testing.T) {
 	_ = sm
 
 	// h2 subscribes to shard "0"
-	topicName := fmt.Sprintf("%s-creative-commons-shard-%s", cfg2.PubsubTopicPrefix, "0")
+	topicName := fmt.Sprintf("%s-%s-shard-%s", cfg2.PubsubTopicPrefix, cfg2.TopicName, "0")
 	topic2, err := ps2.Join(topicName)
 	if err != nil {
 		t.Fatal(err)

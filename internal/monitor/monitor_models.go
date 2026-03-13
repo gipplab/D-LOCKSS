@@ -2,6 +2,7 @@
 package monitor
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -14,8 +15,15 @@ import (
 	"github.com/oschwald/geoip2-golang"
 
 	"dlockss/internal/common"
-	"dlockss/internal/keywords"
 )
+
+// shardSub bundles a PubSub topic with its subscription so that
+// SwitchTopic / SwitchTopicPrefix can cancel the subscription
+// before closing the topic (Topic.Close fails if subs are active).
+type shardSub struct {
+	topic *pubsub.Topic
+	sub   *pubsub.Subscription
+}
 
 const (
 	DiscoveryServiceTag          = "dlockss-prod"
@@ -55,9 +63,6 @@ func DefaultMonitorConfig() MonitorConfig {
 	}
 }
 
-// StatusResponse, StorageStatus, ReplicationStatus are defined in
-// common/types_status.go and shared with telemetry. Type aliases let the
-// monitor continue using unqualified names.
 type StatusResponse = common.StatusResponse
 type StorageStatus = common.StorageStatus
 type ReplicationStatus = common.ReplicationStatus
@@ -96,7 +101,11 @@ type ShardTreeNode struct {
 type Monitor struct {
 	mu                  sync.RWMutex
 	cfg                 MonitorConfig
-	topicPrefixOverride string // if set, overrides config.PubsubTopicPrefix for subscriptions
+	appCtx              context.Context    // long-lived context from StartLibP2P
+	subCtx              context.Context    // per-generation context; cancelled on topic switch to kill goroutines immediately
+	subCancel           context.CancelFunc // cancels subCtx
+	topicPrefixOverride string             // if set, overrides config.PubsubTopicPrefix for subscriptions
+	topicNameOverride   string             // if set, overrides config.TopicName for subscriptions
 	nodes               map[string]*NodeState
 	splitEvents         []ShardSplitEvent
 	geoDB               *geoip2.Reader // local GeoIP database; nil if not configured
@@ -105,7 +114,7 @@ type Monitor struct {
 	treeCacheTime       time.Time
 	treeDirty           bool
 	uniqueCIDs          map[string]time.Time
-	shardTopics         map[string]*pubsub.Topic
+	shardTopics         map[string]*shardSub
 	ps                  *pubsub.PubSub
 	host                host.Host
 	nodeFiles           map[string]map[string]time.Time
@@ -114,7 +123,6 @@ type Monitor struct {
 	manifestShard       map[string]string // manifest CID → observed shard (from PINNED/IngestMessage announcements)
 	lastSplitTime       time.Time         // when we last detected a split; used to avoid pruning during mesh formation
 	peerLastSiblingMove map[string]siblingMoveRecord
-	keywords            *keywords.Store
 	done                chan struct{} // closed on shutdown to stop background goroutines
 }
 
@@ -143,7 +151,7 @@ func shardLogLabel(shardID string) string {
 }
 
 // isDisplayableNode returns false for PROBE nodes and the monitor itself.
-// Only ACTIVE and PASSIVE nodes should appear in the UI.
+// ACTIVE, PASSIVE, and REPLICATOR nodes appear in the UI.
 func (m *Monitor) isDisplayableNodeUnlocked(peerID string, node *NodeState) bool {
 	if node.Role == "PROBE" {
 		return false
@@ -167,6 +175,21 @@ func (m *Monitor) getTopicPrefixUnlocked() string {
 		return m.topicPrefixOverride
 	}
 	return m.cfg.PubsubTopicPrefix
+}
+
+// getTopicName returns the effective topic name (override or config).
+func (m *Monitor) getTopicName() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.getTopicNameUnlocked()
+}
+
+// getTopicNameUnlocked returns the effective topic name. Call only when holding m.mu.
+func (m *Monitor) getTopicNameUnlocked() string {
+	if m.topicNameOverride != "" {
+		return m.topicNameOverride
+	}
+	return m.cfg.TopicName
 }
 
 // CIDEntry is a manifest CID with its observed shard and replica count.
@@ -203,20 +226,19 @@ func monitorDataDir() string {
 	return dir
 }
 
-func NewMonitor(cfg MonitorConfig, geoDBPath, saiaAPIKey string) *Monitor {
+func NewMonitor(cfg MonitorConfig, geoDBPath string) *Monitor {
 	m := &Monitor{
 		cfg:                 cfg,
 		nodes:               make(map[string]*NodeState),
 		splitEvents:         make([]ShardSplitEvent, 0, 100),
 		geoDB:               openGeoIPDB(geoDBPath),
 		uniqueCIDs:          make(map[string]time.Time),
-		shardTopics:         make(map[string]*pubsub.Topic),
+		shardTopics:         make(map[string]*shardSub),
 		nodeFiles:           make(map[string]map[string]time.Time),
 		manifestReplication: make(map[string]map[string]time.Time),
 		peerShardLastSeen:   make(map[string]map[string]time.Time),
 		manifestShard:       make(map[string]string),
 		peerLastSiblingMove: make(map[string]siblingMoveRecord),
-		keywords:            keywords.NewStore(saiaAPIKey, monitorDataDir()),
 		done:                make(chan struct{}),
 	}
 	if m.geoDB != nil {
@@ -225,17 +247,5 @@ func NewMonitor(cfg MonitorConfig, geoDBPath, saiaAPIKey string) *Monitor {
 		slog.Info("geoip mode", "source", "ip-api.com")
 	}
 	go m.runReplicationCleanup()
-	go m.keywords.Run(m.done, m)
 	return m
-}
-
-// UniqueCIDList implements keywords.CIDSource.
-func (m *Monitor) UniqueCIDList() []string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	out := make([]string, 0, len(m.uniqueCIDs))
-	for cidStr := range m.uniqueCIDs {
-		out = append(out, cidStr)
-	}
-	return out
 }

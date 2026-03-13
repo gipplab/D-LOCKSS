@@ -3,7 +3,7 @@
 # Configuration
 # Reduced to 15 nodes for bandwidth-limited environments
 # Each node runs its own isolated IPFS daemon
-NODE_COUNT=1
+NODE_COUNT=3
 # Make BASE_DIR absolute and relative to the script location
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 BASE_DIR="$SCRIPT_DIR/testnet_data"
@@ -198,6 +198,7 @@ if [ ! -f "$IPFS_REPO/config" ]; then
     # Point D-LOCKSS at the Kubo config to derive its identity
     DLOCKSS_IPFS_CONFIG="$IPFS_REPO_ABS/config" \
     DLOCKSS_NODE_NAME="testnet_$i" \
+    DLOCKSS_TOPIC_NAME="cc" \
     DLOCKSS_METRICS_EXPORT="metrics.csv" \
     DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/$IPFS_API_PORT" \
     DLOCKSS_API_PORT=$DLOCKSS_API_PORT \

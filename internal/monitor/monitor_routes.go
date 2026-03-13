@@ -17,7 +17,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 
-	"dlockss/internal/keywords"
 	"dlockss/pkg/schema"
 )
 
@@ -29,15 +28,10 @@ func (m *Monitor) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/root-topic", m.handleRootTopic)
 	mux.HandleFunc("/api/node-files", m.handleNodeFiles)
 	mux.HandleFunc("/api/unique-cids", m.handleUniqueCIDs)
-	mux.HandleFunc("/api/payload-cids-export", m.handlePayloadCIDsExport)
 	mux.HandleFunc("/api/replication", m.handleReplication)
 	mux.HandleFunc("/api/replication-cids", m.handleReplicationCIDs)
 	mux.HandleFunc("/api/manifest-payload", m.handleManifestPayload)
 	mux.HandleFunc("/api/identify", m.handleIdentify)
-	mux.HandleFunc("/api/keyword-search", m.handleKeywordSearch)
-	mux.HandleFunc("/api/keyword-suggest", m.handleKeywordSuggest)
-	mux.HandleFunc("/api/recent-searches", m.handleRecentSearches)
-	mux.HandleFunc("/api/keyword-stats", m.handleKeywordStats)
 	mux.HandleFunc("/", m.handleDashboard)
 }
 
@@ -166,19 +160,34 @@ func (m *Monitor) handleRootTopic(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if r.Method == http.MethodPost {
 		var body struct {
-			TopicPrefix string `json:"topic_prefix"`
+			TopicPrefix string `json:"topic_prefix,omitempty"`
+			TopicName   string `json:"topic_name,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeJSONError(w, `invalid JSON, expected {"topic_prefix":"..."}`, http.StatusBadRequest)
+			writeJSONError(w, `invalid JSON`, http.StatusBadRequest)
 			return
 		}
-		m.SwitchTopicPrefix(r.Context(), body.TopicPrefix)
-		rootTopic := fmt.Sprintf("%s-%s-shard-", m.getTopicPrefix(), m.cfg.TopicName)
-		json.NewEncoder(w).Encode(map[string]string{"root_topic": rootTopic, "topic_prefix": m.getTopicPrefix()})
+		if body.TopicPrefix != "" || body.TopicName == "" {
+			m.SwitchTopicPrefix(r.Context(), body.TopicPrefix)
+		}
+		if body.TopicName != "" {
+			m.SwitchTopic(r.Context(), body.TopicName)
+		}
+		m.writeRootTopicResponse(w)
 		return
 	}
-	rootTopic := fmt.Sprintf("%s-%s-shard-", m.getTopicPrefix(), m.cfg.TopicName)
-	json.NewEncoder(w).Encode(map[string]string{"root_topic": rootTopic, "topic_prefix": m.getTopicPrefix()})
+	m.writeRootTopicResponse(w)
+}
+
+func (m *Monitor) writeRootTopicResponse(w http.ResponseWriter) {
+	prefix := m.getTopicPrefix()
+	topic := m.getTopicName()
+	rootTopic := fmt.Sprintf("%s-%s-shard-", prefix, topic)
+	json.NewEncoder(w).Encode(map[string]string{
+		"root_topic":   rootTopic,
+		"topic_prefix": prefix,
+		"topic_name":   topic,
+	})
 }
 
 func (m *Monitor) handleNodeFiles(w http.ResponseWriter, r *http.Request) {
@@ -205,16 +214,6 @@ func (m *Monitor) handleUniqueCIDs(w http.ResponseWriter, r *http.Request) {
 	m.mu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"cids": entries, "count": len(entries)})
-}
-
-func (m *Monitor) handlePayloadCIDsExport(w http.ResponseWriter, r *http.Request) {
-	cids := m.keywords.PayloadCIDs()
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("Content-Disposition", "attachment; filename=\"payload_cids.txt\"")
-	for _, c := range cids {
-		w.Write([]byte(c))
-		w.Write([]byte("\n"))
-	}
 }
 
 func (m *Monitor) handleReplication(w http.ResponseWriter, r *http.Request) {
@@ -338,72 +337,6 @@ func (m *Monitor) handleIdentify(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
-}
-
-func (m *Monitor) handleKeywordSearch(w http.ResponseWriter, r *http.Request) {
-	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	if query == "" {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{"results": []struct{}{}, "count": 0})
-		return
-	}
-	results := m.keywords.Search(query)
-	if results == nil {
-		results = []keywords.CIDKeywordEntry{}
-	}
-
-	m.mu.RLock()
-	type enrichedResult struct {
-		keywords.CIDKeywordEntry
-		Shard    string `json:"shard"`
-		Replicas int    `json:"replicas"`
-	}
-	enriched := make([]enrichedResult, 0, len(results))
-	for _, res := range results {
-		replicas := 0
-		if peers, ok := m.manifestReplication[res.ManifestCID]; ok {
-			replicas = len(peers)
-		}
-		shard := m.manifestShard[res.ManifestCID]
-		enriched = append(enriched, enrichedResult{
-			CIDKeywordEntry: res,
-			Shard:           shard,
-			Replicas:        replicas,
-		})
-	}
-	m.mu.RUnlock()
-
-	m.keywords.RecordSearch(query, len(enriched))
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"query": query, "results": enriched, "count": len(enriched)})
-}
-
-func (m *Monitor) handleKeywordSuggest(w http.ResponseWriter, r *http.Request) {
-	prefix := strings.TrimSpace(r.URL.Query().Get("q"))
-	suggestions := m.keywords.Suggest(prefix)
-	if suggestions == nil {
-		suggestions = []keywords.KeywordSuggestion{}
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"suggestions": suggestions})
-}
-
-func (m *Monitor) handleRecentSearches(w http.ResponseWriter, r *http.Request) {
-	recent := m.keywords.GetRecentSearches()
-	if recent == nil {
-		recent = []keywords.RecentSearch{}
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"searches": recent})
-}
-
-func (m *Monitor) handleKeywordStats(w http.ResponseWriter, r *http.Request) {
-	m.mu.RLock()
-	totalCIDs := len(m.uniqueCIDs)
-	m.mu.RUnlock()
-	stats := m.keywords.GetStats(totalCIDs)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(stats)
 }
 
 func (m *Monitor) handleDashboard(w http.ResponseWriter, r *http.Request) {

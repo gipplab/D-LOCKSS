@@ -51,8 +51,8 @@ func (m *mockIPFS) IsPinned(context.Context, cid.Cid) (bool, error)   { return f
 func (m *mockIPFS) GetFileSize(context.Context, cid.Cid) (uint64, error) {
 	return 0, nil
 }
-func (m *mockIPFS) GetPeerID(context.Context) (string, error)         { return "test-peer", nil }
-func (m *mockIPFS) SwarmConnect(context.Context, []string) error       { return nil }
+func (m *mockIPFS) GetPeerID(context.Context) (string, error)    { return "test-peer", nil }
+func (m *mockIPFS) SwarmConnect(context.Context, []string) error { return nil }
 
 // ---------------------------------------------------------------------------
 // Mock: ShardCoordinator (ShardIdentity + ShardPublisher + CustodialInjector)
@@ -64,15 +64,16 @@ type mockShardCoordinator struct {
 	shardDepth  int
 	responsible bool
 
-	mu           sync.Mutex
-	announced    []string
-	pinned       []cid.Cid
-	publishedTo  []string
+	mu          sync.Mutex
+	announced   []string
+	pinned      []cid.Cid
+	publishedTo []string
 }
 
-func (m *mockShardCoordinator) PeerID() peer.ID                  { return m.peerID }
-func (m *mockShardCoordinator) GetShardInfo() (string, int)      { return m.shardID, m.shardDepth }
-func (m *mockShardCoordinator) AmIResponsibleFor(string) bool    { return m.responsible }
+func (m *mockShardCoordinator) PeerID() peer.ID               { return m.peerID }
+func (m *mockShardCoordinator) GetShardInfo() (string, int)   { return m.shardID, m.shardDepth }
+func (m *mockShardCoordinator) AmIResponsibleFor(string) bool { return m.responsible }
+func (m *mockShardCoordinator) IsLocalNodeIngestor() bool     { return true }
 
 func (m *mockShardCoordinator) AnnouncePinned(manifestCID string) {
 	m.mu.Lock()
@@ -96,11 +97,11 @@ func (m *mockShardCoordinator) PublishIngestMessageToCurrentAndChildIfSplit(data
 func (m *mockShardCoordinator) ResolveTargetShardForCustodial(nominal, _ string) string {
 	return nominal
 }
-func (m *mockShardCoordinator) JoinShardAsObserver(string) bool             { return true }
-func (m *mockShardCoordinator) LeaveShardAsObserver(string)                 {}
+func (m *mockShardCoordinator) JoinShardAsObserver(string) bool                     { return true }
+func (m *mockShardCoordinator) LeaveShardAsObserver(string)                         {}
 func (m *mockShardCoordinator) EnsureClusterForShard(context.Context, string) error { return nil }
 func (m *mockShardCoordinator) PinToShard(context.Context, string, cid.Cid) error   { return nil }
-func (m *mockShardCoordinator) PublishToShardCBOR([]byte, string)           {}
+func (m *mockShardCoordinator) PublishToShardCBOR([]byte, string)                   {}
 
 // ---------------------------------------------------------------------------
 // Mock: StorageTracker

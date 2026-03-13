@@ -21,12 +21,15 @@ func writeJSONError(w http.ResponseWriter, msg string, code int) {
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
-func (m *Monitor) handleIngestMessage(im *schema.IngestMessage, senderID peer.ID, shardID string, ip string) {
+func (m *Monitor) handleIngestMessage(ctx context.Context, im *schema.IngestMessage, senderID peer.ID, shardID string, ip string) {
 	now := time.Now()
 	peerIDStr := senderID.String()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
 
 	nodeState, exists := m.nodes[peerIDStr]
 	if !exists {
@@ -99,11 +102,11 @@ func (m *Monitor) setPeerShardLastSeenUnlocked(peerIDStr, shardID string, t time
 	m.peerShardLastSeen[peerIDStr][shardID] = t
 }
 
-func (m *Monitor) handleHeartbeat(senderID peer.ID, shardID string, ip string, pinnedCount int) {
-	m.handleHeartbeatWithRole(senderID, shardID, ip, pinnedCount, "", "")
+func (m *Monitor) handleHeartbeat(ctx context.Context, senderID peer.ID, shardID string, ip string, pinnedCount int) {
+	m.handleHeartbeatWithRole(ctx, senderID, shardID, ip, pinnedCount, "", "")
 }
 
-func (m *Monitor) handleHeartbeatWithRole(senderID peer.ID, shardID string, ip string, pinnedCount int, role string, nodeName string) (shardUpdated bool) {
+func (m *Monitor) handleHeartbeatWithRole(ctx context.Context, senderID peer.ID, shardID string, ip string, pinnedCount int, role string, nodeName string) (shardUpdated bool) {
 	now := time.Now()
 	peerIDStr := senderID.String()
 	if role == "" {
@@ -112,6 +115,9 @@ func (m *Monitor) handleHeartbeatWithRole(senderID peer.ID, shardID string, ip s
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if ctx.Err() != nil {
+		return false
+	}
 
 	m.setPeerShardLastSeenUnlocked(peerIDStr, shardID, now)
 
@@ -146,14 +152,14 @@ func (m *Monitor) handleHeartbeatWithRole(senderID peer.ID, shardID string, ip s
 	if pinnedCount >= 0 {
 		nodeState.PinnedFiles = pinnedCount
 		if pinnedCount == 0 {
-			// Skip UNPIN_ALL during grace period after first discovery; pinned=0 may be a stale
-			// heartbeat from before the node finished pinning (gossip-sub can reorder/delay).
 			firstSeen := now
 			if len(nodeState.ShardHistory) > 0 {
 				firstSeen = nodeState.ShardHistory[0].FirstSeen
 			}
+			// Ignore pinned=0 during grace period: stale heartbeats can arrive
+			// before the node finishes its first pin cycle.
 			if now.Sub(firstSeen) < unpinGracePeriod {
-				// Within grace period: ignore pinned=0 to avoid removing nodes that are still pinning
+				// nop
 			} else {
 				removedFromManifests := 0
 				for manifest, peers := range m.manifestReplication {
@@ -193,10 +199,13 @@ func (m *Monitor) handleHeartbeatWithRole(senderID peer.ID, shardID string, ip s
 	return shardUpdated
 }
 
-func (m *Monitor) handleLeaveShard(peerID peer.ID, shardID string) {
+func (m *Monitor) handleLeaveShard(ctx context.Context, peerID peer.ID, shardID string) {
 	peerIDStr := peerID.String()
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
 	node, exists := m.nodes[peerIDStr]
 	if !exists {
 		return
@@ -219,40 +228,29 @@ func (m *Monitor) updateNodeShardLocked(node *NodeState, newShard string, timest
 	if lastShard == newShard {
 		return false
 	}
-	// Reject stale "parent" updates: if newShard is a prefix of lastShard, the node has
-	// already moved to a child; the heartbeat on the parent topic is delayed/stale.
+	// Stale parent heartbeat: node already moved to a child shard.
 	if len(newShard) < len(lastShard) && strings.HasPrefix(lastShard, newShard) {
 		return false
 	}
-	// Reject cross-branch moves: neither shard is ancestor of the other (e.g. 10→0, 0→11).
-	// Valid moves are split (to child), merge (to parent), or sibling; cross-branch is stale.
-	// Sibling moves (0↔1, 00↔01) are allowed; they are handled by cooldown below.
+	// Cross-branch moves (e.g. 10→0) are always stale; only ancestor, descendant
+	// and sibling transitions are valid.
 	if !isSiblingShard(lastShard, newShard) &&
 		!strings.HasPrefix(lastShard, newShard) && !strings.HasPrefix(newShard, lastShard) {
 		return false
 	}
-	// Reject stale "sibling" updates: if lastShard and newShard are siblings (e.g. 0 and 1, 00 and 01),
-	// block any sibling move for this peer within cooldown. This prevents both A→B and B→A oscillation
-	// from delayed heartbeats (we can't tell which message is stale, so we require a settling period).
+	// Throttle sibling moves (e.g. 0↔1) to suppress oscillation from delayed heartbeats.
 	if isSiblingShard(lastShard, newShard) {
 		if r, ok := m.peerLastSiblingMove[node.PeerID]; ok && timestamp.Sub(r.when) < siblingMoveCooldown {
 			return false
 		}
-		// Will record after accepting
 	}
 
 	m.treeDirty = true
 	slog.Info("shard move", "peer", node.PeerID, "from", shardLogLabel(lastShard), "to", shardLogLabel(newShard))
-	if len(newShard) > len(lastShard) && strings.HasPrefix(newShard, lastShard) {
-		// Log split only once per parent->child pair to avoid redundant logs
-		alreadyLogged := false
-		for _, ev := range m.splitEvents {
-			if ev.ParentShard == lastShard && ev.ChildShard == newShard {
-				alreadyLogged = true
-				break
-			}
-		}
-		if !alreadyLogged {
+
+	isSplit := len(newShard) > len(lastShard) && strings.HasPrefix(newShard, lastShard)
+	if isSplit {
+		if !m.hasSplitEvent(lastShard, newShard) {
 			slog.Info("detected shard split", "parent", shardLogLabel(lastShard), "child", newShard, "peer", node.PeerID)
 		}
 		m.lastSplitTime = timestamp
@@ -285,11 +283,8 @@ func (m *Monitor) updateNodeShardLocked(node *NodeState, newShard string, timest
 		if _, had := peers[peerIDStr]; !had {
 			continue
 		}
-		// Use the observed shard from PINNED announcements (set by nodes using PayloadCID-based
-		// shard assignment). Only remove if the manifest's observed shard is incompatible with
-		// the peer's new shard (neither is a prefix of the other).
-		// Merge moves (e.g. 1→0): node in shard 0 is incompatible with manifests in branch 1
-		// (01, 1, 10, 11); removal is correct—nodes unpin when merging per shard design.
+		// Remove peer from manifests whose shard is incompatible with the
+		// peer's new shard (neither is an ancestor of the other).
 		observedShard := m.manifestShard[manifest]
 		compatible := observedShard == newShard ||
 			strings.HasPrefix(newShard, observedShard) ||
@@ -311,7 +306,16 @@ func (m *Monitor) updateNodeShardLocked(node *NodeState, newShard string, timest
 	return true
 }
 
-func (m *Monitor) getPinnedInShardForNode(peerIDStr string, nodeShard string) int {
+func (m *Monitor) hasSplitEvent(parent, child string) bool {
+	for _, ev := range m.splitEvents {
+		if ev.ParentShard == parent && ev.ChildShard == child {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Monitor) getPinnedInShardForNode(peerIDStr, nodeShard string) int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	cutoff := time.Now().Add(-ReplicationAnnounceTTL)
@@ -325,9 +329,7 @@ func (m *Monitor) getPinnedInShardForNode(peerIDStr string, nodeShard string) in
 		if _, ok := peers[peerIDStr]; !ok {
 			continue
 		}
-		// Use observed shard from PINNED announcements.
-		targetShard := m.manifestShard[manifest]
-		if targetShard != nodeShard {
+		if m.manifestShard[manifest] != nodeShard {
 			continue
 		}
 		count++
@@ -335,9 +337,12 @@ func (m *Monitor) getPinnedInShardForNode(peerIDStr string, nodeShard string) in
 	return count
 }
 
-func (m *Monitor) ensureMinPinnedForPeer(peerIDStr string, min int) {
+func (m *Monitor) ensureMinPinnedForPeer(ctx context.Context, peerIDStr string, min int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
 	node, ok := m.nodes[peerIDStr]
 	if !ok {
 		return
@@ -355,9 +360,7 @@ func (m *Monitor) getShardMembership() map[string][]string {
 		if !m.isDisplayableNodeUnlocked(peerIDStr, node) {
 			continue
 		}
-		shard := node.EffectiveShard()
-		short := peerIDStr
-		shardToPeers[shard] = append(shardToPeers[shard], short)
+		shardToPeers[node.EffectiveShard()] = append(shardToPeers[node.EffectiveShard()], peerIDStr)
 	}
 	for shard := range shardToPeers {
 		sort.Strings(shardToPeers[shard])

@@ -14,9 +14,10 @@ import (
 type PeerRole string
 
 const (
-	RoleActive  PeerRole = "ACTIVE"  // Normal node, can pin new files
-	RolePassive PeerRole = "PASSIVE" // At storage limit, cannot pin; not counted for replication
-	RoleProbe   PeerRole = "PROBE"   // Transient viewer, not counted
+	RoleActive     PeerRole = "ACTIVE"     // Ingestor node with storage capacity
+	RolePassive    PeerRole = "PASSIVE"    // At storage limit, cannot pin; not counted for replication
+	RoleProbe      PeerRole = "PROBE"      // Transient viewer, not counted
+	RoleReplicator PeerRole = "REPLICATOR" // Can replicate but not ingest new files
 )
 
 // PeerRoleInfo holds a peer's role and last-seen time.
@@ -71,7 +72,7 @@ func (pt *PeerTracker) RemoveRole(shardID string, peerID peer.ID) {
 	pt.mu.Unlock()
 }
 
-// CountActive returns the number of ACTIVE peers in the given shard.
+// CountActive returns the number of ACTIVE or REPLICATOR peers in the given shard.
 // When includeSelf is true and shardID matches currentShard, adds 1 for self.
 func (pt *PeerTracker) CountActive(shardID string, includeSelf bool, currentShard string, activeWindow time.Duration) int {
 	pt.mu.RLock()
@@ -86,7 +87,7 @@ func (pt *PeerTracker) CountActive(shardID string, includeSelf bool, currentShar
 	cutoff := time.Now().Add(-activeWindow)
 	n := 0
 	for pid, info := range roles {
-		if info.Role != RoleActive || info.LastSeen.Before(cutoff) || pid == pt.selfID {
+		if (info.Role != RoleActive && info.Role != RoleReplicator) || info.LastSeen.Before(cutoff) || pid == pt.selfID {
 			continue
 		}
 		n++
@@ -99,7 +100,7 @@ func (pt *PeerTracker) CountActive(shardID string, includeSelf bool, currentShar
 	return n
 }
 
-// GetActiveForShard returns ACTIVE peer IDs for the given shard (excluding self).
+// GetActiveForShard returns ACTIVE or REPLICATOR peer IDs for the given shard (excluding self).
 func (pt *PeerTracker) GetActiveForShard(shardID string, activeWindow time.Duration) []peer.ID {
 	pt.mu.RLock()
 	defer pt.mu.RUnlock()
@@ -110,7 +111,7 @@ func (pt *PeerTracker) GetActiveForShard(shardID string, activeWindow time.Durat
 	cutoff := time.Now().Add(-activeWindow)
 	var active []peer.ID
 	for p, info := range roles {
-		if info.Role == RoleActive && info.LastSeen.After(cutoff) && p != pt.selfID {
+		if (info.Role == RoleActive || info.Role == RoleReplicator) && info.LastSeen.After(cutoff) && p != pt.selfID {
 			active = append(active, p)
 		}
 	}
@@ -177,11 +178,9 @@ func parseHeartbeatRole(data []byte) PeerRole {
 	parts := strings.SplitN(s, ":", 4)
 	if len(parts) >= 4 {
 		r := PeerRole(strings.ToUpper(parts[3]))
-		if r == RolePassive {
-			return RolePassive
-		}
-		if r == RoleProbe {
-			return RoleProbe
+		switch r {
+		case RolePassive, RoleProbe, RoleReplicator:
+			return r
 		}
 	}
 	return RoleActive
@@ -195,19 +194,24 @@ func parseJoinRole(data []byte) PeerRole {
 	}
 	parts := strings.SplitN(s, ":", 3)
 	if len(parts) >= 3 {
-		if PeerRole(strings.ToUpper(parts[2])) == RolePassive {
-			return RolePassive
+		r := PeerRole(strings.ToUpper(parts[2]))
+		switch r {
+		case RolePassive, RoleReplicator:
+			return r
 		}
 	}
 	return RoleActive
 }
 
-// getOurRole returns ACTIVE if we can accept custodial files, PASSIVE otherwise.
+// getOurRole returns the node's effective role based on storage capacity and ingest authorization.
 func (sm *ShardManager) getOurRole() PeerRole {
-	if sm.storageMgr.CanAcceptCustodialFile() {
-		return RoleActive
+	if !sm.storageMgr.CanAcceptCustodialFile() {
+		return RolePassive
 	}
-	return RolePassive
+	if !sm.IsLocalNodeIngestor() {
+		return RoleReplicator
+	}
+	return RoleActive
 }
 
 // processTextProtocolForProbe updates PeerTracker for HEARTBEAT/JOIN/LEAVE/PROBE.

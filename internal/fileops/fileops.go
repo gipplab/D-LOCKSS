@@ -31,6 +31,7 @@ type ShardIdentity interface {
 	GetShardInfo() (string, int)
 	AnnouncePinned(manifestCID string)
 	AmIResponsibleFor(key string) bool
+	IsLocalNodeIngestor() bool
 }
 
 // ShardPublisher handles ingest publishing and cluster pinning within the node's own shard.

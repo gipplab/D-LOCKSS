@@ -108,7 +108,7 @@ func (sm *ShardManager) JoinShardAsObserver(shardID string) bool {
 		return false
 	}
 
-	topicName := fmt.Sprintf("%s-creative-commons-shard-%s", sm.cfg.PubsubTopicPrefix, shardID)
+	topicName := sm.shardTopicName(shardID)
 	var t *pubsub.Topic
 	var psSub *pubsub.Subscription
 	if cached := sm.probeTopicCache[shardID]; cached != nil {

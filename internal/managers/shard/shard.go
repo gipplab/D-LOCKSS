@@ -68,7 +68,7 @@ const (
 )
 
 func (sm *ShardManager) shardTopicName(shardID string) string {
-	return sm.cfg.PubsubTopicPrefix + "-creative-commons-shard-" + shardID
+	return sm.cfg.PubsubTopicPrefix + "-" + sm.cfg.TopicName + "-shard-" + shardID
 }
 
 func childShards(parent string) (child0, child1 string) {
@@ -100,6 +100,9 @@ type ShardManager struct {
 	signer      MessageAuthenticator
 	rateLimiter *common.RateLimiter
 	nodeName    string
+
+	// Ingest authorization
+	ingestAllowlist map[peer.ID]struct{}
 
 	// Peer tracking
 	peers *PeerTracker
@@ -157,6 +160,15 @@ type ShardManagerConfig struct {
 }
 
 func NewShardManager(cfg ShardManagerConfig) (*ShardManager, error) {
+	allowlist := make(map[peer.ID]struct{}, len(cfg.Cfg.IngestAllowlist))
+	for _, raw := range cfg.Cfg.IngestAllowlist {
+		pid, err := peer.Decode(raw)
+		if err != nil {
+			slog.Warn("ignoring invalid peer ID in ingest allowlist", "peer", raw, "error", err)
+			continue
+		}
+		allowlist[pid] = struct{}{}
+	}
 	sm := &ShardManager{
 		ctx:                        cfg.Ctx,
 		cfg:                        cfg.Cfg,
@@ -169,6 +181,7 @@ func NewShardManager(cfg ShardManagerConfig) (*ShardManager, error) {
 		signer:                     cfg.Signer,
 		rateLimiter:                cfg.RateLimiter,
 		nodeName:                   cfg.NodeName,
+		ingestAllowlist:            allowlist,
 		peers:                      NewPeerTracker(cfg.Host.ID()),
 		reshardedFiles:             common.NewKnownFiles(),
 		currentShard:               cfg.StartShard,

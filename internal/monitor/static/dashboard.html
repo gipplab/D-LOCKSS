@@ -59,42 +59,6 @@
         .cid-payload { margin-top: 4px; font-size: 0.8em; color: #06A77D; }
         .load-spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #ccc; border-top-color: #06A77D; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; }
         @keyframes spin { to { transform: rotate(360deg); } }
-        .keyword-search-section { background: white; padding: 20px; margin: 20px 0; border: 1px solid #333; }
-        .kw-search-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
-        .kw-input-wrap { position: relative; flex: 1; max-width: 500px; }
-        .kw-input-wrap input { width: 100%; padding: 10px 12px; border: 1px solid #333; font-family: inherit; font-size: 0.95em; box-sizing: border-box; }
-        .kw-input-wrap input:focus { outline: none; border-color: #06A77D; }
-        .kw-ac { position: absolute; top: 100%; left: 0; right: 0; background: white; border: 1px solid #333; border-top: none; max-height: 220px; overflow-y: auto; z-index: 100; display: none; }
-        .kw-ac-item { padding: 8px 12px; cursor: pointer; display: flex; justify-content: space-between; font-size: 0.85em; }
-        .kw-ac-item:hover, .kw-ac-item.active { background: #f0f0f0; }
-        .kw-ac-count { color: #999; font-size: 0.85em; }
-        .kw-search-btn { padding: 10px 20px !important; font-size: 0.95em !important; }
-        .kw-stats-lbl { font-size: 0.75em; color: #999; white-space: nowrap; }
-        .kw-recent { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-        .kw-recent-label { font-size: 0.75em; color: #999; text-transform: uppercase; margin-right: 4px; }
-        .kw-tag-btn { background: #eee; border: 1px solid #ccc; padding: 3px 10px; font-size: 0.8em; cursor: pointer; text-transform: lowercase; font-family: inherit; }
-        .kw-tag-btn:hover { background: #ddd; border-color: #999; }
-        .kw-results { margin-top: 15px; }
-        .kw-results-hdr { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid #ddd; }
-        .kw-result-item { display: flex; flex-direction: column; gap: 4px; padding: 10px 0; border-bottom: 1px solid #eee; font-size: 0.85em; }
-        .kw-result-top { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-        .kw-result-cid { font-family: monospace; word-break: break-all; flex: 1; min-width: 200px; }
-        .kw-result-meta { color: #666; font-size: 0.9em; }
-        .kw-result-kws { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
-        .kw-kw-tag { background: #e8f5e9; border: 1px solid #a5d6a7; padding: 1px 6px; font-size: 0.8em; border-radius: 2px; cursor: pointer; }
-        .kw-kw-tag:hover { background: #c8e6c9; }
-        .kw-class { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
-        .kw-class-tag { padding: 1px 8px; font-size: 0.8em; border-radius: 2px; cursor: pointer; border: 1px solid; }
-        .kw-class-tag:hover { filter: brightness(0.92); }
-        .kw-field { background: #e3f2fd; border-color: #90caf9; color: #1565c0; }
-        .kw-subtopic { background: #f3e5f5; border-color: #ce93d8; color: #7b1fa2; }
-        .kw-pagination { display: flex; justify-content: center; align-items: center; gap: 6px; margin-top: 12px; padding-top: 10px; border-top: 1px solid #eee; }
-        .kw-page-btn { background: #eee; border: 1px solid #ccc; padding: 4px 12px; font-size: 0.85em; cursor: pointer; font-family: inherit; }
-        .kw-page-btn:hover { background: #ddd; border-color: #999; }
-        .kw-page-btn.active { background: #333; color: white; border-color: #333; }
-        .kw-page-btn:disabled { opacity: 0.4; cursor: default; }
-        .kw-page-info { font-size: 0.8em; color: #666; }
-        .kw-niche { background: #fff3e0; border-color: #ffcc80; color: #e65100; }
     </style>
 </head>
 <body>
@@ -104,30 +68,22 @@
             <div style="font-size: 0.9em; text-align: right;">
                 <div>SYSTEM STATUS: <span class="status-text status-online">[ONLINE]</span></div>
                 <div id="root-topic-row" style="font-size: 0.75em; color: #666; margin-top: 4px; word-break: break-all;">
-                    Root topic: <span id="root-topic-value">--</span>
-                    <button class="btn-text" id="root-topic-edit-btn" style="margin-left: 6px; font-size: 0.9em;">EDIT</button>
+                    Topic: <span id="topic-name-value" style="font-weight:bold;">--</span>
+                    <button class="btn-text" id="topic-name-edit-btn" style="margin-left: 4px; font-size: 0.9em;">SWITCH</button>
+                    <span style="margin-left: 8px;">Prefix: <span id="root-topic-value">--</span></span>
+                    <button class="btn-text" id="root-topic-edit-btn" style="margin-left: 4px; font-size: 0.9em;">EDIT</button>
+                </div>
+                <div id="topic-name-edit-row" style="display: none; margin-top: 4px;">
+                    <input type="text" id="topic-name-input" placeholder="e.g. creative-commons" style="padding: 4px; font-family: inherit; font-size: 0.85em; width: 180px; border: 1px solid #333;" title="Archive topic name">
+                    <button class="btn-text btn-save" id="topic-name-save-btn">SWITCH</button>
+                    <button class="btn-text btn-cancel" id="topic-name-cancel-btn">CANCEL</button>
                 </div>
                 <div id="root-topic-edit-row" style="display: none; margin-top: 4px;">
-                    <input type="text" id="root-topic-input" placeholder="e.g. dlockss-v0.0.3" style="padding: 4px; font-family: inherit; font-size: 0.85em; width: 160px; border: 1px solid #333;" title="Topic prefix (full topic: {prefix}-creative-commons-shard-)">
+                    <input type="text" id="root-topic-input" placeholder="e.g. dlockss-v0.0.3" style="padding: 4px; font-family: inherit; font-size: 0.85em; width: 160px; border: 1px solid #333;" title="Topic prefix (protocol version)">
                     <button class="btn-text btn-save" id="root-topic-save-btn">SAVE</button>
                     <button class="btn-text btn-cancel" id="root-topic-cancel-btn">CANCEL</button>
                 </div>
             </div>
-        </div>
-        <div class="keyword-search-section" style="display:none;">
-            <div style="display:flex; justify-content:space-between; align-items:center;">
-                <h3 style="margin:0; text-transform:uppercase; font-size:1em;">Keyword Search</h3>
-                <span id="kwStatsLbl" class="kw-stats-lbl"></span>
-            </div>
-            <div class="kw-search-row">
-                <div class="kw-input-wrap">
-                    <input type="text" id="kwInput" placeholder="Search documents by keyword..." autocomplete="off">
-                    <div id="kwAC" class="kw-ac"></div>
-                </div>
-                <button class="btn-text kw-search-btn" id="kwSearchBtn">SEARCH</button>
-            </div>
-            <div id="kwRecent" class="kw-recent"></div>
-            <div id="kwResults" class="kw-results" style="display:none;"></div>
         </div>
         <div class="stats">
             <div class="stat-card clickable" id="total-nodes-card" title="Click to jump to Network Nodes"><div class="stat-value" id="total-nodes">--</div><div class="stat-label">Total Nodes</div></div>
@@ -253,24 +209,48 @@
                     const displayName = aliasHtml || serverNameHtml || (peerIdHtml.slice(0,12) + '...');
                     const pinned = (n.storage.pinned_in_shard != null) ? n.storage.pinned_in_shard : n.storage.pinned_files;
                     const isPassive = n.role === 'PASSIVE';
+                    const isReplicator = n.role === 'REPLICATOR';
                     const rowClass = isPassive ? 'node-passive' : '';
-                    const statusTag = isPassive ? '<span class="status-text status-full">[FULL]</span>' : '<span class="status-text status-online">[ACTIVE]</span>';
+                    const statusTag = isPassive ? '<span class="status-text status-full">[FULL]</span>' : isReplicator ? '<span class="status-text" style="color:#06A77D;">[REPLICATOR]</span>' : '<span class="status-text status-online">[ACTIVE]</span>';
                     return '<tr class="' + rowClass + '" data-peer-id="' + escapeHtml(n.peer_id.toLowerCase()) + '"><td><button class="btn-text alias-edit-btn" onclick="editAlias(\'' + peerIdEscaped + '\', \'' + aliasEscaped + '\', this)">EDIT</button></td><td class="peer-id-cell"><div class="alias-display-container"><div style="font-weight:600;">' + displayName + '</div><div style="font-size:0.8em; color:#4af; cursor:pointer; text-decoration:underline;" onclick="event.stopPropagation(); showIdentifyModal(\'' + peerIdEscaped + '\')">' + peerIdHtml + '</div></div></td><td><span class="shard-badge">' + shardHtml + '</span></td><td>' + n.peers_in_shard + '</td><td>' + pinned + '</td><td>' + n.storage.known_files + '</td><td>' + Math.floor(n.uptime_seconds/60) + 'm</td><td>' + statusTag + ' ' + lastSeen + 's ago</td></tr>';
                 }).join('');
                 restoreEditingState();
             });
         }
         function debouncedFilter() { clearTimeout(searchTimeout); searchTimeout = setTimeout(() => { updateDashboard(); }, 300); }
-        function loadRootTopic() { fetch('/api/root-topic').then(r=>r.json()).then(d => { const el = document.getElementById('root-topic-value'); if (el && d.root_topic) el.textContent = d.root_topic; if (d.topic_prefix) window._currentTopicPrefix = d.topic_prefix; }).catch(() => {}); }
+        function loadRootTopic() {
+            fetch('/api/root-topic').then(r=>r.json()).then(d => {
+                if (d.topic_prefix) { window._currentTopicPrefix = d.topic_prefix; document.getElementById('root-topic-value').textContent = d.topic_prefix; }
+                if (d.topic_name) { window._currentTopicName = d.topic_name; document.getElementById('topic-name-value').textContent = d.topic_name; }
+            }).catch(() => {});
+        }
+        function applyTopicResponse(d) {
+            if (d.topic_prefix) { window._currentTopicPrefix = d.topic_prefix; document.getElementById('root-topic-value').textContent = d.topic_prefix; }
+            if (d.topic_name) { window._currentTopicName = d.topic_name; document.getElementById('topic-name-value').textContent = d.topic_name; }
+            updateDashboard(); updateShardTree();
+        }
+        function showTopicNameEdit() { document.getElementById('root-topic-row').style.display = 'none'; document.getElementById('topic-name-edit-row').style.display = 'block'; document.getElementById('topic-name-input').value = window._currentTopicName || ''; document.getElementById('topic-name-input').focus(); }
+        function hideTopicNameEdit() { document.getElementById('topic-name-edit-row').style.display = 'none'; document.getElementById('root-topic-row').style.display = ''; }
+        function saveTopicName() {
+            const name = document.getElementById('topic-name-input').value.trim();
+            fetch('/api/root-topic', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ topic_name: name || undefined }) })
+                .then(r => { if (!r.ok) throw new Error(r.statusText); return r.json(); })
+                .then(d => { applyTopicResponse(d); hideTopicNameEdit(); })
+                .catch(e => alert('Failed to switch topic: ' + e.message));
+        }
         function showTopicEdit() { document.getElementById('root-topic-row').style.display = 'none'; document.getElementById('root-topic-edit-row').style.display = 'block'; document.getElementById('root-topic-input').value = window._currentTopicPrefix || ''; document.getElementById('root-topic-input').focus(); }
         function hideTopicEdit() { document.getElementById('root-topic-edit-row').style.display = 'none'; document.getElementById('root-topic-row').style.display = ''; }
         function saveTopicPrefix() {
             const prefix = document.getElementById('root-topic-input').value.trim();
             fetch('/api/root-topic', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ topic_prefix: prefix || undefined }) })
                 .then(r => { if (!r.ok) throw new Error(r.statusText); return r.json(); })
-                .then(d => { window._currentTopicPrefix = d.topic_prefix; document.getElementById('root-topic-value').textContent = d.root_topic; hideTopicEdit(); updateDashboard(); updateShardTree(); })
-                .catch(e => alert('Failed to switch topic: ' + e.message));
+                .then(d => { applyTopicResponse(d); hideTopicEdit(); })
+                .catch(e => alert('Failed to switch prefix: ' + e.message));
         }
+        document.getElementById('topic-name-edit-btn').onclick = showTopicNameEdit;
+        document.getElementById('topic-name-save-btn').onclick = saveTopicName;
+        document.getElementById('topic-name-cancel-btn').onclick = hideTopicNameEdit;
+        document.getElementById('topic-name-input').onkeydown = function(e) { if (e.key === 'Enter') saveTopicName(); else if (e.key === 'Escape') hideTopicNameEdit(); };
         document.getElementById('root-topic-edit-btn').onclick = showTopicEdit;
         document.getElementById('root-topic-save-btn').onclick = saveTopicPrefix;
         document.getElementById('root-topic-cancel-btn').onclick = hideTopicEdit;
@@ -451,156 +431,6 @@
                 row.style.display = (!q || search.includes(q)) ? '' : 'none';
             });
         };
-        // --- Keyword Search ---
-        let kwACIndex = -1;
-        let kwACTimeout;
-        const kwInput = document.getElementById('kwInput');
-        const kwAC = document.getElementById('kwAC');
-        const kwSearchBtn = document.getElementById('kwSearchBtn');
-
-        var kwAllResults = [];
-        var kwCurrentQuery = '';
-        var kwPage = 0;
-        var kwPerPage = 20;
-
-        function kwDoSearch(query) {
-            if (!query || !query.trim()) return;
-            query = query.trim();
-            kwInput.value = query;
-            kwHideAC();
-            kwCurrentQuery = query;
-            kwPage = 0;
-            document.getElementById('kwResults').style.display = 'block';
-            document.getElementById('kwResults').innerHTML = '<p style="color:#999;">Searching...</p>';
-            fetch('/api/keyword-search?q=' + encodeURIComponent(query) + '&t=' + Date.now()).then(r => r.json()).then(data => {
-                kwAllResults = data.results || [];
-                if (kwAllResults.length === 0) {
-                    document.getElementById('kwResults').innerHTML = '<p style="color:#666;">No documents found for "' + escapeHtml(query) + '".</p>';
-                    return;
-                }
-                kwRenderPage();
-                document.getElementById('kwResults').scrollIntoView({ behavior: 'smooth', block: 'start' });
-                kwLoadRecent();
-            }).catch(() => {
-                document.getElementById('kwResults').innerHTML = '<p style="color:#ff6b6b;">Search failed.</p>';
-            });
-        }
-
-        function kwRenderPage() {
-            var total = kwAllResults.length;
-            var totalPages = Math.ceil(total / kwPerPage);
-            var start = kwPage * kwPerPage;
-            var end = Math.min(start + kwPerPage, total);
-            var pageResults = kwAllResults.slice(start, end);
-
-            var html = '<div class="kw-results-hdr"><span>' + total + ' document' + (total !== 1 ? 's' : '') + ' matching "' + escapeHtml(kwCurrentQuery) + '"</span><button class="btn-text" onclick="document.getElementById(\'kwResults\').style.display=\'none\'">CLOSE</button></div>';
-            html += pageResults.map(function(r) {
-                var shard = (r.shard || '') === '' ? 'root' : escapeHtml(r.shard);
-                var kws = (r.keywords || []).map(function(k) { return '<span class="kw-kw-tag" onclick="kwDoSearch(\'' + escapeJs(k) + '\')">' + escapeHtml(k) + '</span>'; }).join('');
-                var title = r.title || '';
-                var payloadUrl = GATEWAY + '/ipfs/' + (r.payload_cid || '') + '/';
-                var titleHtml = title ? '<div style="font-weight:600; margin-bottom:2px;">' + escapeHtml(title) + '</div>' : '';
-                var classHtml = '';
-                var bf = r.broad_field || '', st = r.sub_topic || '', rn = r.research_niche || '';
-                if (bf || st || rn) {
-                    classHtml = '<div class="kw-class">';
-                    if (bf) classHtml += '<span class="kw-class-tag kw-field" onclick="kwDoSearch(\'' + escapeJs(bf) + '\')">' + escapeHtml(bf) + '</span>';
-                    if (st) classHtml += '<span class="kw-class-tag kw-subtopic" onclick="kwDoSearch(\'' + escapeJs(st) + '\')">' + escapeHtml(st) + '</span>';
-                    if (rn) classHtml += '<span class="kw-class-tag kw-niche" onclick="kwDoSearch(\'' + escapeJs(rn) + '\')">' + escapeHtml(rn) + '</span>';
-                    classHtml += '</div>';
-                }
-                return '<div class="kw-result-item">' + titleHtml + classHtml + '<div class="kw-result-top"><div class="kw-result-cid">' + escapeHtml(r.manifest_cid) + '</div><div class="kw-result-meta">Shard: ' + shard + ' | Replicas: ' + (r.replicas || 0) + '</div><a href="' + payloadUrl + '" target="_blank" rel="noopener" class="btn-text">VIEW</a></div><div class="kw-result-kws">' + kws + '</div></div>';
-            }).join('');
-
-            if (totalPages > 1) {
-                html += '<div class="kw-pagination">';
-                html += '<button class="kw-page-btn" onclick="kwGoPage(' + (kwPage - 1) + ')"' + (kwPage === 0 ? ' disabled' : '') + '>&laquo;</button>';
-                for (var p = 0; p < totalPages; p++) {
-                    html += '<button class="kw-page-btn' + (p === kwPage ? ' active' : '') + '" onclick="kwGoPage(' + p + ')">' + (p + 1) + '</button>';
-                }
-                html += '<button class="kw-page-btn" onclick="kwGoPage(' + (kwPage + 1) + ')"' + (kwPage >= totalPages - 1 ? ' disabled' : '') + '>&raquo;</button>';
-                html += '<span class="kw-page-info">' + (start + 1) + '–' + end + ' of ' + total + '</span>';
-                html += '</div>';
-            }
-
-            document.getElementById('kwResults').innerHTML = html;
-        }
-
-        function kwGoPage(p) {
-            var totalPages = Math.ceil(kwAllResults.length / kwPerPage);
-            if (p < 0 || p >= totalPages) return;
-            kwPage = p;
-            kwRenderPage();
-            document.getElementById('kwResults').scrollIntoView({ behavior: 'smooth', block: 'start' });
-        }
-
-        function kwShowAC(suggestions) {
-            if (!suggestions || suggestions.length === 0) { kwHideAC(); return; }
-            kwACIndex = -1;
-            kwAC.innerHTML = suggestions.map((s, i) => '<div class="kw-ac-item" data-idx="' + i + '" onmousedown="kwDoSearch(\'' + escapeJs(s.keyword) + '\')">' + escapeHtml(s.keyword) + '<span class="kw-ac-count">' + s.cid_count + ' doc' + (s.cid_count !== 1 ? 's' : '') + '</span></div>').join('');
-            kwAC.style.display = 'block';
-        }
-
-        function kwHideAC() { kwAC.style.display = 'none'; kwACIndex = -1; }
-
-        function kwFetchSuggestions() {
-            const q = kwInput.value.trim();
-            if (q.length < 1) { kwHideAC(); return; }
-            fetch('/api/keyword-suggest?q=' + encodeURIComponent(q) + '&t=' + Date.now()).then(r => r.json()).then(data => {
-                kwShowAC(data.suggestions || []);
-            }).catch(() => kwHideAC());
-        }
-
-        kwInput.addEventListener('input', function() {
-            clearTimeout(kwACTimeout);
-            kwACTimeout = setTimeout(kwFetchSuggestions, 200);
-        });
-
-        kwInput.addEventListener('keydown', function(e) {
-            const items = kwAC.querySelectorAll('.kw-ac-item');
-            if (e.key === 'ArrowDown') {
-                e.preventDefault();
-                kwACIndex = Math.min(kwACIndex + 1, items.length - 1);
-                items.forEach((el, i) => el.classList.toggle('active', i === kwACIndex));
-                if (kwACIndex >= 0) kwInput.value = items[kwACIndex].textContent.replace(/\d+ docs?$/, '').trim();
-            } else if (e.key === 'ArrowUp') {
-                e.preventDefault();
-                kwACIndex = Math.max(kwACIndex - 1, -1);
-                items.forEach((el, i) => el.classList.toggle('active', i === kwACIndex));
-                if (kwACIndex >= 0) kwInput.value = items[kwACIndex].textContent.replace(/\d+ docs?$/, '').trim();
-            } else if (e.key === 'Enter') {
-                kwHideAC();
-                kwDoSearch(kwInput.value);
-            } else if (e.key === 'Escape') {
-                kwHideAC();
-            }
-        });
-
-        kwInput.addEventListener('blur', function() { setTimeout(kwHideAC, 150); });
-        kwSearchBtn.addEventListener('click', function() { kwDoSearch(kwInput.value); });
-
-        function kwLoadRecent() {
-            fetch('/api/recent-searches?t=' + Date.now()).then(r => r.json()).then(data => {
-                const el = document.getElementById('kwRecent');
-                const searches = data.searches || [];
-                if (searches.length === 0) { el.innerHTML = ''; return; }
-                el.innerHTML = '<span class="kw-recent-label">Recent:</span>' + searches.slice(0, 5).map(s => '<button class="kw-tag-btn" onclick="kwDoSearch(\'' + escapeJs(s.keyword) + '\')">' + escapeHtml(s.keyword) + ' (' + s.result_count + ')</button>').join('');
-            }).catch(() => {});
-        }
-
-        function kwLoadStats() {
-            fetch('/api/keyword-stats?t=' + Date.now()).then(r => r.json()).then(data => {
-                const section = document.querySelector('.keyword-search-section');
-                if (!data.enabled) { section.style.display = 'none'; return; }
-                section.style.display = '';
-                document.getElementById('kwStatsLbl').textContent = 'Indexed: ' + data.indexed + '/' + data.total_cids + ' | Keywords: ' + data.unique_keywords;
-            }).catch(() => {});
-        }
-
-        kwLoadRecent();
-        kwLoadStats();
-        setInterval(kwLoadStats, 10000);
-
         initCharts(); updateDashboard(); updateShardTree(); loadRootTopic();
         setInterval(() => { if(!document.getElementById('nodeSearch').value && currentlyEditingPeerID === null) { updateDashboard(); updateShardTree(); } }, 5000);
     </script>

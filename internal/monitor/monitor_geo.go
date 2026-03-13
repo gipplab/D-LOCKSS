@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	ma "github.com/multiformats/go-multiaddr"
@@ -166,6 +165,3 @@ func (m *Monitor) resolveRegionFromAddrs(addrs []ma.Multiaddr) string {
 	ip := preferPublicIP(ips)
 	return m.resolveGeoIPSync(ip)
 }
-
-// compile-time check that sync.Map is used (avoids unused import if refactored)
-var _ sync.Map
