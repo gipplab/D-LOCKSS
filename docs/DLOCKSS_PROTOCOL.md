@@ -247,14 +247,13 @@ services:
     depends_on: [ipfs]
     volumes:
       - ipfs-data:/ipfs-repo:ro
-      - dlockss-data:/data
+      - ./dlockss-files:/data
     environment:
       DLOCKSS_IPFS_CONFIG: /ipfs-repo/config
       DLOCKSS_IPFS_NODE: /dns4/ipfs/tcp/5001
       DLOCKSS_DATA_DIR: /data/ingest
 volumes:
   ipfs-data:
-  dlockss-data:
 ```
 
 **Legacy migration:** If a `dlockss.key` exists in the working directory but not at the configured identity path (e.g. after upgrading), it is automatically copied to the new location so the node retains its Peer ID.

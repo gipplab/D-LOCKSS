@@ -45,6 +45,11 @@ func (fp *FileProcessor) validateFilePath(path string) bool {
 func (fp *FileProcessor) processNewFile(path string) {
 	slog.Info("processing file", "path", path)
 
+	if !fp.shardMgr.IsLocalNodeIngestor() {
+		slog.Warn("node is not an authorized ingestor, skipping file", "path", path)
+		return
+	}
+
 	if !fp.validateFilePath(path) {
 		slog.Warn("file validation failed", "path", path)
 		return

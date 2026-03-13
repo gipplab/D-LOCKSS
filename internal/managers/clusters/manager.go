@@ -141,7 +141,7 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string, bootstr
 	}
 
 	cfg := &crdt.Config{
-		ClusterName:         cm.cfg.PubsubTopicPrefix + "-shard-" + shardID,
+		ClusterName:         cm.cfg.PubsubTopicPrefix + "-" + cm.cfg.TopicName + "-crdt-" + shardID,
 		PeersetMetric:       "ping",
 		RebroadcastInterval: 30 * time.Second,
 		DatastoreNamespace:  datastore.NewKey("consensus").String(),

@@ -118,8 +118,8 @@ func (m *Monitor) evictStalePeerstoreEntries() {
 	// Protect peers in any GossipSub topic so mesh recovery remains possible
 	// even after all tracked nodes have been pruned.
 	topicPeers := make(map[peer.ID]bool)
-	for _, topic := range m.shardTopics {
-		for _, pid := range topic.ListPeers() {
+	for _, ss := range m.shardTopics {
+		for _, pid := range ss.topic.ListPeers() {
 			topicPeers[pid] = true
 		}
 	}

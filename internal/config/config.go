@@ -61,6 +61,21 @@ func getEnvBool(key string, defaultValue bool) bool {
 	return defaultValue
 }
 
+func getEnvStringSlice(key string) []string {
+	if value := os.Getenv(key); value != "" {
+		parts := strings.Split(value, ",")
+		var result []string
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				result = append(result, p)
+			}
+		}
+		return result
+	}
+	return nil
+}
+
 func clusterStorePath(dataDir string) string {
 	if p := os.Getenv("DLOCKSS_CLUSTER_STORE"); p != "" {
 		return p
@@ -79,10 +94,15 @@ func nodeNamePath(dataDir string) string {
 	return filepath.Join(filepath.Dir(dataDir), "node_name")
 }
 
+// DefaultTopicName is the archive topic when none is configured.
+const DefaultTopicName = "creative-commons"
+
 // Config holds all runtime configuration for a D-LOCKSS node.
 type Config struct {
 	DiscoveryServiceTag            string
 	PubsubTopicPrefix              string
+	TopicName                      string
+	IngestAllowlist                []string
 	FileWatchFolder                string
 	ClusterStorePath               string
 	MinReplication                 int
@@ -160,6 +180,8 @@ func DefaultConfig() *Config {
 	return &Config{
 		DiscoveryServiceTag:            "dlockss-prod",
 		PubsubTopicPrefix:              DefaultPubsubVersion,
+		TopicName:                      DefaultTopicName,
+		IngestAllowlist:                nil,
 		FileWatchFolder:                dataDir,
 		ClusterStorePath:               filepath.Join(filepath.Dir(dataDir), "cluster_store"),
 		MinReplication:                 5,
@@ -238,6 +260,8 @@ func LoadFromEnv() *Config {
 	return &Config{
 		DiscoveryServiceTag:            getEnvString("DLOCKSS_DISCOVERY_TAG", "dlockss-prod"),
 		PubsubTopicPrefix:              getEnvString("DLOCKSS_PUBSUB_TOPIC_PREFIX", DefaultPubsubVersion),
+		TopicName:                      getEnvString("DLOCKSS_TOPIC_NAME", DefaultTopicName),
+		IngestAllowlist:                getEnvStringSlice("DLOCKSS_INGEST_ALLOWLIST"),
 		FileWatchFolder:                dataDir,
 		ClusterStorePath:               clusterStorePath(dataDir),
 		MinReplication:                 getEnvInt("DLOCKSS_MIN_REPLICATION", 5),
@@ -372,9 +396,15 @@ func (c *Config) ValidatePathSafetyCheck() string {
 func (c *Config) Log() {
 	c.Validate()
 
+	ingestMode := "open"
+	if len(c.IngestAllowlist) > 0 {
+		ingestMode = fmt.Sprintf("allowlist (%d peers)", len(c.IngestAllowlist))
+	}
 	slog.Info("config: network",
 		"discovery_tag", c.DiscoveryServiceTag,
 		"pubsub_prefix", c.PubsubTopicPrefix,
+		"topic_name", c.TopicName,
+		"ingest_mode", ingestMode,
 		"ipfs_node", c.IPFSNodeAddress,
 		"api_port", c.APIPort,
 		"bootstrap_timeout", c.BootstrapTimeout,

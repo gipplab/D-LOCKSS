@@ -79,11 +79,9 @@ func (m *Monitor) GetShardTree() *ShardTreeNode {
 	}
 	root := nodeMap[""]
 	root.Children = nil
-	for i := 1; i <= 1; i++ {
-		for id, node := range nodeMap {
-			if id != "" && len(id) == i {
-				root.Children = append(root.Children, node)
-			}
+	for id, node := range nodeMap {
+		if len(id) == 1 {
+			root.Children = append(root.Children, node)
 		}
 	}
 	sort.Slice(root.Children, func(i, j int) bool { return root.Children[i].ShardID < root.Children[j].ShardID })

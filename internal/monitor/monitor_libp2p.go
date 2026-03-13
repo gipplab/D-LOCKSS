@@ -93,12 +93,10 @@ func StartLibP2P(ctx context.Context, monitor *Monitor) (host.Host, error) {
 	}
 	monitor.ps = ps
 	monitor.host = h
+	monitor.appCtx = ctx
+	monitor.subCtx, monitor.subCancel = context.WithCancel(ctx)
 	go monitor.cleanupStaleCIDs(ctx)
-	// Bootstrap subscribe to all shards up to depth so we see nodes even when joining late
-	// (when all nodes have already moved to deeper shards like 00, 01, 10, 11, etc.).
-	for _, shardID := range shardIDsUpToDepth(monitor.cfg.BootstrapShardDepth) {
-		monitor.ensureShardSubscription(ctx, shardID)
-	}
+	monitor.resubscribeBootstrap()
 	slog.Info("bootstrap subscribed", "shards", 1<<(monitor.cfg.BootstrapShardDepth+1)-1, "depth", monitor.cfg.BootstrapShardDepth)
 	go monitor.subscribeToActiveShards(ctx)
 
