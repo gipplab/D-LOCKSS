@@ -28,6 +28,7 @@ func (m *Monitor) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/root-topic", m.handleRootTopic)
 	mux.HandleFunc("/api/node-files", m.handleNodeFiles)
 	mux.HandleFunc("/api/unique-cids", m.handleUniqueCIDs)
+	mux.HandleFunc("/api/payload-cids-export", m.handlePayloadCIDsExport)
 	mux.HandleFunc("/api/replication", m.handleReplication)
 	mux.HandleFunc("/api/replication-cids", m.handleReplicationCIDs)
 	mux.HandleFunc("/api/manifest-payload", m.handleManifestPayload)
@@ -204,6 +205,23 @@ func (m *Monitor) handleUniqueCIDs(w http.ResponseWriter, r *http.Request) {
 	entries := m.buildCIDEntriesUnlocked(m.uniqueCIDs)
 	m.mu.RUnlock()
 	writeJSON(w, map[string]interface{}{"cids": entries, "count": len(entries)})
+}
+
+func (m *Monitor) handlePayloadCIDsExport(w http.ResponseWriter, r *http.Request) {
+	m.mu.RLock()
+	cids := make([]string, 0, len(m.uniqueCIDs))
+	for c := range m.uniqueCIDs {
+		cids = append(cids, c)
+	}
+	m.mu.RUnlock()
+	sort.Strings(cids)
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="payload_cids.txt"`)
+	for _, c := range cids {
+		w.Write([]byte(c))
+		w.Write([]byte("\n"))
+	}
 }
 
 func (m *Monitor) handleReplication(w http.ResponseWriter, r *http.Request) {
