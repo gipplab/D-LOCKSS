@@ -50,9 +50,11 @@
         .modal { background: white; border: 2px solid #333; max-width: 90vw; max-height: 85vh; overflow: hidden; display: flex; flex-direction: column; }
         .modal-header { padding: 15px 20px; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center; }
         .modal-body { padding: 20px; overflow-y: auto; flex: 1; }
-        .cid-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid #eee; font-size: 0.85em; flex-wrap: wrap; }
-        .cid-row .cid-value { font-family: monospace; word-break: break-all; flex: 1; min-width: 200px; }
-        .cid-row .cid-meta { color: #666; font-size: 0.9em; }
+        .cid-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid #eee; font-size: 0.85em; flex-wrap: nowrap; }
+        .cid-row .cid-value { font-family: monospace; white-space: nowrap; flex: 1; min-width: 200px; cursor: pointer; }
+        .cid-row .cid-value:hover { color: #06A77D; }
+        .cid-row .cid-meta { color: #666; font-size: 0.9em; white-space: nowrap; }
+        .copy-toast { position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%); background: #333; color: #fff; padding: 8px 20px; font-size: 0.85em; z-index: 2000; opacity: 0; transition: opacity 0.3s; pointer-events: none; }
         .cid-row .cid-actions { display: flex; gap: 6px; flex-shrink: 0; }
         .cid-payload { margin-top: 4px; font-size: 0.8em; color: #06A77D; }
         .load-spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #ccc; border-top-color: #06A77D; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; }
@@ -147,9 +149,10 @@
             <table id="nodeTable"><thead><tr><th style="width: 80px;">Action</th><th>Peer ID</th><th>Shard</th><th>Peers</th><th>Pinned</th><th>Known</th><th>Uptime</th><th>Last Seen</th></tr></thead><tbody id="nodeTableBody"></tbody></table>
         </div>
     </div>
+    <div id="copy-toast" class="copy-toast">Copied to clipboard</div>
     <div id="cids-modal" class="modal-overlay" style="display: none;">
-        <div class="modal" style="width: 700px;">
-            <div class="modal-header"><h3 style="margin:0; text-transform: uppercase; font-size: 1em;">Unique CIDs</h3><input type="text" id="cids-modal-search" placeholder="Filter CIDs..." style="padding: 6px; font-family: inherit; font-size: 0.85em; width: 180px; border: 1px solid #333;"><button class="btn-text" id="cids-modal-close">CLOSE</button></div>
+        <div class="modal" style="width: 1100px;">
+            <div class="modal-header"><h3 style="margin:0; text-transform: uppercase; font-size: 1em;">Unique CIDs</h3><div style="display:flex; gap:8px; align-items:center;"><input type="text" id="cids-modal-search" placeholder="Filter CIDs..." style="padding: 6px; font-family: inherit; font-size: 0.85em; width: 180px; border: 1px solid #333;"><button class="btn-text" id="cids-export-btn" title="Export payload CIDs as text file">EXPORT PAYLOAD CIDS</button><button class="btn-text" id="cids-modal-close">CLOSE</button></div></div>
             <div class="modal-body"><div id="cids-modal-list"></div></div>
         </div>
     </div>
@@ -273,6 +276,14 @@
         document.getElementById('root-topic-cancel-btn').onclick = hideTopicEdit;
         document.getElementById('root-topic-input').onkeydown = function(e) { if (e.key === 'Enter') saveTopicPrefix(); else if (e.key === 'Escape') hideTopicEdit(); };
         const GATEWAY = 'https://ipfs.io';
+        function showCopyToast() {
+            const toast = document.getElementById('copy-toast');
+            toast.style.opacity = '1';
+            setTimeout(function() { toast.style.opacity = '0'; }, 1200);
+        }
+        function copyCID(text) {
+            navigator.clipboard.writeText(text).then(showCopyToast).catch(function() {});
+        }
         function showCidsModal() {
             document.getElementById('cids-modal').style.display = 'flex';
             fetch('/api/unique-cids?t=' + Date.now()).then(r=>r.json()).then(data => {
@@ -280,11 +291,14 @@
                 const cids = data.cids || [];
                 list.innerHTML = cids.length === 0 ? '<p style="color:#666;">No CIDs yet. CIDs appear when nodes announce pinned files.</p>' : cids.map((entry, i) => {
                     const cid = entry.cid || entry.CID || entry; const shard = (entry.shard || entry.Shard || '') === '' ? 'root' : (entry.shard || entry.Shard); const replicas = entry.replicas ?? entry.Replicas ?? 0;
-                    return '<div class="cid-row" data-cid="' + escapeHtml(cid) + '"><div class="cid-value">' + escapeHtml(cid) + '</div><div class="cid-meta">Shard: ' + escapeHtml(shard) + ' | Replicas: ' + replicas + '</div><div class="cid-actions"><button class="btn-text" onclick="loadManifest(\'' + escapeJs(cid) + '\', this.parentElement)">LOAD MANIFEST</button></div></div>';
+                    return '<div class="cid-row" data-cid="' + escapeHtml(cid) + '"><div class="cid-value" onclick="copyCID(\'' + escapeJs(cid) + '\')" title="Click to copy">' + escapeHtml(cid) + '</div><div class="cid-meta">Shard: ' + escapeHtml(shard) + ' | Replicas: ' + replicas + '</div><div class="cid-actions"><button class="btn-text" onclick="loadManifest(\'' + escapeJs(cid) + '\', this.parentElement)">LOAD MANIFEST</button></div></div>';
                 }).join('');
             }).catch(() => { document.getElementById('cids-modal-list').innerHTML = '<p style="color:#999;">Failed to load CIDs.</p>'; });
         }
         function hideCidsModal() { document.getElementById('cids-modal').style.display = 'none'; }
+        function exportPayloadCIDs() {
+            window.open('/api/payload-cids-export', '_blank');
+        }
         function showNodeFilesModal(peerId) {
             const aliases = loadAliases();
             const label = aliases[peerId] || (window._nodeNames && window._nodeNames[peerId]) || peerId.slice(-6);
@@ -296,7 +310,7 @@
                 const cids = data.cids || [];
                 list.innerHTML = cids.length === 0 ? '<p style="color:#666;">No pinned files for this node.</p>' : cids.map((entry, i) => {
                     const cid = entry.cid || entry.CID || entry; const shard = (entry.shard || entry.Shard || '') === '' ? 'root' : (entry.shard || entry.Shard); const replicas = entry.replicas ?? entry.Replicas ?? 0;
-                    return '<div class="cid-row" data-cid="' + escapeHtml(cid) + '"><div class="cid-value">' + escapeHtml(cid) + '</div><div class="cid-meta">Shard: ' + escapeHtml(shard) + ' | Replicas: ' + replicas + '</div><div class="cid-actions"><button class="btn-text" onclick="loadManifest(\'' + escapeJs(cid) + '\', this.parentElement)">LOAD MANIFEST</button></div></div>';
+                    return '<div class="cid-row" data-cid="' + escapeHtml(cid) + '"><div class="cid-value" onclick="copyCID(\'' + escapeJs(cid) + '\')" title="Click to copy">' + escapeHtml(cid) + '</div><div class="cid-meta">Shard: ' + escapeHtml(shard) + ' | Replicas: ' + replicas + '</div><div class="cid-actions"><button class="btn-text" onclick="loadManifest(\'' + escapeJs(cid) + '\', this.parentElement)">LOAD MANIFEST</button></div></div>';
                 }).join('');
             }).catch(() => { document.getElementById('node-files-modal-list').innerHTML = '<p style="color:#999;">Failed to load node files.</p>'; });
         }
@@ -311,7 +325,7 @@
                 const cids = data.cids || [];
                 list.innerHTML = cids.length === 0 ? '<p style="color:#666;">No files at this replication level.</p>' : cids.map((entry, i) => {
                     const cid = entry.cid || entry.CID || entry; const shard = (entry.shard || entry.Shard || '') === '' ? 'root' : (entry.shard || entry.Shard); const replicas = entry.replicas ?? entry.Replicas ?? 0;
-                    return '<div class="cid-row" data-cid="' + escapeHtml(cid) + '"><div class="cid-value">' + escapeHtml(cid) + '</div><div class="cid-meta">Shard: ' + escapeHtml(shard) + ' | Replicas: ' + replicas + '</div><div class="cid-actions"><button class="btn-text" onclick="loadManifest(\'' + escapeJs(cid) + '\', this.parentElement)">LOAD MANIFEST</button></div></div>';
+                    return '<div class="cid-row" data-cid="' + escapeHtml(cid) + '"><div class="cid-value" onclick="copyCID(\'' + escapeJs(cid) + '\')" title="Click to copy">' + escapeHtml(cid) + '</div><div class="cid-meta">Shard: ' + escapeHtml(shard) + ' | Replicas: ' + replicas + '</div><div class="cid-actions"><button class="btn-text" onclick="loadManifest(\'' + escapeJs(cid) + '\', this.parentElement)">LOAD MANIFEST</button></div></div>';
                 }).join('');
             }).catch(() => { document.getElementById('replication-modal-list').innerHTML = '<p style="color:#999;">Failed to load CIDs.</p>'; });
         }
@@ -398,6 +412,7 @@
                 alert('Failed to load manifest');
             });
         }
+        document.getElementById('cids-export-btn').onclick = exportPayloadCIDs;
         document.getElementById('unique-cids-card').onclick = showCidsModal;
         document.getElementById('total-nodes-card').onclick = function() { document.getElementById('network-nodes-section').scrollIntoView({ behavior: 'smooth' }); };
         document.getElementById('total-shards-card').onclick = function() { document.getElementById('shard-topology-section').scrollIntoView({ behavior: 'smooth' }); };

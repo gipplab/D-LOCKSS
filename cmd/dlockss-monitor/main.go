@@ -44,6 +44,10 @@ func main() {
 		cfg.PubsubTopicPrefix = v
 		slog.Info("pubsub topic prefix from env", "prefix", cfg.PubsubTopicPrefix)
 	}
+	if v := os.Getenv("DLOCKSS_TOPIC_NAME"); v != "" {
+		cfg.TopicName = v
+		slog.Info("topic name from env", "topic", cfg.TopicName)
+	}
 
 	geoDBPath := *geoipDB
 	if geoDBPath == "" {

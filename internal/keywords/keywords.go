@@ -827,6 +827,20 @@ func (s *Store) GetRecentSearches() []RecentSearch {
 	return result
 }
 
+// PayloadCIDs returns all known payload CIDs from the keyword index.
+func (s *Store) PayloadCIDs() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]string, 0, len(s.cidKeywords))
+	for _, entry := range s.cidKeywords {
+		if entry.PayloadCID != "" {
+			out = append(out, entry.PayloadCID)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // GetStats returns keyword extraction progress statistics.
 func (s *Store) GetStats(totalUniqueCIDs int) Stats {
 	s.mu.RLock()
