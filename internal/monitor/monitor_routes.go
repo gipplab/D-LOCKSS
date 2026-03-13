@@ -132,14 +132,12 @@ func (m *Monitor) handleNodes(w http.ResponseWriter, r *http.Request) {
 			strings.Contains(strings.ToLower(node.NodeName), query)
 	})
 	response := m.buildNodeResponse(snapshot)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	writeJSON(w, response)
 }
 
 func (m *Monitor) handleShardTree(w http.ResponseWriter, r *http.Request) {
 	tree := m.GetShardTree()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(tree)
+	writeJSON(w, tree)
 }
 
 func (m *Monitor) handleShardNodes(w http.ResponseWriter, r *http.Request) {
@@ -148,16 +146,10 @@ func (m *Monitor) handleShardNodes(w http.ResponseWriter, r *http.Request) {
 		return shard == shardFilter
 	})
 	response := m.buildNodeResponse(snapshot)
-	shardLabel := shardFilter
-	if shardLabel == "" {
-		shardLabel = "root"
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"shard_id": shardFilter, "shard_label": shardLabel, "nodes": response, "count": len(response)})
+	writeJSON(w, map[string]interface{}{"shard_id": shardFilter, "shard_label": shardLabel(shardFilter), "nodes": response, "count": len(response)})
 }
 
 func (m *Monitor) handleRootTopic(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
 	if r.Method == http.MethodPost {
 		var body struct {
 			TopicPrefix string `json:"topic_prefix,omitempty"`
@@ -183,7 +175,7 @@ func (m *Monitor) writeRootTopicResponse(w http.ResponseWriter) {
 	prefix := m.getTopicPrefix()
 	topic := m.getTopicName()
 	rootTopic := fmt.Sprintf("%s-%s-shard-", prefix, topic)
-	json.NewEncoder(w).Encode(map[string]string{
+	writeJSON(w, map[string]string{
 		"root_topic":   rootTopic,
 		"topic_prefix": prefix,
 		"topic_name":   topic,
@@ -204,16 +196,14 @@ func (m *Monitor) handleNodeFiles(w http.ResponseWriter, r *http.Request) {
 		entries = []CIDEntry{}
 	}
 	m.mu.RUnlock()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"peer_id": peerID, "cids": entries, "count": len(entries)})
+	writeJSON(w, map[string]interface{}{"peer_id": peerID, "cids": entries, "count": len(entries)})
 }
 
 func (m *Monitor) handleUniqueCIDs(w http.ResponseWriter, r *http.Request) {
 	m.mu.RLock()
 	entries := m.buildCIDEntriesUnlocked(m.uniqueCIDs)
 	m.mu.RUnlock()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"cids": entries, "count": len(entries)})
+	writeJSON(w, map[string]interface{}{"cids": entries, "count": len(entries)})
 }
 
 func (m *Monitor) handleReplication(w http.ResponseWriter, r *http.Request) {
@@ -223,9 +213,8 @@ func (m *Monitor) handleReplication(w http.ResponseWriter, r *http.Request) {
 	}
 	dist, avg, atTarget := m.getReplicationStats()
 	byShard := m.getReplicationByShard()
-	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, map[string]interface{}{
 		"replication_distribution":  dist,
 		"avg_replication_level":     avg,
 		"files_at_target":           atTarget,
@@ -246,8 +235,7 @@ func (m *Monitor) handleReplicationCIDs(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	entries := m.getReplicationCIDsByLevel(level)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"level": level, "cids": entries, "count": len(entries)})
+	writeJSON(w, map[string]interface{}{"level": level, "cids": entries, "count": len(entries)})
 }
 
 func (m *Monitor) handleManifestPayload(w http.ResponseWriter, r *http.Request) {
@@ -284,17 +272,16 @@ func (m *Monitor) handleManifestPayload(w http.ResponseWriter, r *http.Request) 
 		"size":        ro.TotalSize,
 		"sig":         base64.StdEncoding.EncodeToString(ro.Signature),
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"payload_cid": ro.Payload.String(), "manifest": manifest})
+	writeJSON(w, map[string]interface{}{"payload_cid": ro.Payload.String(), "manifest": manifest})
 }
 
 func (m *Monitor) handleIdentify(w http.ResponseWriter, r *http.Request) {
-	peerStr := strings.TrimSpace(r.URL.Query().Get("peer"))
-	if peerStr == "" {
+	peerIDStr := strings.TrimSpace(r.URL.Query().Get("peer"))
+	if peerIDStr == "" {
 		writeJSONError(w, "missing peer parameter", http.StatusBadRequest)
 		return
 	}
-	pid, err := peer.Decode(peerStr)
+	pid, err := peer.Decode(peerIDStr)
 	if err != nil {
 		writeJSONError(w, "invalid peer ID", http.StatusBadRequest)
 		return
@@ -335,8 +322,7 @@ func (m *Monitor) handleIdentify(w http.ResponseWriter, r *http.Request) {
 		"connected":        connected,
 		"region":           region,
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	writeJSON(w, result)
 }
 
 func (m *Monitor) handleDashboard(w http.ResponseWriter, r *http.Request) {
@@ -376,7 +362,7 @@ func (m *Monitor) RunStatusLogger(ctx context.Context) {
 			sort.Strings(shardIDs)
 			parts := make([]string, 0, len(shardIDs))
 			for _, sid := range shardIDs {
-				parts = append(parts, fmt.Sprintf("%s: %d", shardLogLabel(sid), shardCounts[sid]))
+				parts = append(parts, fmt.Sprintf("%s: %d", shardLabel(sid), shardCounts[sid]))
 			}
 			slog.Info("status", "nodes", nodeCount, "shards", len(shardCounts), "pinned", totalPinned, "detail", strings.Join(parts, ", "))
 		}

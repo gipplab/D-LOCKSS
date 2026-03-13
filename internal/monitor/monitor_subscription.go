@@ -96,7 +96,7 @@ func (m *Monitor) ensureShardSubscriptionUnlocked(ctx context.Context, shardID s
 		_ = topic.Publish(ctx, probeMsg)
 	}
 	go m.handleShardMessages(m.subCtx, sub, shardID, topicName)
-	slog.Info("subscribed to shard topic", "shard", shardLogLabel(shardID))
+	slog.Info("subscribed to shard topic", "shard", shardLabel(shardID))
 }
 
 // resolveIPFromPeer extracts the best public IP address for the given peer
@@ -169,7 +169,7 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 			if peerStr := strings.TrimSpace(string(data[6:])); peerStr != "" {
 				if leaveID, err := decodePeerIDWithFallback(peerStr); err == nil {
 					m.handleLeaveShard(ctx, leaveID, shardID)
-					slog.Info("shard leave", "peer", leaveID.String(), "shard", shardLogLabel(shardID))
+					slog.Info("shard leave", "peer", leaveID.String(), "shard", shardLabel(shardID))
 				}
 			}
 
@@ -263,7 +263,7 @@ func (m *Monitor) dispatchJoin(ctx context.Context, data []byte, senderID peer.I
 		if nodeName != "" {
 			logLabel = nodeName + " (" + joinID.String() + ")"
 		}
-		slog.Info("shard join", "peer", logLabel, "shard", shardLogLabel(shardID), "role", role)
+		slog.Info("shard join", "peer", logLabel, "shard", shardLabel(shardID), "role", role)
 	}
 }
 

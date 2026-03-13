@@ -56,7 +56,7 @@
         .cid-row .cid-meta { color: #666; font-size: 0.9em; white-space: nowrap; }
         .copy-toast { position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%); background: #333; color: #fff; padding: 8px 20px; font-size: 0.85em; z-index: 2000; opacity: 0; transition: opacity 0.3s; pointer-events: none; }
         .cid-row .cid-actions { display: flex; gap: 6px; flex-shrink: 0; }
-        .cid-payload { margin-top: 4px; font-size: 0.8em; color: #06A77D; }
+
         .load-spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #ccc; border-top-color: #06A77D; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; }
         @keyframes spin { to { transform: rotate(360deg); } }
     </style>
@@ -264,15 +264,29 @@
         function copyCID(text) {
             navigator.clipboard.writeText(text).then(showCopyToast).catch(function() {});
         }
+        function normalizeCidEntry(entry) {
+            var cid = entry.cid || entry.CID || entry;
+            var raw = entry.shard || entry.Shard || '';
+            return { cid: cid, shard: raw === '' ? 'root' : raw, replicas: entry.replicas ?? entry.Replicas ?? 0 };
+        }
+        function renderCidRow(entry) {
+            var e = normalizeCidEntry(entry);
+            return '<div class="cid-row" data-cid="' + escapeHtml(e.cid) + '"><div class="cid-value" onclick="copyCID(\'' + escapeJs(e.cid) + '\')" title="Click to copy">' + escapeHtml(e.cid) + '</div><div class="cid-meta">Shard: ' + escapeHtml(e.shard) + ' | Replicas: ' + e.replicas + '</div><div class="cid-actions"><button class="btn-text" onclick="loadManifest(\'' + escapeJs(e.cid) + '\', this.parentElement)">LOAD MANIFEST</button></div></div>';
+        }
+        function setupModalFilter(inputId, listId, rowSelector, attrFn) {
+            document.getElementById(inputId).oninput = function() {
+                var q = this.value.toLowerCase();
+                document.querySelectorAll('#' + listId + ' ' + rowSelector).forEach(function(row) {
+                    row.style.display = (!q || attrFn(row).toLowerCase().includes(q)) ? '' : 'none';
+                });
+            };
+        }
         function showCidsModal() {
             document.getElementById('cids-modal').style.display = 'flex';
             fetch('/api/unique-cids?t=' + Date.now()).then(r=>r.json()).then(data => {
                 const list = document.getElementById('cids-modal-list');
                 const cids = data.cids || [];
-                list.innerHTML = cids.length === 0 ? '<p style="color:#666;">No CIDs yet. CIDs appear when nodes announce pinned files.</p>' : cids.map((entry, i) => {
-                    const cid = entry.cid || entry.CID || entry; const shard = (entry.shard || entry.Shard || '') === '' ? 'root' : (entry.shard || entry.Shard); const replicas = entry.replicas ?? entry.Replicas ?? 0;
-                    return '<div class="cid-row" data-cid="' + escapeHtml(cid) + '"><div class="cid-value" onclick="copyCID(\'' + escapeJs(cid) + '\')" title="Click to copy">' + escapeHtml(cid) + '</div><div class="cid-meta">Shard: ' + escapeHtml(shard) + ' | Replicas: ' + replicas + '</div><div class="cid-actions"><button class="btn-text" onclick="loadManifest(\'' + escapeJs(cid) + '\', this.parentElement)">LOAD MANIFEST</button></div></div>';
-                }).join('');
+                list.innerHTML = cids.length === 0 ? '<p style="color:#666;">No CIDs yet. CIDs appear when nodes announce pinned files.</p>' : cids.map(renderCidRow).join('');
             }).catch(() => { document.getElementById('cids-modal-list').innerHTML = '<p style="color:#999;">Failed to load CIDs.</p>'; });
         }
         function hideCidsModal() { document.getElementById('cids-modal').style.display = 'none'; }
@@ -288,10 +302,7 @@
             fetch('/api/node-files?peer=' + encodeURIComponent(peerId) + '&t=' + Date.now()).then(r=>r.json()).then(data => {
                 const list = document.getElementById('node-files-modal-list');
                 const cids = data.cids || [];
-                list.innerHTML = cids.length === 0 ? '<p style="color:#666;">No pinned files for this node.</p>' : cids.map((entry, i) => {
-                    const cid = entry.cid || entry.CID || entry; const shard = (entry.shard || entry.Shard || '') === '' ? 'root' : (entry.shard || entry.Shard); const replicas = entry.replicas ?? entry.Replicas ?? 0;
-                    return '<div class="cid-row" data-cid="' + escapeHtml(cid) + '"><div class="cid-value" onclick="copyCID(\'' + escapeJs(cid) + '\')" title="Click to copy">' + escapeHtml(cid) + '</div><div class="cid-meta">Shard: ' + escapeHtml(shard) + ' | Replicas: ' + replicas + '</div><div class="cid-actions"><button class="btn-text" onclick="loadManifest(\'' + escapeJs(cid) + '\', this.parentElement)">LOAD MANIFEST</button></div></div>';
-                }).join('');
+                list.innerHTML = cids.length === 0 ? '<p style="color:#666;">No pinned files for this node.</p>' : cids.map(renderCidRow).join('');
             }).catch(() => { document.getElementById('node-files-modal-list').innerHTML = '<p style="color:#999;">Failed to load node files.</p>'; });
         }
         function hideNodeFilesModal() { document.getElementById('node-files-modal').style.display = 'none'; }
@@ -303,10 +314,7 @@
             fetch('/api/replication-cids?level=' + level + '&t=' + Date.now()).then(r=>r.json()).then(data => {
                 const list = document.getElementById('replication-modal-list');
                 const cids = data.cids || [];
-                list.innerHTML = cids.length === 0 ? '<p style="color:#666;">No files at this replication level.</p>' : cids.map((entry, i) => {
-                    const cid = entry.cid || entry.CID || entry; const shard = (entry.shard || entry.Shard || '') === '' ? 'root' : (entry.shard || entry.Shard); const replicas = entry.replicas ?? entry.Replicas ?? 0;
-                    return '<div class="cid-row" data-cid="' + escapeHtml(cid) + '"><div class="cid-value" onclick="copyCID(\'' + escapeJs(cid) + '\')" title="Click to copy">' + escapeHtml(cid) + '</div><div class="cid-meta">Shard: ' + escapeHtml(shard) + ' | Replicas: ' + replicas + '</div><div class="cid-actions"><button class="btn-text" onclick="loadManifest(\'' + escapeJs(cid) + '\', this.parentElement)">LOAD MANIFEST</button></div></div>';
-                }).join('');
+                list.innerHTML = cids.length === 0 ? '<p style="color:#666;">No files at this replication level.</p>' : cids.map(renderCidRow).join('');
             }).catch(() => { document.getElementById('replication-modal-list').innerHTML = '<p style="color:#999;">Failed to load CIDs.</p>'; });
         }
         function hideReplicationModal() { document.getElementById('replication-modal').style.display = 'none'; }
@@ -398,39 +406,18 @@
         document.getElementById('total-shards-card').onclick = function() { document.getElementById('shard-topology-section').scrollIntoView({ behavior: 'smooth' }); };
         document.getElementById('cids-modal-close').onclick = hideCidsModal;
         document.getElementById('cids-modal').onclick = function(e) { if (e.target === this) hideCidsModal(); };
-        document.getElementById('cids-modal-search').oninput = function() {
-            const q = this.value.toLowerCase();
-            document.querySelectorAll('#cids-modal-list .cid-row').forEach(row => {
-                row.style.display = (!q || row.dataset.cid.toLowerCase().includes(q)) ? '' : 'none';
-            });
-        };
+        setupModalFilter('cids-modal-search', 'cids-modal-list', '.cid-row', function(r) { return r.dataset.cid || ''; });
         document.getElementById('node-files-modal-close').onclick = hideNodeFilesModal;
         document.getElementById('node-files-modal').onclick = function(e) { if (e.target === this) hideNodeFilesModal(); };
-        document.getElementById('node-files-modal-search').oninput = function() {
-            const q = this.value.toLowerCase();
-            document.querySelectorAll('#node-files-modal-list .cid-row').forEach(row => {
-                row.style.display = (!q || row.dataset.cid.toLowerCase().includes(q)) ? '' : 'none';
-            });
-        };
+        setupModalFilter('node-files-modal-search', 'node-files-modal-list', '.cid-row', function(r) { return r.dataset.cid || ''; });
         document.getElementById('replication-modal-close').onclick = hideReplicationModal;
         document.getElementById('replication-modal').onclick = function(e) { if (e.target === this) hideReplicationModal(); };
-        document.getElementById('replication-modal-search').oninput = function() {
-            const q = this.value.toLowerCase();
-            document.querySelectorAll('#replication-modal-list .cid-row').forEach(row => {
-                row.style.display = (!q || row.dataset.cid.toLowerCase().includes(q)) ? '' : 'none';
-            });
-        };
+        setupModalFilter('replication-modal-search', 'replication-modal-list', '.cid-row', function(r) { return r.dataset.cid || ''; });
         document.getElementById('shard-nodes-modal-close').onclick = hideShardNodesModal;
         document.getElementById('shard-nodes-modal').onclick = function(e) { if (e.target === this) hideShardNodesModal(); };
         document.getElementById('identify-modal-close').onclick = hideIdentifyModal;
         document.getElementById('identify-modal').onclick = function(e) { if (e.target === this) hideIdentifyModal(); };
-        document.getElementById('shard-nodes-modal-search').oninput = function() {
-            const q = this.value.toLowerCase();
-            document.querySelectorAll('#shard-nodes-modal-list .node-row').forEach(row => {
-                const search = (row.dataset.search || row.dataset.peerId || '').toLowerCase();
-                row.style.display = (!q || search.includes(q)) ? '' : 'none';
-            });
-        };
+        setupModalFilter('shard-nodes-modal-search', 'shard-nodes-modal-list', '.node-row', function(r) { return r.dataset.search || r.dataset.peerId || ''; });
         initCharts(); updateDashboard(); updateShardTree(); loadRootTopic();
         setInterval(() => { if(!document.getElementById('nodeSearch').value && currentlyEditingPeerID === null) { updateDashboard(); updateShardTree(); } }, 5000);
     </script>

@@ -134,8 +134,6 @@ func (mr manifestResult) isAtTarget() bool {
 	return mr.count >= minRep && mr.count <= mr.maxRep
 }
 
-// --- Public methods using the shared helpers ---
-
 func (m *Monitor) runReplicationCleanup() {
 	ticker := time.NewTicker(ReplicationCleanupEvery)
 	defer ticker.Stop()
@@ -147,15 +145,15 @@ func (m *Monitor) runReplicationCleanup() {
 		}
 		m.mu.Lock()
 		cutoff := time.Now().Add(-ReplicationAnnounceTTL)
-		for manifest, peers := range m.manifestReplication {
+		for cid, peers := range m.manifestReplication {
 			for peerID, lastSeen := range peers {
 				if lastSeen.Before(cutoff) {
 					delete(peers, peerID)
 				}
 			}
 			if len(peers) == 0 {
-				delete(m.manifestReplication, manifest)
-				delete(m.manifestShard, manifest)
+				delete(m.manifestReplication, cid)
+				delete(m.manifestShard, cid)
 			}
 		}
 		m.mu.Unlock()
@@ -178,11 +176,7 @@ func (m *Monitor) runReplicationCleanup() {
 		for _, shard := range shardLabels {
 			peers := membership[shard]
 			atTarget := byShard[shard]
-			shardLabel := shard
-			if shardLabel == "" {
-				shardLabel = "(root)"
-			}
-			fmt.Fprintf(&b, " %s: %d nodes [%s] %d files at target;", shardLabel, len(peers), strings.Join(peers, ","), atTarget)
+			fmt.Fprintf(&b, " %s: %d nodes [%s] %d files at target;", shardLabel(shard), len(peers), strings.Join(peers, ","), atTarget)
 		}
 		slog.Info("replication snapshot", "total_nodes", totalNodes, "total_manifests", totalFiles, "total_at_target", filesAtTarget, "avg_replication", fmt.Sprintf("%.2f", avgLevel), "shards", strings.TrimSpace(b.String()))
 		if filesAtTarget == 0 && totalFiles > 0 && totalNodes > 0 {
@@ -277,12 +271,12 @@ func (m *Monitor) getReplicationStats() (distribution [11]int, avgLevel float64,
 	rs := m.newReplicationSnapshotUnlocked()
 	var totalReplication, manifestCount int
 
-	for manifest, peers := range m.manifestReplication {
+	for cid, peers := range m.manifestReplication {
 		if len(peers) == 0 {
 			continue
 		}
 		shardCounts := rs.buildShardCounts(peers)
-		mr := rs.resolveManifest(manifest, peers, shardCounts)
+		mr := rs.resolveManifest(cid, peers, shardCounts)
 		if mr.count == 0 {
 			continue
 		}
@@ -313,22 +307,18 @@ func (m *Monitor) getReplicationCIDsByLevel(level int) []CIDEntry {
 	rs := m.newReplicationSnapshotUnlocked()
 	var result []CIDEntry
 
-	for manifest, peers := range m.manifestReplication {
+	for cid, peers := range m.manifestReplication {
 		if len(peers) == 0 {
 			continue
 		}
 		shardCounts := rs.buildShardCounts(peers)
-		mr := rs.resolveManifest(manifest, peers, shardCounts)
+		mr := rs.resolveManifest(cid, peers, shardCounts)
 		if mr.count == 0 {
 			continue
 		}
 		matches := (level == 10 && mr.count >= 10) || (level < 10 && mr.count == level)
 		if matches {
-			shardLabel := m.manifestShard[manifest]
-			if shardLabel == "" {
-				shardLabel = "root"
-			}
-			result = append(result, CIDEntry{CID: manifest, Shard: shardLabel, Replicas: mr.count})
+			result = append(result, CIDEntry{CID: cid, Shard: shardLabel(m.manifestShard[cid]), Replicas: mr.count})
 		}
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].CID < result[j].CID })
@@ -347,19 +337,19 @@ func (m *Monitor) getReplicationByShard() map[string]int {
 		peers       map[string]time.Time
 	}
 	manifests := make(map[string]manifestInfo, len(m.manifestReplication))
-	for manifest, peers := range m.manifestReplication {
+	for cid, peers := range m.manifestReplication {
 		if len(peers) == 0 {
 			continue
 		}
-		manifests[manifest] = manifestInfo{
+		manifests[cid] = manifestInfo{
 			shardCounts: rs.buildShardCounts(peers),
 			peers:       peers,
 		}
 	}
 
 	filesAtTargetPerShard := make(map[string]int)
-	for manifest, info := range manifests {
-		mr := rs.resolveManifest(manifest, info.peers, info.shardCounts)
+	for cid, info := range manifests {
+		mr := rs.resolveManifest(cid, info.peers, info.shardCounts)
 		if mr.count == 0 || mr.maxRep == 0 {
 			continue
 		}

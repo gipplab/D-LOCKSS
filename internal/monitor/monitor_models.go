@@ -143,7 +143,7 @@ func (n *NodeState) EffectiveShard() string {
 	return ""
 }
 
-func shardLogLabel(shardID string) string {
+func shardLabel(shardID string) string {
 	if shardID == "" {
 		return "root"
 	}

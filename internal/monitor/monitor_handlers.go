@@ -14,7 +14,11 @@ import (
 	"dlockss/pkg/schema"
 )
 
-// writeJSONError writes a JSON {"error":"..."} response with the given status code.
+func writeJSON(w http.ResponseWriter, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(v)
+}
+
 func writeJSONError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -127,7 +131,7 @@ func (m *Monitor) handleHeartbeatWithRole(ctx context.Context, senderID peer.ID,
 		if nodeName != "" {
 			logName = nodeName + " (" + peerIDStr + ")"
 		}
-		slog.Info("new node discovered via heartbeat", "peer", logName, "shard", shardLogLabel(shardID), "pinned", pinnedCount, "role", role)
+		slog.Info("new node discovered via heartbeat", "peer", logName, "shard", shardLabel(shardID), "pinned", pinnedCount, "role", role)
 		nodeState = &NodeState{
 			PeerID:         peerIDStr,
 			NodeName:       nodeName,
@@ -158,9 +162,7 @@ func (m *Monitor) handleHeartbeatWithRole(ctx context.Context, senderID peer.ID,
 			}
 			// Ignore pinned=0 during grace period: stale heartbeats can arrive
 			// before the node finishes its first pin cycle.
-			if now.Sub(firstSeen) < unpinGracePeriod {
-				// nop
-			} else {
+			if now.Sub(firstSeen) >= unpinGracePeriod {
 				removedFromManifests := 0
 				for manifest, peers := range m.manifestReplication {
 					if _, had := peers[peerIDStr]; had {
@@ -172,7 +174,7 @@ func (m *Monitor) handleHeartbeatWithRole(ctx context.Context, senderID peer.ID,
 					}
 				}
 				if removedFromManifests > 0 {
-					slog.Info("unpin all", "peer", peerIDStr, "shard", shardLogLabel(shardID), "removed_manifests", removedFromManifests)
+					slog.Info("unpin all", "peer", peerIDStr, "shard", shardLabel(shardID), "removed_manifests", removedFromManifests)
 				}
 			}
 		} else {
@@ -246,12 +248,12 @@ func (m *Monitor) updateNodeShardLocked(node *NodeState, newShard string, timest
 	}
 
 	m.treeDirty = true
-	slog.Info("shard move", "peer", node.PeerID, "from", shardLogLabel(lastShard), "to", shardLogLabel(newShard))
+	slog.Info("shard move", "peer", node.PeerID, "from", shardLabel(lastShard), "to", shardLabel(newShard))
 
 	isSplit := len(newShard) > len(lastShard) && strings.HasPrefix(newShard, lastShard)
 	if isSplit {
 		if !m.hasSplitEvent(lastShard, newShard) {
-			slog.Info("detected shard split", "parent", shardLogLabel(lastShard), "child", newShard, "peer", node.PeerID)
+			slog.Info("detected shard split", "parent", shardLabel(lastShard), "child", newShard, "peer", node.PeerID)
 		}
 		m.lastSplitTime = timestamp
 		m.splitEvents = append(m.splitEvents, ShardSplitEvent{
@@ -298,7 +300,7 @@ func (m *Monitor) updateNodeShardLocked(node *NodeState, newShard string, timest
 		}
 	}
 	if removed > 0 {
-		slog.Info("shard move removed peer from manifests", "peer", peerIDStr, "removed_manifests", removed, "shard", shardLogLabel(newShard))
+		slog.Info("shard move removed peer from manifests", "peer", peerIDStr, "removed_manifests", removed, "shard", shardLabel(newShard))
 	}
 	if isSiblingShard(lastShard, newShard) {
 		m.peerLastSiblingMove[peerIDStr] = siblingMoveRecord{from: lastShard, to: newShard, when: timestamp}
