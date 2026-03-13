@@ -99,7 +99,7 @@ services:
       # DLOCKSS_NODE_NAME: my-node               # human-readable name shown in the monitor;
       #                                          # if empty the peer ID is displayed instead
     volumes:
-      - dlockss-data:/data                       # persistent D-LOCKSS data (identity, cluster state, ingested files)
+      - ./dlockss-files:/data                    # persistent D-LOCKSS data (identity, cluster state, ingested files)
       - ipfs-data:/ipfs-repo:ro                  # read-only access to Kubo config for identity
     depends_on:
       - ipfs
@@ -138,7 +138,6 @@ services:
 volumes:
   ipfs-staging:  # IPFS staging area on /export
   ipfs-data:     # IPFS repo on /data/ipfs (shared read-only with D-LOCKSS for identity)
-  dlockss-data:  # persistent D-LOCKSS data (identity key, cluster state, ingested files)
 ```
 
 See [docs/DLOCKSS_PROTOCOL.md](docs/DLOCKSS_PROTOCOL.md) for protocol details.

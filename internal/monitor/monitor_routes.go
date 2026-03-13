@@ -29,6 +29,7 @@ func (m *Monitor) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/root-topic", m.handleRootTopic)
 	mux.HandleFunc("/api/node-files", m.handleNodeFiles)
 	mux.HandleFunc("/api/unique-cids", m.handleUniqueCIDs)
+	mux.HandleFunc("/api/payload-cids-export", m.handlePayloadCIDsExport)
 	mux.HandleFunc("/api/replication", m.handleReplication)
 	mux.HandleFunc("/api/replication-cids", m.handleReplicationCIDs)
 	mux.HandleFunc("/api/manifest-payload", m.handleManifestPayload)
@@ -172,11 +173,11 @@ func (m *Monitor) handleRootTopic(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		m.SwitchTopicPrefix(r.Context(), body.TopicPrefix)
-		rootTopic := fmt.Sprintf("%s-creative-commons-shard-", m.getTopicPrefix())
+		rootTopic := fmt.Sprintf("%s-%s-shard-", m.getTopicPrefix(), m.cfg.TopicName)
 		json.NewEncoder(w).Encode(map[string]string{"root_topic": rootTopic, "topic_prefix": m.getTopicPrefix()})
 		return
 	}
-	rootTopic := fmt.Sprintf("%s-creative-commons-shard-", m.getTopicPrefix())
+	rootTopic := fmt.Sprintf("%s-%s-shard-", m.getTopicPrefix(), m.cfg.TopicName)
 	json.NewEncoder(w).Encode(map[string]string{"root_topic": rootTopic, "topic_prefix": m.getTopicPrefix()})
 }
 
@@ -204,6 +205,16 @@ func (m *Monitor) handleUniqueCIDs(w http.ResponseWriter, r *http.Request) {
 	m.mu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"cids": entries, "count": len(entries)})
+}
+
+func (m *Monitor) handlePayloadCIDsExport(w http.ResponseWriter, r *http.Request) {
+	cids := m.keywords.PayloadCIDs()
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Disposition", "attachment; filename=\"payload_cids.txt\"")
+	for _, c := range cids {
+		w.Write([]byte(c))
+		w.Write([]byte("\n"))
+	}
 }
 
 func (m *Monitor) handleReplication(w http.ResponseWriter, r *http.Request) {

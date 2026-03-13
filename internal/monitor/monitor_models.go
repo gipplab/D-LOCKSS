@@ -39,15 +39,19 @@ type MonitorConfig struct {
 	NodeCleanupTimeout  time.Duration
 	BootstrapShardDepth int
 	PubsubTopicPrefix   string
+	TopicName           string
 }
 
 const DefaultPubsubTopicPrefix = "dlockss-v0.0.3"
+
+const DefaultTopicName = "creative-commons"
 
 func DefaultMonitorConfig() MonitorConfig {
 	return MonitorConfig{
 		NodeCleanupTimeout:  DefaultNodeCleanupTimeout,
 		BootstrapShardDepth: DefaultBootstrapShardDepth,
 		PubsubTopicPrefix:   DefaultPubsubTopicPrefix,
+		TopicName:           DefaultTopicName,
 	}
 }
 
@@ -62,7 +66,7 @@ type NodeState struct {
 	PeerID         string              `json:"peer_id"`
 	NodeName       string              `json:"node_name,omitempty"`
 	CurrentShard   string              `json:"current_shard"`
-	Role           string              `json:"role,omitempty"` // ACTIVE, PASSIVE, or PROBE (empty = ACTIVE)
+	Role           string              `json:"role,omitempty"` // ACTIVE, PASSIVE, REPLICATOR, or PROBE (empty = ACTIVE)
 	PinnedFiles    int                 `json:"pinned_files"`
 	KnownFiles     int                 `json:"known_files"`
 	LastSeen       time.Time           `json:"last_seen"`

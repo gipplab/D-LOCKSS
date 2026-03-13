@@ -73,7 +73,7 @@ func (m *Monitor) ensureShardSubscriptionUnlocked(ctx context.Context, shardID s
 	if _, exists := m.shardTopics[shardID]; exists {
 		return
 	}
-	topicName := fmt.Sprintf("%s-creative-commons-shard-%s", m.getTopicPrefixUnlocked(), shardID)
+	topicName := fmt.Sprintf("%s-%s-shard-%s", m.getTopicPrefixUnlocked(), m.cfg.TopicName, shardID)
 	topic, err := m.ps.Join(topicName)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "context canceled") {
@@ -134,6 +134,8 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 						role = "PASSIVE"
 					case "PROBE":
 						role = "PROBE"
+					case "REPLICATOR":
+						role = "REPLICATOR"
 					}
 				}
 				nodeName := ""
@@ -189,8 +191,13 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 				parts := strings.SplitN(string(msg.Data[5:]), ":", 3)
 				peerIDStr := strings.TrimSpace(parts[0])
 				role := "ACTIVE"
-				if len(parts) >= 2 && strings.ToUpper(parts[1]) == "PASSIVE" {
-					role = "PASSIVE"
+				if len(parts) >= 2 {
+					switch strings.ToUpper(parts[1]) {
+					case "PASSIVE":
+						role = "PASSIVE"
+					case "REPLICATOR":
+						role = "REPLICATOR"
+					}
 				}
 				nodeName := ""
 				if len(parts) >= 3 {
