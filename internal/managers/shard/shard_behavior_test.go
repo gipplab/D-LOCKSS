@@ -13,7 +13,6 @@ import (
 
 	"dlockss/internal/config"
 	"dlockss/internal/managers/storage"
-	"dlockss/internal/telemetry"
 	"dlockss/internal/testutil"
 )
 
@@ -32,10 +31,9 @@ func newTestShardManager(t *testing.T, ctx context.Context, startShard string) *
 		t.Fatal(err)
 	}
 
-	metrics := telemetry.NewMetricsManager(config.DefaultConfig())
 	dht := &testutil.MockDHTProvider{}
 	cfg := config.DefaultConfig()
-	storageMgr := storage.NewStorageManager(cfg, dht, metrics, nil)
+	storageMgr := storage.NewStorageManager(cfg, dht, nil)
 	clusterMgr := &testutil.MockClusterManager{}
 
 	sm, err := NewShardManager(ShardManagerConfig{
@@ -45,7 +43,6 @@ func newTestShardManager(t *testing.T, ctx context.Context, startShard string) *
 		PubSub:     ps,
 		IPFSClient: &testutil.MockIPFSClient{},
 		Storage:    storageMgr,
-		Metrics:    metrics,
 		Cluster:    clusterMgr,
 		StartShard: startShard,
 	})
@@ -255,10 +252,9 @@ func TestMoveToShard_PublishesLeave(t *testing.T) {
 	}
 
 	// Set up ShardManager on h1 starting in shard "0"
-	metrics := telemetry.NewMetricsManager(config.DefaultConfig())
 	dht := &testutil.MockDHTProvider{}
 	cfg1 := config.DefaultConfig()
-	storageMgr := storage.NewStorageManager(cfg1, dht, metrics, nil)
+	storageMgr := storage.NewStorageManager(cfg1, dht, nil)
 	clusterMgr := &testutil.MockClusterManager{}
 	sm, err := NewShardManager(ShardManagerConfig{
 		Cfg:        cfg1,
@@ -267,7 +263,6 @@ func TestMoveToShard_PublishesLeave(t *testing.T) {
 		PubSub:     ps1,
 		IPFSClient: &testutil.MockIPFSClient{},
 		Storage:    storageMgr,
-		Metrics:    metrics,
 		Cluster:    clusterMgr,
 		StartShard: "0",
 	})
@@ -355,10 +350,9 @@ func TestProcessMessage_ProbeTriggersHeartbeat(t *testing.T) {
 	}
 
 	// Set up ShardManager on h1 in shard "0"
-	metrics := telemetry.NewMetricsManager(config.DefaultConfig())
 	dht := &testutil.MockDHTProvider{}
 	cfg2 := config.DefaultConfig()
-	storageMgr := storage.NewStorageManager(cfg2, dht, metrics, nil)
+	storageMgr := storage.NewStorageManager(cfg2, dht, nil)
 	clusterMgr := &testutil.MockClusterManager{}
 	sm, err := NewShardManager(ShardManagerConfig{
 		Cfg:        cfg2,
@@ -367,7 +361,6 @@ func TestProcessMessage_ProbeTriggersHeartbeat(t *testing.T) {
 		PubSub:     ps1,
 		IPFSClient: &testutil.MockIPFSClient{},
 		Storage:    storageMgr,
-		Metrics:    metrics,
 		Cluster:    clusterMgr,
 		StartShard: "0",
 	})

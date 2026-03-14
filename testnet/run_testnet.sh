@@ -199,7 +199,6 @@ if [ ! -f "$IPFS_REPO/config" ]; then
     DLOCKSS_IPFS_CONFIG="$IPFS_REPO_ABS/config" \
     DLOCKSS_NODE_NAME="testnet_$i" \
     DLOCKSS_TOPIC_NAME="cc" \
-    DLOCKSS_METRICS_EXPORT="metrics.csv" \
     DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/$IPFS_API_PORT" \
     DLOCKSS_API_PORT=$DLOCKSS_API_PORT \
     DLOCKSS_MAX_PEERS_PER_SHARD=12 \

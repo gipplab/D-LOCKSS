@@ -16,7 +16,6 @@ import (
 	"dlockss/internal/common"
 	"dlockss/internal/config"
 	"dlockss/internal/managers/clusters"
-	"dlockss/internal/telemetry"
 	"dlockss/pkg/ipfs"
 	"dlockss/pkg/schema"
 )
@@ -96,7 +95,6 @@ type ShardManager struct {
 	ipfsClient  ipfs.IPFSClient
 	storageMgr  StorageProvider
 	clusterMgr  clusters.ClusterManagerInterface
-	metrics     *telemetry.MetricsManager
 	signer      MessageAuthenticator
 	rateLimiter *common.RateLimiter
 	nodeName    string
@@ -151,7 +149,6 @@ type ShardManagerConfig struct {
 	PubSub      *pubsub.PubSub
 	IPFSClient  ipfs.IPFSClient
 	Storage     StorageProvider
-	Metrics     *telemetry.MetricsManager
 	Signer      MessageAuthenticator
 	RateLimiter *common.RateLimiter
 	Cluster     clusters.ClusterManagerInterface
@@ -177,7 +174,6 @@ func NewShardManager(cfg ShardManagerConfig) (*ShardManager, error) {
 		ipfsClient:                 cfg.IPFSClient,
 		storageMgr:                 cfg.Storage,
 		clusterMgr:                 cfg.Cluster,
-		metrics:                    cfg.Metrics,
 		signer:                     cfg.Signer,
 		rateLimiter:                cfg.RateLimiter,
 		nodeName:                   cfg.NodeName,
@@ -281,9 +277,7 @@ func (sm *ShardManager) localPeerID() peer.ID {
 	return sm.h.ID()
 }
 
-func (sm *ShardManager) incrementShardSplits() {
-	sm.metrics.IncrementShardSplits()
-}
+func (sm *ShardManager) incrementShardSplits() {}
 
 func (sm *ShardManager) pruneStaleSeenPeers() {
 	sm.peers.PruneStale(sm.cfg.PruneStalePeersInterval)

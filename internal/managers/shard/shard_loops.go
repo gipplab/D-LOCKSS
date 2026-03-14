@@ -346,7 +346,6 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 	}
 
 	if sm.rateLimiter != nil && !sm.rateLimiter.Check(msg.GetFrom()) {
-		sm.metrics.IncrementMessagesDropped()
 		return
 	}
 

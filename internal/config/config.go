@@ -123,10 +123,8 @@ type Config struct {
 	InitialBackoffDelay            time.Duration
 	MaxBackoffDelay                time.Duration
 	BackoffMultiplier              float64
-	MetricsReportInterval          time.Duration
 	ReplicationCheckCooldown       time.Duration
 	RemovedFileCooldown            time.Duration
-	MetricsExportPath              string
 	BadBitsPath                    string
 	ShardOverlapDuration           time.Duration
 	OrphanUnpinGracePeriod         time.Duration
@@ -159,8 +157,6 @@ type Config struct {
 	NonceSize                      int
 	MinNonceSize                   int
 	FutureSkewTolerance            time.Duration
-	TelemetryInterval              time.Duration
-	TelemetryIncludeCIDs           bool
 	HeartbeatInterval              time.Duration
 	VerboseLogging                 bool
 	MergeUpCooldown                time.Duration
@@ -202,10 +198,8 @@ func DefaultConfig() *Config {
 		InitialBackoffDelay:            5 * time.Second,
 		MaxBackoffDelay:                5 * time.Minute,
 		BackoffMultiplier:              2.0,
-		MetricsReportInterval:          5 * time.Second,
 		ReplicationCheckCooldown:       1 * time.Minute,
 		RemovedFileCooldown:            2 * time.Minute,
-		MetricsExportPath:              "",
 		BadBitsPath:                    "badBits.csv",
 		ShardOverlapDuration:           2 * time.Minute,
 		OrphanUnpinGracePeriod:         6 * time.Minute,
@@ -238,8 +232,6 @@ func DefaultConfig() *Config {
 		NonceSize:                      16,
 		MinNonceSize:                   8,
 		FutureSkewTolerance:            30 * time.Second,
-		TelemetryInterval:              30 * time.Second,
-		TelemetryIncludeCIDs:           false,
 		HeartbeatInterval:              10 * time.Second,
 		VerboseLogging:                 false,
 		MergeUpCooldown:                2 * time.Minute,
@@ -282,10 +274,8 @@ func LoadFromEnv() *Config {
 		InitialBackoffDelay:            getEnvDuration("DLOCKSS_INITIAL_BACKOFF", 5*time.Second),
 		MaxBackoffDelay:                getEnvDuration("DLOCKSS_MAX_BACKOFF", 5*time.Minute),
 		BackoffMultiplier:              getEnvFloat("DLOCKSS_BACKOFF_MULTIPLIER", 2.0),
-		MetricsReportInterval:          getEnvDuration("DLOCKSS_METRICS_INTERVAL", 5*time.Second),
 		ReplicationCheckCooldown:       getEnvDuration("DLOCKSS_REPLICATION_COOLDOWN", 1*time.Minute),
 		RemovedFileCooldown:            getEnvDuration("DLOCKSS_REMOVED_COOLDOWN", 2*time.Minute),
-		MetricsExportPath:              getEnvString("DLOCKSS_METRICS_EXPORT", ""),
 		BadBitsPath:                    getEnvString("DLOCKSS_BADBITS_PATH", "badBits.csv"),
 		ShardOverlapDuration:           getEnvDuration("DLOCKSS_SHARD_OVERLAP_DURATION", 2*time.Minute),
 		OrphanUnpinGracePeriod:         getEnvDuration("DLOCKSS_ORPHAN_UNPIN_GRACE", 6*time.Minute),
@@ -318,8 +308,6 @@ func LoadFromEnv() *Config {
 		NonceSize:                      getEnvInt("DLOCKSS_NONCE_SIZE", 16),
 		MinNonceSize:                   getEnvInt("DLOCKSS_MIN_NONCE_SIZE", 8),
 		FutureSkewTolerance:            getEnvDuration("DLOCKSS_FUTURE_SKEW_TOLERANCE", 30*time.Second),
-		TelemetryInterval:              getEnvDuration("DLOCKSS_TELEMETRY_INTERVAL", 30*time.Second),
-		TelemetryIncludeCIDs:           getEnvBool("DLOCKSS_TELEMETRY_INCLUDE_CIDS", false),
 		HeartbeatInterval:              getEnvDuration("DLOCKSS_HEARTBEAT_INTERVAL", 10*time.Second),
 		VerboseLogging:                 getEnvBool("DLOCKSS_VERBOSE_LOGGING", false),
 		MergeUpCooldown:                getEnvDuration("DLOCKSS_MERGE_UP_COOLDOWN", 2*time.Minute),
@@ -415,7 +403,6 @@ func (c *Config) Log() {
 		"identity", c.IdentityPath,
 		"badbits", c.BadBitsPath,
 		"trust_store", c.TrustStorePath,
-		"metrics_export", c.MetricsExportPath,
 	)
 	slog.Info("config: sharding",
 		"max_peers", c.MaxPeersPerShard,
@@ -476,10 +463,7 @@ func (c *Config) Log() {
 	if c.HeartbeatInterval > 0 {
 		heartbeat = c.HeartbeatInterval.String()
 	}
-	slog.Info("config: telemetry",
-		"metrics_interval", c.MetricsReportInterval,
-		"telemetry_interval", c.TelemetryInterval,
-		"include_cids", c.TelemetryIncludeCIDs,
+	slog.Info("config: heartbeat",
 		"heartbeat_interval", heartbeat,
 		"verbose", c.VerboseLogging,
 	)

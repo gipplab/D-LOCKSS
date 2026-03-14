@@ -11,7 +11,6 @@ import (
 	"dlockss/internal/common"
 	"dlockss/internal/config"
 	"dlockss/internal/managers/storage"
-	"dlockss/internal/telemetry"
 	"dlockss/internal/testutil"
 )
 
@@ -33,9 +32,8 @@ func TestSplitShard_NoDeadlock(t *testing.T) {
 	}
 
 	// Setup Dependencies
-	metrics := telemetry.NewMetricsManager(config.DefaultConfig())
 	dht := &testutil.MockDHTProvider{}
-	storageMgr := storage.NewStorageManager(config.DefaultConfig(), dht, metrics, nil)
+	storageMgr := storage.NewStorageManager(config.DefaultConfig(), dht, nil)
 	ipfsClient := &testutil.MockIPFSClient{}
 
 	clusterMgr := &testutil.MockClusterManager{}
@@ -46,15 +44,11 @@ func TestSplitShard_NoDeadlock(t *testing.T) {
 		PubSub:     ps,
 		IPFSClient: ipfsClient,
 		Storage:    storageMgr,
-		Metrics:    metrics,
 		Cluster:    clusterMgr,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// Register shard info with metrics to simulate production setup
-	metrics.RegisterProviders(sm, storageMgr, nil)
 
 	// Trigger splitShard
 	done := make(chan struct{})

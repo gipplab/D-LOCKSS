@@ -103,7 +103,6 @@ func (sm *ShardManager) handleIngestMessage(msg *pubsub.Message, im *schema.Inge
 		return
 	}
 	key := im.ManifestCID.String()
-	sm.metrics.IncrementMessagesReceived()
 
 	checkCtx, checkCancel := context.WithTimeout(sm.ctx, 5*time.Second)
 	legacy := common.IsLegacyManifest(checkCtx, sm.ipfsClient, key)

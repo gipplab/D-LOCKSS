@@ -10,7 +10,6 @@ import (
 	"dlockss/internal/badbits"
 	"dlockss/internal/common"
 	"dlockss/internal/config"
-	"dlockss/internal/telemetry"
 )
 
 // StorageManager handles local file state and DHT announcements.
@@ -24,7 +23,6 @@ type StorageManager struct {
 	recentlyRemoved       *common.RecentlyRemoved
 	fileReplicationLevels *common.FileReplicationLevels
 	failedOperations      *BackoffTable
-	metrics               *telemetry.MetricsManager
 	provideSem            chan struct{}
 
 	announceMu        sync.Mutex
@@ -34,7 +32,7 @@ type StorageManager struct {
 }
 
 // NewStorageManager creates a new StorageManager.
-func NewStorageManager(cfg *config.Config, dht common.DHTProvider, metrics *telemetry.MetricsManager, badBits *badbits.Filter) *StorageManager {
+func NewStorageManager(cfg *config.Config, dht common.DHTProvider, badBits *badbits.Filter) *StorageManager {
 	maxProvides := cfg.MaxConcurrentDHTProvides
 	if maxProvides < 1 {
 		maxProvides = 8
@@ -49,7 +47,6 @@ func NewStorageManager(cfg *config.Config, dht common.DHTProvider, metrics *tele
 		recentlyRemoved:       common.NewRecentlyRemoved(),
 		fileReplicationLevels: common.NewFileReplicationLevels(),
 		failedOperations:      newBackoffTable(cfg.InitialBackoffDelay, cfg.MaxBackoffDelay, cfg.BackoffMultiplier),
-		metrics:               metrics,
 		provideSem:            make(chan struct{}, maxProvides),
 	}
 }
@@ -114,9 +111,6 @@ func (sm *StorageManager) PinFile(manifestCIDStr string) bool {
 		sm.announceMu.Lock()
 		sm.announceKeysDirty = true
 		sm.announceMu.Unlock()
-		if sm.metrics != nil {
-			sm.metrics.SetPinnedFilesCount(sm.pinnedFiles.Size())
-		}
 		slog.Info("pinned manifest", "manifest", manifestCIDStr, "total", sm.pinnedFiles.Size())
 	} else {
 		slog.Debug("manifest already pinned, timestamp updated", "manifest", manifestCIDStr, "total", sm.pinnedFiles.Size())
@@ -132,9 +126,6 @@ func (sm *StorageManager) UnpinFile(key string) {
 		sm.announceMu.Lock()
 		sm.announceKeysDirty = true
 		sm.announceMu.Unlock()
-		if sm.metrics != nil {
-			sm.metrics.SetPinnedFilesCount(sm.pinnedFiles.Size())
-		}
 		slog.Info("unpinned file", "key", key, "pinned_for", time.Since(pinTime), "remaining", sm.pinnedFiles.Size())
 	} else {
 		slog.Warn("attempted to unpin file that was not pinned", "key", key)
@@ -153,11 +144,7 @@ func (sm *StorageManager) AddKnownFile(key string) {
 		return
 	}
 
-	if sm.knownFiles.Add(key) {
-		if sm.metrics != nil {
-			sm.metrics.SetKnownFilesCount(sm.knownFiles.Size())
-		}
-	}
+	sm.knownFiles.Add(key)
 
 	// Ensure we track replication level for new files, starting at 0 (or 1 if pinned)
 	if sm.pinnedFiles.Has(key) {
@@ -170,10 +157,6 @@ func (sm *StorageManager) AddKnownFile(key string) {
 // RemoveKnownFile removes a file/manifest from the known files set.
 func (sm *StorageManager) RemoveKnownFile(key string) {
 	sm.knownFiles.Remove(key)
-	if sm.metrics != nil {
-		sm.metrics.SetKnownFilesCount(sm.knownFiles.Size())
-	}
-
 	sm.fileReplicationLevels.Delete(key)
 
 	sm.recentlyRemoved.Record(key)

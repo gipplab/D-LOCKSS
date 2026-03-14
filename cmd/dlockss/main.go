@@ -22,7 +22,6 @@ import (
 	"dlockss/internal/managers/shard"
 	"dlockss/internal/managers/storage"
 	"dlockss/internal/signing"
-	"dlockss/internal/telemetry"
 	"dlockss/internal/trust"
 	"dlockss/pkg/ipfs"
 	"dlockss/pkg/schema"
@@ -191,8 +190,7 @@ func main() {
 	defer dstore.Close()
 
 	rateLimiter := common.NewRateLimiter(cfg.RateLimitWindow, cfg.MaxMessagesPerWindow)
-	metrics := telemetry.NewMetricsManager(cfg)
-	storageMgr := storage.NewStorageManager(cfg, dht, metrics, badBitsFilter)
+	storageMgr := storage.NewStorageManager(cfg, dht, badBitsFilter)
 	signer := signing.NewSigner(signing.SignerConfig{
 		Cfg:      cfg,
 		Host:     h,
@@ -274,7 +272,6 @@ func main() {
 		PubSub:      ps,
 		IPFSClient:  ipfsClient,
 		Storage:     storageMgr,
-		Metrics:     metrics,
 		Signer:      signer,
 		RateLimiter: rateLimiter,
 		Cluster:     clusterMgr,
@@ -286,17 +283,7 @@ func main() {
 	clusterMgr.SetShardPeerProvider(shardMgr) // CRDT Peers() and allocations use real shard membership
 	announcePinned = shardMgr.AnnouncePinned
 
-	metrics.RegisterProviders(shardMgr, storageMgr, rateLimiter)
-	metrics.RegisterClusterProvider(clusterMgr) // cluster-style metrics: pins/peers/allocations per shard
-	metrics.SetPeerID(h.ID().String())
-
-	// Telemetry and API
-	tc := telemetry.NewTelemetryClient(cfg, h, ps, metrics)
-	if tc != nil {
-		tc.SetShardPublisher(shardMgr, shardMgr)
-		tc.Start(ctx)
-	}
-	apiServer := api.NewAPIServer(cfg.APIPort, metrics)
+	apiServer := api.NewAPIServer(cfg.APIPort)
 	apiServer.Start()
 
 	// File processor and watcher
