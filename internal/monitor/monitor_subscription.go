@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"strings"
 	"time"
 
@@ -430,4 +431,38 @@ func (m *Monitor) SwitchTopic(_ context.Context, newTopic string) {
 
 	m.resubscribeBootstrap()
 	slog.Info("switched topic name", "topic", effectiveTopic, "shards", 1<<(m.cfg.BootstrapShardDepth+1)-1)
+}
+
+func isPrivateIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+	privateIPBlocks := []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
+	for _, cidr := range privateIPBlocks {
+		_, block, _ := net.ParseCIDR(cidr)
+		if block.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func preferPublicIP(ips []string) string {
+	var fallback string
+	for _, ip := range ips {
+		if ip == "" {
+			continue
+		}
+		if fallback == "" {
+			fallback = ip
+		}
+		if !isPrivateIP(ip) {
+			return ip
+		}
+	}
+	return fallback
 }

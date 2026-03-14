@@ -355,11 +355,9 @@
                 const connected = data.connected ? '<span style="color:#4ecdc4;">connected</span>' : '<span style="color:#ff6b6b;">not connected</span>';
                 const addrs = (data.addresses || []).map(a => '<div style="padding:2px 0; font-size:0.85em;">' + escapeHtml(a) + '</div>').join('') || '<span style="color:#666;">none</span>';
                 const protos = (data.protocols || []).map(p => '<span style="display:inline-block; background:#ccc; border:1px solid #444; border-radius:3px; padding:1px 6px; margin:2px; font-size:0.8em;">' + escapeHtml(p) + '</span>').join('') || '<span style="color:#666;">none</span>';
-                const regionVal = data.region ? escapeHtml(data.region) : '<span style="color:#999;">unknown</span>';
                 c.innerHTML = '<table style="width:100%; border-collapse:collapse;">' +
                     '<tr><td style="padding:6px 8px; color:#999; width:130px; vertical-align:top;">Peer ID</td><td style="padding:6px 8px; word-break:break-all;">' + escapeHtml(data.peer_id || peerId) + '</td></tr>' +
                     '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Status</td><td style="padding:6px 8px;">' + connected + '</td></tr>' +
-                    '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Region</td><td style="padding:6px 8px;">' + regionVal + '</td></tr>' +
                     '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Agent</td><td style="padding:6px 8px;">' + escapeHtml(data.agent_version || '-') + '</td></tr>' +
                     '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Protocol</td><td style="padding:6px 8px;">' + escapeHtml(data.protocol_version || '-') + '</td></tr>' +
                     '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Addresses</td><td style="padding:6px 8px;">' + addrs + '</td></tr>' +

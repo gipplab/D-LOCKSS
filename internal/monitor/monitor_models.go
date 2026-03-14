@@ -3,7 +3,6 @@ package monitor
 
 import (
 	"context"
-	"log/slog"
 	"sort"
 	"sync"
 	"time"
@@ -113,7 +112,6 @@ type Monitor struct {
 	topicNameOverride   string             // if set, overrides config.TopicName for subscriptions
 	nodes               map[string]*nodeState
 	splitEvents         []ShardSplitEvent
-	geo                 *geoResolver
 	treeCache           *ShardTreeNode
 	treeCacheTime       time.Time
 	treeDirty           bool
@@ -213,12 +211,11 @@ func (m *Monitor) buildCIDEntriesUnlocked(cids map[string]time.Time) []cidEntry 
 	return entries
 }
 
-func NewMonitor(cfg MonitorConfig, geoDBPath string) *Monitor {
+func NewMonitor(cfg MonitorConfig) *Monitor {
 	m := &Monitor{
 		cfg:                 cfg,
 		nodes:               make(map[string]*nodeState),
 		splitEvents:         make([]ShardSplitEvent, 0, 100),
-		geo:                 newGeoResolver(geoDBPath),
 		uniqueCIDs:          make(map[string]time.Time),
 		shardTopics:         make(map[string]*shardSub),
 		nodeFiles:           make(map[string]map[string]time.Time),
@@ -226,11 +223,6 @@ func NewMonitor(cfg MonitorConfig, geoDBPath string) *Monitor {
 		peerShardLastSeen:   make(map[string]map[string]time.Time),
 		manifestShard:       make(map[string]string),
 		peerLastSiblingMove: make(map[string]siblingMoveRecord),
-	}
-	if m.geo.hasDB() {
-		slog.Info("geoip mode", "source", "local database")
-	} else {
-		slog.Info("geoip mode", "source", "ip-api.com")
 	}
 	go m.runReplicationCleanup()
 	return m

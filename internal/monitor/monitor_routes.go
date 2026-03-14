@@ -328,8 +328,6 @@ func (m *Monitor) handleIdentify(w http.ResponseWriter, r *http.Request) {
 		protoStrs = append(protoStrs, string(p))
 	}
 
-	region := m.geo.ResolveFromAddrs(m.host.Peerstore().Addrs(pid))
-
 	result := map[string]interface{}{
 		"peer_id":          pid.String(),
 		"agent_version":    fmt.Sprintf("%v", agentVersion),
@@ -337,7 +335,6 @@ func (m *Monitor) handleIdentify(w http.ResponseWriter, r *http.Request) {
 		"protocols":        protoStrs,
 		"addresses":        addrStrs,
 		"connected":        connected,
-		"region":           region,
 	}
 	writeJSON(w, result)
 }
@@ -386,9 +383,6 @@ func (m *Monitor) RunStatusLogger(ctx context.Context) {
 	}
 }
 
-// Close releases resources held by the monitor (GeoIP database, etc.).
+// Close releases resources held by the monitor.
 func (m *Monitor) Close() {
-	if m.geo != nil {
-		m.geo.close()
-	}
 }

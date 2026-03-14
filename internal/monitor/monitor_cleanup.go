@@ -155,7 +155,6 @@ func (m *Monitor) cleanupStaleCIDs(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			m.geo.evictStaleCache()
 			m.evictStalePeerstoreEntries()
 			cutoff := time.Now().Add(-30 * time.Minute)
 			m.mu.Lock()
