@@ -182,9 +182,13 @@ go build -ldflags="-s -w" -o dlockss ./cmd/dlockss
 Optional monitor (dashboard):
 ```bash
 go build -o dlockss-monitor ./cmd/dlockss-monitor
-./dlockss-monitor
+./dlockss-monitor                           # uses default topic (creative-commons)
+./dlockss-monitor -topic my-archive         # monitor a specific topic
+./dlockss-monitor -topic my-archive -prefix dlockss-v0.0.4  # custom topic + prefix
 ```
-Open http://localhost:8080. The monitor displays each node's **name** (if configured via `DLOCKSS_NODE_NAME`), falling back to the Peer ID. Names propagate via HEARTBEAT/JOIN messages and appear in the node table, charts, and shard modals. Client-side aliases (EDIT button) override server-side names. Each node has **one peer ID**: when `DLOCKSS_IPFS_CONFIG` is set (e.g. in testnet), D-LOCKSS uses the IPFS repo identity so the same ID appears in the monitor and in `node_x.ipfs.log`.
+Open http://localhost:8080. The `-topic` and `-prefix` flags override the `DLOCKSS_TOPIC_NAME` and `DLOCKSS_PUBSUB_TOPIC_PREFIX` environment variables respectively. The topic is fixed at startup (the dashboard displays it read-only).
+
+The monitor displays each node's **name** (if configured via `DLOCKSS_NODE_NAME`), falling back to the Peer ID. Names propagate via HEARTBEAT/JOIN messages and appear in the node table, charts, and shard modals. Client-side aliases (EDIT button) override server-side names. Each node has **one peer ID**: when `DLOCKSS_IPFS_CONFIG` is set (e.g. in testnet), D-LOCKSS uses the IPFS repo identity so the same ID appears in the monitor and in `node_x.ipfs.log`.
 
 The monitor bootstrap-subscribes to all shards up to depth 6 (127 shards) so it can see nodes even when started late. Set `DLOCKSS_MONITOR_BOOTSTRAP_SHARD_DEPTH` (0–12) to tune.
 

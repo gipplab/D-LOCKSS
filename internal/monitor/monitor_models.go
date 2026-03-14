@@ -13,9 +13,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 )
 
-// shardSub bundles a PubSub topic with its subscription so that
-// SwitchTopic / SwitchTopicPrefix can cancel the subscription
-// before closing the topic (Topic.Close fails if subs are active).
+// shardSub bundles a PubSub topic with its subscription.
 type shardSub struct {
 	topic *pubsub.Topic
 	sub   *pubsub.Subscription
@@ -106,10 +104,8 @@ type Monitor struct {
 	mu                  sync.RWMutex
 	cfg                 MonitorConfig
 	appCtx              context.Context    // long-lived context from StartLibP2P
-	subCtx              context.Context    // per-generation context; cancelled on topic switch to kill goroutines immediately
+	subCtx              context.Context    // per-generation context
 	subCancel           context.CancelFunc // cancels subCtx
-	topicPrefixOverride string             // if set, overrides config.PubsubTopicPrefix for subscriptions
-	topicNameOverride   string             // if set, overrides config.TopicName for subscriptions
 	nodes               map[string]*nodeState
 	splitEvents         []ShardSplitEvent
 	treeCache           *ShardTreeNode
@@ -168,11 +164,8 @@ func (m *Monitor) getTopicPrefix() string {
 	return m.getTopicPrefixUnlocked()
 }
 
-// getTopicPrefixUnlocked returns the effective topic prefix. Call only when holding m.mu.
+// getTopicPrefixUnlocked returns the topic prefix from config. Call only when holding m.mu.
 func (m *Monitor) getTopicPrefixUnlocked() string {
-	if m.topicPrefixOverride != "" {
-		return m.topicPrefixOverride
-	}
 	return m.cfg.PubsubTopicPrefix
 }
 
@@ -183,11 +176,8 @@ func (m *Monitor) getTopicName() string {
 	return m.getTopicNameUnlocked()
 }
 
-// getTopicNameUnlocked returns the effective topic name. Call only when holding m.mu.
+// getTopicNameUnlocked returns the topic name from config. Call only when holding m.mu.
 func (m *Monitor) getTopicNameUnlocked() string {
-	if m.topicNameOverride != "" {
-		return m.topicNameOverride
-	}
 	return m.cfg.TopicName
 }
 

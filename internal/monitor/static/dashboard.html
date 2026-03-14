@@ -69,19 +69,7 @@
                 <div>SYSTEM STATUS: <span class="status-text status-online">[ONLINE]</span></div>
                 <div id="root-topic-row" style="font-size: 0.75em; color: #666; margin-top: 4px; word-break: break-all;">
                     Topic: <span id="topic-name-value" style="font-weight:bold;">--</span>
-                    <button class="btn-text" id="topic-name-edit-btn" style="margin-left: 4px; font-size: 0.9em;">SWITCH</button>
                     <span style="margin-left: 8px;">Prefix: <span id="root-topic-value">--</span></span>
-                    <button class="btn-text" id="root-topic-edit-btn" style="margin-left: 4px; font-size: 0.9em;">EDIT</button>
-                </div>
-                <div id="topic-name-edit-row" style="display: none; margin-top: 4px;">
-                    <input type="text" id="topic-name-input" placeholder="e.g. creative-commons" style="padding: 4px; font-family: inherit; font-size: 0.85em; width: 180px; border: 1px solid #333;" title="Archive topic name">
-                    <button class="btn-text btn-save" id="topic-name-save-btn">SWITCH</button>
-                    <button class="btn-text btn-cancel" id="topic-name-cancel-btn">CANCEL</button>
-                </div>
-                <div id="root-topic-edit-row" style="display: none; margin-top: 4px;">
-                    <input type="text" id="root-topic-input" placeholder="e.g. dlockss-v0.0.3" style="padding: 4px; font-family: inherit; font-size: 0.85em; width: 160px; border: 1px solid #333;" title="Topic prefix (protocol version)">
-                    <button class="btn-text btn-save" id="root-topic-save-btn">SAVE</button>
-                    <button class="btn-text btn-cancel" id="root-topic-cancel-btn">CANCEL</button>
                 </div>
             </div>
         </div>
@@ -224,37 +212,6 @@
                 if (d.topic_name) { window._currentTopicName = d.topic_name; document.getElementById('topic-name-value').textContent = d.topic_name; }
             }).catch(() => {});
         }
-        function applyTopicResponse(d) {
-            if (d.topic_prefix) { window._currentTopicPrefix = d.topic_prefix; document.getElementById('root-topic-value').textContent = d.topic_prefix; }
-            if (d.topic_name) { window._currentTopicName = d.topic_name; document.getElementById('topic-name-value').textContent = d.topic_name; }
-            updateDashboard(); updateShardTree();
-        }
-        function showTopicNameEdit() { document.getElementById('root-topic-row').style.display = 'none'; document.getElementById('topic-name-edit-row').style.display = 'block'; document.getElementById('topic-name-input').value = window._currentTopicName || ''; document.getElementById('topic-name-input').focus(); }
-        function hideTopicNameEdit() { document.getElementById('topic-name-edit-row').style.display = 'none'; document.getElementById('root-topic-row').style.display = ''; }
-        function saveTopicName() {
-            const name = document.getElementById('topic-name-input').value.trim();
-            fetch('/api/root-topic', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ topic_name: name || undefined }) })
-                .then(r => { if (!r.ok) throw new Error(r.statusText); return r.json(); })
-                .then(d => { applyTopicResponse(d); hideTopicNameEdit(); })
-                .catch(e => alert('Failed to switch topic: ' + e.message));
-        }
-        function showTopicEdit() { document.getElementById('root-topic-row').style.display = 'none'; document.getElementById('root-topic-edit-row').style.display = 'block'; document.getElementById('root-topic-input').value = window._currentTopicPrefix || ''; document.getElementById('root-topic-input').focus(); }
-        function hideTopicEdit() { document.getElementById('root-topic-edit-row').style.display = 'none'; document.getElementById('root-topic-row').style.display = ''; }
-        function saveTopicPrefix() {
-            const prefix = document.getElementById('root-topic-input').value.trim();
-            fetch('/api/root-topic', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ topic_prefix: prefix || undefined }) })
-                .then(r => { if (!r.ok) throw new Error(r.statusText); return r.json(); })
-                .then(d => { applyTopicResponse(d); hideTopicEdit(); })
-                .catch(e => alert('Failed to switch prefix: ' + e.message));
-        }
-        document.getElementById('topic-name-edit-btn').onclick = showTopicNameEdit;
-        document.getElementById('topic-name-save-btn').onclick = saveTopicName;
-        document.getElementById('topic-name-cancel-btn').onclick = hideTopicNameEdit;
-        document.getElementById('topic-name-input').onkeydown = function(e) { if (e.key === 'Enter') saveTopicName(); else if (e.key === 'Escape') hideTopicNameEdit(); };
-        document.getElementById('root-topic-edit-btn').onclick = showTopicEdit;
-        document.getElementById('root-topic-save-btn').onclick = saveTopicPrefix;
-        document.getElementById('root-topic-cancel-btn').onclick = hideTopicEdit;
-        document.getElementById('root-topic-input').onkeydown = function(e) { if (e.key === 'Enter') saveTopicPrefix(); else if (e.key === 'Escape') hideTopicEdit(); };
         const GATEWAY = 'https://ipfs.io';
         function showCopyToast() {
             const toast = document.getElementById('copy-toast');

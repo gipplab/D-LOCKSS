@@ -361,76 +361,11 @@ func (m *Monitor) collectShardTargets() map[string]bool {
 	return targets
 }
 
-// closeAllShardSubsUnlocked tears down the current subscription generation:
-// cancels the generation context (killing all goroutines immediately), then
-// cancels each subscription and closes the underlying topic. A fresh
-// generation context is created for subsequent subscriptions.
-// Caller must hold m.mu.
-func (m *Monitor) closeAllShardSubsUnlocked() {
-	if m.subCancel != nil {
-		m.subCancel()
-	}
-	for shardID, ss := range m.shardTopics {
-		ss.sub.Cancel()
-		_ = ss.topic.Close()
-		delete(m.shardTopics, shardID)
-	}
-	m.subCtx, m.subCancel = context.WithCancel(m.appCtx)
-}
-
-// clearNodeStateUnlocked resets all per-network state maps so the monitor
-// starts fresh after a topic switch. Caller must hold m.mu.
-func (m *Monitor) clearNodeStateUnlocked() {
-	m.nodes = make(map[string]*nodeState)
-	m.splitEvents = m.splitEvents[:0]
-	m.uniqueCIDs = make(map[string]time.Time)
-	m.manifestReplication = make(map[string]map[string]time.Time)
-	m.manifestShard = make(map[string]string)
-	m.nodeFiles = make(map[string]map[string]time.Time)
-	m.peerShardLastSeen = make(map[string]map[string]time.Time)
-	m.treeCache = nil
-	m.treeDirty = true
-}
-
 // resubscribeBootstrap subscribes to all bootstrap shards in the current topic.
 func (m *Monitor) resubscribeBootstrap() {
 	for _, shardID := range shardIDsUpToDepth(m.cfg.BootstrapShardDepth) {
 		m.ensureShardSubscription(m.appCtx, shardID)
 	}
-}
-
-// SwitchTopicPrefix changes the topic prefix (protocol version) and
-// re-subscribes to the new network. Pass "" to reset to the config default.
-func (m *Monitor) SwitchTopicPrefix(_ context.Context, newPrefix string) {
-	effectivePrefix := newPrefix
-	if effectivePrefix == "" {
-		effectivePrefix = m.cfg.PubsubTopicPrefix
-	}
-	m.mu.Lock()
-	m.closeAllShardSubsUnlocked()
-	m.topicPrefixOverride = newPrefix
-	m.clearNodeStateUnlocked()
-	m.mu.Unlock()
-
-	m.resubscribeBootstrap()
-	slog.Info("switched topic prefix", "prefix", effectivePrefix, "shards", 1<<(m.cfg.BootstrapShardDepth+1)-1)
-}
-
-// SwitchTopic changes the archive topic name and re-subscribes to the new
-// topic's shard tree. Pass "" to reset to the config default.
-func (m *Monitor) SwitchTopic(_ context.Context, newTopic string) {
-	effectiveTopic := newTopic
-	if effectiveTopic == "" {
-		effectiveTopic = m.cfg.TopicName
-	}
-	m.mu.Lock()
-	m.closeAllShardSubsUnlocked()
-	m.topicNameOverride = newTopic
-	m.clearNodeStateUnlocked()
-	m.mu.Unlock()
-
-	m.resubscribeBootstrap()
-	slog.Info("switched topic name", "topic", effectiveTopic, "shards", 1<<(m.cfg.BootstrapShardDepth+1)-1)
 }
 
 func isPrivateIP(ipStr string) bool {

@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"log/slog"
@@ -18,6 +19,10 @@ import (
 )
 
 func main() {
+	topicFlag := flag.String("topic", "", "archive topic name (overrides DLOCKSS_TOPIC_NAME env var)")
+	prefixFlag := flag.String("prefix", "", "pubsub topic prefix / protocol version (overrides DLOCKSS_PUBSUB_TOPIC_PREFIX env var)")
+	flag.Parse()
+
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -43,6 +48,14 @@ func main() {
 	if v := os.Getenv("DLOCKSS_TOPIC_NAME"); v != "" {
 		cfg.TopicName = v
 		slog.Info("topic name from env", "topic", cfg.TopicName)
+	}
+	if *topicFlag != "" {
+		cfg.TopicName = *topicFlag
+		slog.Info("topic name from flag", "topic", cfg.TopicName)
+	}
+	if *prefixFlag != "" {
+		cfg.PubsubTopicPrefix = *prefixFlag
+		slog.Info("pubsub topic prefix from flag", "prefix", cfg.PubsubTopicPrefix)
 	}
 
 	m := monitor.NewMonitor(cfg)

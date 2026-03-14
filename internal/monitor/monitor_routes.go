@@ -3,7 +3,6 @@ package monitor
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -149,25 +148,7 @@ func (m *Monitor) handleShardNodes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{"shard_id": shardFilter, "shard_label": shardLabel(shardFilter), "nodes": response, "count": len(response)})
 }
 
-func (m *Monitor) handleRootTopic(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPost {
-		var body struct {
-			TopicPrefix string `json:"topic_prefix,omitempty"`
-			TopicName   string `json:"topic_name,omitempty"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeJSONError(w, `invalid JSON`, http.StatusBadRequest)
-			return
-		}
-		if body.TopicPrefix != "" || body.TopicName == "" {
-			m.SwitchTopicPrefix(r.Context(), body.TopicPrefix)
-		}
-		if body.TopicName != "" {
-			m.SwitchTopic(r.Context(), body.TopicName)
-		}
-		m.writeRootTopicResponse(w)
-		return
-	}
+func (m *Monitor) handleRootTopic(w http.ResponseWriter, _ *http.Request) {
 	m.writeRootTopicResponse(w)
 }
 
