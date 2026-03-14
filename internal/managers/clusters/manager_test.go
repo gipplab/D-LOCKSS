@@ -55,7 +55,7 @@ func TestClusterManager_Lifecycle(t *testing.T) {
 
 	// 3. Test JoinShard (Primary Shard "1")
 	shard1 := "1"
-	err = cm.JoinShard(ctx, shard1, nil)
+	err = cm.JoinShard(ctx, shard1)
 	if err != nil {
 		t.Fatalf("JoinShard failed for %s: %v", shard1, err)
 	}
@@ -63,7 +63,7 @@ func TestClusterManager_Lifecycle(t *testing.T) {
 
 	// 4. Test JoinShard (Secondary Shard "10" - Dual Homing)
 	shard10 := "10"
-	err = cm.JoinShard(ctx, shard10, nil)
+	err = cm.JoinShard(ctx, shard10)
 	if err != nil {
 		t.Fatalf("JoinShard failed for %s: %v", shard10, err)
 	}

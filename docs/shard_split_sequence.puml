@@ -10,7 +10,7 @@ participant "IPFS" as IPFS
 == Path 1: Split when current shard is overcrowded ==
 
 ShardMgr -> ShardMgr: runPeerCountChecker()\n(ticker: rootPeerCheckInterval at root, ShardPeerCheckInterval otherwise)
-ShardMgr -> ShardMgr: getShardPeerCountForSplit()\n(ACTIVE peers only from HEARTBEAT/JOIN; no mesh fallback)
+ShardMgr -> ShardMgr: getShardPeerCount(useMeshFallback=false)\n(ACTIVE peers only from HEARTBEAT/JOIN; no mesh fallback)
 
 alt peerCount >= MaxPeersPerShard (2 consecutive checks)\nAND estimatedPerChild >= MinPeersPerShard\nAND (child has >=1 peer OR parent >= 14 to create)\nAND time.Since(lastShardMove) >= ShardMoveCooldown (30s)
     ShardMgr -> ShardMgr: announceSplit(parentShard, targetChild)\nPublish SPLIT:child0:child1 on parent topic

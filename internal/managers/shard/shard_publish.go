@@ -25,22 +25,6 @@ func (sm *ShardManager) AnnouncePinned(manifestCID string) {
 	_ = sub.topic.Publish(sm.ctx, msg)
 }
 
-func (sm *ShardManager) PublishToShard(shardID, msg string) {
-	sm.mu.RLock()
-	sub, exists := sm.shardSubs[shardID]
-	sm.mu.RUnlock()
-
-	if !exists {
-		return
-	}
-	if sub.topic != nil {
-		_ = sub.topic.Publish(sm.ctx, []byte(msg))
-	} else {
-		topicName := sm.shardTopicName(shardID)
-		_ = sm.ps.Publish(topicName, []byte(msg))
-	}
-}
-
 func (sm *ShardManager) PublishToShardCBOR(data []byte, shardID string) {
 	sm.mu.RLock()
 	sub, exists := sm.shardSubs[shardID]
@@ -127,7 +111,7 @@ func (sm *ShardManager) PinToCluster(ctx context.Context, c cid.Cid) error {
 }
 
 func (sm *ShardManager) EnsureClusterForShard(ctx context.Context, shardID string) error {
-	return sm.clusterMgr.JoinShard(ctx, shardID, nil)
+	return sm.clusterMgr.JoinShard(ctx, shardID)
 }
 
 func (sm *ShardManager) PinToShard(ctx context.Context, shardID string, c cid.Cid) error {

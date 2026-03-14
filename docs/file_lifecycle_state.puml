@@ -11,8 +11,8 @@ Custodial --> InTargetCluster: CRDT syncs; responsible nodes\nLocalPinTracker pi
 
 Responsible --> InCluster: Pin in CRDT; LocalPinTracker\nsyncs to self and peers (allocations)
 
-InCluster --> UnderReplicated: runReplicationChecker:\nallocations < MinReplication
-UnderReplicated --> InCluster: ReplicationRequest -> peers\nPin(targetShard), TriggerSync
+InCluster --> UnderReplicated: repl.runChecker():\nunder target replication
+UnderReplicated --> InCluster: ReplicationRequest -> peers\nauto-replication: PinRecursive, ClusterPinIfAbsent, TriggerSync
 
 InCluster --> Removed: RunReshardPass: we split/moved\nfile belongs to other shard
 Removed --> [*]: Unpin from cluster\nUnpinRecursive, UnpinFile

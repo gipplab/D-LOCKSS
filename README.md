@@ -149,9 +149,9 @@ See [docs/DLOCKSS_PROTOCOL.md](docs/DLOCKSS_PROTOCOL.md) for protocol details.
 D-LOCKSS acts as a self-healing, sharded storage cluster using the IPFS/Libp2p stack.
 
 ### Key Components
-1.  **Shard Manager:** Dynamically splits responsibilities based on peer count to maintain scalability.
+1.  **Shard Manager:** Dynamically splits responsibilities based on peer count to maintain scalability. Delegates lifecycle decisions (split/merge/discovery) to a `lifecycleManager` and replication to a `replicationManager`.
 2.  **Cluster Manager:** Manages embedded **IPFS Cluster** instances (one per shard) using **CRDTs** for state consensus; nodes in a shard sync and pin content assigned to that shard.
-3.  **File Watcher:** Monitors the data directory to automatically ingest content.
+3.  **File Watcher:** Monitors the data directory to automatically ingest content (via `handleWatcherEvent` / `handleNewDirectory`).
 4.  **Storage Monitor:** Protects nodes from disk exhaustion by rejecting custodial requests when full.
 5.  **BadBits Manager:** Enforces content blocking (e.g., DMCA) based on configured country codes.
 
@@ -186,14 +186,6 @@ go build -o dlockss-monitor ./cmd/dlockss-monitor
 ```
 Open http://localhost:8080. The monitor displays each node's **name** (if configured via `DLOCKSS_NODE_NAME`), falling back to the Peer ID. Names propagate via HEARTBEAT/JOIN messages and appear in the node table, charts, and shard modals. Client-side aliases (EDIT button) override server-side names. Each node has **one peer ID**: when `DLOCKSS_IPFS_CONFIG` is set (e.g. in testnet), D-LOCKSS uses the IPFS repo identity so the same ID appears in the monitor and in `node_x.ipfs.log`.
 
-For geographic region display, optionally provide a GeoIP database:
-```bash
-./dlockss-monitor --geoip-db /path/to/GeoLite2-City.mmdb
-# or via environment variable:
-export DLOCKSS_MONITOR_GEOIP_DB=/path/to/GeoLite2-City.mmdb
-```
-Without a local database, the monitor falls back to the ip-api.com batch API with permanent caching.
-
 The monitor bootstrap-subscribes to all shards up to depth 6 (127 shards) so it can see nodes even when started late. Set `DLOCKSS_MONITOR_BOOTSTRAP_SHARD_DEPTH` (0–12) to tune.
 
 Alternatively use: https://dlockss-monitor.wmcloud.org.
@@ -207,7 +199,7 @@ go test ./... -v
 ```
 
 ### Project Status
-*   **Current Phase:** Production — active refactoring for code quality and operational robustness (see [Code Elegance Plan](docs/CODE_ELEGANCE_PLAN.md)).
+*   **Current Phase:** Production — structural refactoring complete (see [Code Elegance Plan](docs/CODE_ELEGANCE_PLAN.md)). Config uses nested sub-structs (`Sharding`, `Replication`, `Files`, `Security`, `Orphan`). ShardManager delegates to `replicationManager` and `lifecycleManager`.
 
 ---
 

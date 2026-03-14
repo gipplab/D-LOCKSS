@@ -4,13 +4,11 @@ package testutil
 
 import (
 	"context"
-	"io"
 	"testing"
 
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/routing"
-	"github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multihash"
 )
 
@@ -20,21 +18,15 @@ type MockIPFSClient struct{}
 func (m *MockIPFSClient) ImportFile(ctx context.Context, filePath string) (cid.Cid, error) {
 	return cid.Cid{}, nil
 }
-func (m *MockIPFSClient) ImportReader(ctx context.Context, reader io.Reader) (cid.Cid, error) {
-	return cid.Cid{}, nil
-}
 func (m *MockIPFSClient) PutDagCBOR(ctx context.Context, block []byte) (cid.Cid, error) {
 	return cid.Cid{}, nil
 }
 func (m *MockIPFSClient) GetBlock(ctx context.Context, blockCID cid.Cid) ([]byte, error) {
 	return nil, nil
 }
-func (m *MockIPFSClient) PinRecursive(ctx context.Context, c cid.Cid) error          { return nil }
-func (m *MockIPFSClient) UnpinRecursive(ctx context.Context, c cid.Cid) error        { return nil }
-func (m *MockIPFSClient) IsPinned(ctx context.Context, c cid.Cid) (bool, error)      { return false, nil }
-func (m *MockIPFSClient) GetFileSize(ctx context.Context, c cid.Cid) (uint64, error) { return 0, nil }
-func (m *MockIPFSClient) GetPeerID(ctx context.Context) (string, error)              { return "mock-peer-id", nil }
-func (m *MockIPFSClient) SwarmConnect(ctx context.Context, addrs []string) error     { return nil }
+func (m *MockIPFSClient) PinRecursive(ctx context.Context, c cid.Cid) error     { return nil }
+func (m *MockIPFSClient) UnpinRecursive(ctx context.Context, c cid.Cid) error   { return nil }
+func (m *MockIPFSClient) IsPinned(ctx context.Context, c cid.Cid) (bool, error) { return false, nil }
 
 // MockDHTProvider is a no-op implementation of common.DHTProvider that also
 // satisfies routing.Routing.
@@ -63,7 +55,7 @@ var _ routing.Routing = (*MockDHTProvider)(nil)
 // MockClusterManager is a no-op implementation of clusters.ClusterManagerInterface.
 type MockClusterManager struct{}
 
-func (m *MockClusterManager) JoinShard(ctx context.Context, shardID string, bootstrapPeers []multiaddr.Multiaddr) error {
+func (m *MockClusterManager) JoinShard(ctx context.Context, shardID string) error {
 	return nil
 }
 func (m *MockClusterManager) LeaveShard(shardID string) error { return nil }

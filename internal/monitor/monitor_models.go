@@ -3,18 +3,14 @@ package monitor
 
 import (
 	"context"
-	"log/slog"
-	"os"
-	"path/filepath"
 	"sort"
 	"sync"
 	"time"
 
+	"dlockss/internal/config"
+
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/oschwald/geoip2-golang"
-
-	"dlockss/internal/common"
 )
 
 // shardSub bundles a PubSub topic with its subscription so that
@@ -26,16 +22,15 @@ type shardSub struct {
 }
 
 const (
-	DiscoveryServiceTag          = "dlockss-prod"
+	discoveryServiceTag          = "dlockss-prod"
 	WebUIPort                    = 8080
-	DefaultBootstrapShardDepth   = 6  // Depth of shard tree to subscribe to on startup (covers late-join case)
-	MaxShardDepthForSubscription = 10 // Don't subscribe to shards deeper than this (avoids thousands of topics)
-	MaxShardDepthForTreeDisplay  = 8  // Prune tree display at this depth (avoids very deep chart)
-	DefaultNodeCleanupTimeout    = 350 * time.Second
-	ReplicationAnnounceTTL       = 350 * time.Second
-	MonitorMinReplication        = 5
-	MonitorMaxReplication        = 10
-	ReplicationCleanupEvery      = 1 * time.Minute
+	defaultBootstrapShardDepth   = 6
+	maxShardDepthForSubscription = 10
+	maxShardDepthForTreeDisplay  = 8
+	defaultNodeCleanupTimeout    = 350 * time.Second
+	replicationAnnounceTTL       = 350 * time.Second
+	monitorMinReplication        = 5
+	replicationCleanupEvery      = 1 * time.Minute
 	MonitorIdentityFile          = "monitor_identity.key"
 	siblingMoveCooldown          = 90 * time.Second // ignore sibling moves within this window (reduces 00↔01, 10↔11 oscillation; gossip-sub can delay 20–30s)
 	unpinGracePeriod             = 30 * time.Second // don't act on pinned=0 until this long after first discovery (avoids stale heartbeats)
@@ -50,28 +45,37 @@ type MonitorConfig struct {
 	TopicName           string
 }
 
-const DefaultPubsubTopicPrefix = "dlockss-v0.0.3"
-
-const DefaultTopicName = "creative-commons"
-
 func DefaultMonitorConfig() MonitorConfig {
 	return MonitorConfig{
-		NodeCleanupTimeout:  DefaultNodeCleanupTimeout,
-		BootstrapShardDepth: DefaultBootstrapShardDepth,
-		PubsubTopicPrefix:   DefaultPubsubTopicPrefix,
-		TopicName:           DefaultTopicName,
+		NodeCleanupTimeout:  defaultNodeCleanupTimeout,
+		BootstrapShardDepth: defaultBootstrapShardDepth,
+		PubsubTopicPrefix:   config.DefaultPubsubVersion,
+		TopicName:           config.DefaultTopicName,
 	}
 }
 
-type StatusResponse = common.StatusResponse
-type StorageStatus = common.StorageStatus
-type ReplicationStatus = common.ReplicationStatus
+// StatusResponse defines the JSON structure for monitor node views.
+type StatusResponse struct {
+	PeerID        string        `json:"peer_id"`
+	Version       string        `json:"version"`
+	CurrentShard  string        `json:"current_shard"`
+	Role          string        `json:"role,omitempty"`
+	PeersInShard  int           `json:"peers_in_shard"`
+	Storage       StorageStatus `json:"storage"`
+	UptimeSeconds float64       `json:"uptime_seconds"`
+}
 
-type NodeState struct {
+type StorageStatus struct {
+	PinnedFiles   int `json:"pinned_files"`
+	PinnedInShard int `json:"pinned_in_shard,omitempty"`
+	KnownFiles    int `json:"known_files"`
+}
+
+type nodeState struct {
 	PeerID         string              `json:"peer_id"`
 	NodeName       string              `json:"node_name,omitempty"`
 	CurrentShard   string              `json:"current_shard"`
-	Role           string              `json:"role,omitempty"` // ACTIVE, PASSIVE, REPLICATOR, or PROBE (empty = ACTIVE)
+	Role           string              `json:"role,omitempty"`
 	PinnedFiles    int                 `json:"pinned_files"`
 	KnownFiles     int                 `json:"known_files"`
 	LastSeen       time.Time           `json:"last_seen"`
@@ -106,10 +110,8 @@ type Monitor struct {
 	subCancel           context.CancelFunc // cancels subCtx
 	topicPrefixOverride string             // if set, overrides config.PubsubTopicPrefix for subscriptions
 	topicNameOverride   string             // if set, overrides config.TopicName for subscriptions
-	nodes               map[string]*NodeState
+	nodes               map[string]*nodeState
 	splitEvents         []ShardSplitEvent
-	geoDB               *geoip2.Reader // local GeoIP database; nil if not configured
-	geoCache            sync.Map       // IP → region string; cache for on-demand lookups
 	treeCache           *ShardTreeNode
 	treeCacheTime       time.Time
 	treeDirty           bool
@@ -123,17 +125,14 @@ type Monitor struct {
 	manifestShard       map[string]string // manifest CID → observed shard (from PINNED/IngestMessage announcements)
 	lastSplitTime       time.Time         // when we last detected a split; used to avoid pruning during mesh formation
 	peerLastSiblingMove map[string]siblingMoveRecord
-	done                chan struct{} // closed on shutdown to stop background goroutines
 }
 
 // siblingMoveRecord tracks the last sibling shard move for cooldown (reduces 0↔1 oscillation from stale messages).
 type siblingMoveRecord struct {
-	from string
-	to   string
 	when time.Time
 }
 
-func (n *NodeState) EffectiveShard() string {
+func (n *nodeState) EffectiveShard() string {
 	if n.CurrentShard != "" {
 		return n.CurrentShard
 	}
@@ -152,7 +151,7 @@ func shardLabel(shardID string) string {
 
 // isDisplayableNode returns false for PROBE nodes and the monitor itself.
 // ACTIVE, PASSIVE, and REPLICATOR nodes appear in the UI.
-func (m *Monitor) isDisplayableNodeUnlocked(peerID string, node *NodeState) bool {
+func (m *Monitor) isDisplayableNodeUnlocked(peerID string, node *nodeState) bool {
 	if node.Role == "PROBE" {
 		return false
 	}
@@ -192,46 +191,31 @@ func (m *Monitor) getTopicNameUnlocked() string {
 	return m.cfg.TopicName
 }
 
-// CIDEntry is a manifest CID with its observed shard and replica count.
-// Used by node-files, unique-cids, and replication-cids API responses.
-type CIDEntry struct {
+type cidEntry struct {
 	CID      string `json:"cid"`
 	Shard    string `json:"shard"`
 	Replicas int    `json:"replicas"`
 }
 
-// buildCIDEntries returns sorted CIDEntries for the given CID→time map.
-// Caller must hold m.mu at least as RLock.
-func (m *Monitor) buildCIDEntriesUnlocked(cids map[string]time.Time) []CIDEntry {
-	entries := make([]CIDEntry, 0, len(cids))
+func (m *Monitor) buildCIDEntriesUnlocked(cids map[string]time.Time) []cidEntry {
+	entries := make([]cidEntry, 0, len(cids))
 	for cidStr := range cids {
 		replicas := 0
 		if peers, ok := m.manifestReplication[cidStr]; ok {
 			replicas = len(peers)
 		}
 		shard := m.manifestShard[cidStr]
-		entries = append(entries, CIDEntry{CID: cidStr, Shard: shard, Replicas: replicas})
+		entries = append(entries, cidEntry{CID: cidStr, Shard: shard, Replicas: replicas})
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].CID < entries[j].CID })
 	return entries
 }
 
-func monitorDataDir() string {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	dir := filepath.Join(homeDir, ".dlockss-monitor")
-	os.MkdirAll(dir, 0700)
-	return dir
-}
-
-func NewMonitor(cfg MonitorConfig, geoDBPath string) *Monitor {
+func NewMonitor(cfg MonitorConfig) *Monitor {
 	m := &Monitor{
 		cfg:                 cfg,
-		nodes:               make(map[string]*NodeState),
+		nodes:               make(map[string]*nodeState),
 		splitEvents:         make([]ShardSplitEvent, 0, 100),
-		geoDB:               openGeoIPDB(geoDBPath),
 		uniqueCIDs:          make(map[string]time.Time),
 		shardTopics:         make(map[string]*shardSub),
 		nodeFiles:           make(map[string]map[string]time.Time),
@@ -239,12 +223,6 @@ func NewMonitor(cfg MonitorConfig, geoDBPath string) *Monitor {
 		peerShardLastSeen:   make(map[string]map[string]time.Time),
 		manifestShard:       make(map[string]string),
 		peerLastSiblingMove: make(map[string]siblingMoveRecord),
-		done:                make(chan struct{}),
-	}
-	if m.geoDB != nil {
-		slog.Info("geoip mode", "source", "local database")
-	} else {
-		slog.Info("geoip mode", "source", "ip-api.com")
 	}
 	go m.runReplicationCleanup()
 	return m

@@ -4,7 +4,6 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"log"
 	"log/slog"
@@ -20,9 +19,6 @@ import (
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
-
-	geoipDB := flag.String("geoip-db", "", "Path to a MaxMind/DB-IP .mmdb GeoIP database file")
-	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -49,11 +45,7 @@ func main() {
 		slog.Info("topic name from env", "topic", cfg.TopicName)
 	}
 
-	geoDBPath := *geoipDB
-	if geoDBPath == "" {
-		geoDBPath = os.Getenv("DLOCKSS_MONITOR_GEOIP_DB")
-	}
-	m := monitor.NewMonitor(cfg, geoDBPath)
+	m := monitor.NewMonitor(cfg)
 	defer m.Close()
 
 	h, err := monitor.StartLibP2P(ctx, m)

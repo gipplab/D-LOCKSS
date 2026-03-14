@@ -2,6 +2,8 @@
 
 package "Core Components" {
     component "ShardManager" as ShardManager
+    component "replicationManager" as ReplMgr
+    component "lifecycleManager" as LifecycleMgr
     component "ClusterManager" as ClusterManager
     component "StorageManager" as StorageManager
     component "FileProcessor" as FileProcessor
@@ -9,6 +11,8 @@ package "Core Components" {
     component "Rate Limiter" as RateLimiter
 }
 
+ShardManager --> ReplMgr : delegates replication
+ShardManager --> LifecycleMgr : delegates split/merge/discovery
 ShardManager --> ClusterManager : joins/leaves shards
 ClusterManager --> StorageManager : onPinSynced/onPinRemoved
 FileProcessor --> StorageManager : pins files, adds known
@@ -19,10 +23,11 @@ Metrics --> ClusterManager : GetClusterMetrics (pins/peers per shard)
 
 note right of ShardManager
     Manages shard assignment and PubSub topics.
-    Lifecycle decisions (split/merge/discovery) delegated
-    to internal lifecycleManager.
-    Replication logic split into focused files:
-    shard_msg_handlers, shard_reshard, shard_maintenance.
+    Lifecycle decisions delegated to lifecycleManager.
+    Replication requests delegated to replicationManager.
+    Code organized into focused files:
+    shard_loops, shard_msg_handlers, shard_reshard,
+    shard_orphan, shard_legacy, shard_replication.
     Stability (v0.0.3):
     - Move cooldown (30s) after any transition
     - Jittered discovery timers

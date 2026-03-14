@@ -23,12 +23,11 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/routing"
-	"github.com/multiformats/go-multiaddr"
 )
 
 // ClusterManagerInterface defines the interface for ClusterManager to allow mocking.
 type ClusterManagerInterface interface {
-	JoinShard(ctx context.Context, shardID string, bootstrapPeers []multiaddr.Multiaddr) error
+	JoinShard(ctx context.Context, shardID string) error
 	LeaveShard(shardID string) error
 	Pin(ctx context.Context, shardID string, c cid.Cid, replicationFactorMin, replicationFactorMax int) error
 	PinIfAbsent(ctx context.Context, shardID string, c cid.Cid, replicationFactorMin, replicationFactorMax int) error
@@ -60,11 +59,10 @@ type ClusterManager struct {
 	peerProvider ShardPeerProvider
 
 	mu       sync.RWMutex
-	clusters map[string]*EmbeddedCluster
+	clusters map[string]*embeddedCluster
 }
 
-// ConsensusClient defines the interface for interacting with the consensus component.
-type ConsensusClient interface {
+type consensusClient interface {
 	LogPin(ctx context.Context, pin api.Pin) error
 	LogUnpin(ctx context.Context, pin api.Pin) error
 	State(ctx context.Context) (state.ReadOnly, error)
@@ -72,16 +70,10 @@ type ConsensusClient interface {
 	Shutdown(ctx context.Context) error
 }
 
-// EmbeddedCluster represents a single shard's consensus state (CRDT).
-type EmbeddedCluster struct {
-	ShardID string
-	// Consensus holds the CRDT state for this shard
-	Consensus ConsensusClient
-	// PinTracker syncs consensus to IPFS
-	PinTracker *LocalPinTracker
-
-	ctx    context.Context
-	cancel context.CancelFunc
+type embeddedCluster struct {
+	consensus  consensusClient
+	pinTracker *localPinTracker
+	cancel     context.CancelFunc
 }
 
 // ClusterManagerConfig holds all dependencies for a ClusterManager.
@@ -110,7 +102,7 @@ func NewClusterManager(cfg ClusterManagerConfig) *ClusterManager {
 		trustedPeers: cfg.TrustedPeers,
 		onPinSynced:  cfg.OnPinSynced,
 		onPinRemoved: cfg.OnPinRemoved,
-		clusters:     make(map[string]*EmbeddedCluster),
+		clusters:     make(map[string]*embeddedCluster),
 	}
 }
 
@@ -122,8 +114,7 @@ func (cm *ClusterManager) SetShardPeerProvider(provider ShardPeerProvider) {
 }
 
 // JoinShard initializes a new embedded cluster for the given shard.
-// secret is the deterministically generated shared key for the cluster.
-func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string, bootstrapPeers []multiaddr.Multiaddr) error {
+func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
@@ -136,7 +127,7 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string, bootstr
 
 	// Configure CRDT
 	trustAll := true
-	if cm.cfg.TrustMode == "allowlist" {
+	if cm.cfg.Security.TrustMode == "allowlist" {
 		trustAll = false
 	}
 
@@ -194,7 +185,7 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string, bootstr
 
 	subCtx, cancel := context.WithCancel(context.Background())
 
-	tracker := NewLocalPinTracker(cm.ipfsClient, shardID, cm.onPinSynced, cm.onPinRemoved, cm.badBits)
+	tracker := newLocalPinTracker(cm.ipfsClient, shardID, cm.onPinSynced, cm.onPinRemoved, cm.badBits)
 	tracker.Start(consensus)
 
 	go func() {
@@ -214,11 +205,9 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string, bootstr
 		}
 	}()
 
-	cm.clusters[shardID] = &EmbeddedCluster{
-		ShardID:    shardID,
-		Consensus:  consensus,
-		PinTracker: tracker,
-		ctx:        subCtx,
+	cm.clusters[shardID] = &embeddedCluster{
+		consensus:  consensus,
+		pinTracker: tracker,
 		cancel:     cancel,
 	}
 
@@ -237,38 +226,17 @@ func (cm *ClusterManager) LeaveShard(shardID string) error {
 	cm.mu.Unlock()
 
 	slog.Info("shutting down embedded cluster", "shard", shardID)
-	if cluster.PinTracker != nil {
-		cluster.PinTracker.Stop()
+	if cluster.pinTracker != nil {
+		cluster.pinTracker.Stop()
 	}
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer shutCancel()
 	var shutdownErr error
-	if err := cluster.Consensus.Shutdown(shutCtx); err != nil {
+	if err := cluster.consensus.Shutdown(shutCtx); err != nil {
 		shutdownErr = fmt.Errorf("consensus shutdown for shard %s: %w", shardID, err)
 	}
 	cluster.cancel()
 	return shutdownErr
-}
-
-// Shutdown gracefully shuts down all embedded clusters.
-func (cm *ClusterManager) Shutdown() error {
-	cm.mu.Lock()
-	shards := make([]string, 0, len(cm.clusters))
-	for shardID := range cm.clusters {
-		shards = append(shards, shardID)
-	}
-	cm.mu.Unlock()
-
-	var firstErr error
-	for _, shardID := range shards {
-		if err := cm.LeaveShard(shardID); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			slog.Error("failed to leave shard during shutdown", "shard", shardID, "error", err)
-		}
-	}
-	return firstErr
 }
 
 // SelectAllocations deterministically chooses n peers from sorted list for the given CID (same CID → same set on all nodes).
@@ -293,7 +261,7 @@ func SelectAllocations(peers []peer.ID, c cid.Cid, n int) []peer.ID {
 	return out
 }
 
-// Pin submits a pin to the shard's cluster. Use context with long timeout (e.g. CRDTOpTimeout).
+// Pin submits a pin to the shard's cluster.
 func (cm *ClusterManager) Pin(ctx context.Context, shardID string, c cid.Cid, replicationFactorMin, replicationFactorMax int) error {
 	cm.mu.RLock()
 	cluster, exists := cm.clusters[shardID]
@@ -308,15 +276,15 @@ func (cm *ClusterManager) Pin(ctx context.Context, shardID string, c cid.Cid, re
 	repMin := replicationFactorMin
 	repMax := replicationFactorMax
 	if repMin < 0 {
-		repMin = cm.cfg.MinReplication
+		repMin = cm.cfg.Replication.MinReplication
 	}
 	if repMax < 0 {
-		repMax = cm.cfg.MaxReplication
+		repMax = cm.cfg.Replication.MaxReplication
 	}
 
 	var allocations []peer.ID
 	if repMin > 0 || repMax > 0 {
-		peers, err := cluster.Consensus.Peers(ctx)
+		peers, err := cluster.consensus.Peers(ctx)
 		if err != nil {
 			slog.Warn("failed to get peers, using full replication", "shard", shardID, "error", err)
 		}
@@ -337,8 +305,8 @@ func (cm *ClusterManager) Pin(ctx context.Context, shardID string, c cid.Cid, re
 	} else {
 		// repMin=0 && repMax=0: full replication mode (used during migration).
 		// Store config defaults as metadata but leave Allocations empty so all nodes pin.
-		repMin = cm.cfg.MinReplication
-		repMax = cm.cfg.MaxReplication
+		repMin = cm.cfg.Replication.MinReplication
+		repMax = cm.cfg.Replication.MaxReplication
 	}
 
 	pin := api.Pin{
@@ -350,7 +318,7 @@ func (cm *ClusterManager) Pin(ctx context.Context, shardID string, c cid.Cid, re
 	pin.ReplicationFactorMin = repMin
 	pin.ReplicationFactorMax = repMax
 
-	if err := cluster.Consensus.LogPin(ctx, pin); err != nil {
+	if err := cluster.consensus.LogPin(ctx, pin); err != nil {
 		return fmt.Errorf("failed to log pin to CRDT: %w", err)
 	}
 
@@ -384,7 +352,7 @@ func (cm *ClusterManager) Unpin(ctx context.Context, shardID string, c cid.Cid) 
 		Type: api.DataType,
 	}
 
-	if err := cluster.Consensus.LogUnpin(ctx, pin); err != nil {
+	if err := cluster.consensus.LogUnpin(ctx, pin); err != nil {
 		return fmt.Errorf("failed to log unpin to CRDT: %w", err)
 	}
 
@@ -402,13 +370,11 @@ func (cm *ClusterManager) GetAllocations(ctx context.Context, shardID string, c 
 		return nil, fmt.Errorf("not a member of shard %s", shardID)
 	}
 
-	st, err := cluster.Consensus.State(ctx)
+	st, err := cluster.consensus.State(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	// List streams pins to a channel. Use a cancellable context so the List
-	// goroutine exits promptly when we find our CID and stop reading.
 	listCtx, listCancel := context.WithCancel(ctx)
 	defer listCancel()
 
@@ -426,7 +392,6 @@ func (cm *ClusterManager) GetAllocations(ctx context.Context, shardID string, c 
 }
 
 // ListPins returns all pins in the shard's consensus state (CRDT).
-// Useful for migration, replication checks, and API/monitor.
 func (cm *ClusterManager) ListPins(ctx context.Context, shardID string) ([]api.Pin, error) {
 	cm.mu.RLock()
 	cluster, exists := cm.clusters[shardID]
@@ -436,12 +401,11 @@ func (cm *ClusterManager) ListPins(ctx context.Context, shardID string) ([]api.P
 		return nil, fmt.Errorf("not a member of shard %s", shardID)
 	}
 
-	st, err := cluster.Consensus.State(ctx)
+	st, err := cluster.consensus.State(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	// state.List closes out when done; do not close it here (double-close causes panic).
 	out := make(chan api.Pin)
 	go func() {
 		_ = st.List(ctx, out)
@@ -454,7 +418,6 @@ func (cm *ClusterManager) ListPins(ctx context.Context, shardID string) ([]api.P
 	return pins, nil
 }
 
-// GetPeerCount returns the number of peers in the shard's consensus cluster.
 func (cm *ClusterManager) GetPeerCount(ctx context.Context, shardID string) (int, error) {
 	cm.mu.RLock()
 	cluster, exists := cm.clusters[shardID]
@@ -464,7 +427,7 @@ func (cm *ClusterManager) GetPeerCount(ctx context.Context, shardID string) (int
 		return 0, fmt.Errorf("not a member of shard %s", shardID)
 	}
 
-	peers, err := cluster.Consensus.Peers(ctx)
+	peers, err := cluster.consensus.Peers(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -476,43 +439,8 @@ func (cm *ClusterManager) TriggerSync(shardID string) {
 	cm.mu.RLock()
 	cluster, exists := cm.clusters[shardID]
 	cm.mu.RUnlock()
-	if !exists || cluster.PinTracker == nil {
+	if !exists || cluster.pinTracker == nil {
 		return
 	}
-	cluster.PinTracker.TriggerSync()
-}
-
-// GetClusterMetrics returns cluster-style metrics per shard for telemetry.
-// Implements telemetry.ClusterInfoProvider.
-func (cm *ClusterManager) GetClusterMetrics(ctx context.Context) (pinsPerShard, peersPerShard, allocationsTotalPerShard map[string]int, err error) {
-	cm.mu.RLock()
-	shardIDs := make([]string, 0, len(cm.clusters))
-	for id := range cm.clusters {
-		shardIDs = append(shardIDs, id)
-	}
-	cm.mu.RUnlock()
-
-	pinsPerShard = make(map[string]int)
-	peersPerShard = make(map[string]int)
-	allocationsTotalPerShard = make(map[string]int)
-
-	for _, shardID := range shardIDs {
-		pins, err := cm.ListPins(ctx, shardID)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		pinsPerShard[shardID] = len(pins)
-		allocTotal := 0
-		for _, pin := range pins {
-			allocTotal += len(pin.Allocations)
-		}
-		allocationsTotalPerShard[shardID] = allocTotal
-
-		peerCount, err := cm.GetPeerCount(ctx, shardID)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		peersPerShard[shardID] = peerCount
-	}
-	return pinsPerShard, peersPerShard, allocationsTotalPerShard, nil
+	cluster.pinTracker.TriggerSync()
 }

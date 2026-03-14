@@ -1,12 +1,19 @@
 package signing
 
 import (
+	"crypto/rand"
 	"encoding/hex"
 	"sync"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
 )
+
+func newNonce(n int) ([]byte, error) {
+	b := make([]byte, n)
+	_, err := rand.Read(b)
+	return b, err
+}
 
 func nonceKey(sender peer.ID, nonce []byte) string {
 	return sender.String() + ":" + hex.EncodeToString(nonce)

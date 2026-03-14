@@ -27,17 +27,15 @@ type provideRequest struct {
 // IPFSDHTAdapter implements DHTProvider using IPFS's DHT via HTTP API
 // It also implements routing.Routing to be compatible with libp2p/ipfs-cluster.
 type IPFSDHTAdapter struct {
-	api             *ipfsapi.Shell
-	retryAttempts   int
-	retryDelay      time.Duration
-	provideTimeout  time.Duration // Timeout for provide operations
-	provideInterval time.Duration // Min delay between provide ops (0 = no delay) to avoid overwhelming the DHT
-	provideQueue    chan *provideRequest
-	workerCtx       context.Context
-	workerCancel    context.CancelFunc
-	workerStarted   bool
-	workerMu        sync.Mutex
-	intervalMu      sync.RWMutex
+	api            *ipfsapi.Shell
+	retryAttempts  int
+	retryDelay     time.Duration
+	provideTimeout time.Duration // Timeout for provide operations
+	provideQueue   chan *provideRequest
+	workerCtx      context.Context
+	workerCancel   context.CancelFunc
+	workerStarted  bool
+	workerMu       sync.Mutex
 }
 
 var _ routing.Routing = (*IPFSDHTAdapter)(nil)
@@ -45,52 +43,18 @@ var _ routing.Routing = (*IPFSDHTAdapter)(nil)
 // NewIPFSDHTAdapterFromClient creates a DHT adapter from an ipfs.Client,
 // avoiding the need for callers to access the raw Shell.
 func NewIPFSDHTAdapterFromClient(c *Client) *IPFSDHTAdapter {
-	return NewIPFSDHTAdapter(c.shell())
-}
-
-// NewIPFSDHTAdapter creates a new DHT adapter that uses IPFS's DHT
-func NewIPFSDHTAdapter(api *ipfsapi.Shell) *IPFSDHTAdapter {
 	ctx, cancel := context.WithCancel(context.Background())
 	adapter := &IPFSDHTAdapter{
-		api:            api,
-		retryAttempts:  3,                               // Default retry attempts
-		retryDelay:     500 * time.Millisecond,          // Default retry delay
-		provideTimeout: 60 * time.Second,                // Default timeout
-		provideQueue:   make(chan *provideRequest, 100), // Buffer up to 100 queued operations
+		api:            c.shell(),
+		retryAttempts:  3,
+		retryDelay:     500 * time.Millisecond,
+		provideTimeout: 60 * time.Second,
+		provideQueue:   make(chan *provideRequest, 100),
 		workerCtx:      ctx,
 		workerCancel:   cancel,
 	}
 	adapter.startWorker()
 	return adapter
-}
-
-// NewIPFSDHTAdapterWithRetry creates a new DHT adapter with custom retry configuration
-func NewIPFSDHTAdapterWithRetry(api *ipfsapi.Shell, retryAttempts int, retryDelay time.Duration) *IPFSDHTAdapter {
-	return NewIPFSDHTAdapterWithTimeout(api, retryAttempts, retryDelay, 60*time.Second)
-}
-
-// NewIPFSDHTAdapterWithTimeout creates a new DHT adapter with custom retry and timeout configuration
-func NewIPFSDHTAdapterWithTimeout(api *ipfsapi.Shell, retryAttempts int, retryDelay time.Duration, provideTimeout time.Duration) *IPFSDHTAdapter {
-	ctx, cancel := context.WithCancel(context.Background())
-	adapter := &IPFSDHTAdapter{
-		api:            api,
-		retryAttempts:  retryAttempts,
-		retryDelay:     retryDelay,
-		provideTimeout: provideTimeout,
-		provideQueue:   make(chan *provideRequest, 100), // Buffer up to 100 queued operations
-		workerCtx:      ctx,
-		workerCancel:   cancel,
-	}
-	adapter.startWorker()
-	return adapter
-}
-
-// SetProvideInterval sets the minimum delay between processing provide operations.
-// Use > 0 (e.g. 3s) to avoid overwhelming the DHT when many files are announced.
-func (a *IPFSDHTAdapter) SetProvideInterval(d time.Duration) {
-	a.intervalMu.Lock()
-	defer a.intervalMu.Unlock()
-	a.provideInterval = d
 }
 
 // startWorker starts the worker goroutine that processes provide operations one at a time
@@ -114,17 +78,6 @@ func (a *IPFSDHTAdapter) worker() {
 			return
 		case req := <-a.provideQueue:
 			a.processProvideRequest(req)
-
-			a.intervalMu.RLock()
-			interval := a.provideInterval
-			a.intervalMu.RUnlock()
-			if interval > 0 {
-				select {
-				case <-a.workerCtx.Done():
-					return
-				case <-time.After(interval):
-				}
-			}
 		}
 	}
 }
@@ -150,11 +103,6 @@ func (a *IPFSDHTAdapter) processProvideRequest(req *provideRequest) {
 	case req.resultCh <- err:
 	case <-req.ctx.Done():
 	}
-}
-
-// Close shuts down the worker goroutine
-func (a *IPFSDHTAdapter) Close() {
-	a.workerCancel()
 }
 
 // FindProvidersAsync finds providers of a CID using IPFS DHT

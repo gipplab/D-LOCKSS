@@ -59,10 +59,9 @@ class ShardManager {
     - ipfsClient: ipfs.IPFSClient
     - storageMgr: StorageProvider
     - clusterMgr: ClusterManagerInterface
-    - metrics: *telemetry.MetricsManager
     - signer: MessageAuthenticator
     - rateLimiter: *common.RateLimiter
-    - peers: *PeerTracker
+    - peers: *peerTracker
     - mu: sync.RWMutex
     - currentShard: string
     - shardSubs: map[string]*shardSubscription
@@ -70,8 +69,8 @@ class ShardManager {
     - observerOnlyShards: map[string]struct{}
     - reshardedFiles: *common.KnownFiles
     - orphanHandoffSent: map[...]
-    - autoReplicationSem: chan struct{}
     - reprovideInFlight: atomic.Bool
+    - repl: *replicationManager
     - lifecycle: *lifecycleManager
     --
     + NewShardManager(cfg ShardManagerConfig): (*ShardManager, error)
@@ -91,6 +90,25 @@ class ShardManager {
     + AnnouncePinned(manifestCID)
 }
 
+class replicationManager {
+    - ops: replicationOps
+    - mu: sync.Mutex
+    - cooldown: map[string]time.Time
+    - sem: chan struct{}
+    --
+    + runChecker()
+    - sendReplicationRequests(ctx, cfg, shard, manifests)
+    - handleRequest(msg, rr, shardID)
+    - pruneCooldown()
+}
+note right of replicationManager
+  Extracted from ShardManager.
+  Owns replication request cooldown
+  and auto-replication semaphore.
+  Interacts with ShardManager via
+  replicationOps interface.
+end note
+
 class lifecycleManager {
     - ops: lifecycleOps
     - cfg: *config.Config
@@ -108,14 +126,18 @@ class lifecycleManager {
     - recordSplitAnnouncement(child0, child1)
 }
 
+ShardManager --> replicationManager : delegates replication
 ShardManager --> lifecycleManager : delegates split/merge/discovery
 
 note right of ShardManager
   PubSub topics: dlockss-creative-commons-shard-<id>.
   One subscription per shard (refCount); observer mode for probing.
-  Lifecycle decisions (split/merge/discovery) delegated to lifecycleManager.
-  Replication code split into shard_msg_handlers.go, shard_reshard.go,
-  shard_maintenance.go.
+  Lifecycle decisions delegated to lifecycleManager.
+  Replication requests delegated to replicationManager.
+  Code organized into focused files:
+  shard_loops.go (message dispatch, heartbeat, pin reannounce),
+  shard_msg_handlers.go, shard_reshard.go,
+  shard_orphan.go, shard_legacy.go, shard_replication.go.
   Stability (v0.0.3):
   - ShardMoveCooldown (30s) after ANY transition
   - PROBE response rate limiting (5s)
@@ -249,5 +271,51 @@ class KnownFiles {
 }
 RateLimiter --> peerRateLimit : contains
 BackoffTable --> operationBackoff : contains
+
+class Config {
+    + DiscoveryServiceTag: string
+    + PubsubTopicPrefix: string
+    + TopicName: string
+    + FileWatchFolder: string
+    + NodeName: string
+    + IPFSNodeAddress: string
+    + ...
+    --
+    + Sharding: ShardingConfig
+    + Replication: ReplicationConfig
+    + Files: FileConfig
+    + Security: SecurityConfig
+    + Orphan: OrphanConfig
+    --
+    + DefaultConfig(): *Config
+    + LoadFromEnv(): *Config
+    + Validate(): error
+    + Log()
+}
+
+class ShardingConfig {
+    + MaxPeersPerShard: int
+    + MinPeersPerShard: int
+    + MinPeersAcrossSiblings: int
+    + ShardMoveCooldown: time.Duration
+    + ShardOverlapDuration: time.Duration
+    + ShardPeerCheckInterval: time.Duration
+    + ShardDiscoveryInterval: time.Duration
+    + ShardSplitRebroadcastInterval: time.Duration
+    + ...
+}
+
+class ReplicationConfig {
+    + MinReplication: int
+    + MaxReplication: int
+    + CheckInterval: time.Duration
+    + AutoReplicationEnabled: bool
+    + AutoReplicationTimeout: time.Duration
+    + MaxConcurrentReplicationChecks: int
+    + ...
+}
+
+Config --> ShardingConfig
+Config --> ReplicationConfig
 
 @enduml

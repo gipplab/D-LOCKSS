@@ -7,25 +7,22 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ipfs/go-cid"
+
 	"dlockss/internal/badbits"
 	"dlockss/internal/common"
 	"dlockss/internal/config"
-	"dlockss/internal/telemetry"
 )
 
 // StorageManager handles local file state and DHT announcements.
 type StorageManager struct {
-	cfg                   *config.Config
-	dht                   common.DHTProvider
-	badBits               *badbits.Filter
-	disk                  *DiskMonitor
-	pinnedFiles           *common.PinnedSet
-	knownFiles            *common.KnownFiles
-	recentlyRemoved       *common.RecentlyRemoved
-	fileReplicationLevels *common.FileReplicationLevels
-	failedOperations      *BackoffTable
-	metrics               *telemetry.MetricsManager
-	provideSem            chan struct{}
+	cfg         *config.Config
+	dht         common.DHTProvider
+	badBits     *badbits.Filter
+	disk        *DiskMonitor
+	pinnedFiles *common.PinnedSet
+	knownFiles  *common.KnownFiles
+	provideSem  chan struct{}
 
 	announceMu        sync.Mutex
 	announceIndex     int
@@ -34,23 +31,19 @@ type StorageManager struct {
 }
 
 // NewStorageManager creates a new StorageManager.
-func NewStorageManager(cfg *config.Config, dht common.DHTProvider, metrics *telemetry.MetricsManager, badBits *badbits.Filter) *StorageManager {
-	maxProvides := cfg.MaxConcurrentDHTProvides
+func NewStorageManager(cfg *config.Config, dht common.DHTProvider, badBits *badbits.Filter) *StorageManager {
+	maxProvides := cfg.Files.MaxConcurrentDHTProvides
 	if maxProvides < 1 {
 		maxProvides = 8
 	}
 	return &StorageManager{
-		cfg:                   cfg,
-		dht:                   dht,
-		badBits:               badBits,
-		disk:                  NewDiskMonitor(cfg.FileWatchFolder, cfg.DiskUsageHighWaterMark),
-		pinnedFiles:           common.NewPinnedSet(),
-		knownFiles:            common.NewKnownFiles(),
-		recentlyRemoved:       common.NewRecentlyRemoved(),
-		fileReplicationLevels: common.NewFileReplicationLevels(),
-		failedOperations:      newBackoffTable(cfg.InitialBackoffDelay, cfg.MaxBackoffDelay, cfg.BackoffMultiplier),
-		metrics:               metrics,
-		provideSem:            make(chan struct{}, maxProvides),
+		cfg:         cfg,
+		dht:         dht,
+		badBits:     badBits,
+		disk:        NewDiskMonitor(cfg.FileWatchFolder, cfg.DiskUsageHighWaterMark),
+		pinnedFiles: common.NewPinnedSet(),
+		knownFiles:  common.NewKnownFiles(),
+		provideSem:  make(chan struct{}, maxProvides),
 	}
 }
 
@@ -114,9 +107,6 @@ func (sm *StorageManager) PinFile(manifestCIDStr string) bool {
 		sm.announceMu.Lock()
 		sm.announceKeysDirty = true
 		sm.announceMu.Unlock()
-		if sm.metrics != nil {
-			sm.metrics.SetPinnedFilesCount(sm.pinnedFiles.Size())
-		}
 		slog.Info("pinned manifest", "manifest", manifestCIDStr, "total", sm.pinnedFiles.Size())
 	} else {
 		slog.Debug("manifest already pinned, timestamp updated", "manifest", manifestCIDStr, "total", sm.pinnedFiles.Size())
@@ -132,9 +122,6 @@ func (sm *StorageManager) UnpinFile(key string) {
 		sm.announceMu.Lock()
 		sm.announceKeysDirty = true
 		sm.announceMu.Unlock()
-		if sm.metrics != nil {
-			sm.metrics.SetPinnedFilesCount(sm.pinnedFiles.Size())
-		}
 		slog.Info("unpinned file", "key", key, "pinned_for", time.Since(pinTime), "remaining", sm.pinnedFiles.Size())
 	} else {
 		slog.Warn("attempted to unpin file that was not pinned", "key", key)
@@ -148,35 +135,7 @@ func (sm *StorageManager) IsPinned(key string) bool {
 
 // AddKnownFile adds a file/manifest to the known files set.
 func (sm *StorageManager) AddKnownFile(key string) {
-	removedTime, wasRemoved := sm.recentlyRemoved.WasRemoved(key)
-	if wasRemoved && time.Since(removedTime) < sm.cfg.RemovedFileCooldown {
-		return
-	}
-
-	if sm.knownFiles.Add(key) {
-		if sm.metrics != nil {
-			sm.metrics.SetKnownFilesCount(sm.knownFiles.Size())
-		}
-	}
-
-	// Ensure we track replication level for new files, starting at 0 (or 1 if pinned)
-	if sm.pinnedFiles.Has(key) {
-		sm.fileReplicationLevels.Set(key, 1)
-	} else {
-		sm.fileReplicationLevels.Set(key, 0)
-	}
-}
-
-// RemoveKnownFile removes a file/manifest from the known files set.
-func (sm *StorageManager) RemoveKnownFile(key string) {
-	sm.knownFiles.Remove(key)
-	if sm.metrics != nil {
-		sm.metrics.SetKnownFilesCount(sm.knownFiles.Size())
-	}
-
-	sm.fileReplicationLevels.Delete(key)
-
-	sm.recentlyRemoved.Record(key)
+	sm.knownFiles.Add(key)
 }
 
 // ProvideFile announces a file/manifest to the DHT.
@@ -187,7 +146,7 @@ func (sm *StorageManager) ProvideFile(ctx context.Context, key string) {
 	if sm.dht == nil {
 		return
 	}
-	c, err := common.KeyToCID(key)
+	c, err := cid.Decode(key)
 	if err != nil {
 		slog.Error("failed to convert key to CID", "key", key, "error", err)
 		return
@@ -203,30 +162,8 @@ func (sm *StorageManager) ProvideFile(ctx context.Context, key string) {
 
 	if err := sm.dht.Provide(ctx, c, true); err != nil {
 		slog.Warn("failed to provide file to DHT", "key", key, "error", err)
-		sm.RecordFailedOperation(key)
 		return
 	}
-}
-
-// RecordFailedOperation records a failure for exponential backoff
-func (sm *StorageManager) RecordFailedOperation(key string) {
-	sm.failedOperations.recordFailure(key)
-}
-
-func (sm *StorageManager) ClearFailedOperation(key string) {
-	sm.failedOperations.clear(key)
-}
-
-func (sm *StorageManager) SetReplicationLevel(key string, count int) {
-	sm.fileReplicationLevels.Set(key, count)
-}
-
-func (sm *StorageManager) GetReplicationLevels() map[string]int {
-	return sm.fileReplicationLevels.Snapshot()
-}
-
-func (sm *StorageManager) GetKnownFiles() *common.KnownFiles {
-	return sm.knownFiles
 }
 
 // GetAllKnownFiles returns a snapshot of all known file keys.
@@ -240,19 +177,4 @@ func (sm *StorageManager) GetPinTime(key string) time.Time {
 
 func (sm *StorageManager) GetPinnedCount() int {
 	return sm.pinnedFiles.Size()
-}
-
-// GetStorageStatus returns a snapshot of current storage state.
-func (sm *StorageManager) GetStorageStatus() common.StorageSnapshot {
-	allKnown := sm.knownFiles.All()
-	knownCIDs := make([]string, 0, len(allKnown))
-	for k := range allKnown {
-		knownCIDs = append(knownCIDs, k)
-	}
-	return common.StorageSnapshot{
-		PinnedCount:  sm.pinnedFiles.Size(),
-		KnownCount:   sm.knownFiles.Size(),
-		KnownCIDs:    knownCIDs,
-		BackoffCount: sm.failedOperations.size(),
-	}
 }

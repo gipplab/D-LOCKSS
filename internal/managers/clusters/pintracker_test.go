@@ -53,7 +53,7 @@ func (m *mockConsensus) Peers(ctx context.Context) ([]peer.ID, error) {
 }
 func (m *mockConsensus) Shutdown(ctx context.Context) error { return nil }
 
-// mockIPFSForTracker implements IPFSPinner and records Pin calls.
+// mockIPFSForTracker implements ipfsPinner and records Pin calls.
 type mockIPFSForTracker struct {
 	mu       sync.Mutex
 	pinCalls []cid.Cid
@@ -75,7 +75,7 @@ func TestPinTracker_allocation_pin(t *testing.T) {
 	ourPeer := testutil.MustPeerID(t, "our")
 	c1, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
 	ipfs := &mockIPFSForTracker{}
-	pt := NewLocalPinTracker(ipfs, "1", nil, nil, nil)
+	pt := newLocalPinTracker(ipfs, "1", nil, nil, nil)
 
 	state := &mockState{
 		pins: []api.Pin{
@@ -104,7 +104,7 @@ func TestPinTracker_allocation_skip(t *testing.T) {
 	otherPeer := testutil.MustPeerID(t, "other")
 	c1, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
 	ipfs := &mockIPFSForTracker{}
-	pt := NewLocalPinTracker(ipfs, "1", nil, nil, nil)
+	pt := newLocalPinTracker(ipfs, "1", nil, nil, nil)
 
 	state := &mockState{
 		pins: []api.Pin{
@@ -126,7 +126,7 @@ func TestPinTracker_allocation_skip(t *testing.T) {
 func TestPinTracker_empty_allocations_full_replication(t *testing.T) {
 	c1, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
 	ipfs := &mockIPFSForTracker{}
-	pt := NewLocalPinTracker(ipfs, "1", nil, nil, nil)
+	pt := newLocalPinTracker(ipfs, "1", nil, nil, nil)
 
 	// Empty Allocations means "pin everywhere" (full replication)
 	state := &mockState{
@@ -155,7 +155,7 @@ func TestPinTracker_tracking_released_when_removed_from_CRDT(t *testing.T) {
 	removed := make([]string, 0)
 	onRemoved := func(cidStr string) { removed = append(removed, cidStr) }
 	ipfs := &mockIPFSForTracker{}
-	pt := NewLocalPinTracker(ipfs, "1", nil, onRemoved, nil)
+	pt := newLocalPinTracker(ipfs, "1", nil, onRemoved, nil)
 
 	stateWithPin := &mockState{
 		pins: []api.Pin{
@@ -178,7 +178,7 @@ func TestPinTracker_tracking_released_when_removed_from_CRDT(t *testing.T) {
 	pt.syncState(consensusEmpty)
 
 	// PinTracker should NOT call UnpinRecursive (migration-safe);
-	// the IPFSPinner interface doesn't even include UnpinRecursive.
+	// the ipfsPinner interface doesn't even include UnpinRecursive.
 	// But onPinRemoved callback should have been called.
 	if len(removed) != 1 {
 		t.Errorf("expected onPinRemoved called once, got %d", len(removed))

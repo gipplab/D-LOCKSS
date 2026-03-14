@@ -43,6 +43,6 @@ ClusterMgr -> CRDT: LogUnpin(pin)
 CRDT -> Peers: Sync State
 Peers -> PinTracker: State() on next sync
 PinTracker -> Storage: onPinRemoved(cid)
-Note over PinTracker: Releases tracking only.\nActual IPFS UnpinRecursive is called\nby the reshard/orphan unpin passes\n(shard_reshard.go, shard_maintenance.go).
+Note over PinTracker: Releases tracking only.\nActual IPFS UnpinRecursive is called\nby the reshard/orphan unpin passes\n(shard_reshard.go, shard_orphan.go).
 
 @enduml

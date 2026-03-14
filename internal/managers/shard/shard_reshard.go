@@ -4,6 +4,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/ipfs/go-cid"
+
 	"dlockss/internal/common"
 	"dlockss/pkg/schema"
 )
@@ -49,7 +51,7 @@ func (sm *ShardManager) RunReshardPass(oldShard, newShard string) {
 			continue
 		}
 
-		manifestCID, err := common.KeyToCID(key)
+		manifestCID, err := cid.Decode(key)
 		if err != nil {
 			continue
 		}
@@ -77,7 +79,7 @@ func (sm *ShardManager) RunReshardPass(oldShard, newShard string) {
 							slog.Info("reshard: ReplicationRequest sent before unpinning", "target_shard", targetNew, "manifest", key)
 							select {
 							case <-sm.ctx.Done():
-							case <-time.After(sm.cfg.ReshardHandoffDelay):
+							case <-time.After(sm.cfg.Files.ReshardHandoffDelay):
 							}
 						}
 					}

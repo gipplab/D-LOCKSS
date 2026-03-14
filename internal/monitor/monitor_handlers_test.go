@@ -6,7 +6,7 @@ import (
 )
 
 func TestUpdateNodeShardLocked_CrossBranchRejected(t *testing.T) {
-	m := NewMonitor(DefaultMonitorConfig(), "")
+	m := NewMonitor(DefaultMonitorConfig())
 	peerID := "12D3KooWTestCrossBranch123"
 	now := time.Now()
 
@@ -24,7 +24,7 @@ func TestUpdateNodeShardLocked_CrossBranchRejected(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			node := &NodeState{
+			node := &nodeState{
 				PeerID:       peerID,
 				CurrentShard: tt.lastShard,
 				ShardHistory: []ShardHistoryEntry{{ShardID: tt.lastShard, FirstSeen: now}},
@@ -49,12 +49,12 @@ func TestUpdateNodeShardLocked_CrossBranchRejected(t *testing.T) {
 }
 
 func TestUpdateNodeShardLocked_ValidMovesAccepted(t *testing.T) {
-	m := NewMonitor(DefaultMonitorConfig(), "")
+	m := NewMonitor(DefaultMonitorConfig())
 	now := time.Now()
 
 	t.Run("split_0_to_00", func(t *testing.T) {
 		peerID := "12D3KooWTestSplit123"
-		node := &NodeState{
+		node := &nodeState{
 			PeerID:       peerID,
 			CurrentShard: "0",
 			ShardHistory: []ShardHistoryEntry{{ShardID: "0", FirstSeen: now}},
@@ -77,7 +77,7 @@ func TestUpdateNodeShardLocked_ValidMovesAccepted(t *testing.T) {
 
 	t.Run("sibling_0_to_1", func(t *testing.T) {
 		peerID := "12D3KooWTestSibling456"
-		node := &NodeState{
+		node := &nodeState{
 			PeerID:       peerID,
 			CurrentShard: "0",
 			ShardHistory: []ShardHistoryEntry{{ShardID: "0", FirstSeen: now}},

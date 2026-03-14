@@ -60,7 +60,7 @@ func (fp *FileProcessor) processNewFile(path string) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(fp.ctx, fp.cfg.FileImportTimeout)
+	ctx, cancel := context.WithTimeout(fp.ctx, fp.cfg.Files.FileImportTimeout)
 	defer cancel()
 
 	slog.Debug("importing file to IPFS", "path", path)
@@ -225,7 +225,7 @@ func (fp *FileProcessor) trackAndAnnounceFile(manifestCID cid.Cid, manifestCIDSt
 func (fp *FileProcessor) announceResponsibleFile(manifestCID cid.Cid, manifestCIDStr, payloadCIDStr string) {
 	slog.Info("responsible for file, announcing to shard", "payload", payloadCIDStr, "manifest", manifestCIDStr)
 
-	currentShard, _ := fp.shardMgr.GetShardInfo()
+	currentShard := fp.shardMgr.GetShardInfo()
 	im := schema.IngestMessage{
 		SignedEnvelope: schema.SignedEnvelope{Type: schema.MessageTypeIngest, ManifestCID: manifestCID},
 		ShardID:        currentShard,
@@ -247,12 +247,12 @@ func (fp *FileProcessor) announceResponsibleFile(manifestCID cid.Cid, manifestCI
 	// Announce both manifest and payload to the DHT so gateways can find providers.
 	// Each gets its own timeout so a slow manifest provide can't starve the payload.
 	go func() {
-		ctx1, cancel1 := context.WithTimeout(fp.ctx, fp.cfg.DHTProvideTimeout)
+		ctx1, cancel1 := context.WithTimeout(fp.ctx, fp.cfg.Files.DHTProvideTimeout)
 		defer cancel1()
 		fp.storageMgr.ProvideFile(ctx1, manifestCIDStr)
 	}()
 	go func() {
-		ctx2, cancel2 := context.WithTimeout(fp.ctx, fp.cfg.DHTProvideTimeout)
+		ctx2, cancel2 := context.WithTimeout(fp.ctx, fp.cfg.Files.DHTProvideTimeout)
 		defer cancel2()
 		fp.storageMgr.ProvideFile(ctx2, payloadCIDStr)
 	}()
@@ -261,7 +261,7 @@ func (fp *FileProcessor) announceResponsibleFile(manifestCID cid.Cid, manifestCI
 func (fp *FileProcessor) announceCustodialFile(manifestCID cid.Cid, manifestCIDStr, payloadCIDStr string) {
 	slog.Info("custodial mode, injecting into target shard", "payload", payloadCIDStr, "manifest", manifestCIDStr)
 
-	currentShard, _ := fp.shardMgr.GetShardInfo()
+	currentShard := fp.shardMgr.GetShardInfo()
 	targetDepth := len(currentShard)
 	if targetDepth == 0 {
 		targetDepth = 1

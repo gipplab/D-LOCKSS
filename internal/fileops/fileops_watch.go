@@ -65,7 +65,7 @@ func (fp *FileProcessor) shouldProcessFileEvent(path string) bool {
 // waits for the file size to be unchanged for that duration before enqueueing,
 // to avoid ingesting files still being written (e.g. downloads).
 func (fp *FileProcessor) enqueueWithStabilityCheck(path string) {
-	if fp.cfg.FileStabilityDelay <= 0 {
+	if fp.cfg.Files.FileStabilityDelay <= 0 {
 		_ = fp.EnqueueOrRetry(path)
 		return
 	}
@@ -81,7 +81,7 @@ func (fp *FileProcessor) enqueueWithStabilityCheck(path string) {
 		t.Stop()
 	}
 	fp.stabilityPath[path] = currentSize
-	fp.stabilityTimer[path] = time.AfterFunc(fp.cfg.FileStabilityDelay, func() {
+	fp.stabilityTimer[path] = time.AfterFunc(fp.cfg.Files.FileStabilityDelay, func() {
 		if fp.ctx.Err() != nil {
 			return
 		}
@@ -186,90 +186,7 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 			if !ok {
 				return fmt.Errorf("events channel closed unexpectedly")
 			}
-
-			if event.Op&fsnotify.Create == fsnotify.Create {
-				info, err := os.Stat(event.Name)
-				if err == nil && info.IsDir() {
-					watchedDirsMu.RLock()
-					alreadyWatched := watchedDirs[event.Name]
-					watchedDirsMu.RUnlock()
-
-					if !alreadyWatched {
-						if err := watcher.Add(event.Name); err != nil {
-							slog.Error("failed to watch new directory", "path", event.Name, "error", err)
-						} else {
-							watchedDirsMu.Lock()
-							watchedDirs[event.Name] = true
-							watchedDirsMu.Unlock()
-							slog.Debug("added watch for new directory", "path", event.Name)
-						}
-					}
-					go func(dirPath string) {
-						time.Sleep(fp.cfg.FileProcessingDelay)
-
-						fileCount := 0
-						dirCount := 0
-
-						err := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
-							if err != nil {
-								slog.Warn("error accessing path during directory scan", "path", path, "error", err)
-								return nil
-							}
-							if info.IsDir() {
-								if path != dirPath {
-									watchedDirsMu.RLock()
-									alreadyWatched := watchedDirs[path]
-									watchedDirsMu.RUnlock()
-
-									if !alreadyWatched {
-										if err := watcher.Add(path); err != nil {
-											slog.Error("failed to watch nested directory", "path", path, "error", err)
-										} else {
-											watchedDirsMu.Lock()
-											watchedDirs[path] = true
-											watchedDirsMu.Unlock()
-											slog.Debug("added watch for nested directory", "path", path)
-											dirCount++
-										}
-									}
-								}
-								return nil
-							}
-							if !fp.validateFilePath(path) {
-								slog.Debug("file filtered by validation", "path", path)
-								return nil
-							}
-							fileCount++
-
-							fp.enqueueWithStabilityCheck(path)
-							return nil
-						})
-						if err != nil {
-							slog.Error("failed to scan new directory", "path", dirPath, "error", err)
-						} else {
-							slog.Info("scanned directory", "path", dirPath, "files", fileCount, "nested_dirs", dirCount)
-						}
-					}(event.Name)
-					continue
-				}
-			}
-
-			if event.Op&fsnotify.Create == fsnotify.Create || event.Op&fsnotify.Write == fsnotify.Write {
-				path := event.Name
-
-				if !fp.validateFilePath(path) {
-					continue
-				}
-
-				info, err := os.Stat(path)
-				if err != nil || info.IsDir() {
-					continue
-				}
-
-				if fp.shouldProcessFileEvent(path) {
-					fp.enqueueWithStabilityCheck(path)
-				}
-			}
+			fp.handleWatcherEvent(event, watcher, watchedDirs, &watchedDirsMu)
 		case err, ok := <-watcher.Errors:
 			if !ok {
 				return fmt.Errorf("errors channel closed unexpectedly")
@@ -277,4 +194,86 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 			slog.Error("watcher error", "error", err)
 		}
 	}
+}
+
+func (fp *FileProcessor) handleWatcherEvent(event fsnotify.Event, watcher *fsnotify.Watcher, watchedDirs map[string]bool, mu *sync.RWMutex) {
+	if event.Op&fsnotify.Create == fsnotify.Create {
+		info, err := os.Stat(event.Name)
+		if err == nil && info.IsDir() {
+			fp.handleNewDirectory(event.Name, watcher, watchedDirs, mu)
+			return
+		}
+	}
+
+	if event.Op&fsnotify.Create == fsnotify.Create || event.Op&fsnotify.Write == fsnotify.Write {
+		path := event.Name
+		if !fp.validateFilePath(path) {
+			return
+		}
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			return
+		}
+		if fp.shouldProcessFileEvent(path) {
+			fp.enqueueWithStabilityCheck(path)
+		}
+	}
+}
+
+func (fp *FileProcessor) handleNewDirectory(dirPath string, watcher *fsnotify.Watcher, watchedDirs map[string]bool, mu *sync.RWMutex) {
+	mu.RLock()
+	alreadyWatched := watchedDirs[dirPath]
+	mu.RUnlock()
+
+	if !alreadyWatched {
+		if err := watcher.Add(dirPath); err != nil {
+			slog.Error("failed to watch new directory", "path", dirPath, "error", err)
+		} else {
+			mu.Lock()
+			watchedDirs[dirPath] = true
+			mu.Unlock()
+			slog.Debug("added watch for new directory", "path", dirPath)
+		}
+	}
+
+	go func() {
+		time.Sleep(fp.cfg.Files.FileProcessingDelay)
+		fileCount := 0
+		dirCount := 0
+		err := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				slog.Warn("error accessing path during directory scan", "path", path, "error", err)
+				return nil
+			}
+			if info.IsDir() {
+				if path != dirPath {
+					mu.RLock()
+					seen := watchedDirs[path]
+					mu.RUnlock()
+					if !seen {
+						if err := watcher.Add(path); err != nil {
+							slog.Error("failed to watch nested directory", "path", path, "error", err)
+						} else {
+							mu.Lock()
+							watchedDirs[path] = true
+							mu.Unlock()
+							dirCount++
+						}
+					}
+				}
+				return nil
+			}
+			if !fp.validateFilePath(path) {
+				return nil
+			}
+			fileCount++
+			fp.enqueueWithStabilityCheck(path)
+			return nil
+		})
+		if err != nil {
+			slog.Error("failed to scan new directory", "path", dirPath, "error", err)
+		} else {
+			slog.Info("scanned directory", "path", dirPath, "files", fileCount, "nested_dirs", dirCount)
+		}
+	}()
 }

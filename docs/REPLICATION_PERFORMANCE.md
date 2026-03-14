@@ -1,136 +1,122 @@
 # Replication Performance Analysis
 
+## Architecture Overview
+
+Replication in D-LOCKSS is driven by two complementary mechanisms:
+
+1. **CRDT Cluster Sync** — Each shard runs an embedded IPFS Cluster with CRDT consensus. When a file is pinned to a shard's cluster, the `LocalPinTracker` on every peer in that shard automatically syncs and pins the content locally.
+
+2. **ReplicationRequest Protocol** — The `replicationManager` (extracted from `ShardManager`) periodically broadcasts `ReplicationRequest` messages for pinned manifests. Peers that don't yet have the file perform **auto-replication**: fetch via `PinRecursive` and add to the cluster.
+
+## Key Constants and Defaults
+
+| Parameter | Default | Env Variable | Location |
+|-----------|---------|-------------|----------|
+| Replication Check Interval | 1 minute | `DLOCKSS_CHECK_INTERVAL` | `config.Replication.CheckInterval` |
+| Root Shard Check Interval | 20 seconds | (hardcoded) | `rootReplicationCheckInterval` |
+| Request Cooldown Per Manifest | 5 minutes | (hardcoded) | `replicationRequestCooldownDuration` |
+| Max Requests Per Cycle | 50 | (hardcoded) | `maxReplicationRequestsPerCycle` |
+| Auto-Replication Enabled | true | `DLOCKSS_AUTO_REPLICATION_ENABLED` | `config.Replication.AutoReplicationEnabled` |
+| Auto-Replication Timeout | 5 minutes | `DLOCKSS_AUTO_REPLICATION_TIMEOUT` | `config.Replication.AutoReplicationTimeout` |
+| Max Concurrent Checks | 5 | `DLOCKSS_MAX_CONCURRENT_CHECKS` | `config.Replication.MaxConcurrentReplicationChecks` |
+| Pin Reannounce Interval | 2 minutes | `DLOCKSS_PIN_REANNOUNCE_INTERVAL` | `config.Replication.PinReannounceInterval` |
+| Min Replication | 5 | `DLOCKSS_MIN_REPLICATION` | `config.Replication.MinReplication` |
+| Max Replication | 10 | `DLOCKSS_MAX_REPLICATION` | `config.Replication.MaxReplication` |
+
+## Convergence Timeline
+
+For a newly ingested file to reach full replication across a shard:
+
+1. **Ingest** (immediate): File pinned locally, `IngestMessage` broadcast to shard, cluster `Pin()` called.
+2. **CRDT Sync** (seconds): Cluster state propagates to peers via PubSub; `LocalPinTracker` detects new pin and starts `PinRecursive`.
+3. **First Replication Check** (up to 20s at root, 1m elsewhere): `replicationManager.runChecker()` sends `ReplicationRequest` for all pinned manifests.
+4. **Auto-Replication** (seconds to minutes): Peers receiving the request that don't have the file fetch it via `PinRecursive` (up to 5-minute timeout).
+5. **Cooldown** (5 minutes): After sending a request for a manifest, no new request is sent for that manifest for 5 minutes.
+
+**Typical convergence**: Most files replicate within 1-2 minutes via CRDT sync alone. Files that fail the initial sync (large DAGs, slow block propagation) recover on the next replication cycle after the 5-minute cooldown.
+
 ## Current Bottlenecks
 
-Based on code analysis, the following factors contribute to slow replication convergence:
+### 1. Request Cooldown (5 minutes)
 
-### 1. **Replication Check Interval** (Default: 1 minute)
-- **Location**: `CheckInterval = 1*time.Minute`
-- **Impact**: Replication levels are only checked once per minute
-- **Effect**: Minimum delay of 1 minute before detecting under-replication
+Once a `ReplicationRequest` is sent for a manifest, `replicationRequestCooldownDuration` prevents resending for 5 minutes. If the first request fails (e.g., the receiving peer's `PinRecursive` times out), the file appears "stuck" until the cooldown expires.
 
-### 2. **Hysteresis Verification Delay** (Default: 30 seconds)
-- **Location**: `ReplicationVerificationDelay = 30*time.Second`
-- **Impact**: When under-replication is detected, system waits ~30 seconds before triggering replication requests
-- **Effect**: Adds 30+ seconds delay before NEED messages are broadcast
-- **Rationale**: Prevents false alarms from transient DHT issues
+**Mitigation**: The cooldown prevents flooding but causes visible delays for files that fail on the first attempt.
 
-### 3. **Replication Check Cooldown** (Default: 15 seconds)
-- **Location**: `ReplicationCheckCooldown = 15*time.Second`
-- **Impact**: Prevents checking the same file more than once every 15 seconds
-- **Effect**: Limits how quickly replication can be re-checked after a change
+### 2. Auto-Replication Timeout (5 minutes)
 
-### 4. **Replication Cache TTL** (Default: 5 minutes)
-- **Location**: `ReplicationCacheTTL = 5*time.Minute`
-- **Impact**: Cached replication counts prevent frequent DHT queries
-- **Effect**: Replication counts may be stale for up to 5 minutes
-- **Trade-off**: Reduces DHT load but slows convergence detection
+`PinRecursive` for large files or over slow links may hit the `AutoReplicationTimeout`. The file remains unreplicated until the next replication cycle.
 
-### 5. **DHT Query Timeout** (Default: 2 minutes)
-- **Location**: `context.WithTimeout(ctx, 2*time.Minute)` in `checkReplication()`
-- **Impact**: DHT queries can take up to 2 minutes to timeout
-- **Effect**: Slow DHT queries delay replication checks
+**Mitigation**: Heartbeat-driven re-pin gradually fills in missing blocks (see below).
 
-### 6. **DHT Max Sample Size** (Default: 50)
-- **Location**: `DHTMaxSampleSize = 50`
-- **Impact**: Limits how many providers are queried per DHT lookup
-- **Effect**: May underestimate replication count in large networks
+### 3. Concurrent Replication Limit (5)
 
-### 7. **Worker Pool Limit** (Default: 10 concurrent checks)
-- **Location**: `MaxConcurrentReplicationChecks = 10`
-- **Impact**: Limits parallelism of replication checks
-- **Effect**: With many files, checks are serialized
+The `replicationManager.sem` channel limits concurrent auto-replications to `MaxConcurrentReplicationChecks` (default 5). When all slots are occupied, additional `ReplicationRequest` messages are silently dropped.
 
-### 8. **Missing Automatic Replication**
-- **Issue**: When a `ReplicationRequest` is received, nodes only check replication - they don't automatically fetch and pin missing files
-- **Impact**: Nodes must already have the file to replicate it
-- **Effect**: Replication requests don't trigger new replication, only verify existing state
+**Mitigation**: Increase `DLOCKSS_MAX_CONCURRENT_CHECKS` for nodes with sufficient bandwidth.
 
-## Total Minimum Delay
+### 4. Max Requests Per Cycle (50)
 
-For a new file to reach target replication:
-1. **Initial check**: Up to 1 minute (CheckInterval)
-2. **Verification delay**: ~30 seconds (ReplicationVerificationDelay)
-3. **Replication request broadcast**: Immediate
-4. **Other nodes check**: Up to 1 minute (their CheckInterval)
-5. **Re-check after replication**: Up to 1 minute + 15 seconds cooldown
+At most 50 `ReplicationRequest` messages are sent per checker cycle. With thousands of files, not all manifests are requested in a single cycle.
 
-**Minimum time to convergence**: ~3-4 minutes in ideal conditions
-**With DHT delays**: Can be 5-10 minutes or more
+**Mitigation**: Subsequent cycles pick up remaining manifests. The cooldown map ensures already-sent requests aren't duplicated.
+
+## Heartbeat-Driven Gradual DAG Completion (Built-In)
+
+Every heartbeat (~10s), each node picks **one** pinned manifest CID (round-robin) and:
+
+1. **Re-pins the ManifestCID recursively** (`PinRecursive`, 2-minute timeout). Idempotent — returns instantly when the DAG is already complete locally, and incrementally fetches missing blocks otherwise.
+2. **Pins the PayloadCID as its own root** so Kubo's reprovider (`pinned` strategy) re-announces it.
+3. **Provides both CIDs to the DHT** (only if the re-pin succeeded).
+
+A `CompareAndSwap` guard prevents concurrent re-provides from piling up.
+
+**Impact**: Resource-constrained nodes (e.g., Raspberry Pis) that failed the initial `PinRecursive` gradually complete the DAG over successive heartbeats without manual intervention. DHT provider records (which expire after ~24h) are kept fresh.
 
 ## Optimization Options
 
-### Option 1: Reduce Check Interval (Quick Win)
+### Reduce Check Interval (Quick Win)
 ```bash
 export DLOCKSS_CHECK_INTERVAL=15s  # Default: 1m
 ```
-**Pros**: Faster detection of under-replication
-**Cons**: More DHT queries, higher CPU usage
-**Recommendation**: Use 15-30s for testnets
+Faster detection at non-root shards. Root shards already check every 20s.
 
-### Option 3: Reduce Replication Cooldown (Quick Win)
+### Increase Concurrent Checks (Moderate Impact)
 ```bash
-export DLOCKSS_REPLICATION_COOLDOWN=5s  # Default: 15s
+export DLOCKSS_MAX_CONCURRENT_CHECKS=10  # Default: 5
 ```
-**Pros**: Faster re-checking after replication changes
-**Cons**: More frequent checks of same files
-**Recommendation**: Use 5s for testnets
+More parallel auto-replications. Higher bandwidth usage.
 
-### Option 5: Increase Worker Pool (Moderate Impact)
+### Increase Auto-Replication Timeout (Large Files)
 ```bash
-export DLOCKSS_MAX_CONCURRENT_CHECKS=20  # Default: 10
+export DLOCKSS_AUTO_REPLICATION_TIMEOUT=10m  # Default: 5m
 ```
-**Pros**: More parallel replication checks
-**Cons**: Higher CPU/memory usage
-**Recommendation**: Use 20-30 for testnets with many files
-
-### Option 8: Implement Automatic Replication (Major Feature)
-**Code Change Required**: Add logic to fetch and pin files when receiving ReplicationRequest
-**Pros**: Actually triggers replication, not just checks
-**Cons**: Requires IPFS content fetching, bandwidth usage
-**Recommendation**: High priority for production
+Allows more time for large DAG fetches. Ties up semaphore slots longer.
 
 ## Recommended Testnet Configuration
 
-For faster convergence in testnets, use:
+For faster convergence in testnets:
 
 ```bash
 export DLOCKSS_CHECK_INTERVAL=15s
-export DLOCKSS_REPLICATION_VERIFICATION_DELAY=5s
-export DLOCKSS_REPLICATION_COOLDOWN=5s
-export DLOCKSS_REPLICATION_CACHE_TTL=30s
-export DLOCKSS_MAX_CONCURRENT_CHECKS=20
-export DLOCKSS_DHT_MAX_SAMPLE_SIZE=100
+export DLOCKSS_MAX_CONCURRENT_CHECKS=10
 ```
-
-This reduces minimum convergence time from ~3-4 minutes to ~30-60 seconds.
-
-### Heartbeat-Driven Gradual DAG Completion (Built-In)
-
-Every heartbeat (~10s), each node picks one pinned manifest (round-robin) and calls `PinRecursive` with a 2-minute timeout. This is idempotent: if the DAG is already fully local it returns instantly, otherwise it incrementally fetches the missing blocks. On success, the manifest and payload CIDs are re-provided to the DHT.
-
-**Impact on resource-constrained nodes (Raspberry Pis):**
-- Initial `PinRecursive` during replication may time out or OOM before fetching the full DAG.
-- Instead of leaving the file permanently incomplete, subsequent heartbeats gradually fetch the remaining blocks.
-- After all blocks are local, Kubo's reprovider stops emitting "block not found locally, cannot provide" errors.
-- DHT provider records (which expire after ~24h) are kept fresh without relying solely on Kubo's reprovider.
-
-No configuration needed — this runs automatically on every node.
 
 ## Production Considerations
 
-For production networks:
-- Keep `ReplicationVerificationDelay` at 30s to prevent false alarms
-- Keep `ReplicationCacheTTL` at 5m to reduce DHT load
-- Keep `CheckInterval` at 1m for reasonable resource usage
-- Consider implementing Option 8 (automatic replication) for better convergence
+- Keep `CheckInterval` at 1m for reasonable resource usage (root shards already use 20s).
+- Keep `AutoReplicationTimeout` at 5m unless dealing with consistently large files.
+- The 5-minute request cooldown is a deliberate trade-off between convergence speed and network overhead; files that fail on the first attempt self-heal after the cooldown expires.
 
 ## Monitoring
 
-Watch these metrics to understand replication performance:
-- `replicationChecks`: Number of checks performed
-- `dhtQueries`: Number of DHT queries
-- `dhtQueryTimeouts`: DHT query failures
-- `filesAtTargetReplication`: Files with adequate replication
-- `lowReplicationFiles`: Files needing replication
-- `avgReplicationLevel`: Average replication across all files
+The monitor's `replication snapshot` log line reports:
+- `total_manifests`: Number of known manifests
+- `total_at_target`: Files with replica count >= min(MinReplication, shard_peer_count)
+- `avg_replication`: Average replica count across all manifests
+
+Node daemon logs to watch:
+- `"auto-replication: fetched and pinned"` — successful auto-replication
+- `"auto-replication: failed to fetch/pin"` — `PinRecursive` timeout or failure
+- `"auto-replication skipped, concurrency limit reached"` — semaphore full
+- `"ReplicationRequest sent"` — outbound request (debug level)

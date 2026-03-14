@@ -12,7 +12,6 @@ type MessageType uint8
 const (
 	MessageTypeIngest MessageType = iota + 1
 	MessageTypeReplicationRequest
-	MessageTypeUnreplicateRequest
 )
 
 // SignedEnvelope holds the fields common to every signed protocol message:
@@ -88,8 +87,7 @@ type Signable interface {
 // IngestMessage announces a new ResearchObject for ingestion.
 type IngestMessage struct {
 	SignedEnvelope
-	ShardID  string `cbor:"shard_id"`  // Target shard prefix
-	HintSize uint64 `cbor:"hint_size"` // Total size in bytes
+	ShardID string `cbor:"shard_id"` // Target shard prefix
 }
 
 func (m *IngestMessage) GetEnvelope() *SignedEnvelope { return &m.SignedEnvelope }
@@ -97,22 +95,9 @@ func (m *IngestMessage) GetEnvelope() *SignedEnvelope { return &m.SignedEnvelope
 // ReplicationRequest asks peers to replicate a ResearchObject.
 type ReplicationRequest struct {
 	SignedEnvelope
-	Priority uint8 `cbor:"priority"` // 0=Low, 1=High
-	Deadline int64 `cbor:"deadline"` // Unix timestamp deadline (0 = no deadline)
 }
 
 func (m *ReplicationRequest) GetEnvelope() *SignedEnvelope { return &m.SignedEnvelope }
-
-// UnreplicateRequest asks peers to drop over-replicated files.
-// Peers use deterministic selection (hash of ManifestCID + PeerID) to decide
-// whether to drop, ensuring distributed consensus without coordination.
-type UnreplicateRequest struct {
-	SignedEnvelope
-	ExcessCount  int `cbor:"excess_count"`  // How many replicas to drop
-	CurrentCount int `cbor:"current_count"` // Current replication count
-}
-
-func (m *UnreplicateRequest) GetEnvelope() *SignedEnvelope { return &m.SignedEnvelope }
 
 // marshalFields builds a CBOR map from envelope prefix + message-specific + envelope suffix fields.
 func marshalFields(env *SignedEnvelope, specific []cborKV, includeSig bool) ([]byte, error) {
@@ -135,7 +120,6 @@ func (m *IngestMessage) MarshalCBORForSigning() ([]byte, error) {
 func (m *IngestMessage) specificFields() []cborKV {
 	return []cborKV{
 		{"shard_id", m.ShardID},
-		{"hint_size", int64(m.HintSize)},
 	}
 }
 
@@ -151,11 +135,6 @@ func (m *IngestMessage) UnmarshalCBOR(data []byte) error {
 	if err != nil {
 		return err
 	}
-	sizeInt, err := readInt(node, "hint_size")
-	if err != nil {
-		return err
-	}
-	m.HintSize = uint64(sizeInt)
 	return nil
 }
 
@@ -170,10 +149,7 @@ func (m *ReplicationRequest) MarshalCBORForSigning() ([]byte, error) {
 }
 
 func (m *ReplicationRequest) specificFields() []cborKV {
-	return []cborKV{
-		{"priority", int64(m.Priority)},
-		{"deadline", m.Deadline},
-	}
+	return nil
 }
 
 func (m *ReplicationRequest) UnmarshalCBOR(data []byte) error {
@@ -182,15 +158,6 @@ func (m *ReplicationRequest) UnmarshalCBOR(data []byte) error {
 		return err
 	}
 	if err := m.unmarshalEnvelope(node); err != nil {
-		return err
-	}
-	priorityInt, err := readInt(node, "priority")
-	if err != nil {
-		return err
-	}
-	m.Priority = uint8(priorityInt)
-	m.Deadline, err = readInt(node, "deadline")
-	if err != nil {
 		return err
 	}
 	return nil

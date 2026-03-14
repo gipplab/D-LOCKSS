@@ -15,7 +15,7 @@ func (m *Monitor) GetShardTree() *ShardTreeNode {
 
 	rawShardIDs := make(map[string]bool)
 	rawShardIDs[""] = true
-	maxDepth := MaxShardDepthForTreeDisplay
+	maxDepth := maxShardDepthForTreeDisplay
 	shardCounts := make(map[string]int)
 	for id, n := range m.nodes {
 		if !m.isDisplayableNodeUnlocked(id, n) {

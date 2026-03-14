@@ -35,10 +35,10 @@ func (m *Monitor) handleIngestMessage(ctx context.Context, im *schema.IngestMess
 		return
 	}
 
-	nodeState, exists := m.nodes[peerIDStr]
+	ns, exists := m.nodes[peerIDStr]
 	if !exists {
 		slog.Info("new node discovered via ingest message", "peer", peerIDStr, "shard", shardID)
-		nodeState = &NodeState{
+		ns = &nodeState{
 			PeerID:         peerIDStr,
 			CurrentShard:   shardID,
 			PinnedFiles:    0,
@@ -48,27 +48,27 @@ func (m *Monitor) handleIngestMessage(ctx context.Context, im *schema.IngestMess
 			IPAddress:      ip,
 			announcedFiles: make(map[string]time.Time),
 		}
-		m.nodes[peerIDStr] = nodeState
+		m.nodes[peerIDStr] = ns
 		m.nodeFiles[peerIDStr] = make(map[string]time.Time)
 		m.treeDirty = true
 	}
 
-	nodeState.LastSeen = now
+	ns.LastSeen = now
 	manifestCIDStr := im.ManifestCID.String()
 
-	if nodeState.announcedFiles == nil {
-		nodeState.announcedFiles = make(map[string]time.Time)
+	if ns.announcedFiles == nil {
+		ns.announcedFiles = make(map[string]time.Time)
 	}
-	nodeState.announcedFiles[manifestCIDStr] = now
+	ns.announcedFiles[manifestCIDStr] = now
 
 	if m.nodeFiles[peerIDStr] == nil {
 		m.nodeFiles[peerIDStr] = make(map[string]time.Time)
 	}
 	m.nodeFiles[peerIDStr][manifestCIDStr] = now
 
-	nodeState.KnownFiles = len(nodeState.announcedFiles)
-	if n := len(nodeState.announcedFiles); n > nodeState.PinnedFiles {
-		nodeState.PinnedFiles = n
+	ns.KnownFiles = len(ns.announcedFiles)
+	if n := len(ns.announcedFiles); n > ns.PinnedFiles {
+		ns.PinnedFiles = n
 	}
 	m.uniqueCIDs[manifestCIDStr] = now
 
@@ -76,7 +76,6 @@ func (m *Monitor) handleIngestMessage(ctx context.Context, im *schema.IngestMess
 		m.manifestReplication[manifestCIDStr] = make(map[string]time.Time)
 	}
 	m.manifestReplication[manifestCIDStr][peerIDStr] = now
-	// Prefer deeper shard in same subtree; ignore sibling-shard announcements.
 	if existing, ok := m.manifestShard[manifestCIDStr]; !ok || (len(shardID) > len(existing) && strings.HasPrefix(shardID, existing)) {
 		m.manifestShard[manifestCIDStr] = shardID
 	}
@@ -86,8 +85,8 @@ func (m *Monitor) handleIngestMessage(ctx context.Context, im *schema.IngestMess
 		m.ensureShardSubscriptionUnlocked(context.Background(), shardID)
 	}
 
-	if ip != "" && ip != nodeState.IPAddress {
-		nodeState.IPAddress = ip
+	if ip != "" && ip != ns.IPAddress {
+		ns.IPAddress = ip
 	}
 }
 
@@ -106,10 +105,6 @@ func (m *Monitor) setPeerShardLastSeenUnlocked(peerIDStr, shardID string, t time
 	m.peerShardLastSeen[peerIDStr][shardID] = t
 }
 
-func (m *Monitor) handleHeartbeat(ctx context.Context, senderID peer.ID, shardID string, ip string, pinnedCount int) {
-	m.handleHeartbeatWithRole(ctx, senderID, shardID, ip, pinnedCount, "", "")
-}
-
 func (m *Monitor) handleHeartbeatWithRole(ctx context.Context, senderID peer.ID, shardID string, ip string, pinnedCount int, role string, nodeName string) (shardUpdated bool) {
 	now := time.Now()
 	peerIDStr := senderID.String()
@@ -125,14 +120,14 @@ func (m *Monitor) handleHeartbeatWithRole(ctx context.Context, senderID peer.ID,
 
 	m.setPeerShardLastSeenUnlocked(peerIDStr, shardID, now)
 
-	nodeState, exists := m.nodes[peerIDStr]
+	ns, exists := m.nodes[peerIDStr]
 	if !exists {
 		logName := peerIDStr
 		if nodeName != "" {
 			logName = nodeName + " (" + peerIDStr + ")"
 		}
 		slog.Info("new node discovered via heartbeat", "peer", logName, "shard", shardLabel(shardID), "pinned", pinnedCount, "role", role)
-		nodeState = &NodeState{
+		ns = &nodeState{
 			PeerID:         peerIDStr,
 			NodeName:       nodeName,
 			CurrentShard:   shardID,
@@ -144,24 +139,22 @@ func (m *Monitor) handleHeartbeatWithRole(ctx context.Context, senderID peer.ID,
 			IPAddress:      ip,
 			announcedFiles: make(map[string]time.Time),
 		}
-		m.nodes[peerIDStr] = nodeState
+		m.nodes[peerIDStr] = ns
 		m.treeDirty = true
 		return true
 	}
-	nodeState.LastSeen = now
-	nodeState.Role = role
+	ns.LastSeen = now
+	ns.Role = role
 	if nodeName != "" {
-		nodeState.NodeName = nodeName
+		ns.NodeName = nodeName
 	}
 	if pinnedCount >= 0 {
-		nodeState.PinnedFiles = pinnedCount
+		ns.PinnedFiles = pinnedCount
 		if pinnedCount == 0 {
 			firstSeen := now
-			if len(nodeState.ShardHistory) > 0 {
-				firstSeen = nodeState.ShardHistory[0].FirstSeen
+			if len(ns.ShardHistory) > 0 {
+				firstSeen = ns.ShardHistory[0].FirstSeen
 			}
-			// Ignore pinned=0 during grace period: stale heartbeats can arrive
-			// before the node finishes its first pin cycle.
 			if now.Sub(firstSeen) >= unpinGracePeriod {
 				removedFromManifests := 0
 				for manifest, peers := range m.manifestReplication {
@@ -178,8 +171,6 @@ func (m *Monitor) handleHeartbeatWithRole(ctx context.Context, senderID peer.ID,
 				}
 			}
 		} else {
-			// Peer is alive and pinning: refresh manifestReplication timestamps
-			// so entries don't expire between PINNED re-announcements.
 			for _, peers := range m.manifestReplication {
 				if _, ok := peers[peerIDStr]; ok {
 					peers[peerIDStr] = now
@@ -187,16 +178,16 @@ func (m *Monitor) handleHeartbeatWithRole(ctx context.Context, senderID peer.ID,
 			}
 		}
 	}
-	if nodeState.CurrentShard == "" {
-		nodeState.CurrentShard = shardID
-		nodeState.ShardHistory = append(nodeState.ShardHistory, ShardHistoryEntry{ShardID: shardID, FirstSeen: now})
+	if ns.CurrentShard == "" {
+		ns.CurrentShard = shardID
+		ns.ShardHistory = append(ns.ShardHistory, ShardHistoryEntry{ShardID: shardID, FirstSeen: now})
 		m.treeDirty = true
 		shardUpdated = true
 	} else {
-		shardUpdated = m.updateNodeShardLocked(nodeState, shardID, now)
+		shardUpdated = m.updateNodeShardLocked(ns, shardID, now)
 	}
-	if ip != "" && ip != nodeState.IPAddress {
-		nodeState.IPAddress = ip
+	if ip != "" && ip != ns.IPAddress {
+		ns.IPAddress = ip
 	}
 	return shardUpdated
 }
@@ -221,7 +212,7 @@ func (m *Monitor) handleLeaveShard(ctx context.Context, peerID peer.ID, shardID 
 	}
 }
 
-func (m *Monitor) updateNodeShardLocked(node *NodeState, newShard string, timestamp time.Time) bool {
+func (m *Monitor) updateNodeShardLocked(node *nodeState, newShard string, timestamp time.Time) bool {
 	if len(node.ShardHistory) == 0 {
 		return false
 	}
@@ -303,7 +294,7 @@ func (m *Monitor) updateNodeShardLocked(node *NodeState, newShard string, timest
 		slog.Info("shard move removed peer from manifests", "peer", peerIDStr, "removed_manifests", removed, "shard", shardLabel(newShard))
 	}
 	if isSiblingShard(lastShard, newShard) {
-		m.peerLastSiblingMove[peerIDStr] = siblingMoveRecord{from: lastShard, to: newShard, when: timestamp}
+		m.peerLastSiblingMove[peerIDStr] = siblingMoveRecord{when: timestamp}
 	}
 	return true
 }
@@ -320,7 +311,7 @@ func (m *Monitor) hasSplitEvent(parent, child string) bool {
 func (m *Monitor) getPinnedInShardForNode(peerIDStr, nodeShard string) int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	cutoff := time.Now().Add(-ReplicationAnnounceTTL)
+	cutoff := time.Now().Add(-replicationAnnounceTTL)
 	if m.peerShardLastSeen[peerIDStr] != nil {
 		if last := m.peerShardLastSeen[peerIDStr][nodeShard]; last.Before(cutoff) {
 			return 0

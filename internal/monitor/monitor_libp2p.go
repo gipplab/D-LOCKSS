@@ -123,16 +123,16 @@ func StartLibP2P(ctx context.Context, monitor *Monitor) (host.Host, error) {
 	wg.Wait()
 
 	routingDiscovery := routing.NewRoutingDiscovery(kademliaDHT)
-	dutil.Advertise(ctx, routingDiscovery, DiscoveryServiceTag)
-	slog.Info("advertising service", "tag", DiscoveryServiceTag)
+	dutil.Advertise(ctx, routingDiscovery, discoveryServiceTag)
+	slog.Info("advertising service", "tag", discoveryServiceTag)
 
 	notifee := &discovery.DiscoveryNotifee{H: h, Ctx: ctx}
-	mdnsSvc := mdns.NewMdnsService(h, DiscoveryServiceTag, notifee)
+	mdnsSvc := mdns.NewMdnsService(h, discoveryServiceTag, notifee)
 	if err := mdnsSvc.Start(); err != nil {
 		slog.Warn("mdns start failed", "error", err)
 	}
 
-	go discovery.RunPeerFinder(ctx, h, routingDiscovery, DiscoveryServiceTag)
+	go discovery.RunPeerFinder(ctx, h, routingDiscovery, discoveryServiceTag)
 	go runMeshMaintenance(ctx, h, kademliaDHT, routingDiscovery)
 
 	return h, nil
@@ -179,7 +179,7 @@ func runMeshMaintenance(ctx context.Context, h host.Host, kademliaDHT *dht.IpfsD
 			cancel()
 		}
 
-		dutil.Advertise(ctx, rd, DiscoveryServiceTag)
+		dutil.Advertise(ctx, rd, discoveryServiceTag)
 
 		slog.Info("mesh maintenance complete",
 			"connected_peers", connected,

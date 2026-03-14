@@ -10,41 +10,36 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-// PeerRole indicates whether a peer is actively contributing to replication.
-type PeerRole string
+type peerRole string
 
 const (
-	RoleActive     PeerRole = "ACTIVE"     // Ingestor node with storage capacity
-	RolePassive    PeerRole = "PASSIVE"    // At storage limit, cannot pin; not counted for replication
-	RoleProbe      PeerRole = "PROBE"      // Transient viewer, not counted
-	RoleReplicator PeerRole = "REPLICATOR" // Can replicate but not ingest new files
+	roleActive     peerRole = "ACTIVE"
+	rolePassive    peerRole = "PASSIVE"
+	roleProbe      peerRole = "PROBE"
+	roleReplicator peerRole = "REPLICATOR"
 )
 
-// PeerRoleInfo holds a peer's role and last-seen time.
-type PeerRoleInfo struct {
-	Role     PeerRole
-	LastSeen time.Time
+type peerRoleInfo struct {
+	role     peerRole
+	lastSeen time.Time
 }
 
-// PeerTracker tracks which peers are present in each shard and their roles.
-// Thread-safe with its own mutex, independent of ShardManager.mu.
-type PeerTracker struct {
+type peerTracker struct {
 	mu     sync.RWMutex
 	selfID peer.ID
 	seen   map[string]map[peer.ID]time.Time    // shard → peer → lastSeen
-	roles  map[string]map[peer.ID]PeerRoleInfo // shard → peer → role
+	roles  map[string]map[peer.ID]peerRoleInfo // shard → peer → role
 }
 
-func NewPeerTracker(selfID peer.ID) *PeerTracker {
-	return &PeerTracker{
+func newPeerTracker(selfID peer.ID) *peerTracker {
+	return &peerTracker{
 		selfID: selfID,
 		seen:   make(map[string]map[peer.ID]time.Time),
-		roles:  make(map[string]map[peer.ID]PeerRoleInfo),
+		roles:  make(map[string]map[peer.ID]peerRoleInfo),
 	}
 }
 
-// RecordSeen marks a peer as seen in a shard.
-func (pt *PeerTracker) RecordSeen(shardID string, peerID peer.ID) {
+func (pt *peerTracker) RecordSeen(shardID string, peerID peer.ID) {
 	pt.mu.Lock()
 	if pt.seen[shardID] == nil {
 		pt.seen[shardID] = make(map[peer.ID]time.Time)
@@ -53,18 +48,16 @@ func (pt *PeerTracker) RecordSeen(shardID string, peerID peer.ID) {
 	pt.mu.Unlock()
 }
 
-// RecordRole records a peer's role in a shard.
-func (pt *PeerTracker) RecordRole(shardID string, peerID peer.ID, role PeerRole) {
+func (pt *peerTracker) RecordRole(shardID string, peerID peer.ID, role peerRole) {
 	pt.mu.Lock()
 	if pt.roles[shardID] == nil {
-		pt.roles[shardID] = make(map[peer.ID]PeerRoleInfo)
+		pt.roles[shardID] = make(map[peer.ID]peerRoleInfo)
 	}
-	pt.roles[shardID][peerID] = PeerRoleInfo{Role: role, LastSeen: time.Now()}
+	pt.roles[shardID][peerID] = peerRoleInfo{role: role, lastSeen: time.Now()}
 	pt.mu.Unlock()
 }
 
-// RemoveRole removes a peer's role entry (e.g. on LEAVE).
-func (pt *PeerTracker) RemoveRole(shardID string, peerID peer.ID) {
+func (pt *peerTracker) RemoveRole(shardID string, peerID peer.ID) {
 	pt.mu.Lock()
 	if pt.roles[shardID] != nil {
 		delete(pt.roles[shardID], peerID)
@@ -72,9 +65,7 @@ func (pt *PeerTracker) RemoveRole(shardID string, peerID peer.ID) {
 	pt.mu.Unlock()
 }
 
-// CountActive returns the number of ACTIVE or REPLICATOR peers in the given shard.
-// When includeSelf is true and shardID matches currentShard, adds 1 for self.
-func (pt *PeerTracker) CountActive(shardID string, includeSelf bool, currentShard string, activeWindow time.Duration) int {
+func (pt *peerTracker) CountActive(shardID string, includeSelf bool, currentShard string, activeWindow time.Duration) int {
 	pt.mu.RLock()
 	roles, ok := pt.roles[shardID]
 	if !ok {
@@ -87,7 +78,7 @@ func (pt *PeerTracker) CountActive(shardID string, includeSelf bool, currentShar
 	cutoff := time.Now().Add(-activeWindow)
 	n := 0
 	for pid, info := range roles {
-		if (info.Role != RoleActive && info.Role != RoleReplicator) || info.LastSeen.Before(cutoff) || pid == pt.selfID {
+		if (info.role != roleActive && info.role != roleReplicator) || info.lastSeen.Before(cutoff) || pid == pt.selfID {
 			continue
 		}
 		n++
@@ -100,8 +91,7 @@ func (pt *PeerTracker) CountActive(shardID string, includeSelf bool, currentShar
 	return n
 }
 
-// GetActiveForShard returns ACTIVE or REPLICATOR peer IDs for the given shard (excluding self).
-func (pt *PeerTracker) GetActiveForShard(shardID string, activeWindow time.Duration) []peer.ID {
+func (pt *peerTracker) GetActiveForShard(shardID string, activeWindow time.Duration) []peer.ID {
 	pt.mu.RLock()
 	defer pt.mu.RUnlock()
 	roles, ok := pt.roles[shardID]
@@ -111,15 +101,14 @@ func (pt *PeerTracker) GetActiveForShard(shardID string, activeWindow time.Durat
 	cutoff := time.Now().Add(-activeWindow)
 	var active []peer.ID
 	for p, info := range roles {
-		if (info.Role == RoleActive || info.Role == RoleReplicator) && info.LastSeen.After(cutoff) && p != pt.selfID {
+		if (info.role == roleActive || info.role == roleReplicator) && info.lastSeen.After(cutoff) && p != pt.selfID {
 			active = append(active, p)
 		}
 	}
 	return active
 }
 
-// GetSeenPeers returns all peers seen in a shard within the cutoff window (excluding self).
-func (pt *PeerTracker) GetSeenPeers(shardID string, activeWindow time.Duration) map[peer.ID]struct{} {
+func (pt *peerTracker) GetSeenPeers(shardID string, activeWindow time.Duration) map[peer.ID]struct{} {
 	pt.mu.RLock()
 	defer pt.mu.RUnlock()
 	cutoff := time.Now().Add(-activeWindow)
@@ -134,16 +123,14 @@ func (pt *PeerTracker) GetSeenPeers(shardID string, activeWindow time.Duration) 
 	return result
 }
 
-// HasRoles returns true if any role data exists for the given shard.
-func (pt *PeerTracker) HasRoles(shardID string) bool {
+func (pt *peerTracker) HasRoles(shardID string) bool {
 	pt.mu.RLock()
 	defer pt.mu.RUnlock()
 	_, ok := pt.roles[shardID]
 	return ok
 }
 
-// PruneStale removes peers not seen within the given duration.
-func (pt *PeerTracker) PruneStale(maxAge time.Duration) {
+func (pt *peerTracker) PruneStale(maxAge time.Duration) {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
 	cutoff := time.Now().Add(-maxAge)
@@ -159,7 +146,7 @@ func (pt *PeerTracker) PruneStale(maxAge time.Duration) {
 	}
 	for shardID, roles := range pt.roles {
 		for peerID, info := range roles {
-			if info.LastSeen.Before(cutoff) {
+			if info.lastSeen.Before(cutoff) {
 				delete(roles, peerID)
 			}
 		}
@@ -169,76 +156,66 @@ func (pt *PeerTracker) PruneStale(maxAge time.Duration) {
 	}
 }
 
-// parseHeartbeatRole extracts role from HEARTBEAT:pid:count or HEARTBEAT:pid:count:ROLE.
-func parseHeartbeatRole(data []byte) PeerRole {
+func parseHeartbeatRole(data []byte) peerRole {
 	s := string(data)
 	if !strings.HasPrefix(s, msgPrefixHeartbeat) {
-		return RoleActive
+		return roleActive
 	}
 	parts := strings.SplitN(s, ":", 4)
 	if len(parts) >= 4 {
-		r := PeerRole(strings.ToUpper(parts[3]))
+		r := peerRole(strings.ToUpper(parts[3]))
 		switch r {
-		case RolePassive, RoleProbe, RoleReplicator:
+		case rolePassive, roleProbe, roleReplicator:
 			return r
 		}
 	}
-	return RoleActive
+	return roleActive
 }
 
-// parseJoinRole extracts role from JOIN:pid or JOIN:pid:ROLE.
-func parseJoinRole(data []byte) PeerRole {
+func parseJoinRole(data []byte) peerRole {
 	s := string(data)
 	if !strings.HasPrefix(s, msgPrefixJoin) {
-		return RoleActive
+		return roleActive
 	}
 	parts := strings.SplitN(s, ":", 3)
 	if len(parts) >= 3 {
-		r := PeerRole(strings.ToUpper(parts[2]))
+		r := peerRole(strings.ToUpper(parts[2]))
 		switch r {
-		case RolePassive, RoleReplicator:
+		case rolePassive, roleReplicator:
 			return r
 		}
 	}
-	return RoleActive
+	return roleActive
 }
 
-// getOurRole returns the node's effective role based on storage capacity and ingest authorization.
-func (sm *ShardManager) getOurRole() PeerRole {
+func (sm *ShardManager) getOurRole() peerRole {
 	if !sm.storageMgr.CanAcceptCustodialFile() {
-		return RolePassive
+		return rolePassive
 	}
 	if !sm.IsLocalNodeIngestor() {
-		return RoleReplicator
+		return roleReplicator
 	}
-	return RoleActive
+	return roleActive
 }
 
 // processTextProtocolForProbe updates PeerTracker for HEARTBEAT/JOIN/LEAVE/PROBE.
 // Used when probing a shard to collect role info without full message handling.
-func (sm *ShardManager) processTextProtocolForProbe(msg *pubsub.Message, shardID string) bool {
+func (sm *ShardManager) processTextProtocolForProbe(msg *pubsub.Message, shardID string) {
 	data := msg.Data
 	if len(data) == 0 {
-		return false
+		return
 	}
 	from := msg.GetFrom()
 	sm.peers.RecordSeen(shardID, from)
 
-	if bytes.HasPrefix(data, []byte(msgPrefixHeartbeat)) {
+	switch {
+	case bytes.HasPrefix(data, []byte(msgPrefixHeartbeat)):
 		sm.peers.RecordRole(shardID, from, parseHeartbeatRole(data))
-		return true
-	}
-	if bytes.HasPrefix(data, []byte(msgPrefixJoin)) {
+	case bytes.HasPrefix(data, []byte(msgPrefixJoin)):
 		sm.peers.RecordRole(shardID, from, parseJoinRole(data))
-		return true
-	}
-	if bytes.HasPrefix(data, []byte(msgPrefixLeave)) {
+	case bytes.HasPrefix(data, []byte(msgPrefixLeave)):
 		sm.peers.RemoveRole(shardID, from)
-		return true
+	case bytes.HasPrefix(data, []byte(msgPrefixProbe)):
+		sm.peers.RecordRole(shardID, from, roleProbe)
 	}
-	if bytes.HasPrefix(data, []byte(msgPrefixProbe)) {
-		sm.peers.RecordRole(shardID, from, RoleProbe)
-		return true
-	}
-	return false
 }

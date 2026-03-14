@@ -22,7 +22,6 @@ import (
 	"dlockss/internal/managers/shard"
 	"dlockss/internal/managers/storage"
 	"dlockss/internal/signing"
-	"dlockss/internal/telemetry"
 	"dlockss/internal/trust"
 	"dlockss/pkg/ipfs"
 	"dlockss/pkg/schema"
@@ -176,8 +175,8 @@ func main() {
 	go discovery.RunPeerFinder(ctx, h, routingDiscovery, cfg.DiscoveryServiceTag)
 
 	// Trust (optional: load peers if file exists)
-	trustMgr := trust.NewTrustManager(cfg.TrustMode)
-	if err := trustMgr.LoadTrustedPeers(cfg.TrustStorePath); err != nil && !os.IsNotExist(err) {
+	trustMgr := trust.NewTrustManager(cfg.Security.TrustMode)
+	if err := trustMgr.LoadTrustedPeers(cfg.Security.TrustStorePath); err != nil && !os.IsNotExist(err) {
 		slog.Warn("trust store load failed", "error", err)
 	}
 
@@ -191,8 +190,7 @@ func main() {
 	defer dstore.Close()
 
 	rateLimiter := common.NewRateLimiter(cfg.RateLimitWindow, cfg.MaxMessagesPerWindow)
-	metrics := telemetry.NewMetricsManager(cfg)
-	storageMgr := storage.NewStorageManager(cfg, dht, metrics, badBitsFilter)
+	storageMgr := storage.NewStorageManager(cfg, dht, badBitsFilter)
 	signer := signing.NewSigner(signing.SignerConfig{
 		Cfg:      cfg,
 		Host:     h,
@@ -213,7 +211,7 @@ func main() {
 		}
 		// Provide manifest in its own goroutine with its own timeout.
 		go func() {
-			pctx, pcancel := context.WithTimeout(ctx, cfg.DHTProvideTimeout)
+			pctx, pcancel := context.WithTimeout(ctx, cfg.Files.DHTProvideTimeout)
 			defer pcancel()
 			storageMgr.ProvideFile(pctx, manifestCIDStr)
 		}()
@@ -224,7 +222,7 @@ func main() {
 		// this call adds the missing pin entry.  Blocks are already local
 		// from the manifest's recursive pin so this returns quickly.
 		go func() {
-			pctx, pcancel := context.WithTimeout(ctx, cfg.DHTProvideTimeout)
+			pctx, pcancel := context.WithTimeout(ctx, cfg.Files.DHTProvideTimeout)
 			defer pcancel()
 			manifestCID, err := cid.Decode(manifestCIDStr)
 			if err != nil {
@@ -274,7 +272,6 @@ func main() {
 		PubSub:      ps,
 		IPFSClient:  ipfsClient,
 		Storage:     storageMgr,
-		Metrics:     metrics,
 		Signer:      signer,
 		RateLimiter: rateLimiter,
 		Cluster:     clusterMgr,
@@ -286,17 +283,7 @@ func main() {
 	clusterMgr.SetShardPeerProvider(shardMgr) // CRDT Peers() and allocations use real shard membership
 	announcePinned = shardMgr.AnnouncePinned
 
-	metrics.RegisterProviders(shardMgr, storageMgr, rateLimiter)
-	metrics.RegisterClusterProvider(clusterMgr) // cluster-style metrics: pins/peers/allocations per shard
-	metrics.SetPeerID(h.ID().String())
-
-	// Telemetry and API
-	tc := telemetry.NewTelemetryClient(cfg, h, ps, metrics)
-	if tc != nil {
-		tc.SetShardPublisher(shardMgr, shardMgr)
-		tc.Start(ctx)
-	}
-	apiServer := api.NewAPIServer(cfg.APIPort, metrics)
+	apiServer := api.NewAPIServer(cfg.APIPort)
 	apiServer.Start()
 
 	// File processor and watcher
@@ -330,6 +317,7 @@ func main() {
 
 	<-ctx.Done()
 	slog.Info("shutting down")
+	fp.Stop()
 	if err := shardMgr.Close(); err != nil {
 		slog.Error("shard manager close error", "error", err)
 	}

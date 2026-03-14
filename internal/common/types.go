@@ -2,7 +2,6 @@ package common
 
 import (
 	"context"
-	"crypto/rand"
 	"time"
 
 	"github.com/ipfs/go-cid"
@@ -11,15 +10,8 @@ import (
 	"dlockss/internal/syncmap"
 )
 
-func NewNonce(n int) ([]byte, error) {
-	b := make([]byte, n)
-	_, err := rand.Read(b)
-	return b, err
-}
-
 // DHTProvider abstracts the DHT operations for testing.
 type DHTProvider interface {
-	FindProvidersAsync(ctx context.Context, key cid.Cid, count int) <-chan peer.AddrInfo
 	Provide(ctx context.Context, key cid.Cid, broadcast bool) error
 	FindPeer(ctx context.Context, id peer.ID) (peer.AddrInfo, error)
 }
@@ -35,7 +27,6 @@ func NewPinnedSet() *PinnedSet {
 
 // Add pins a key (always refreshes timestamp). Returns true if key was new.
 func (ps *PinnedSet) Add(key string) bool { return ps.m.Upsert(key, time.Now()) }
-func (ps *PinnedSet) Remove(key string)   { ps.m.Delete(key) }
 func (ps *PinnedSet) Has(key string) bool { return ps.m.Has(key) }
 func (ps *PinnedSet) Size() int           { return ps.m.Len() }
 func (ps *PinnedSet) Keys() []string      { return ps.m.Keys() }
@@ -59,9 +50,6 @@ func NewKnownFiles() *KnownFiles {
 	return &KnownFiles{m: syncmap.New[string, bool]()}
 }
 
-// Add returns true if the key was new.
-func (kf *KnownFiles) Add(key string) bool  { return kf.m.SetIfAbsent(key, true) }
-func (kf *KnownFiles) Remove(key string)    { kf.m.Delete(key) }
+func (kf *KnownFiles) Add(key string)       { kf.m.SetIfAbsent(key, true) }
 func (kf *KnownFiles) Has(key string) bool  { return kf.m.Has(key) }
-func (kf *KnownFiles) Size() int            { return kf.m.Len() }
 func (kf *KnownFiles) All() map[string]bool { return kf.m.Snapshot() }

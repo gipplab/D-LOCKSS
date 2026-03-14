@@ -14,8 +14,9 @@ participant "PubSub" as PubSub
 participant "Other Nodes" as Nodes
 
 User -> FS: Drop file into ./data
-FS -> Watcher: File created event
-Watcher -> FileOps: processNewFile(path)
+FS -> Watcher: fsnotify.Create event
+Watcher -> Watcher: handleWatcherEvent(event)\n(if directory: handleNewDirectory)
+Watcher -> FileOps: enqueue file via processNewFile(path)
 
 FileOps -> IPFS: Import file (UnixFS)\nPayloadCID
 FileOps -> FileOps: Build ResearchObject (CBOR)\n{meta_ref, ingester_id, payload, size}

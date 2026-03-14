@@ -12,7 +12,6 @@ func TestDefaultConfig(t *testing.T) {
 		t.Fatal("DefaultConfig returned nil")
 	}
 
-	// Key string fields
 	if cfg.DiscoveryServiceTag != "dlockss-prod" {
 		t.Errorf("DiscoveryServiceTag = %q, want dlockss-prod", cfg.DiscoveryServiceTag)
 	}
@@ -25,62 +24,48 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.BadBitsPath != "badBits.csv" {
 		t.Errorf("BadBitsPath = %q, want badBits.csv", cfg.BadBitsPath)
 	}
-	if cfg.TrustMode != "open" {
-		t.Errorf("TrustMode = %q, want open", cfg.TrustMode)
+	if cfg.Security.TrustMode != "open" {
+		t.Errorf("TrustMode = %q, want open", cfg.Security.TrustMode)
 	}
-	if cfg.SignatureMode != "strict" {
-		t.Errorf("SignatureMode = %q, want strict", cfg.SignatureMode)
+	if cfg.Security.SignatureMode != "strict" {
+		t.Errorf("SignatureMode = %q, want strict", cfg.Security.SignatureMode)
 	}
 	if cfg.IPFSNodeAddress != "/ip4/127.0.0.1/tcp/5001" {
 		t.Errorf("IPFSNodeAddress = %q, want /ip4/127.0.0.1/tcp/5001", cfg.IPFSNodeAddress)
 	}
-
-	// Key numeric fields
-	if cfg.MinReplication != 5 {
-		t.Errorf("MinReplication = %d, want 5", cfg.MinReplication)
+	if cfg.Replication.MinReplication != 5 {
+		t.Errorf("MinReplication = %d, want 5", cfg.Replication.MinReplication)
 	}
-	if cfg.MaxReplication != 10 {
-		t.Errorf("MaxReplication = %d, want 10", cfg.MaxReplication)
+	if cfg.Replication.MaxReplication != 10 {
+		t.Errorf("MaxReplication = %d, want 10", cfg.Replication.MaxReplication)
 	}
 	if cfg.APIPort != 5050 {
 		t.Errorf("APIPort = %d, want 5050", cfg.APIPort)
 	}
-	if cfg.MaxPeersPerShard != 12 {
-		t.Errorf("MaxPeersPerShard = %d, want 12", cfg.MaxPeersPerShard)
+	if cfg.Sharding.MaxPeersPerShard != 12 {
+		t.Errorf("MaxPeersPerShard = %d, want 12", cfg.Sharding.MaxPeersPerShard)
 	}
-	if cfg.MinPeersPerShard != 6 {
-		t.Errorf("MinPeersPerShard = %d, want 6", cfg.MinPeersPerShard)
+	if cfg.Sharding.MinPeersPerShard != 6 {
+		t.Errorf("MinPeersPerShard = %d, want 6", cfg.Sharding.MinPeersPerShard)
 	}
 	if cfg.DiskUsageHighWaterMark != 90.0 {
 		t.Errorf("DiskUsageHighWaterMark = %f, want 90.0", cfg.DiskUsageHighWaterMark)
 	}
-	if cfg.BackoffMultiplier != 2.0 {
-		t.Errorf("BackoffMultiplier = %f, want 2.0", cfg.BackoffMultiplier)
-	}
-
-	// Key duration fields (non-zero)
-	if cfg.CheckInterval != 1*time.Minute {
-		t.Errorf("CheckInterval = %v, want 1m", cfg.CheckInterval)
+	if cfg.Replication.CheckInterval != 1*time.Minute {
+		t.Errorf("CheckInterval = %v, want 1m", cfg.Replication.CheckInterval)
 	}
 	if cfg.BootstrapTimeout != 15*time.Second {
 		t.Errorf("BootstrapTimeout = %v, want 15s", cfg.BootstrapTimeout)
 	}
-	if cfg.SignatureMaxAge != 10*time.Minute {
-		t.Errorf("SignatureMaxAge = %v, want 10m", cfg.SignatureMaxAge)
+	if cfg.Security.SignatureMaxAge != 10*time.Minute {
+		t.Errorf("SignatureMaxAge = %v, want 10m", cfg.Security.SignatureMaxAge)
 	}
-
-	// Key bool fields
-	if !cfg.UsePubsubForReplication {
-		t.Error("UsePubsubForReplication = false, want true")
-	}
-	if !cfg.AutoReplicationEnabled {
+	if !cfg.Replication.AutoReplicationEnabled {
 		t.Error("AutoReplicationEnabled = false, want true")
 	}
 	if cfg.VerboseLogging {
 		t.Error("VerboseLogging = true, want false")
 	}
-
-	// Path fields derived from data dir
 	wantClusterStore := filepath.Join(filepath.Dir("./data"), "cluster_store")
 	if cfg.ClusterStorePath != wantClusterStore {
 		t.Errorf("ClusterStorePath = %q, want %q", cfg.ClusterStorePath, wantClusterStore)
@@ -92,18 +77,15 @@ func TestDefaultConfig(t *testing.T) {
 }
 
 func TestLoadFromEnv(t *testing.T) {
-	// Set specific env vars and verify they are picked up
 	t.Setenv("DLOCKSS_DATA_DIR", "/custom/data")
 	t.Setenv("DLOCKSS_DISCOVERY_TAG", "dlockss-test")
 	t.Setenv("DLOCKSS_MIN_REPLICATION", "3")
 	t.Setenv("DLOCKSS_MAX_REPLICATION", "7")
 	t.Setenv("DLOCKSS_API_PORT", "9090")
 	t.Setenv("DLOCKSS_SIGNATURE_MODE", "warn")
-	t.Setenv("DLOCKSS_USE_PUBSUB_FOR_REPLICATION", "false")
 	t.Setenv("DLOCKSS_VERBOSE_LOGGING", "true")
 	t.Setenv("DLOCKSS_CHECK_INTERVAL", "2m")
 	t.Setenv("DLOCKSS_DISK_USAGE_HIGH_WATER_MARK", "85.5")
-	t.Setenv("DLOCKSS_BACKOFF_MULTIPLIER", "3.5")
 	t.Setenv("DLOCKSS_NODE_NAME", "test-node-1")
 
 	cfg := LoadFromEnv()
@@ -114,32 +96,26 @@ func TestLoadFromEnv(t *testing.T) {
 	if cfg.DiscoveryServiceTag != "dlockss-test" {
 		t.Errorf("DiscoveryServiceTag = %q, want dlockss-test", cfg.DiscoveryServiceTag)
 	}
-	if cfg.MinReplication != 3 {
-		t.Errorf("MinReplication = %d, want 3", cfg.MinReplication)
+	if cfg.Replication.MinReplication != 3 {
+		t.Errorf("MinReplication = %d, want 3", cfg.Replication.MinReplication)
 	}
-	if cfg.MaxReplication != 7 {
-		t.Errorf("MaxReplication = %d, want 7", cfg.MaxReplication)
+	if cfg.Replication.MaxReplication != 7 {
+		t.Errorf("MaxReplication = %d, want 7", cfg.Replication.MaxReplication)
 	}
 	if cfg.APIPort != 9090 {
 		t.Errorf("APIPort = %d, want 9090", cfg.APIPort)
 	}
-	if cfg.SignatureMode != "warn" {
-		t.Errorf("SignatureMode = %q, want warn", cfg.SignatureMode)
-	}
-	if cfg.UsePubsubForReplication {
-		t.Errorf("UsePubsubForReplication = true, want false")
+	if cfg.Security.SignatureMode != "warn" {
+		t.Errorf("SignatureMode = %q, want warn", cfg.Security.SignatureMode)
 	}
 	if !cfg.VerboseLogging {
 		t.Errorf("VerboseLogging = false, want true")
 	}
-	if cfg.CheckInterval != 2*time.Minute {
-		t.Errorf("CheckInterval = %v, want 2m", cfg.CheckInterval)
+	if cfg.Replication.CheckInterval != 2*time.Minute {
+		t.Errorf("CheckInterval = %v, want 2m", cfg.Replication.CheckInterval)
 	}
 	if cfg.DiskUsageHighWaterMark != 85.5 {
 		t.Errorf("DiskUsageHighWaterMark = %f, want 85.5", cfg.DiskUsageHighWaterMark)
-	}
-	if cfg.BackoffMultiplier != 3.5 {
-		t.Errorf("BackoffMultiplier = %f, want 3.5", cfg.BackoffMultiplier)
 	}
 	if cfg.NodeName != "test-node-1" {
 		t.Errorf("NodeName = %q, want test-node-1", cfg.NodeName)
@@ -166,79 +142,79 @@ func TestLoadFromEnv_IdentityPathOverride(t *testing.T) {
 
 func TestValidate_InvalidSignatureMode(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.SignatureMode = "invalid-mode"
+	cfg.Security.SignatureMode = "invalid-mode"
 	cfg.Validate()
-	if cfg.SignatureMode != "strict" {
-		t.Errorf("SignatureMode after Validate = %q, want strict", cfg.SignatureMode)
+	if cfg.Security.SignatureMode != "strict" {
+		t.Errorf("SignatureMode after Validate = %q, want strict", cfg.Security.SignatureMode)
 	}
 }
 
 func TestValidate_ValidSignatureModes(t *testing.T) {
 	for _, mode := range []string{"off", "warn", "strict"} {
 		cfg := DefaultConfig()
-		cfg.SignatureMode = mode
+		cfg.Security.SignatureMode = mode
 		cfg.Validate()
-		if cfg.SignatureMode != mode {
-			t.Errorf("SignatureMode %q was changed to %q", mode, cfg.SignatureMode)
+		if cfg.Security.SignatureMode != mode {
+			t.Errorf("SignatureMode %q was changed to %q", mode, cfg.Security.SignatureMode)
 		}
 	}
 }
 
 func TestValidate_MaxConcurrentFileProcessing(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.MaxConcurrentFileProcessing = 0
+	cfg.Files.MaxConcurrentFileProcessing = 0
 	cfg.Validate()
-	if cfg.MaxConcurrentFileProcessing != 5 {
-		t.Errorf("MaxConcurrentFileProcessing = %d, want 5", cfg.MaxConcurrentFileProcessing)
+	if cfg.Files.MaxConcurrentFileProcessing != 5 {
+		t.Errorf("MaxConcurrentFileProcessing = %d, want 5", cfg.Files.MaxConcurrentFileProcessing)
 	}
 
-	cfg.MaxConcurrentFileProcessing = -1
+	cfg.Files.MaxConcurrentFileProcessing = -1
 	cfg.Validate()
-	if cfg.MaxConcurrentFileProcessing != 5 {
-		t.Errorf("MaxConcurrentFileProcessing (negative) = %d, want 5", cfg.MaxConcurrentFileProcessing)
+	if cfg.Files.MaxConcurrentFileProcessing != 5 {
+		t.Errorf("MaxConcurrentFileProcessing (negative) = %d, want 5", cfg.Files.MaxConcurrentFileProcessing)
 	}
 }
 
 func TestValidate_NonceSize(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.NonceSize = 0
+	cfg.Security.NonceSize = 0
 	cfg.Validate()
-	if cfg.NonceSize != 16 {
-		t.Errorf("NonceSize = %d, want 16", cfg.NonceSize)
+	if cfg.Security.NonceSize != 16 {
+		t.Errorf("NonceSize = %d, want 16", cfg.Security.NonceSize)
 	}
 
-	cfg.NonceSize = -5
+	cfg.Security.NonceSize = -5
 	cfg.Validate()
-	if cfg.NonceSize != 16 {
-		t.Errorf("NonceSize (negative) = %d, want 16", cfg.NonceSize)
+	if cfg.Security.NonceSize != 16 {
+		t.Errorf("NonceSize (negative) = %d, want 16", cfg.Security.NonceSize)
 	}
 }
 
 func TestValidate_MinNonceSize(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.MinNonceSize = 0
+	cfg.Security.MinNonceSize = 0
 	cfg.Validate()
-	if cfg.MinNonceSize != 8 {
-		t.Errorf("MinNonceSize = %d, want 8", cfg.MinNonceSize)
+	if cfg.Security.MinNonceSize != 8 {
+		t.Errorf("MinNonceSize = %d, want 8", cfg.Security.MinNonceSize)
 	}
 }
 
 func TestValidate_MinMaxReplicationSwap(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.MinReplication = 20
-	cfg.MaxReplication = 5
+	cfg.Replication.MinReplication = 20
+	cfg.Replication.MaxReplication = 5
 	cfg.Validate()
-	if cfg.MinReplication != 5 || cfg.MaxReplication != 20 {
-		t.Errorf("Min/MaxReplication not swapped: min=%d max=%d, want min=5 max=20", cfg.MinReplication, cfg.MaxReplication)
+	if cfg.Replication.MinReplication != 5 || cfg.Replication.MaxReplication != 20 {
+		t.Errorf("Min/MaxReplication not swapped: min=%d max=%d, want min=5 max=20", cfg.Replication.MinReplication, cfg.Replication.MaxReplication)
 	}
 }
 
 func TestValidate_MaxConcurrentReplicationChecks(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.MaxConcurrentReplicationChecks = 0
+	cfg.Replication.MaxConcurrentReplicationChecks = 0
 	cfg.Validate()
-	if cfg.MaxConcurrentReplicationChecks != 5 {
-		t.Errorf("MaxConcurrentReplicationChecks = %d, want 5", cfg.MaxConcurrentReplicationChecks)
+	if cfg.Replication.MaxConcurrentReplicationChecks != 5 {
+		t.Errorf("MaxConcurrentReplicationChecks = %d, want 5", cfg.Replication.MaxConcurrentReplicationChecks)
 	}
 }
 
@@ -282,7 +258,7 @@ func TestGetEnvInt_Invalid(t *testing.T) {
 }
 
 func TestGetEnvInt_Unset(t *testing.T) {
-	t.Setenv("TEST_INT_UNSET", "") // empty = unset for getEnv* semantics
+	t.Setenv("TEST_INT_UNSET", "")
 	got := getEnvInt("TEST_INT_UNSET", 7)
 	if got != 7 {
 		t.Errorf("getEnvInt(unset) = %d, want 7", got)
@@ -339,9 +315,9 @@ func TestGetEnvFloat_Unset(t *testing.T) {
 
 func TestGetEnvBool_Valid(t *testing.T) {
 	for _, tc := range []struct {
-		env   string
-		def   bool
-		want  bool
+		env  string
+		def  bool
+		want bool
 	}{
 		{"true", false, true},
 		{"1", false, true},

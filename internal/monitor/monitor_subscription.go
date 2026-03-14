@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"strings"
 	"time"
 
@@ -69,7 +70,7 @@ func (m *Monitor) ensureShardSubscriptionUnlocked(ctx context.Context, shardID s
 	if m.ps == nil {
 		return
 	}
-	if len(shardID) > MaxShardDepthForSubscription {
+	if len(shardID) > maxShardDepthForSubscription {
 		return // Avoid subscribing to very deep shards (e.g. 16-bit IDs)
 	}
 	if _, exists := m.shardTopics[shardID]; exists {
@@ -177,14 +178,14 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 			m.dispatchJoin(ctx, data[5:], senderID, shardID, ip)
 
 		case hasPrefix(data, "PINNED:"):
-			m.handleHeartbeat(ctx, senderID, shardID, ip, -1)
+			m.handleHeartbeatWithRole(ctx, senderID, shardID, ip, -1, "", "")
 			if manifestCID, err := cid.Decode(string(data[7:])); err == nil {
 				im := schema.IngestMessage{SignedEnvelope: schema.SignedEnvelope{ManifestCID: manifestCID}, ShardID: shardID}
 				m.handleIngestMessage(ctx, &im, senderID, shardID, ip)
 			}
 
 		default:
-			m.handleHeartbeat(ctx, senderID, shardID, ip, -1)
+			m.handleHeartbeatWithRole(ctx, senderID, shardID, ip, -1, "", "")
 			var im schema.IngestMessage
 			if err := im.UnmarshalCBOR(data); err == nil {
 				m.dispatchIngestMessage(ctx, &im, senderID, shardID, ip)
@@ -204,7 +205,7 @@ func (m *Monitor) dispatchHeartbeat(ctx context.Context, data []byte, senderID p
 	}
 	parts := strings.SplitN(string(data), ":", 5)
 	if len(parts) < 2 || parts[1] == "" {
-		m.handleHeartbeat(ctx, senderID, shardID, ip, -1)
+		m.handleHeartbeatWithRole(ctx, senderID, shardID, ip, -1, "", "")
 		return
 	}
 
@@ -285,7 +286,7 @@ func (m *Monitor) dispatchIngestMessage(ctx context.Context, im *schema.IngestMe
 	}
 	m.handleIngestMessage(ctx, im, authorID, targetShard, ip)
 	m.ensureMinPinnedForPeer(ctx, authorID.String(), 1)
-	m.handleHeartbeat(ctx, authorID, targetShard, ip, -1)
+	m.handleHeartbeatWithRole(ctx, authorID, targetShard, ip, -1, "", "")
 }
 
 // subscribeToActiveShards runs in the background and periodically subscribes
@@ -310,7 +311,7 @@ func (m *Monitor) subscribeToActiveShardsPass(ctx context.Context) {
 	}
 	targets := m.collectShardTargets()
 	for shardID := range targets {
-		if len(shardID) <= MaxShardDepthForSubscription {
+		if len(shardID) <= maxShardDepthForSubscription {
 			m.ensureShardSubscription(ctx, shardID)
 		}
 	}
@@ -344,8 +345,12 @@ func (m *Monitor) collectShardTargets() map[string]bool {
 			targets["1"] = true
 		}
 	}
-	// Add children of every known shard so we catch imminent splits.
-	for shardID := range copyKeys(targets) {
+	// Snapshot keys so we can mutate targets while iterating.
+	existing := make([]string, 0, len(targets))
+	for k := range targets {
+		existing = append(existing, k)
+	}
+	for _, shardID := range existing {
 		c0, c1 := shardID+"0", shardID+"1"
 		if shardID == "" {
 			c0, c1 = "0", "1"
@@ -354,14 +359,6 @@ func (m *Monitor) collectShardTargets() map[string]bool {
 		targets[c1] = true
 	}
 	return targets
-}
-
-func copyKeys(m map[string]bool) map[string]bool {
-	out := make(map[string]bool, len(m))
-	for k, v := range m {
-		out[k] = v
-	}
-	return out
 }
 
 // closeAllShardSubsUnlocked tears down the current subscription generation:
@@ -384,7 +381,7 @@ func (m *Monitor) closeAllShardSubsUnlocked() {
 // clearNodeStateUnlocked resets all per-network state maps so the monitor
 // starts fresh after a topic switch. Caller must hold m.mu.
 func (m *Monitor) clearNodeStateUnlocked() {
-	m.nodes = make(map[string]*NodeState)
+	m.nodes = make(map[string]*nodeState)
 	m.splitEvents = m.splitEvents[:0]
 	m.uniqueCIDs = make(map[string]time.Time)
 	m.manifestReplication = make(map[string]map[string]time.Time)
@@ -434,4 +431,38 @@ func (m *Monitor) SwitchTopic(_ context.Context, newTopic string) {
 
 	m.resubscribeBootstrap()
 	slog.Info("switched topic name", "topic", effectiveTopic, "shards", 1<<(m.cfg.BootstrapShardDepth+1)-1)
+}
+
+func isPrivateIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+	privateIPBlocks := []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
+	for _, cidr := range privateIPBlocks {
+		_, block, _ := net.ParseCIDR(cidr)
+		if block.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func preferPublicIP(ips []string) string {
+	var fallback string
+	for _, ip := range ips {
+		if ip == "" {
+			continue
+		}
+		if fallback == "" {
+			fallback = ip
+		}
+		if !isPrivateIP(ip) {
+			return ip
+		}
+	}
+	return fallback
 }
