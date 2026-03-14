@@ -9,7 +9,6 @@ import (
 	"github.com/ipfs/go-cid"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/multiformats/go-multiaddr"
 
 	"dlockss/internal/common"
 	"dlockss/internal/config"
@@ -93,7 +92,7 @@ type recordingCluster struct {
 	synced   []string
 }
 
-func (c *recordingCluster) JoinShard(_ context.Context, shardID string, _ []multiaddr.Multiaddr) error {
+func (c *recordingCluster) JoinShard(_ context.Context, shardID string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.joinedSh = append(c.joinedSh, shardID)
@@ -132,21 +131,21 @@ func (c *recordingCluster) TriggerSync(shardID string) {
 // buildTestSM creates a minimal ShardManager for testing without requiring pubsub.
 func buildTestSM(ctx context.Context, storage *recordingStorage, cluster *recordingCluster) *ShardManager {
 	cfg := config.DefaultConfig()
-	cfg.ReshardHandoffDelay = 0
-	return &ShardManager{
-		ctx:                        ctx,
-		cfg:                        cfg,
-		ipfsClient:                 &testutil.MockIPFSClient{},
-		storageMgr:                 storage,
-		clusterMgr:                 cluster,
-		reshardedFiles:             common.NewKnownFiles(),
-		shardSubs:                  make(map[string]*shardSubscription),
-		probeTopicCache:            make(map[string]*pubsub.Topic),
-		observerOnlyShards:         make(map[string]struct{}),
-		orphanHandoffSent:          make(map[string]map[string]*orphanHandoffInfo),
-		replicationRequestLastSent: make(map[string]time.Time),
-		autoReplicationSem:         make(chan struct{}, 1),
+	cfg.Files.ReshardHandoffDelay = 0
+	sm := &ShardManager{
+		ctx:                ctx,
+		cfg:                cfg,
+		ipfsClient:         &testutil.MockIPFSClient{},
+		storageMgr:         storage,
+		clusterMgr:         cluster,
+		reshardedFiles:     common.NewKnownFiles(),
+		shardSubs:          make(map[string]*shardSubscription),
+		probeTopicCache:    make(map[string]*pubsub.Topic),
+		observerOnlyShards: make(map[string]struct{}),
+		orphanHandoffSent:  make(map[string]map[string]*orphanHandoffInfo),
 	}
+	sm.repl = newReplicationManager(sm, 1)
+	return sm
 }
 
 // --- RunReshardPass tests ---

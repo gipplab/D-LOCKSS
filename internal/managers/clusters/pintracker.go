@@ -13,30 +13,18 @@ import (
 	"github.com/ipfs/go-cid"
 )
 
-// IPFSPinner defines the minimal IPFS operations needed by the pin tracker.
-type IPFSPinner interface {
+type ipfsPinner interface {
 	PinRecursive(ctx context.Context, c cid.Cid) error
 	IsPinned(ctx context.Context, c cid.Cid) (bool, error)
 	GetBlock(ctx context.Context, c cid.Cid) ([]byte, error)
 }
 
-// OnPinSynced is called when a pin is present locally (after sync or already pinned).
-// Used so the node can register the CID with storage and announce it (e.g. PINNED on pubsub),
-// allowing the monitor to count replication per file.
-type OnPinSynced func(cid string)
-
-// OnPinRemoved is called when we unpin a CID (no longer allocated). Used so storage/heartbeat count stays correct.
-type OnPinRemoved func(cid string)
-
-// LocalPinTracker monitors the CRDT state and syncs it to the local IPFS node.
-// It acts as a bridge between the Cluster Consensus and the actual IPFS Daemon.
-// Tracks which CIDs we pinned from this shard so we can unpin when no longer allocated.
-type LocalPinTracker struct {
-	ipfsClient   IPFSPinner
+type localPinTracker struct {
+	ipfsClient   ipfsPinner
 	badBits      *badbits.Filter
 	shardID      string
-	onPinSynced  OnPinSynced
-	onPinRemoved OnPinRemoved
+	onPinSynced  func(cid string)
+	onPinRemoved func(cid string)
 
 	// State
 	mu sync.RWMutex
@@ -55,7 +43,7 @@ type LocalPinTracker struct {
 // isLegacyManifest fetches the block for a CID and checks if it's a manifest
 // with a legacy timestamp field. Returns false if the block can't be fetched
 // or decoded (non-manifest CIDs, unavailable blocks).
-func (pt *LocalPinTracker) isLegacyManifest(c cid.Cid) bool {
+func (pt *localPinTracker) isLegacyManifest(c cid.Cid) bool {
 	ctx, cancel := context.WithTimeout(pt.ctx, 5*time.Second)
 	defer cancel()
 	data, err := pt.ipfsClient.GetBlock(ctx, c)
@@ -69,9 +57,9 @@ func (pt *LocalPinTracker) isLegacyManifest(c cid.Cid) bool {
 	return ro.HasLegacyTimestamp
 }
 
-func NewLocalPinTracker(ipfsClient IPFSPinner, shardID string, onPinSynced OnPinSynced, onPinRemoved OnPinRemoved, badBits *badbits.Filter) *LocalPinTracker {
+func newLocalPinTracker(ipfsClient ipfsPinner, shardID string, onPinSynced func(string), onPinRemoved func(string), badBits *badbits.Filter) *localPinTracker {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &LocalPinTracker{
+	return &localPinTracker{
 		ipfsClient:   ipfsClient,
 		badBits:      badBits,
 		shardID:      shardID,
@@ -85,7 +73,7 @@ func NewLocalPinTracker(ipfsClient IPFSPinner, shardID string, onPinSynced OnPin
 }
 
 // TriggerSync forces an immediate sync check.
-func (pt *LocalPinTracker) TriggerSync() {
+func (pt *localPinTracker) TriggerSync() {
 	select {
 	case pt.trigger <- struct{}{}:
 	default:
@@ -95,15 +83,15 @@ func (pt *LocalPinTracker) TriggerSync() {
 
 // Start begins monitoring the consensus state and syncing pins.
 // consensusClient is the CRDT component to watch.
-func (pt *LocalPinTracker) Start(consensusClient ConsensusClient) {
-	go pt.syncLoop(consensusClient)
+func (pt *localPinTracker) Start(cc consensusClient) {
+	go pt.syncLoop(cc)
 }
 
-func (pt *LocalPinTracker) Stop() {
+func (pt *localPinTracker) Stop() {
 	pt.cancel()
 }
 
-func (pt *LocalPinTracker) syncLoop(consensus ConsensusClient) {
+func (pt *localPinTracker) syncLoop(consensus consensusClient) {
 	ticker := time.NewTicker(10 * time.Second) // Poll state every 10s so peers replicate sooner
 	defer ticker.Stop()
 
@@ -119,7 +107,7 @@ func (pt *LocalPinTracker) syncLoop(consensus ConsensusClient) {
 	}
 }
 
-func (pt *LocalPinTracker) syncState(consensus ConsensusClient) {
+func (pt *localPinTracker) syncState(consensus consensusClient) {
 	// 1. Get Global State
 	state, err := consensus.State(pt.ctx)
 	if err != nil {

@@ -126,7 +126,7 @@ func loadOrCreate(cfg *config.Config) (crypto.PrivKey, error) {
 //  3. Interactive prompt on stdin
 func ResolveNodeName(cfg *config.Config) string {
 	if cfg.NodeName != "" {
-		if err := PersistNodeName(cfg, cfg.NodeName); err != nil {
+		if err := persistNodeName(cfg, cfg.NodeName); err != nil {
 			slog.Warn("failed to persist node name", "error", err)
 		}
 		return cfg.NodeName
@@ -142,7 +142,7 @@ func ResolveNodeName(cfg *config.Config) string {
 	scanner := bufio.NewScanner(os.Stdin)
 	if scanner.Scan() {
 		if name := strings.TrimSpace(scanner.Text()); name != "" {
-			if err := PersistNodeName(cfg, name); err != nil {
+			if err := persistNodeName(cfg, name); err != nil {
 				slog.Warn("failed to persist node name", "error", err)
 			}
 			return name
@@ -151,8 +151,7 @@ func ResolveNodeName(cfg *config.Config) string {
 	return ""
 }
 
-// PersistNodeName writes the node name to disk so it survives restarts.
-func PersistNodeName(cfg *config.Config, name string) error {
+func persistNodeName(cfg *config.Config, name string) error {
 	nameFile := cfg.NodeNamePath
 	ensureDir(nameFile)
 	if err := os.WriteFile(nameFile, []byte(name+"\n"), 0644); err != nil {

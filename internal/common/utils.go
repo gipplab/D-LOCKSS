@@ -13,14 +13,6 @@ import (
 	"github.com/ipfs/go-cid"
 )
 
-func ValidateHash(hash string) bool {
-	if len(hash) != 64 {
-		return false
-	}
-	_, err := hex.DecodeString(hash)
-	return err == nil
-}
-
 func GetBinaryPrefix(s string, depth int) string {
 	h := sha256.Sum256([]byte(s))
 	return bytesToBinaryString(h[:], depth)
@@ -32,10 +24,6 @@ func GetHexBinaryPrefix(hexStr string, depth int) (string, error) {
 		return "", fmt.Errorf("decode hex %q: %w", hexStr, err)
 	}
 	return bytesToBinaryString(b, depth), nil
-}
-
-func KeyToCID(key string) (cid.Cid, error) {
-	return cid.Decode(key)
 }
 
 func KeyToStableHex(key string) string {

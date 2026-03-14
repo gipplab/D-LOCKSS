@@ -36,7 +36,7 @@ func (m *Monitor) newReplicationSnapshotUnlocked() replicationSnapshot {
 	return replicationSnapshot{
 		shardPeerCount: spc,
 		depth:          depth,
-		cutoff:         time.Now().Add(-ReplicationAnnounceTTL),
+		cutoff:         time.Now().Add(-replicationAnnounceTTL),
 		m:              m,
 	}
 }
@@ -73,7 +73,7 @@ func (rs *replicationSnapshot) buildShardCounts(peers map[string]time.Time) map[
 func (rs *replicationSnapshot) resolveManifest(manifest string, peers map[string]time.Time, shardCounts map[string]int) manifestResult {
 	targetShard := rs.m.manifestShard[manifest]
 	if targetShard == "" || rs.shardPeerCount[targetShard] == 0 {
-		targetShard, _ = effectiveTargetShardForManifest(manifest, rs.depth, rs.shardPeerCount)
+		targetShard = effectiveTargetShardForManifest(manifest, rs.depth, rs.shardPeerCount)
 	}
 
 	count := shardCounts[targetShard]
@@ -90,7 +90,7 @@ func (rs *replicationSnapshot) resolveManifest(manifest string, peers map[string
 
 	// Sibling aggregation: replicas split across children of the same parent.
 	if count > 0 && len(targetShard) >= 1 {
-		minRep := MonitorMinReplication
+		minRep := monitorMinReplication
 		if maxRep > 0 && minRep > maxRep {
 			minRep = maxRep
 		}
@@ -127,7 +127,7 @@ func (rs *replicationSnapshot) resolveManifest(manifest string, peers map[string
 
 // isAtTarget returns true if count is within the replication target range.
 func (mr manifestResult) isAtTarget() bool {
-	minRep := MonitorMinReplication
+	minRep := monitorMinReplication
 	if mr.maxRep > 0 && minRep > mr.maxRep {
 		minRep = mr.maxRep
 	}
@@ -135,16 +135,12 @@ func (mr manifestResult) isAtTarget() bool {
 }
 
 func (m *Monitor) runReplicationCleanup() {
-	ticker := time.NewTicker(ReplicationCleanupEvery)
+	ticker := time.NewTicker(replicationCleanupEvery)
 	defer ticker.Stop()
 	for {
-		select {
-		case <-m.done:
-			return
-		case <-ticker.C:
-		}
+		<-ticker.C
 		m.mu.Lock()
-		cutoff := time.Now().Add(-ReplicationAnnounceTTL)
+		cutoff := time.Now().Add(-replicationAnnounceTTL)
 		for cid, peers := range m.manifestReplication {
 			for peerID, lastSeen := range peers {
 				if lastSeen.Before(cutoff) {
@@ -180,7 +176,7 @@ func (m *Monitor) runReplicationCleanup() {
 		}
 		slog.Info("replication snapshot", "total_nodes", totalNodes, "total_manifests", totalFiles, "total_at_target", filesAtTarget, "avg_replication", fmt.Sprintf("%.2f", avgLevel), "shards", strings.TrimSpace(b.String()))
 		if filesAtTarget == 0 && totalFiles > 0 && totalNodes > 0 {
-			slog.Warn("total at target is zero", "replication_announce_ttl", ReplicationAnnounceTTL)
+			slog.Warn("total at target is zero", "replication_announce_ttl", replicationAnnounceTTL)
 		}
 		if totalFiles == 0 && totalNodes > 0 {
 			m.mu.RLock()
@@ -193,27 +189,15 @@ func (m *Monitor) runReplicationCleanup() {
 	}
 }
 
-func targetShardForManifest(manifestCIDStr string, depth int) string {
-	if depth <= 0 {
-		return ""
-	}
-	hexStr := common.KeyToStableHex(manifestCIDStr)
-	prefix, err := common.GetHexBinaryPrefix(hexStr, depth)
-	if err != nil {
-		return ""
-	}
-	return prefix
-}
-
-func effectiveTargetShardForManifest(manifestCIDStr string, depth int, shardPeerCount map[string]int) (targetShard string, maxRep int) {
+func effectiveTargetShardForManifest(manifestCIDStr string, depth int, shardPeerCount map[string]int) string {
 	for d := depth; d >= 0; d-- {
-		shard := targetShardForManifest(manifestCIDStr, d)
-		n := shardPeerCount[shard]
-		if n > 0 {
-			return shard, n
+		shard, err := common.TargetShardForPayload(manifestCIDStr, d)
+		if err != nil || shardPeerCount[shard] == 0 {
+			continue
 		}
+		return shard
 	}
-	return "", 0
+	return ""
 }
 
 func shardWithMostReplicas(shardCounts map[string]int, shardPeerCount map[string]int) string {
@@ -242,26 +226,6 @@ func sumDescendantReplicasAndNodes(manifestShardCounts map[string]int, shardPeer
 		}
 	}
 	return totalReplicas, totalNodes
-}
-
-func (m *Monitor) replicationNetworkDepth() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.replicationNetworkDepthUnlocked()
-}
-
-func (m *Monitor) replicationNetworkDepthUnlocked() int {
-	maxLen := 0
-	for id, node := range m.nodes {
-		if !m.isDisplayableNodeUnlocked(id, node) {
-			continue
-		}
-		shard := node.EffectiveShard()
-		if len(shard) > maxLen {
-			maxLen = len(shard)
-		}
-	}
-	return maxLen
 }
 
 func (m *Monitor) getReplicationStats() (distribution [11]int, avgLevel float64, filesAtTarget int) {
@@ -297,7 +261,7 @@ func (m *Monitor) getReplicationStats() (distribution [11]int, avgLevel float64,
 	return distribution, avgLevel, filesAtTarget
 }
 
-func (m *Monitor) getReplicationCIDsByLevel(level int) []CIDEntry {
+func (m *Monitor) getReplicationCIDsByLevel(level int) []cidEntry {
 	if level < 0 || level > 10 {
 		return nil
 	}
@@ -305,7 +269,7 @@ func (m *Monitor) getReplicationCIDsByLevel(level int) []CIDEntry {
 	defer m.mu.RUnlock()
 
 	rs := m.newReplicationSnapshotUnlocked()
-	var result []CIDEntry
+	var result []cidEntry
 
 	for cid, peers := range m.manifestReplication {
 		if len(peers) == 0 {
@@ -318,7 +282,7 @@ func (m *Monitor) getReplicationCIDsByLevel(level int) []CIDEntry {
 		}
 		matches := (level == 10 && mr.count >= 10) || (level < 10 && mr.count == level)
 		if matches {
-			result = append(result, CIDEntry{CID: cid, Shard: shardLabel(m.manifestShard[cid]), Replicas: mr.count})
+			result = append(result, cidEntry{CID: cid, Shard: shardLabel(m.manifestShard[cid]), Replicas: mr.count})
 		}
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].CID < result[j].CID })

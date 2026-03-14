@@ -57,7 +57,7 @@ func populateFakeActivePeers(sm *ShardManager, shardID string, count int) []peer
 	var peers []peer.ID
 	for i := 0; i < count; i++ {
 		pid := peer.ID(fmt.Sprintf("fake-active-peer-%d", i))
-		sm.peers.RecordRole(shardID, pid, RoleActive)
+		sm.peers.RecordRole(shardID, pid, roleActive)
 		peers = append(peers, pid)
 	}
 	return peers
@@ -71,19 +71,19 @@ func TestCountActivePeers_OnlyCountsActive(t *testing.T) {
 	sm := newTestShardManager(t, ctx, "0")
 
 	shard := "0"
-	sm.peers.RecordRole(shard, "peer-active-1", RoleActive)
-	sm.peers.RecordRole(shard, "peer-active-2", RoleActive)
-	sm.peers.RecordRole(shard, "peer-passive-1", RolePassive)
-	sm.peers.RecordRole(shard, "peer-probe-1", RoleProbe)
+	sm.peers.RecordRole(shard, "peer-active-1", roleActive)
+	sm.peers.RecordRole(shard, "peer-active-2", roleActive)
+	sm.peers.RecordRole(shard, "peer-passive-1", rolePassive)
+	sm.peers.RecordRole(shard, "peer-probe-1", roleProbe)
 
 	// includeSelf=true: should count 2 active peers + self = 3
-	count := sm.peers.CountActive(shard, true, "0", sm.cfg.SeenPeersWindow)
+	count := sm.peers.CountActive(shard, true, "0", sm.cfg.Sharding.SeenPeersWindow)
 	if count != 3 {
 		t.Errorf("expected 3 (2 active + self), got %d", count)
 	}
 
 	// includeSelf=false: should count only 2 active peers
-	count = sm.peers.CountActive(shard, false, "0", sm.cfg.SeenPeersWindow)
+	count = sm.peers.CountActive(shard, false, "0", sm.cfg.Sharding.SeenPeersWindow)
 	if count != 2 {
 		t.Errorf("expected 2 active peers, got %d", count)
 	}
@@ -96,10 +96,9 @@ func TestCountActivePeers_ExcludesStaleEntries(t *testing.T) {
 
 	shard := "0"
 	now := time.Now()
-	sm.peers.RecordRole(shard, "peer-fresh", RoleActive)
-	// Inject a stale entry by writing directly (RecordRole always uses time.Now())
+	sm.peers.RecordRole(shard, "peer-fresh", roleActive)
 	sm.peers.mu.Lock()
-	sm.peers.roles[shard]["peer-stale"] = PeerRoleInfo{Role: RoleActive, LastSeen: now.Add(-10 * time.Minute)}
+	sm.peers.roles[shard]["peer-stale"] = peerRoleInfo{role: roleActive, lastSeen: now.Add(-10 * time.Minute)}
 	sm.peers.mu.Unlock()
 
 	// With a 5-minute window, only the fresh peer should count
@@ -122,17 +121,17 @@ func TestCountActivePeers_ExcludesSelf(t *testing.T) {
 
 	shard := "0"
 	selfID := sm.h.ID()
-	sm.peers.RecordRole(shard, selfID, RoleActive)
-	sm.peers.RecordRole(shard, "other-peer", RoleActive)
+	sm.peers.RecordRole(shard, selfID, roleActive)
+	sm.peers.RecordRole(shard, "other-peer", roleActive)
 
 	// Self should not be double-counted. With includeSelf=true, self is added once
 	// by the function, not counted from the map.
-	count := sm.peers.CountActive(shard, true, "0", sm.cfg.SeenPeersWindow)
+	count := sm.peers.CountActive(shard, true, "0", sm.cfg.Sharding.SeenPeersWindow)
 	if count != 2 {
 		t.Errorf("expected 2 (1 other + 1 self), got %d", count)
 	}
 
-	count = sm.peers.CountActive(shard, false, "0", sm.cfg.SeenPeersWindow)
+	count = sm.peers.CountActive(shard, false, "0", sm.cfg.Sharding.SeenPeersWindow)
 	if count != 1 {
 		t.Errorf("expected 1 (only other peer), got %d", count)
 	}
@@ -145,11 +144,11 @@ func TestMergeRefusal_HealthyShardEmptySibling(t *testing.T) {
 	defer cancel()
 	sm := newTestShardManager(t, ctx, "00")
 
-	sm.cfg.ProbeTimeoutMerge = 100 * time.Millisecond
-	sm.cfg.MergeUpCooldown = 50 * time.Millisecond
-	sm.cfg.SiblingEmptyMergeAfter = 50 * time.Millisecond
+	sm.cfg.Sharding.ProbeTimeoutMerge = 100 * time.Millisecond
+	sm.cfg.Sharding.MergeUpCooldown = 50 * time.Millisecond
+	sm.cfg.Sharding.SiblingEmptyMergeAfter = 50 * time.Millisecond
 
-	populateFakeActivePeers(sm, "00", sm.cfg.MinPeersPerShard+2)
+	populateFakeActivePeers(sm, "00", sm.cfg.Sharding.MinPeersPerShard+2)
 
 	// Set lastMoveToDeeperShard far enough in the past to pass both cooldown and siblingEmptyMergeAfter
 	sm.mu.Lock()
@@ -171,12 +170,12 @@ func TestMergeAllowed_UnderstaffedShardEmptySibling(t *testing.T) {
 	defer cancel()
 	sm := newTestShardManager(t, ctx, "00")
 
-	sm.cfg.ProbeTimeoutMerge = 100 * time.Millisecond
-	sm.cfg.MergeUpCooldown = 50 * time.Millisecond
-	sm.cfg.SiblingEmptyMergeAfter = 50 * time.Millisecond
+	sm.cfg.Sharding.ProbeTimeoutMerge = 100 * time.Millisecond
+	sm.cfg.Sharding.MergeUpCooldown = 50 * time.Millisecond
+	sm.cfg.Sharding.SiblingEmptyMergeAfter = 50 * time.Millisecond
 
-	if sm.cfg.MinPeersPerShard > 2 {
-		populateFakeActivePeers(sm, "00", sm.cfg.MinPeersPerShard-2)
+	if sm.cfg.Sharding.MinPeersPerShard > 2 {
+		populateFakeActivePeers(sm, "00", sm.cfg.Sharding.MinPeersPerShard-2)
 	}
 
 	// Set lastMoveToDeeperShard far enough in the past
@@ -199,8 +198,8 @@ func TestMergeRefusal_CooldownPreventsEarlyMerge(t *testing.T) {
 	defer cancel()
 	sm := newTestShardManager(t, ctx, "00")
 
-	sm.cfg.ProbeTimeoutMerge = 100 * time.Millisecond
-	sm.cfg.MergeUpCooldown = 10 * time.Minute
+	sm.cfg.Sharding.ProbeTimeoutMerge = 100 * time.Millisecond
+	sm.cfg.Sharding.MergeUpCooldown = 10 * time.Minute
 
 	// Set lastMoveToDeeperShard to very recently (within cooldown)
 	sm.mu.Lock()

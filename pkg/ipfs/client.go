@@ -3,7 +3,6 @@ package ipfs
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 
@@ -14,15 +13,11 @@ import (
 // IPFSClient is the interface for IPFS node operations.
 type IPFSClient interface {
 	ImportFile(ctx context.Context, filePath string) (cid.Cid, error)
-	ImportReader(ctx context.Context, reader io.Reader) (cid.Cid, error)
 	PutDagCBOR(ctx context.Context, block []byte) (cid.Cid, error)
 	GetBlock(ctx context.Context, blockCID cid.Cid) ([]byte, error)
 	PinRecursive(ctx context.Context, cid cid.Cid) error
 	UnpinRecursive(ctx context.Context, cid cid.Cid) error
 	IsPinned(ctx context.Context, cid cid.Cid) (bool, error)
-	GetFileSize(ctx context.Context, cid cid.Cid) (uint64, error)
-	GetPeerID(ctx context.Context) (string, error)
-	SwarmConnect(ctx context.Context, addrs []string) error
 }
 
 // Client wraps IPFS API operations for importing files and managing pins.
@@ -65,21 +60,6 @@ func (c *Client) ImportFile(ctx context.Context, filePath string) (cid.Cid, erro
 	ipfsPath, err := c.api.Add(file, ipfsapi.Pin(true))
 	if err != nil {
 		return cid.Cid{}, fmt.Errorf("failed to import file to IPFS: %w", err)
-	}
-
-	parsedCID, err := cid.Decode(ipfsPath)
-	if err != nil {
-		return cid.Cid{}, fmt.Errorf("failed to parse CID from IPFS path: %w", err)
-	}
-
-	return parsedCID, nil
-}
-
-// ImportReader imports from io.Reader into IPFS as UnixFS. ctx unused (go-ipfs-api Add has no cancel).
-func (c *Client) ImportReader(ctx context.Context, reader io.Reader) (cid.Cid, error) {
-	ipfsPath, err := c.api.Add(reader, ipfsapi.Pin(true))
-	if err != nil {
-		return cid.Cid{}, fmt.Errorf("failed to import data to IPFS: %w", err)
 	}
 
 	parsedCID, err := cid.Decode(ipfsPath)
@@ -135,25 +115,4 @@ func (c *Client) IsPinned(ctx context.Context, cid cid.Cid) (bool, error) {
 	}
 	_, ok := raw.Keys[cid.String()]
 	return ok, nil
-}
-
-func (c *Client) GetFileSize(ctx context.Context, cid cid.Cid) (uint64, error) {
-	stat, err := c.api.FilesStat(ctx, "/ipfs/"+cid.String())
-	if err != nil {
-		return 0, fmt.Errorf("failed to stat file: %w", err)
-	}
-
-	return uint64(stat.Size), nil
-}
-
-func (c *Client) GetPeerID(ctx context.Context) (string, error) {
-	id, err := c.api.ID()
-	if err != nil {
-		return "", fmt.Errorf("failed to get IPFS peer ID: %w", err)
-	}
-	return id.ID, nil
-}
-
-func (c *Client) SwarmConnect(ctx context.Context, addrs []string) error {
-	return c.api.SwarmConnect(ctx, addrs...)
 }

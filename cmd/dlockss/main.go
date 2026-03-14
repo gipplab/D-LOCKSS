@@ -175,8 +175,8 @@ func main() {
 	go discovery.RunPeerFinder(ctx, h, routingDiscovery, cfg.DiscoveryServiceTag)
 
 	// Trust (optional: load peers if file exists)
-	trustMgr := trust.NewTrustManager(cfg.TrustMode)
-	if err := trustMgr.LoadTrustedPeers(cfg.TrustStorePath); err != nil && !os.IsNotExist(err) {
+	trustMgr := trust.NewTrustManager(cfg.Security.TrustMode)
+	if err := trustMgr.LoadTrustedPeers(cfg.Security.TrustStorePath); err != nil && !os.IsNotExist(err) {
 		slog.Warn("trust store load failed", "error", err)
 	}
 
@@ -211,7 +211,7 @@ func main() {
 		}
 		// Provide manifest in its own goroutine with its own timeout.
 		go func() {
-			pctx, pcancel := context.WithTimeout(ctx, cfg.DHTProvideTimeout)
+			pctx, pcancel := context.WithTimeout(ctx, cfg.Files.DHTProvideTimeout)
 			defer pcancel()
 			storageMgr.ProvideFile(pctx, manifestCIDStr)
 		}()
@@ -222,7 +222,7 @@ func main() {
 		// this call adds the missing pin entry.  Blocks are already local
 		// from the manifest's recursive pin so this returns quickly.
 		go func() {
-			pctx, pcancel := context.WithTimeout(ctx, cfg.DHTProvideTimeout)
+			pctx, pcancel := context.WithTimeout(ctx, cfg.Files.DHTProvideTimeout)
 			defer pcancel()
 			manifestCID, err := cid.Decode(manifestCIDStr)
 			if err != nil {
@@ -317,6 +317,7 @@ func main() {
 
 	<-ctx.Done()
 	slog.Info("shutting down")
+	fp.Stop()
 	if err := shardMgr.Close(); err != nil {
 		slog.Error("shard manager close error", "error", err)
 	}

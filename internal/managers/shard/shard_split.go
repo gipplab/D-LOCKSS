@@ -56,8 +56,3 @@ func (sm *ShardManager) rebroadcastSplitToAncestors() {
 		ancestor = ancestor[:len(ancestor)-1]
 	}
 }
-
-// splitShard moves this node to its target child. For tests; normal path uses lifecycle.checkAndSplitIfNeeded.
-func (sm *ShardManager) splitShard() {
-	sm.lifecycle.splitShard()
-}

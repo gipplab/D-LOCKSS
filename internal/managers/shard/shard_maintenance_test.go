@@ -17,11 +17,11 @@ func TestPruneOrphanHandoffSent(t *testing.T) {
 
 	cfg := config.DefaultConfig()
 	sm.cfg = cfg
-	cfg.OrphanHandoffGrace = 100 * time.Millisecond
+	cfg.Orphan.HandoffGrace = 100 * time.Millisecond
 
 	now := time.Now()
-	old := now.Add(-5 * cfg.OrphanHandoffGrace)
-	recent := now.Add(-cfg.OrphanHandoffGrace / 2)
+	old := now.Add(-5 * cfg.Orphan.HandoffGrace)
+	recent := now.Add(-cfg.Orphan.HandoffGrace / 2)
 
 	sm.orphanHandoffSent = map[string]map[string]*orphanHandoffInfo{
 		"old-manifest": {
@@ -131,7 +131,7 @@ func TestReshardedFilesMarking(t *testing.T) {
 	if !kf.Has("test") {
 		t.Error("should have key after add")
 	}
-	if kf.Size() != 1 {
-		t.Errorf("expected size 1, got %d", kf.Size())
+	if len(kf.All()) != 1 {
+		t.Errorf("expected size 1, got %d", len(kf.All()))
 	}
 }

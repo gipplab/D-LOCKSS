@@ -17,63 +17,6 @@ func mustGetHexBinaryPrefix(hexStr string, depth int) string {
 	return result
 }
 
-func TestValidateHash(t *testing.T) {
-	tests := []struct {
-		name  string
-		hash  string
-		valid bool
-	}{
-		{
-			name:  "valid 64-char hex",
-			hash:  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-			valid: true,
-		},
-		{
-			name:  "valid all zeros",
-			hash:  "0000000000000000000000000000000000000000000000000000000000000000",
-			valid: true,
-		},
-		{
-			name:  "valid all f",
-			hash:  "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-			valid: true,
-		},
-		{
-			name:  "too short",
-			hash:  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85",
-			valid: false,
-		},
-		{
-			name:  "too long",
-			hash:  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b8550",
-			valid: false,
-		},
-		{
-			name:  "non-hex chars",
-			hash:  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85g",
-			valid: false,
-		},
-		{
-			name:  "uppercase non-hex",
-			hash:  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85G",
-			valid: false,
-		},
-		{
-			name:  "empty",
-			hash:  "",
-			valid: false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ValidateHash(tt.hash)
-			if got != tt.valid {
-				t.Errorf("ValidateHash(%q) = %v, want %v", tt.hash, got, tt.valid)
-			}
-		})
-	}
-}
-
 func TestGetBinaryPrefix(t *testing.T) {
 	// Known SHA256 outputs for verification at various depths.
 	// SHA256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
@@ -162,7 +105,7 @@ func TestKeyToStableHex(t *testing.T) {
 	if len(got1) != 64 {
 		t.Errorf("KeyToStableHex(%q) len = %d, want 64", key, len(got1))
 	}
-	if !ValidateHash(got1) {
+	if _, err := hex.DecodeString(got1); err != nil {
 		t.Errorf("KeyToStableHex(%q) = %q is not valid hex", key, got1)
 	}
 	// Different keys produce different output

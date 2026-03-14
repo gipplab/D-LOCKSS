@@ -97,76 +97,91 @@ func nodeNamePath(dataDir string) string {
 // DefaultTopicName is the archive topic when none is configured.
 const DefaultTopicName = "creative-commons"
 
-// Config holds all runtime configuration for a D-LOCKSS node.
-type Config struct {
-	DiscoveryServiceTag            string
-	PubsubTopicPrefix              string
-	TopicName                      string
-	IngestAllowlist                []string
-	FileWatchFolder                string
-	ClusterStorePath               string
+// ShardingConfig holds parameters that govern shard splitting, merging, and peer tracking.
+type ShardingConfig struct {
+	MaxPeersPerShard              int
+	MinPeersPerShard              int
+	MinPeersAcrossSiblings        int
+	ShardPeerCheckInterval        time.Duration
+	ShardDiscoveryInterval        time.Duration
+	ShardSplitRebroadcastInterval time.Duration
+	SeenPeersWindow               time.Duration
+	PruneStalePeersInterval       time.Duration
+	ShardOverlapDuration          time.Duration
+	ShardMoveCooldown             time.Duration
+	MergeUpCooldown               time.Duration
+	ProbeTimeoutMerge             time.Duration
+	SiblingEmptyMergeAfter        time.Duration
+}
+
+// ReplicationConfig holds parameters for content replication across peers.
+type ReplicationConfig struct {
 	MinReplication                 int
 	MaxReplication                 int
 	CheckInterval                  time.Duration
-	MaxPeersPerShard               int
-	MinPeersPerShard               int
-	MinPeersAcrossSiblings         int
-	ShardPeerCheckInterval         time.Duration
-	ShardDiscoveryInterval         time.Duration
-	ShardSplitRebroadcastInterval  time.Duration
-	BootstrapTimeout               time.Duration
-	SeenPeersWindow                time.Duration
-	PruneStalePeersInterval        time.Duration
 	MaxConcurrentReplicationChecks int
-	RateLimitWindow                time.Duration
-	MaxMessagesPerWindow           int
-	InitialBackoffDelay            time.Duration
-	MaxBackoffDelay                time.Duration
-	BackoffMultiplier              float64
-	ReplicationCheckCooldown       time.Duration
-	RemovedFileCooldown            time.Duration
-	BadBitsPath                    string
-	ShardOverlapDuration           time.Duration
-	OrphanUnpinGracePeriod         time.Duration
-	OrphanHandoffGrace             time.Duration
-	OrphanUnpinMinHandoffCount     int
-	ReplicationVerificationDelay   time.Duration
-	DiskUsageHighWaterMark         float64
-	IPFSNodeAddress                string
-	APIPort                        int
-	TrustMode                      string
-	TrustStorePath                 string
-	SignatureMode                  string
-	SignatureMaxAge                time.Duration
-	UsePubsubForReplication        bool
-	MinShardPeersForPubsubOnly     int
-	ReplicationCacheTTL            time.Duration
 	AutoReplicationEnabled         bool
 	AutoReplicationTimeout         time.Duration
-	CRDTOpTimeout                  time.Duration
-	FileImportTimeout              time.Duration
-	DHTProvideTimeout              time.Duration
-	MaxConcurrentDHTProvides       int
-	FileProcessingDelay            time.Duration
-	FileStabilityDelay             time.Duration
-	MaxConcurrentFileProcessing    int
-	DHTQueryTimeout                time.Duration
-	ReshardDelay                   time.Duration
-	ReshardHandoffDelay            time.Duration
 	PinReannounceInterval          time.Duration
-	NonceSize                      int
-	MinNonceSize                   int
-	FutureSkewTolerance            time.Duration
-	HeartbeatInterval              time.Duration
-	VerboseLogging                 bool
-	MergeUpCooldown                time.Duration
-	ProbeTimeoutMerge              time.Duration
-	SiblingEmptyMergeAfter         time.Duration
-	ShardMoveCooldown              time.Duration
-	NodeName                       string
-	IdentityPath                   string
-	NodeNamePath                   string
-	IPFSConfigPath                 string
+}
+
+// FileConfig holds parameters for file ingestion and DHT operations.
+type FileConfig struct {
+	FileImportTimeout           time.Duration
+	DHTProvideTimeout           time.Duration
+	MaxConcurrentDHTProvides    int
+	FileProcessingDelay         time.Duration
+	FileStabilityDelay          time.Duration
+	MaxConcurrentFileProcessing int
+	ReshardDelay                time.Duration
+	ReshardHandoffDelay         time.Duration
+}
+
+// SecurityConfig holds trust, signing, and nonce parameters.
+type SecurityConfig struct {
+	TrustMode           string
+	TrustStorePath      string
+	SignatureMode       string
+	SignatureMaxAge     time.Duration
+	NonceSize           int
+	MinNonceSize        int
+	FutureSkewTolerance time.Duration
+}
+
+// OrphanConfig holds parameters for orphan file detection and cleanup.
+type OrphanConfig struct {
+	UnpinGracePeriod   time.Duration
+	HandoffGrace       time.Duration
+	UnpinMinHandoffCnt int
+}
+
+// Config holds all runtime configuration for a D-LOCKSS node.
+type Config struct {
+	DiscoveryServiceTag    string
+	PubsubTopicPrefix      string
+	TopicName              string
+	IngestAllowlist        []string
+	FileWatchFolder        string
+	ClusterStorePath       string
+	BadBitsPath            string
+	IPFSNodeAddress        string
+	APIPort                int
+	BootstrapTimeout       time.Duration
+	HeartbeatInterval      time.Duration
+	VerboseLogging         bool
+	RateLimitWindow        time.Duration
+	MaxMessagesPerWindow   int
+	DiskUsageHighWaterMark float64
+	NodeName               string
+	IdentityPath           string
+	NodeNamePath           string
+	IPFSConfigPath         string
+
+	Sharding    ShardingConfig
+	Replication ReplicationConfig
+	Files       FileConfig
+	Security    SecurityConfig
+	Orphan      OrphanConfig
 }
 
 // DefaultConfig returns a Config with all hardcoded defaults (no env reads).
@@ -174,74 +189,70 @@ type Config struct {
 func DefaultConfig() *Config {
 	dataDir := "./data"
 	return &Config{
-		DiscoveryServiceTag:            "dlockss-prod",
-		PubsubTopicPrefix:              DefaultPubsubVersion,
-		TopicName:                      DefaultTopicName,
-		IngestAllowlist:                nil,
-		FileWatchFolder:                dataDir,
-		ClusterStorePath:               filepath.Join(filepath.Dir(dataDir), "cluster_store"),
-		MinReplication:                 5,
-		MaxReplication:                 10,
-		CheckInterval:                  1 * time.Minute,
-		MaxPeersPerShard:               12,
-		MinPeersPerShard:               6,
-		MinPeersAcrossSiblings:         10,
-		ShardPeerCheckInterval:         2 * time.Minute,
-		ShardDiscoveryInterval:         2 * time.Minute,
-		ShardSplitRebroadcastInterval:  60 * time.Second,
-		BootstrapTimeout:               15 * time.Second,
-		SeenPeersWindow:                350 * time.Second,
-		PruneStalePeersInterval:        10 * time.Minute,
-		MaxConcurrentReplicationChecks: 5,
-		RateLimitWindow:                1 * time.Minute,
-		MaxMessagesPerWindow:           100,
-		InitialBackoffDelay:            5 * time.Second,
-		MaxBackoffDelay:                5 * time.Minute,
-		BackoffMultiplier:              2.0,
-		ReplicationCheckCooldown:       1 * time.Minute,
-		RemovedFileCooldown:            2 * time.Minute,
-		BadBitsPath:                    "badBits.csv",
-		ShardOverlapDuration:           2 * time.Minute,
-		OrphanUnpinGracePeriod:         6 * time.Minute,
-		OrphanHandoffGrace:             6 * time.Minute,
-		OrphanUnpinMinHandoffCount:     2,
-		ReplicationVerificationDelay:   2 * time.Minute,
-		DiskUsageHighWaterMark:         90.0,
-		IPFSNodeAddress:                "/ip4/127.0.0.1/tcp/5001",
-		APIPort:                        5050,
-		TrustMode:                      "open",
-		TrustStorePath:                 "trusted_peers.json",
-		SignatureMode:                  "strict",
-		SignatureMaxAge:                10 * time.Minute,
-		UsePubsubForReplication:        true,
-		MinShardPeersForPubsubOnly:     5,
-		ReplicationCacheTTL:            5 * time.Minute,
-		AutoReplicationEnabled:         true,
-		AutoReplicationTimeout:         5 * time.Minute,
-		CRDTOpTimeout:                  10 * time.Minute,
-		FileImportTimeout:              2 * time.Minute,
-		DHTProvideTimeout:              60 * time.Second,
-		MaxConcurrentDHTProvides:       8,
-		FileProcessingDelay:            100 * time.Millisecond,
-		FileStabilityDelay:             3 * time.Second,
-		MaxConcurrentFileProcessing:    5,
-		DHTQueryTimeout:                2 * time.Minute,
-		ReshardDelay:                   5 * time.Second,
-		ReshardHandoffDelay:            3 * time.Second,
-		PinReannounceInterval:          2 * time.Minute,
-		NonceSize:                      16,
-		MinNonceSize:                   8,
-		FutureSkewTolerance:            30 * time.Second,
-		HeartbeatInterval:              10 * time.Second,
-		VerboseLogging:                 false,
-		MergeUpCooldown:                2 * time.Minute,
-		ProbeTimeoutMerge:              6 * time.Second,
-		SiblingEmptyMergeAfter:         5 * time.Minute,
-		ShardMoveCooldown:              30 * time.Second,
-		NodeName:                       "",
-		IdentityPath:                   filepath.Join(filepath.Dir(dataDir), "dlockss.key"),
-		NodeNamePath:                   filepath.Join(filepath.Dir(dataDir), "node_name"),
-		IPFSConfigPath:                 "",
+		DiscoveryServiceTag:    "dlockss-prod",
+		PubsubTopicPrefix:      DefaultPubsubVersion,
+		TopicName:              DefaultTopicName,
+		FileWatchFolder:        dataDir,
+		ClusterStorePath:       filepath.Join(filepath.Dir(dataDir), "cluster_store"),
+		BadBitsPath:            "badBits.csv",
+		IPFSNodeAddress:        "/ip4/127.0.0.1/tcp/5001",
+		APIPort:                5050,
+		BootstrapTimeout:       15 * time.Second,
+		HeartbeatInterval:      10 * time.Second,
+		RateLimitWindow:        1 * time.Minute,
+		MaxMessagesPerWindow:   100,
+		DiskUsageHighWaterMark: 90.0,
+		IdentityPath:           filepath.Join(filepath.Dir(dataDir), "dlockss.key"),
+		NodeNamePath:           filepath.Join(filepath.Dir(dataDir), "node_name"),
+
+		Sharding: ShardingConfig{
+			MaxPeersPerShard:              12,
+			MinPeersPerShard:              6,
+			MinPeersAcrossSiblings:        10,
+			ShardPeerCheckInterval:        2 * time.Minute,
+			ShardDiscoveryInterval:        2 * time.Minute,
+			ShardSplitRebroadcastInterval: 60 * time.Second,
+			SeenPeersWindow:               350 * time.Second,
+			PruneStalePeersInterval:       10 * time.Minute,
+			ShardOverlapDuration:          2 * time.Minute,
+			ShardMoveCooldown:             30 * time.Second,
+			MergeUpCooldown:               2 * time.Minute,
+			ProbeTimeoutMerge:             6 * time.Second,
+			SiblingEmptyMergeAfter:        5 * time.Minute,
+		},
+		Replication: ReplicationConfig{
+			MinReplication:                 5,
+			MaxReplication:                 10,
+			CheckInterval:                  1 * time.Minute,
+			MaxConcurrentReplicationChecks: 5,
+			AutoReplicationEnabled:         true,
+			AutoReplicationTimeout:         5 * time.Minute,
+			PinReannounceInterval:          2 * time.Minute,
+		},
+		Files: FileConfig{
+			FileImportTimeout:           2 * time.Minute,
+			DHTProvideTimeout:           60 * time.Second,
+			MaxConcurrentDHTProvides:    8,
+			FileProcessingDelay:         100 * time.Millisecond,
+			FileStabilityDelay:          3 * time.Second,
+			MaxConcurrentFileProcessing: 5,
+			ReshardDelay:                5 * time.Second,
+			ReshardHandoffDelay:         3 * time.Second,
+		},
+		Security: SecurityConfig{
+			TrustMode:           "open",
+			TrustStorePath:      "trusted_peers.json",
+			SignatureMode:       "strict",
+			SignatureMaxAge:     10 * time.Minute,
+			NonceSize:           16,
+			MinNonceSize:        8,
+			FutureSkewTolerance: 30 * time.Second,
+		},
+		Orphan: OrphanConfig{
+			UnpinGracePeriod:   6 * time.Minute,
+			HandoffGrace:       6 * time.Minute,
+			UnpinMinHandoffCnt: 2,
+		},
 	}
 }
 
@@ -249,103 +260,105 @@ func DefaultConfig() *Config {
 // to hardcoded defaults for any variable that is not set.
 func LoadFromEnv() *Config {
 	dataDir := getEnvString("DLOCKSS_DATA_DIR", "./data")
-	return &Config{
-		DiscoveryServiceTag:            getEnvString("DLOCKSS_DISCOVERY_TAG", "dlockss-prod"),
-		PubsubTopicPrefix:              getEnvString("DLOCKSS_PUBSUB_TOPIC_PREFIX", DefaultPubsubVersion),
-		TopicName:                      getEnvString("DLOCKSS_TOPIC_NAME", DefaultTopicName),
-		IngestAllowlist:                getEnvStringSlice("DLOCKSS_INGEST_ALLOWLIST"),
-		FileWatchFolder:                dataDir,
-		ClusterStorePath:               clusterStorePath(dataDir),
-		MinReplication:                 getEnvInt("DLOCKSS_MIN_REPLICATION", 5),
-		MaxReplication:                 getEnvInt("DLOCKSS_MAX_REPLICATION", 10),
-		CheckInterval:                  getEnvDuration("DLOCKSS_CHECK_INTERVAL", 1*time.Minute),
-		MaxPeersPerShard:               getEnvInt("DLOCKSS_MAX_PEERS_PER_SHARD", 12),
-		MinPeersPerShard:               getEnvInt("DLOCKSS_MIN_PEERS_PER_SHARD", 6),
-		MinPeersAcrossSiblings:         getEnvInt("DLOCKSS_MIN_PEERS_ACROSS_SIBLINGS", 10),
-		ShardPeerCheckInterval:         getEnvDuration("DLOCKSS_SHARD_PEER_CHECK_INTERVAL", 2*time.Minute),
-		ShardDiscoveryInterval:         getEnvDuration("DLOCKSS_SHARD_DISCOVERY_INTERVAL", 2*time.Minute),
-		ShardSplitRebroadcastInterval:  getEnvDuration("DLOCKSS_SHARD_SPLIT_REBROADCAST_INTERVAL", 60*time.Second),
-		BootstrapTimeout:               getEnvDuration("DLOCKSS_BOOTSTRAP_TIMEOUT", 15*time.Second),
-		SeenPeersWindow:                getEnvDuration("DLOCKSS_SEEN_PEERS_WINDOW", 350*time.Second),
-		PruneStalePeersInterval:        getEnvDuration("DLOCKSS_PRUNE_STALE_PEERS_INTERVAL", 10*time.Minute),
-		MaxConcurrentReplicationChecks: getEnvInt("DLOCKSS_MAX_CONCURRENT_CHECKS", 5),
-		RateLimitWindow:                getEnvDuration("DLOCKSS_RATE_LIMIT_WINDOW", 1*time.Minute),
-		MaxMessagesPerWindow:           getEnvInt("DLOCKSS_MAX_MESSAGES_PER_WINDOW", 100),
-		InitialBackoffDelay:            getEnvDuration("DLOCKSS_INITIAL_BACKOFF", 5*time.Second),
-		MaxBackoffDelay:                getEnvDuration("DLOCKSS_MAX_BACKOFF", 5*time.Minute),
-		BackoffMultiplier:              getEnvFloat("DLOCKSS_BACKOFF_MULTIPLIER", 2.0),
-		ReplicationCheckCooldown:       getEnvDuration("DLOCKSS_REPLICATION_COOLDOWN", 1*time.Minute),
-		RemovedFileCooldown:            getEnvDuration("DLOCKSS_REMOVED_COOLDOWN", 2*time.Minute),
-		BadBitsPath:                    getEnvString("DLOCKSS_BADBITS_PATH", "badBits.csv"),
-		ShardOverlapDuration:           getEnvDuration("DLOCKSS_SHARD_OVERLAP_DURATION", 2*time.Minute),
-		OrphanUnpinGracePeriod:         getEnvDuration("DLOCKSS_ORPHAN_UNPIN_GRACE", 6*time.Minute),
-		OrphanHandoffGrace:             getEnvDuration("DLOCKSS_ORPHAN_HANDOFF_GRACE", 6*time.Minute),
-		OrphanUnpinMinHandoffCount:     getEnvInt("DLOCKSS_ORPHAN_MIN_HANDOFF_COUNT", 2),
-		ReplicationVerificationDelay:   getEnvDuration("DLOCKSS_REPLICATION_VERIFICATION_DELAY", 2*time.Minute),
-		DiskUsageHighWaterMark:         getEnvFloat("DLOCKSS_DISK_USAGE_HIGH_WATER_MARK", 90.0),
-		IPFSNodeAddress:                getEnvString("DLOCKSS_IPFS_NODE", "/ip4/127.0.0.1/tcp/5001"),
-		APIPort:                        getEnvInt("DLOCKSS_API_PORT", 5050),
-		TrustMode:                      getEnvString("DLOCKSS_TRUST_MODE", "open"),
-		TrustStorePath:                 getEnvString("DLOCKSS_TRUST_STORE", "trusted_peers.json"),
-		SignatureMode:                  getEnvString("DLOCKSS_SIGNATURE_MODE", "strict"),
-		SignatureMaxAge:                getEnvDuration("DLOCKSS_SIGNATURE_MAX_AGE", 10*time.Minute),
-		UsePubsubForReplication:        getEnvBool("DLOCKSS_USE_PUBSUB_FOR_REPLICATION", true),
-		MinShardPeersForPubsubOnly:     getEnvInt("DLOCKSS_MIN_SHARD_PEERS_PUBSUB_ONLY", 5),
-		ReplicationCacheTTL:            getEnvDuration("DLOCKSS_REPLICATION_CACHE_TTL", 5*time.Minute),
-		AutoReplicationEnabled:         getEnvBool("DLOCKSS_AUTO_REPLICATION_ENABLED", true),
-		AutoReplicationTimeout:         getEnvDuration("DLOCKSS_AUTO_REPLICATION_TIMEOUT", 5*time.Minute),
-		CRDTOpTimeout:                  getEnvDuration("DLOCKSS_CRDT_OP_TIMEOUT", 10*time.Minute),
-		FileImportTimeout:              getEnvDuration("DLOCKSS_FILE_IMPORT_TIMEOUT", 2*time.Minute),
-		DHTProvideTimeout:              getEnvDuration("DLOCKSS_DHT_PROVIDE_TIMEOUT", 60*time.Second),
-		MaxConcurrentDHTProvides:       getEnvInt("DLOCKSS_MAX_CONCURRENT_DHT_PROVIDES", 8),
-		FileProcessingDelay:            getEnvDuration("DLOCKSS_FILE_PROCESSING_DELAY", 100*time.Millisecond),
-		FileStabilityDelay:             getEnvDuration("DLOCKSS_FILE_STABILITY_DELAY", 3*time.Second),
-		MaxConcurrentFileProcessing:    getEnvInt("DLOCKSS_MAX_CONCURRENT_FILE_PROCESSING", 5),
-		DHTQueryTimeout:                getEnvDuration("DLOCKSS_DHT_QUERY_TIMEOUT", 2*time.Minute),
-		ReshardDelay:                   getEnvDuration("DLOCKSS_RESHARD_DELAY", 5*time.Second),
-		ReshardHandoffDelay:            getEnvDuration("DLOCKSS_RESHARD_HANDOFF_DELAY", 3*time.Second),
-		PinReannounceInterval:          getEnvDuration("DLOCKSS_PIN_REANNOUNCE_INTERVAL", 2*time.Minute),
-		NonceSize:                      getEnvInt("DLOCKSS_NONCE_SIZE", 16),
-		MinNonceSize:                   getEnvInt("DLOCKSS_MIN_NONCE_SIZE", 8),
-		FutureSkewTolerance:            getEnvDuration("DLOCKSS_FUTURE_SKEW_TOLERANCE", 30*time.Second),
-		HeartbeatInterval:              getEnvDuration("DLOCKSS_HEARTBEAT_INTERVAL", 10*time.Second),
-		VerboseLogging:                 getEnvBool("DLOCKSS_VERBOSE_LOGGING", false),
-		MergeUpCooldown:                getEnvDuration("DLOCKSS_MERGE_UP_COOLDOWN", 2*time.Minute),
-		ProbeTimeoutMerge:              getEnvDuration("DLOCKSS_PROBE_TIMEOUT_MERGE", 6*time.Second),
-		SiblingEmptyMergeAfter:         getEnvDuration("DLOCKSS_SIBLING_EMPTY_MERGE_AFTER", 5*time.Minute),
-		ShardMoveCooldown:              getEnvDuration("DLOCKSS_SHARD_MOVE_COOLDOWN", 30*time.Second),
-		NodeName:                       getEnvString("DLOCKSS_NODE_NAME", ""),
-		IdentityPath:                   identityPath(dataDir),
-		NodeNamePath:                   nodeNamePath(dataDir),
-		IPFSConfigPath:                 getEnvString("DLOCKSS_IPFS_CONFIG", ""),
-	}
+
+	cfg := DefaultConfig()
+
+	cfg.DiscoveryServiceTag = getEnvString("DLOCKSS_DISCOVERY_TAG", cfg.DiscoveryServiceTag)
+	cfg.PubsubTopicPrefix = getEnvString("DLOCKSS_PUBSUB_TOPIC_PREFIX", cfg.PubsubTopicPrefix)
+	cfg.TopicName = getEnvString("DLOCKSS_TOPIC_NAME", cfg.TopicName)
+	cfg.IngestAllowlist = getEnvStringSlice("DLOCKSS_INGEST_ALLOWLIST")
+	cfg.FileWatchFolder = dataDir
+	cfg.ClusterStorePath = clusterStorePath(dataDir)
+	cfg.BadBitsPath = getEnvString("DLOCKSS_BADBITS_PATH", cfg.BadBitsPath)
+	cfg.IPFSNodeAddress = getEnvString("DLOCKSS_IPFS_NODE", cfg.IPFSNodeAddress)
+	cfg.APIPort = getEnvInt("DLOCKSS_API_PORT", cfg.APIPort)
+	cfg.BootstrapTimeout = getEnvDuration("DLOCKSS_BOOTSTRAP_TIMEOUT", cfg.BootstrapTimeout)
+	cfg.HeartbeatInterval = getEnvDuration("DLOCKSS_HEARTBEAT_INTERVAL", cfg.HeartbeatInterval)
+	cfg.VerboseLogging = getEnvBool("DLOCKSS_VERBOSE_LOGGING", cfg.VerboseLogging)
+	cfg.RateLimitWindow = getEnvDuration("DLOCKSS_RATE_LIMIT_WINDOW", cfg.RateLimitWindow)
+	cfg.MaxMessagesPerWindow = getEnvInt("DLOCKSS_MAX_MESSAGES_PER_WINDOW", cfg.MaxMessagesPerWindow)
+	cfg.DiskUsageHighWaterMark = getEnvFloat("DLOCKSS_DISK_USAGE_HIGH_WATER_MARK", cfg.DiskUsageHighWaterMark)
+	cfg.NodeName = getEnvString("DLOCKSS_NODE_NAME", cfg.NodeName)
+	cfg.IdentityPath = identityPath(dataDir)
+	cfg.NodeNamePath = nodeNamePath(dataDir)
+	cfg.IPFSConfigPath = getEnvString("DLOCKSS_IPFS_CONFIG", cfg.IPFSConfigPath)
+
+	// Sharding
+	cfg.Sharding.MaxPeersPerShard = getEnvInt("DLOCKSS_MAX_PEERS_PER_SHARD", cfg.Sharding.MaxPeersPerShard)
+	cfg.Sharding.MinPeersPerShard = getEnvInt("DLOCKSS_MIN_PEERS_PER_SHARD", cfg.Sharding.MinPeersPerShard)
+	cfg.Sharding.MinPeersAcrossSiblings = getEnvInt("DLOCKSS_MIN_PEERS_ACROSS_SIBLINGS", cfg.Sharding.MinPeersAcrossSiblings)
+	cfg.Sharding.ShardPeerCheckInterval = getEnvDuration("DLOCKSS_SHARD_PEER_CHECK_INTERVAL", cfg.Sharding.ShardPeerCheckInterval)
+	cfg.Sharding.ShardDiscoveryInterval = getEnvDuration("DLOCKSS_SHARD_DISCOVERY_INTERVAL", cfg.Sharding.ShardDiscoveryInterval)
+	cfg.Sharding.ShardSplitRebroadcastInterval = getEnvDuration("DLOCKSS_SHARD_SPLIT_REBROADCAST_INTERVAL", cfg.Sharding.ShardSplitRebroadcastInterval)
+	cfg.Sharding.SeenPeersWindow = getEnvDuration("DLOCKSS_SEEN_PEERS_WINDOW", cfg.Sharding.SeenPeersWindow)
+	cfg.Sharding.PruneStalePeersInterval = getEnvDuration("DLOCKSS_PRUNE_STALE_PEERS_INTERVAL", cfg.Sharding.PruneStalePeersInterval)
+	cfg.Sharding.ShardOverlapDuration = getEnvDuration("DLOCKSS_SHARD_OVERLAP_DURATION", cfg.Sharding.ShardOverlapDuration)
+	cfg.Sharding.ShardMoveCooldown = getEnvDuration("DLOCKSS_SHARD_MOVE_COOLDOWN", cfg.Sharding.ShardMoveCooldown)
+	cfg.Sharding.MergeUpCooldown = getEnvDuration("DLOCKSS_MERGE_UP_COOLDOWN", cfg.Sharding.MergeUpCooldown)
+	cfg.Sharding.ProbeTimeoutMerge = getEnvDuration("DLOCKSS_PROBE_TIMEOUT_MERGE", cfg.Sharding.ProbeTimeoutMerge)
+	cfg.Sharding.SiblingEmptyMergeAfter = getEnvDuration("DLOCKSS_SIBLING_EMPTY_MERGE_AFTER", cfg.Sharding.SiblingEmptyMergeAfter)
+
+	// Replication
+	cfg.Replication.MinReplication = getEnvInt("DLOCKSS_MIN_REPLICATION", cfg.Replication.MinReplication)
+	cfg.Replication.MaxReplication = getEnvInt("DLOCKSS_MAX_REPLICATION", cfg.Replication.MaxReplication)
+	cfg.Replication.CheckInterval = getEnvDuration("DLOCKSS_CHECK_INTERVAL", cfg.Replication.CheckInterval)
+	cfg.Replication.MaxConcurrentReplicationChecks = getEnvInt("DLOCKSS_MAX_CONCURRENT_CHECKS", cfg.Replication.MaxConcurrentReplicationChecks)
+	cfg.Replication.AutoReplicationEnabled = getEnvBool("DLOCKSS_AUTO_REPLICATION_ENABLED", cfg.Replication.AutoReplicationEnabled)
+	cfg.Replication.AutoReplicationTimeout = getEnvDuration("DLOCKSS_AUTO_REPLICATION_TIMEOUT", cfg.Replication.AutoReplicationTimeout)
+	cfg.Replication.PinReannounceInterval = getEnvDuration("DLOCKSS_PIN_REANNOUNCE_INTERVAL", cfg.Replication.PinReannounceInterval)
+
+	// Files
+	cfg.Files.FileImportTimeout = getEnvDuration("DLOCKSS_FILE_IMPORT_TIMEOUT", cfg.Files.FileImportTimeout)
+	cfg.Files.DHTProvideTimeout = getEnvDuration("DLOCKSS_DHT_PROVIDE_TIMEOUT", cfg.Files.DHTProvideTimeout)
+	cfg.Files.MaxConcurrentDHTProvides = getEnvInt("DLOCKSS_MAX_CONCURRENT_DHT_PROVIDES", cfg.Files.MaxConcurrentDHTProvides)
+	cfg.Files.FileProcessingDelay = getEnvDuration("DLOCKSS_FILE_PROCESSING_DELAY", cfg.Files.FileProcessingDelay)
+	cfg.Files.FileStabilityDelay = getEnvDuration("DLOCKSS_FILE_STABILITY_DELAY", cfg.Files.FileStabilityDelay)
+	cfg.Files.MaxConcurrentFileProcessing = getEnvInt("DLOCKSS_MAX_CONCURRENT_FILE_PROCESSING", cfg.Files.MaxConcurrentFileProcessing)
+	cfg.Files.ReshardDelay = getEnvDuration("DLOCKSS_RESHARD_DELAY", cfg.Files.ReshardDelay)
+	cfg.Files.ReshardHandoffDelay = getEnvDuration("DLOCKSS_RESHARD_HANDOFF_DELAY", cfg.Files.ReshardHandoffDelay)
+
+	// Security
+	cfg.Security.TrustMode = getEnvString("DLOCKSS_TRUST_MODE", cfg.Security.TrustMode)
+	cfg.Security.TrustStorePath = getEnvString("DLOCKSS_TRUST_STORE", cfg.Security.TrustStorePath)
+	cfg.Security.SignatureMode = getEnvString("DLOCKSS_SIGNATURE_MODE", cfg.Security.SignatureMode)
+	cfg.Security.SignatureMaxAge = getEnvDuration("DLOCKSS_SIGNATURE_MAX_AGE", cfg.Security.SignatureMaxAge)
+	cfg.Security.NonceSize = getEnvInt("DLOCKSS_NONCE_SIZE", cfg.Security.NonceSize)
+	cfg.Security.MinNonceSize = getEnvInt("DLOCKSS_MIN_NONCE_SIZE", cfg.Security.MinNonceSize)
+	cfg.Security.FutureSkewTolerance = getEnvDuration("DLOCKSS_FUTURE_SKEW_TOLERANCE", cfg.Security.FutureSkewTolerance)
+
+	// Orphan
+	cfg.Orphan.UnpinGracePeriod = getEnvDuration("DLOCKSS_ORPHAN_UNPIN_GRACE", cfg.Orphan.UnpinGracePeriod)
+	cfg.Orphan.HandoffGrace = getEnvDuration("DLOCKSS_ORPHAN_HANDOFF_GRACE", cfg.Orphan.HandoffGrace)
+	cfg.Orphan.UnpinMinHandoffCnt = getEnvInt("DLOCKSS_ORPHAN_MIN_HANDOFF_COUNT", cfg.Orphan.UnpinMinHandoffCnt)
+
+	return cfg
 }
 
 // Validate checks and corrects invalid configuration values.
 func (c *Config) Validate() {
-	if c.SignatureMode != "off" && c.SignatureMode != "warn" && c.SignatureMode != "strict" {
-		slog.Warn("unknown signature mode, defaulting to strict", "mode", c.SignatureMode)
-		c.SignatureMode = "strict"
+	if c.Security.SignatureMode != "off" && c.Security.SignatureMode != "warn" && c.Security.SignatureMode != "strict" {
+		slog.Warn("unknown signature mode, defaulting to strict", "mode", c.Security.SignatureMode)
+		c.Security.SignatureMode = "strict"
 	}
-	if c.MaxConcurrentFileProcessing < 1 {
-		slog.Warn("invalid config value, using default", "key", "MaxConcurrentFileProcessing", "value", c.MaxConcurrentFileProcessing, "default", 5)
-		c.MaxConcurrentFileProcessing = 5
+	if c.Files.MaxConcurrentFileProcessing < 1 {
+		slog.Warn("invalid config value, using default", "key", "MaxConcurrentFileProcessing", "value", c.Files.MaxConcurrentFileProcessing, "default", 5)
+		c.Files.MaxConcurrentFileProcessing = 5
 	}
-	if c.NonceSize < 1 {
-		slog.Warn("invalid config value, using default", "key", "NonceSize", "value", c.NonceSize, "default", 16)
-		c.NonceSize = 16
+	if c.Security.NonceSize < 1 {
+		slog.Warn("invalid config value, using default", "key", "NonceSize", "value", c.Security.NonceSize, "default", 16)
+		c.Security.NonceSize = 16
 	}
-	if c.MinNonceSize < 1 {
-		slog.Warn("invalid config value, using default", "key", "MinNonceSize", "value", c.MinNonceSize, "default", 8)
-		c.MinNonceSize = 8
+	if c.Security.MinNonceSize < 1 {
+		slog.Warn("invalid config value, using default", "key", "MinNonceSize", "value", c.Security.MinNonceSize, "default", 8)
+		c.Security.MinNonceSize = 8
 	}
-	if c.MinReplication > c.MaxReplication {
-		slog.Warn("MinReplication > MaxReplication, swapping", "min", c.MinReplication, "max", c.MaxReplication)
-		c.MinReplication, c.MaxReplication = c.MaxReplication, c.MinReplication
+	if c.Replication.MinReplication > c.Replication.MaxReplication {
+		slog.Warn("MinReplication > MaxReplication, swapping", "min", c.Replication.MinReplication, "max", c.Replication.MaxReplication)
+		c.Replication.MinReplication, c.Replication.MaxReplication = c.Replication.MaxReplication, c.Replication.MinReplication
 	}
-	if c.MaxConcurrentReplicationChecks < 1 {
-		slog.Warn("invalid config value, using default", "key", "MaxConcurrentReplicationChecks", "value", c.MaxConcurrentReplicationChecks, "default", 5)
-		c.MaxConcurrentReplicationChecks = 5
+	if c.Replication.MaxConcurrentReplicationChecks < 1 {
+		slog.Warn("invalid config value, using default", "key", "MaxConcurrentReplicationChecks", "value", c.Replication.MaxConcurrentReplicationChecks, "default", 5)
+		c.Replication.MaxConcurrentReplicationChecks = 5
 	}
 	if c.DiskUsageHighWaterMark <= 0 || c.DiskUsageHighWaterMark > 100 {
 		slog.Warn("disk usage high water mark out of range, using default", "value", c.DiskUsageHighWaterMark, "default", 90.0)
@@ -402,62 +415,54 @@ func (c *Config) Log() {
 		"cluster_store", c.ClusterStorePath,
 		"identity", c.IdentityPath,
 		"badbits", c.BadBitsPath,
-		"trust_store", c.TrustStorePath,
+		"trust_store", c.Security.TrustStorePath,
 	)
 	slog.Info("config: sharding",
-		"max_peers", c.MaxPeersPerShard,
-		"min_peers", c.MinPeersPerShard,
-		"min_across_siblings", c.MinPeersAcrossSiblings,
-		"peer_check_interval", c.ShardPeerCheckInterval,
-		"discovery_interval", c.ShardDiscoveryInterval,
-		"split_rebroadcast", c.ShardSplitRebroadcastInterval,
-		"seen_peers_window", c.SeenPeersWindow,
-		"prune_stale_interval", c.PruneStalePeersInterval,
-		"overlap_duration", c.ShardOverlapDuration,
-		"move_cooldown", c.ShardMoveCooldown,
-		"merge_up_cooldown", c.MergeUpCooldown,
-		"probe_timeout_merge", c.ProbeTimeoutMerge,
-		"sibling_empty_merge_after", c.SiblingEmptyMergeAfter,
+		"max_peers", c.Sharding.MaxPeersPerShard,
+		"min_peers", c.Sharding.MinPeersPerShard,
+		"min_across_siblings", c.Sharding.MinPeersAcrossSiblings,
+		"peer_check_interval", c.Sharding.ShardPeerCheckInterval,
+		"discovery_interval", c.Sharding.ShardDiscoveryInterval,
+		"split_rebroadcast", c.Sharding.ShardSplitRebroadcastInterval,
+		"seen_peers_window", c.Sharding.SeenPeersWindow,
+		"prune_stale_interval", c.Sharding.PruneStalePeersInterval,
+		"overlap_duration", c.Sharding.ShardOverlapDuration,
+		"move_cooldown", c.Sharding.ShardMoveCooldown,
+		"merge_up_cooldown", c.Sharding.MergeUpCooldown,
+		"probe_timeout_merge", c.Sharding.ProbeTimeoutMerge,
+		"sibling_empty_merge_after", c.Sharding.SiblingEmptyMergeAfter,
 	)
 	slog.Info("config: replication",
-		"min", c.MinReplication,
-		"max", c.MaxReplication,
-		"check_interval", c.CheckInterval,
-		"max_concurrent_checks", c.MaxConcurrentReplicationChecks,
-		"cooldown", c.ReplicationCheckCooldown,
-		"removed_cooldown", c.RemovedFileCooldown,
-		"verification_delay", c.ReplicationVerificationDelay,
-		"use_pubsub", c.UsePubsubForReplication,
-		"min_pubsub_peers", c.MinShardPeersForPubsubOnly,
-		"cache_ttl", c.ReplicationCacheTTL,
-		"auto_enabled", c.AutoReplicationEnabled,
-		"auto_timeout", c.AutoReplicationTimeout,
-		"crdt_op_timeout", c.CRDTOpTimeout,
-		"pin_reannounce", c.PinReannounceInterval,
+		"min", c.Replication.MinReplication,
+		"max", c.Replication.MaxReplication,
+		"check_interval", c.Replication.CheckInterval,
+		"max_concurrent_checks", c.Replication.MaxConcurrentReplicationChecks,
+		"auto_enabled", c.Replication.AutoReplicationEnabled,
+		"auto_timeout", c.Replication.AutoReplicationTimeout,
+		"pin_reannounce", c.Replication.PinReannounceInterval,
 	)
 	slog.Info("config: files",
-		"import_timeout", c.FileImportTimeout,
-		"dht_provide_timeout", c.DHTProvideTimeout,
-		"max_concurrent_dht_provides", c.MaxConcurrentDHTProvides,
-		"processing_delay", c.FileProcessingDelay,
-		"stability_delay", c.FileStabilityDelay,
-		"max_concurrent", c.MaxConcurrentFileProcessing,
-		"dht_query_timeout", c.DHTQueryTimeout,
-		"reshard_delay", c.ReshardDelay,
-		"reshard_handoff_delay", c.ReshardHandoffDelay,
+		"import_timeout", c.Files.FileImportTimeout,
+		"dht_provide_timeout", c.Files.DHTProvideTimeout,
+		"max_concurrent_dht_provides", c.Files.MaxConcurrentDHTProvides,
+		"processing_delay", c.Files.FileProcessingDelay,
+		"stability_delay", c.Files.FileStabilityDelay,
+		"max_concurrent", c.Files.MaxConcurrentFileProcessing,
+		"reshard_delay", c.Files.ReshardDelay,
+		"reshard_handoff_delay", c.Files.ReshardHandoffDelay,
 	)
 	slog.Info("config: orphan",
-		"unpin_grace", c.OrphanUnpinGracePeriod,
-		"handoff_grace", c.OrphanHandoffGrace,
-		"min_handoff_count", c.OrphanUnpinMinHandoffCount,
+		"unpin_grace", c.Orphan.UnpinGracePeriod,
+		"handoff_grace", c.Orphan.HandoffGrace,
+		"min_handoff_count", c.Orphan.UnpinMinHandoffCnt,
 	)
 	slog.Info("config: security",
-		"trust_mode", c.TrustMode,
-		"signature_mode", c.SignatureMode,
-		"signature_max_age", c.SignatureMaxAge,
-		"nonce_size", c.NonceSize,
-		"min_nonce_size", c.MinNonceSize,
-		"future_skew_tolerance", c.FutureSkewTolerance,
+		"trust_mode", c.Security.TrustMode,
+		"signature_mode", c.Security.SignatureMode,
+		"signature_max_age", c.Security.SignatureMaxAge,
+		"nonce_size", c.Security.NonceSize,
+		"min_nonce_size", c.Security.MinNonceSize,
+		"future_skew_tolerance", c.Security.FutureSkewTolerance,
 	)
 	heartbeat := "auto"
 	if c.HeartbeatInterval > 0 {
@@ -470,11 +475,6 @@ func (c *Config) Log() {
 	slog.Info("config: rate limiting",
 		"window", c.RateLimitWindow,
 		"max_messages", c.MaxMessagesPerWindow,
-	)
-	slog.Info("config: backoff",
-		"initial", c.InitialBackoffDelay,
-		"max", c.MaxBackoffDelay,
-		"multiplier", c.BackoffMultiplier,
 	)
 	slog.Info("config: storage",
 		"disk_high_water_mark", c.DiskUsageHighWaterMark,

@@ -5,10 +5,10 @@ import (
 	"testing"
 )
 
-func TestSetAndGet(t *testing.T) {
+func TestUpsertAndGet(t *testing.T) {
 	m := New[string, int]()
-	m.Set("a", 1)
-	m.Set("b", 2)
+	m.Upsert("a", 1)
+	m.Upsert("b", 2)
 
 	if v, ok := m.Get("a"); !ok || v != 1 {
 		t.Errorf("Get(\"a\") = %v, %v; want 1, true", v, ok)
@@ -20,7 +20,7 @@ func TestSetAndGet(t *testing.T) {
 
 func TestGet_MissingKeyReturnsZeroValueAndFalse(t *testing.T) {
 	m := New[string, int]()
-	m.Set("a", 1)
+	m.Upsert("a", 1)
 
 	v, ok := m.Get("missing")
 	if ok {
@@ -31,26 +31,29 @@ func TestGet_MissingKeyReturnsZeroValueAndFalse(t *testing.T) {
 	}
 }
 
-func TestDelete_RemovesEntry(t *testing.T) {
+func TestDeleteAndGet_RemovesEntry(t *testing.T) {
 	m := New[string, int]()
-	m.Set("a", 1)
-	m.Set("b", 2)
+	m.Upsert("a", 1)
+	m.Upsert("b", 2)
 
-	m.Delete("a")
+	v, ok := m.DeleteAndGet("a")
+	if !ok || v != 1 {
+		t.Errorf("DeleteAndGet(\"a\") = %v, %v; want 1, true", v, ok)
+	}
 
 	if _, ok := m.Get("a"); ok {
-		t.Error("Get(\"a\") after Delete: ok=true, want false")
+		t.Error("Get(\"a\") after DeleteAndGet: ok=true, want false")
 	}
 	if v, ok := m.Get("b"); !ok || v != 2 {
-		t.Errorf("Get(\"b\") after Delete(\"a\") = %v, %v; want 2, true", v, ok)
+		t.Errorf("Get(\"b\") after DeleteAndGet(\"a\") = %v, %v; want 2, true", v, ok)
 	}
 }
 
 func TestSnapshot_IteratesAllEntries(t *testing.T) {
 	m := New[string, int]()
-	m.Set("a", 1)
-	m.Set("b", 2)
-	m.Set("c", 3)
+	m.Upsert("a", 1)
+	m.Upsert("b", 2)
+	m.Upsert("c", 3)
 
 	seen := make(map[string]int)
 	for k, v := range m.Snapshot() {
@@ -73,15 +76,15 @@ func TestLen_ReturnsCorrectCount(t *testing.T) {
 		t.Errorf("empty map Len() = %d, want 0", m.Len())
 	}
 
-	m.Set("a", 1)
-	m.Set("b", 2)
+	m.Upsert("a", 1)
+	m.Upsert("b", 2)
 	if m.Len() != 2 {
 		t.Errorf("Len() = %d, want 2", m.Len())
 	}
 
-	m.Delete("a")
+	m.DeleteAndGet("a")
 	if m.Len() != 1 {
-		t.Errorf("after Delete Len() = %d, want 1", m.Len())
+		t.Errorf("after DeleteAndGet Len() = %d, want 1", m.Len())
 	}
 }
 
@@ -94,7 +97,7 @@ func TestConcurrentAccess(t *testing.T) {
 		wg.Add(1)
 		go func(k int) {
 			defer wg.Done()
-			m.Set(k, k*2)
+			m.Upsert(k, k*2)
 		}(i)
 	}
 

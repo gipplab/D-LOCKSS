@@ -20,12 +20,6 @@ func (s *Map[K, V]) Get(key K) (V, bool) {
 	return v, ok
 }
 
-func (s *Map[K, V]) Set(key K, val V) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.m[key] = val
-}
-
 // Upsert sets the value and returns true if the key was new.
 func (s *Map[K, V]) Upsert(key K, val V) (isNew bool) {
 	s.mu.Lock()
@@ -45,12 +39,6 @@ func (s *Map[K, V]) SetIfAbsent(key K, val V) bool {
 	}
 	s.m[key] = val
 	return true
-}
-
-func (s *Map[K, V]) Delete(key K) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.m, key)
 }
 
 // DeleteAndGet atomically removes and returns the value.
@@ -108,19 +96,4 @@ func (s *Map[K, V]) ReplaceAll(m map[K]V) {
 		cp[k] = v
 	}
 	s.m = cp
-}
-
-// Prune removes entries matching a predicate under a single write lock.
-// Returns the number of entries removed.
-func (s *Map[K, V]) Prune(shouldRemove func(K, V) bool) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	removed := 0
-	for k, v := range s.m {
-		if shouldRemove(k, v) {
-			delete(s.m, k)
-			removed++
-		}
-	}
-	return removed
 }

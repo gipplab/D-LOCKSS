@@ -14,7 +14,12 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-const probeTimeoutForSplitChild = 6 * time.Second
+const (
+	probeTimeoutForSplitChild     = 6 * time.Second
+	discoveryIntervalOnRoot       = 10 * time.Second
+	probeTimeoutDiscovery         = 12 * time.Second
+	discoveryIntervalWithChildren = 45 * time.Second
+)
 
 // lifecycleOps is the narrow interface that lifecycleManager uses to query
 // shard state and execute transitions.  ShardManager implements it.
@@ -26,14 +31,12 @@ type lifecycleOps interface {
 	getLastMessageTime() time.Time
 	localPeerID() peer.ID
 
-	getShardPeerCount() int
-	getShardPeerCountForSplit() int
+	getShardPeerCount(useMeshFallback bool) int
 	probeShard(shardID string, timeout time.Duration) int
 
 	moveToShard(from, to string, isMergeUp bool)
 	announceSplit(parentShard, targetChild string)
 	rebroadcastSplitToAncestors()
-	incrementShardSplits()
 
 	pruneStaleSeenPeers()
 }
@@ -106,11 +109,11 @@ func (lm *lifecycleManager) checkAndSplitIfNeeded() {
 	currentShard := lm.ops.getCurrentShard()
 
 	lastShardMove := lm.ops.getLastShardMove()
-	if !lastShardMove.IsZero() && now.Sub(lastShardMove) < lm.cfg.ShardMoveCooldown {
+	if !lastShardMove.IsZero() && now.Sub(lastShardMove) < lm.cfg.Sharding.ShardMoveCooldown {
 		return
 	}
 
-	interval := lm.cfg.ShardPeerCheckInterval
+	interval := lm.cfg.Sharding.ShardPeerCheckInterval
 	if currentShard == "" {
 		interval = rootPeerCheckInterval
 	}
@@ -122,8 +125,8 @@ func (lm *lifecycleManager) checkAndSplitIfNeeded() {
 	lm.lastPeerCheck = now
 	lm.mu.Unlock()
 
-	peerCount := lm.ops.getShardPeerCountForSplit()
-	if peerCount < lm.cfg.MaxPeersPerShard {
+	peerCount := lm.ops.getShardPeerCount(false)
+	if peerCount < lm.cfg.Sharding.MaxPeersPerShard {
 		lm.mu.Lock()
 		lm.splitAboveThresholdCount = 0
 		lm.mu.Unlock()
@@ -135,13 +138,13 @@ func (lm *lifecycleManager) checkAndSplitIfNeeded() {
 	count := lm.splitAboveThresholdCount
 	lm.mu.Unlock()
 	if count < 2 {
-		slog.Debug("waiting for 2nd consecutive check before split", "shard", currentShard, "peers", peerCount, "max_peers", lm.cfg.MaxPeersPerShard)
+		slog.Debug("waiting for 2nd consecutive check before split", "shard", currentShard, "peers", peerCount, "max_peers", lm.cfg.Sharding.MaxPeersPerShard)
 		return
 	}
 
 	estimatedPerChild := peerCount / 2
-	if estimatedPerChild < lm.cfg.MinPeersPerShard {
-		slog.Debug("split would leave too few peers per child", "shard", currentShard, "peers", peerCount, "max_peers", lm.cfg.MaxPeersPerShard, "estimated_per_child", estimatedPerChild, "min_peers", lm.cfg.MinPeersPerShard)
+	if estimatedPerChild < lm.cfg.Sharding.MinPeersPerShard {
+		slog.Debug("split would leave too few peers per child", "shard", currentShard, "peers", peerCount, "max_peers", lm.cfg.Sharding.MaxPeersPerShard, "estimated_per_child", estimatedPerChild, "min_peers", lm.cfg.Sharding.MinPeersPerShard)
 		return
 	}
 
@@ -150,7 +153,7 @@ func (lm *lifecycleManager) checkAndSplitIfNeeded() {
 	childPeerCount := lm.ops.probeShard(targetChild, probeTimeoutForSplitChild)
 
 	canJoinExisting := childPeerCount >= 1
-	minParentToCreate := 2 * lm.cfg.MinPeersPerShard
+	minParentToCreate := 2 * lm.cfg.Sharding.MinPeersPerShard
 	minParentToCreateNew := minParentToCreate + 2
 	canCreateChild := childPeerCount == 0 && peerCount >= minParentToCreateNew
 	if !canJoinExisting && !canCreateChild {
@@ -159,7 +162,6 @@ func (lm *lifecycleManager) checkAndSplitIfNeeded() {
 	}
 
 	slog.Info("shard at limit, splitting", "shard", currentShard, "peers", peerCount, "child", targetChild, "child_peers", childPeerCount)
-	lm.ops.incrementShardSplits()
 	lm.ops.announceSplit(currentShard, targetChild)
 	lm.ops.moveToShard(currentShard, targetChild, false)
 }
@@ -173,43 +175,43 @@ func (lm *lifecycleManager) checkAndMergeUpIfAlone() {
 	}
 
 	lastAnyMove := lm.ops.getLastShardMove()
-	if !lastAnyMove.IsZero() && time.Since(lastAnyMove) < lm.cfg.ShardMoveCooldown {
+	if !lastAnyMove.IsZero() && time.Since(lastAnyMove) < lm.cfg.Sharding.ShardMoveCooldown {
 		return
 	}
 
 	lastMove := lm.ops.getLastMoveToDeeperShard()
 	parentShard := currentShard[:len(currentShard)-1]
-	if !lastMove.IsZero() && time.Since(lastMove) < lm.cfg.MergeUpCooldown {
-		slog.Debug("merge-up skipped, moved to deeper shard recently", "cooldown_elapsed", time.Since(lastMove).Round(time.Second), "cooldown", lm.cfg.MergeUpCooldown)
+	if !lastMove.IsZero() && time.Since(lastMove) < lm.cfg.Sharding.MergeUpCooldown {
+		slog.Debug("merge-up skipped, moved to deeper shard recently", "cooldown_elapsed", time.Since(lastMove).Round(time.Second), "cooldown", lm.cfg.Sharding.MergeUpCooldown)
 		return
 	}
 
-	currentPeerCount := lm.ops.getShardPeerCount()
-	parentPeerCount := lm.ops.probeShard(parentShard, lm.cfg.ProbeTimeoutMerge)
-	if parentPeerCount >= lm.cfg.MaxPeersPerShard {
+	currentPeerCount := lm.ops.getShardPeerCount(true)
+	parentPeerCount := lm.ops.probeShard(parentShard, lm.cfg.Sharding.ProbeTimeoutMerge)
+	if parentPeerCount >= lm.cfg.Sharding.MaxPeersPerShard {
 		return
 	}
 
 	siblingShard := getSiblingShard(currentShard)
-	siblingPeerCount := lm.ops.probeShard(siblingShard, lm.cfg.ProbeTimeoutMerge)
+	siblingPeerCount := lm.ops.probeShard(siblingShard, lm.cfg.Sharding.ProbeTimeoutMerge)
 	siblingsTotal := currentPeerCount + siblingPeerCount
 
 	if siblingPeerCount == 0 {
-		if lastMove.IsZero() || time.Since(lastMove) < lm.cfg.SiblingEmptyMergeAfter {
+		if lastMove.IsZero() || time.Since(lastMove) < lm.cfg.Sharding.SiblingEmptyMergeAfter {
 			slog.Debug("sibling empty, possible split in progress", "shard", currentShard, "peers", currentPeerCount, "sibling", siblingShard)
 			return
 		}
-		if currentPeerCount >= lm.cfg.MinPeersPerShard {
-			slog.Debug("sibling empty but we are healthy, not merging", "shard", currentShard, "peers", currentPeerCount, "min_peers", lm.cfg.MinPeersPerShard, "sibling", siblingShard)
+		if currentPeerCount >= lm.cfg.Sharding.MinPeersPerShard {
+			slog.Debug("sibling empty but we are healthy, not merging", "shard", currentShard, "peers", currentPeerCount, "min_peers", lm.cfg.Sharding.MinPeersPerShard, "sibling", siblingShard)
 			return
 		}
-		slog.Info("merging up, sibling empty too long", "shard", currentShard, "peers", currentPeerCount, "min_peers", lm.cfg.MinPeersPerShard, "sibling", siblingShard, "empty_after", lm.cfg.SiblingEmptyMergeAfter, "target", parentShard)
+		slog.Info("merging up, sibling empty too long", "shard", currentShard, "peers", currentPeerCount, "min_peers", lm.cfg.Sharding.MinPeersPerShard, "sibling", siblingShard, "empty_after", lm.cfg.Sharding.SiblingEmptyMergeAfter, "target", parentShard)
 		lm.ops.moveToShard(currentShard, parentShard, true)
 		return
 	}
 
-	if siblingsTotal >= lm.cfg.MinPeersAcrossSiblings {
-		slog.Debug("siblings have enough peers, not merging", "shard", currentShard, "peers", currentPeerCount, "sibling", siblingShard, "sibling_peers", siblingPeerCount, "total", siblingsTotal, "min_across_siblings", lm.cfg.MinPeersAcrossSiblings)
+	if siblingsTotal >= lm.cfg.Sharding.MinPeersAcrossSiblings {
+		slog.Debug("siblings have enough peers, not merging", "shard", currentShard, "peers", currentPeerCount, "sibling", siblingShard, "sibling_peers", siblingPeerCount, "total", siblingsTotal, "min_across_siblings", lm.cfg.Sharding.MinPeersAcrossSiblings)
 		return
 	}
 	if siblingPeerCount > 0 && currentPeerCount > siblingPeerCount {
@@ -217,7 +219,7 @@ func (lm *lifecycleManager) checkAndMergeUpIfAlone() {
 		return
 	}
 
-	slog.Info("siblings below threshold, merging up", "total", siblingsTotal, "min_across_siblings", lm.cfg.MinPeersAcrossSiblings, "shard", currentShard, "peers", currentPeerCount, "sibling", siblingShard, "sibling_peers", siblingPeerCount, "target", parentShard)
+	slog.Info("siblings below threshold, merging up", "total", siblingsTotal, "min_across_siblings", lm.cfg.Sharding.MinPeersAcrossSiblings, "shard", currentShard, "peers", currentPeerCount, "sibling", siblingShard, "sibling_peers", siblingPeerCount, "target", parentShard)
 
 	lm.ops.moveToShard(currentShard, parentShard, true)
 }
@@ -228,13 +230,13 @@ func (lm *lifecycleManager) discoverAndMoveToDeeperShard() {
 	currentShard := lm.ops.getCurrentShard()
 
 	lastAnyMove := lm.ops.getLastShardMove()
-	if !lastAnyMove.IsZero() && time.Since(lastAnyMove) < lm.cfg.ShardMoveCooldown {
+	if !lastAnyMove.IsZero() && time.Since(lastAnyMove) < lm.cfg.Sharding.ShardMoveCooldown {
 		return
 	}
 
 	lastMerge := lm.ops.getLastMergeUpTime()
-	if !lastMerge.IsZero() && time.Since(lastMerge) < lm.cfg.MergeUpCooldown {
-		slog.Debug("skipped discovery, merged recently", "shard", currentShard, "cooldown_elapsed", time.Since(lastMerge).Round(time.Second), "cooldown", lm.cfg.MergeUpCooldown)
+	if !lastMerge.IsZero() && time.Since(lastMerge) < lm.cfg.Sharding.MergeUpCooldown {
+		slog.Debug("skipped discovery, merged recently", "shard", currentShard, "cooldown_elapsed", time.Since(lastMerge).Round(time.Second), "cooldown", lm.cfg.Sharding.MergeUpCooldown)
 		return
 	}
 
@@ -266,13 +268,13 @@ func (lm *lifecycleManager) discoverAndMoveToDeeperShard() {
 	siblingPeerCount := lm.ops.probeShard(siblingShard, probeTimeoutDiscovery)
 	ourChildAfter := childPeerCount + 1
 	pairTotalAfter := ourChildAfter + siblingPeerCount
-	if pairTotalAfter < lm.cfg.MinPeersAcrossSiblings {
-		parentPeerCount := lm.ops.getShardPeerCount()
+	if pairTotalAfter < lm.cfg.Sharding.MinPeersAcrossSiblings {
+		parentPeerCount := lm.ops.getShardPeerCount(true)
 		projectedPairTotal := pairTotalAfter + (parentPeerCount - 1)
-		if projectedPairTotal >= lm.cfg.MinPeersAcrossSiblings {
-			slog.Info("pair total below threshold but projected allows join", "shard", currentShard, "pair_total", pairTotalAfter, "min_across_siblings", lm.cfg.MinPeersAcrossSiblings, "projected_total", projectedPairTotal, "parent_peers", parentPeerCount)
+		if projectedPairTotal >= lm.cfg.Sharding.MinPeersAcrossSiblings {
+			slog.Info("pair total below threshold but projected allows join", "shard", currentShard, "pair_total", pairTotalAfter, "min_across_siblings", lm.cfg.Sharding.MinPeersAcrossSiblings, "projected_total", projectedPairTotal, "parent_peers", parentPeerCount)
 		} else {
-			slog.Debug("pair total below threshold, not joining", "shard", currentShard, "child", targetChild, "child_after_join", ourChildAfter, "sibling", siblingShard, "sibling_peers", siblingPeerCount, "pair_total", pairTotalAfter, "projected_total", projectedPairTotal, "parent_peers", parentPeerCount, "min_across_siblings", lm.cfg.MinPeersAcrossSiblings)
+			slog.Debug("pair total below threshold, not joining", "shard", currentShard, "child", targetChild, "child_after_join", ourChildAfter, "sibling", siblingShard, "sibling_peers", siblingPeerCount, "pair_total", pairTotalAfter, "projected_total", projectedPairTotal, "parent_peers", parentPeerCount, "min_across_siblings", lm.cfg.Sharding.MinPeersAcrossSiblings)
 			return
 		}
 	}
@@ -302,7 +304,7 @@ func (lm *lifecycleManager) runShardDiscovery() {
 	for {
 		currentShard := lm.ops.getCurrentShard()
 
-		interval := lm.cfg.ShardDiscoveryInterval
+		interval := lm.cfg.Sharding.ShardDiscoveryInterval
 		if currentShard == "" {
 			interval = discoveryIntervalOnRoot
 		} else if lm.hasKnownChildren(currentShard) {
@@ -323,8 +325,8 @@ func (lm *lifecycleManager) runShardDiscovery() {
 			lt := lm.ops.getLastMessageTime()
 			return lt.IsZero() || time.Since(lt) > 1*time.Minute
 		}()
-		peerCount := lm.ops.getShardPeerCountForSplit()
-		fewPeersInShard := peerCount <= lm.cfg.MaxPeersPerShard
+		peerCount := lm.ops.getShardPeerCount(false)
+		fewPeersInShard := peerCount <= lm.cfg.Sharding.MaxPeersPerShard
 		onRoot := currentShard == ""
 		hasChildren := lm.hasKnownChildren(currentShard)
 		if !hasChildren && !isIdle && !fewPeersInShard && !onRoot {
@@ -338,12 +340,12 @@ func (lm *lifecycleManager) runShardDiscovery() {
 }
 
 func (lm *lifecycleManager) runSplitRebroadcast() {
-	jitterRange := lm.cfg.ShardSplitRebroadcastInterval / 2
+	jitterRange := lm.cfg.Sharding.ShardSplitRebroadcastInterval / 2
 	if jitterRange < time.Second {
 		jitterRange = time.Second
 	}
 	for {
-		delay := lm.cfg.ShardSplitRebroadcastInterval + time.Duration(rand.Int63n(int64(jitterRange)))
+		delay := lm.cfg.Sharding.ShardSplitRebroadcastInterval + time.Duration(rand.Int63n(int64(jitterRange)))
 		t := time.NewTimer(delay)
 		select {
 		case <-lm.ctx().Done():
@@ -353,13 +355,4 @@ func (lm *lifecycleManager) runSplitRebroadcast() {
 			lm.ops.rebroadcastSplitToAncestors()
 		}
 	}
-}
-
-// splitShard is a test helper that forces a split to the target child.
-func (lm *lifecycleManager) splitShard() {
-	currentShard := lm.ops.getCurrentShard()
-	nextDepth := len(currentShard) + 1
-	targetChild := common.GetBinaryPrefix(lm.ops.localPeerID().String(), nextDepth)
-	lm.ops.incrementShardSplits()
-	lm.ops.moveToShard(currentShard, targetChild, false)
 }

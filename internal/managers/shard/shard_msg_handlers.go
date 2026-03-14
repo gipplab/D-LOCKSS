@@ -13,65 +13,6 @@ import (
 	"dlockss/pkg/schema"
 )
 
-// handleReplicationRequest verifies, then fetches and pins if not already pinned.
-func (sm *ShardManager) handleReplicationRequest(msg *pubsub.Message, rr *schema.ReplicationRequest, shardID string) {
-	if sm.signer == nil {
-		return
-	}
-	logPrefix := fmt.Sprintf("ReplicationRequest (Shard %s)", shardID)
-	if sm.signer.ShouldDropMessage(msg.GetFrom(), rr.SenderID, rr.Timestamp, rr.Nonce, rr.Sig, rr.MarshalCBORForSigning, logPrefix) {
-		slog.Warn("ReplicationRequest rejected", "manifest", rr.ManifestCID.String(), "from", msg.GetFrom().String(), "shard", shardID)
-		return
-	}
-	manifestCIDStr := rr.ManifestCID.String()
-	c := rr.ManifestCID
-
-	checkCtx, checkCancel := context.WithTimeout(sm.ctx, 5*time.Second)
-	legacy := common.IsLegacyManifest(checkCtx, sm.ipfsClient, manifestCIDStr)
-	checkCancel()
-	if legacy {
-		slog.Info("ignoring legacy manifest in ReplicationRequest", "manifest", manifestCIDStr)
-		return
-	}
-
-	if sm.storageMgr.IsPinned(manifestCIDStr) {
-		if err := sm.EnsureClusterForShard(sm.ctx, shardID); err != nil {
-			slog.Error("ReplicationRequest: failed to ensure cluster for shard", "shard", shardID, "error", err)
-			return
-		}
-		sm.clusterMgr.TriggerSync(shardID)
-		return
-	}
-	if !sm.cfg.AutoReplicationEnabled {
-		return
-	}
-	select {
-	case sm.autoReplicationSem <- struct{}{}:
-	default:
-		slog.Debug("auto-replication skipped, concurrency limit reached", "manifest", manifestCIDStr)
-		return
-	}
-	go func() {
-		defer func() { <-sm.autoReplicationSem }()
-		fetchCtx, cancelFetch := context.WithTimeout(sm.ctx, sm.cfg.AutoReplicationTimeout)
-		if err := sm.ipfsClient.PinRecursive(fetchCtx, c); err != nil {
-			cancelFetch()
-			slog.Error("auto-replication: failed to fetch/pin", "manifest", manifestCIDStr, "error", err)
-			return
-		}
-		cancelFetch()
-		if err := sm.EnsureClusterForShard(sm.ctx, shardID); err != nil {
-			slog.Error("auto-replication: failed to ensure cluster for shard", "shard", shardID, "error", err)
-			return
-		}
-		if err := sm.clusterMgr.PinIfAbsent(sm.ctx, shardID, c, -1, -1); err != nil {
-			slog.Error("auto-replication: failed to write CRDT pin", "manifest", manifestCIDStr, "error", err)
-		}
-		sm.clusterMgr.TriggerSync(shardID)
-		slog.Info("auto-replication: fetched and pinned", "manifest", manifestCIDStr, "shard", shardID)
-	}()
-}
-
 // isAuthorizedIngestor returns true if the peer is allowed to publish ingest
 // messages. When the allowlist is empty the topic is open to all.
 func (sm *ShardManager) isAuthorizedIngestor(senderID peer.ID) bool {

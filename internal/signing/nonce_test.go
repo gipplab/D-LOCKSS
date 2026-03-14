@@ -4,46 +4,45 @@ import (
 	"testing"
 	"time"
 
-	"dlockss/internal/common"
 	"dlockss/internal/testutil"
 )
 
 func TestNewNonce_ReturnsCorrectLength(t *testing.T) {
 	for _, size := range []int{1, 16, 32, 64} {
-		nonce, err := common.NewNonce(size)
+		nonce, err := newNonce(size)
 		if err != nil {
-			t.Fatalf("NewNonce(%d): %v", size, err)
+			t.Fatalf("newNonce(%d): %v", size, err)
 		}
 		if len(nonce) != size {
-			t.Errorf("NewNonce(%d) len=%d, want %d", size, len(nonce), size)
+			t.Errorf("newNonce(%d) len=%d, want %d", size, len(nonce), size)
 		}
 	}
 }
 
 func TestNewNonce_TwoCallsProduceDifferentValues(t *testing.T) {
-	n1, err := common.NewNonce(32)
+	n1, err := newNonce(32)
 	if err != nil {
-		t.Fatalf("NewNonce: %v", err)
+		t.Fatalf("newNonce: %v", err)
 	}
-	n2, err := common.NewNonce(32)
+	n2, err := newNonce(32)
 	if err != nil {
-		t.Fatalf("NewNonce: %v", err)
+		t.Fatalf("newNonce: %v", err)
 	}
 	if string(n1) == string(n2) {
-		t.Error("two NewNonce calls produced identical values")
+		t.Error("two newNonce calls produced identical values")
 	}
 }
 
 func TestNewNonce_ZeroSizeWorks(t *testing.T) {
-	nonce, err := common.NewNonce(0)
+	nonce, err := newNonce(0)
 	if err != nil {
-		t.Fatalf("NewNonce(0): %v", err)
+		t.Fatalf("newNonce(0): %v", err)
 	}
 	if nonce == nil {
-		t.Error("NewNonce(0) returned nil")
+		t.Error("newNonce(0) returned nil")
 	}
 	if len(nonce) != 0 {
-		t.Errorf("NewNonce(0) len=%d, want 0", len(nonce))
+		t.Errorf("newNonce(0) len=%d, want 0", len(nonce))
 	}
 }
 
@@ -66,9 +65,9 @@ func TestSeenBefore_RejectsSameNonceTwice(t *testing.T) {
 func TestSeenBefore_AllowsFreshNonce(t *testing.T) {
 	ns := newNonceStore()
 	pid := testutil.MustPeerID(t, "sender-2")
-	nonce, err := common.NewNonce(16)
+	nonce, err := newNonce(16)
 	if err != nil {
-		t.Fatalf("NewNonce: %v", err)
+		t.Fatalf("newNonce: %v", err)
 	}
 	ttl := 10 * time.Minute
 

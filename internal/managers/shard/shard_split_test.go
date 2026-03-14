@@ -50,10 +50,12 @@ func TestSplitShard_NoDeadlock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Trigger splitShard
+	// Trigger split: compute target child and move
 	done := make(chan struct{})
 	go func() {
-		sm.splitShard()
+		currentShard := sm.getCurrentShard()
+		targetChild := common.GetBinaryPrefix(sm.h.ID().String(), len(currentShard)+1)
+		sm.moveToShard(currentShard, targetChild, false)
 		close(done)
 	}()
 
@@ -66,7 +68,7 @@ func TestSplitShard_NoDeadlock(t *testing.T) {
 	}
 
 	// Verify state changed
-	currentShard, _ := sm.GetShardInfo()
+	currentShard := sm.GetShardInfo()
 	expectedShard := common.GetBinaryPrefix(h.ID().String(), 1)
 	if currentShard != expectedShard {
 		t.Errorf("expected shard %s, got %s", expectedShard, currentShard)

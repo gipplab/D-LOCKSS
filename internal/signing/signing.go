@@ -24,7 +24,7 @@ const maxNonceSize = 64
 const minNonceSizeFloor = 1
 
 func (s *Signer) effectiveMinNonceSize() int {
-	n := s.cfg.MinNonceSize
+	n := s.cfg.Security.MinNonceSize
 	if n < minNonceSizeFloor {
 		n = minNonceSizeFloor
 	}
@@ -35,7 +35,7 @@ func (s *Signer) effectiveMinNonceSize() int {
 }
 
 func (s *Signer) effectiveNonceSizeForSigning() int {
-	n := s.cfg.NonceSize
+	n := s.cfg.Security.NonceSize
 	minSize := s.effectiveMinNonceSize()
 	if n < minSize {
 		n = minSize
@@ -47,8 +47,8 @@ func (s *Signer) effectiveNonceSizeForSigning() int {
 }
 
 func (s *Signer) effectiveSignatureMaxAge() time.Duration {
-	if s.cfg.SignatureMaxAge > 0 {
-		return s.cfg.SignatureMaxAge
+	if s.cfg.Security.SignatureMaxAge > 0 {
+		return s.cfg.Security.SignatureMaxAge
 	}
 	return 10 * time.Minute
 }
@@ -56,7 +56,7 @@ func (s *Signer) effectiveSignatureMaxAge() time.Duration {
 const maxFutureSkewCap = 5 * time.Minute
 
 func (s *Signer) effectiveFutureSkewTolerance() time.Duration {
-	d := s.cfg.FutureSkewTolerance
+	d := s.cfg.Security.FutureSkewTolerance
 	if d <= 0 {
 		return 30 * time.Second
 	}
@@ -67,7 +67,7 @@ func (s *Signer) effectiveFutureSkewTolerance() time.Duration {
 }
 
 func (s *Signer) effectiveNonceTTL() time.Duration {
-	ttl := s.cfg.SignatureMaxAge
+	ttl := s.cfg.Security.SignatureMaxAge
 	if ttl <= 0 {
 		ttl = 10 * time.Minute
 	}
@@ -107,11 +107,11 @@ func NewSigner(cfg SignerConfig) *Signer {
 }
 
 func (s *Signer) shouldEnforceSignatures() bool {
-	return s.cfg.SignatureMode == "strict" ||
-		(s.cfg.SignatureMode != "off" && s.cfg.SignatureMode != "warn")
+	return s.cfg.Security.SignatureMode == "strict" ||
+		(s.cfg.Security.SignatureMode != "off" && s.cfg.Security.SignatureMode != "warn")
 }
-func (s *Signer) shouldWarnOnBadSignatures() bool { return s.cfg.SignatureMode == "warn" }
-func (s *Signer) signaturesDisabled() bool        { return s.cfg.SignatureMode == "off" }
+func (s *Signer) shouldWarnOnBadSignatures() bool { return s.cfg.Security.SignatureMode == "warn" }
+func (s *Signer) signaturesDisabled() bool        { return s.cfg.Security.SignatureMode == "off" }
 
 func (s *Signer) signMessageEnvelope(marshalForSigning func() ([]byte, error), setSig func([]byte)) error {
 	if s.privKey == nil {
@@ -134,7 +134,7 @@ func (s *Signer) SignProtocolMessage(msg schema.Signable) error {
 	if msg == nil {
 		return fmt.Errorf("message is nil")
 	}
-	nonce, err := common.NewNonce(s.effectiveNonceSizeForSigning())
+	nonce, err := newNonce(s.effectiveNonceSizeForSigning())
 	if err != nil {
 		return err
 	}
@@ -153,6 +153,41 @@ func (s *Signer) verifySignedMessage(receivedFrom peer.ID, sender peer.ID, ts in
 	if s.signaturesDisabled() {
 		return nil
 	}
+	if err := s.validateMessageFields(receivedFrom, sender, ts, nonce, sig, unsigned); err != nil {
+		return err
+	}
+
+	maxAge := s.effectiveSignatureMaxAge()
+	now := time.Now()
+	msgTime := time.Unix(ts, 0)
+
+	pk := s.h.Peerstore().PubKey(sender)
+	if pk == nil {
+		pk, now = s.fetchPublicKey(sender)
+		if pk == nil {
+			return fmt.Errorf("missing public key for sender %s", sender.String())
+		}
+	}
+
+	if err := s.checkTimestamp(msgTime, now, maxAge); err != nil {
+		return err
+	}
+	if err := verifySignatureBytes(pk, unsigned, sig); err != nil {
+		return err
+	}
+
+	if s.nonces == nil {
+		return fmt.Errorf("nonce store missing")
+	}
+	nonceSnapshot := make([]byte, len(nonce))
+	copy(nonceSnapshot, nonce)
+	if s.nonces.seenBefore(sender, nonceSnapshot, s.effectiveNonceTTL()) {
+		return errReplay
+	}
+	return nil
+}
+
+func (s *Signer) validateMessageFields(receivedFrom, sender peer.ID, ts int64, nonce, sig, unsigned []byte) error {
 	if s.h == nil {
 		return fmt.Errorf("signer host is nil")
 	}
@@ -168,15 +203,6 @@ func (s *Signer) verifySignedMessage(receivedFrom peer.ID, sender peer.ID, ts in
 	if ts == 0 {
 		return fmt.Errorf("missing timestamp")
 	}
-	maxAge := s.effectiveSignatureMaxAge()
-	now := time.Now()
-	msgTime := time.Unix(ts, 0)
-	if msgTime.After(now.Add(s.effectiveFutureSkewTolerance())) {
-		return fmt.Errorf("timestamp too far in future: %v", msgTime)
-	}
-	if now.Sub(msgTime) > maxAge {
-		return fmt.Errorf("message too old: age=%v", now.Sub(msgTime))
-	}
 	if len(nonce) < s.effectiveMinNonceSize() {
 		return fmt.Errorf("nonce too short")
 	}
@@ -189,52 +215,45 @@ func (s *Signer) verifySignedMessage(receivedFrom peer.ID, sender peer.ID, ts in
 	if len(unsigned) == 0 {
 		return fmt.Errorf("empty message for verification")
 	}
+	return nil
+}
 
-	pk := s.h.Peerstore().PubKey(sender)
-	if pk == nil {
-		if s.h.Network().Connectedness(sender) != network.Connected {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			addrs := s.h.Peerstore().Addrs(sender)
-			if len(addrs) == 0 && s.dht != nil {
-				addrInfo, err := s.dht.FindPeer(ctx, sender)
-				if err == nil {
-					s.h.Peerstore().AddAddrs(addrInfo.ID, addrInfo.Addrs, 10*time.Minute)
-					addrs = addrInfo.Addrs
-				}
+func (s *Signer) checkTimestamp(msgTime, now time.Time, maxAge time.Duration) error {
+	if msgTime.After(now.Add(s.effectiveFutureSkewTolerance())) {
+		return fmt.Errorf("timestamp too far in future: %v", msgTime)
+	}
+	if now.Sub(msgTime) > maxAge {
+		return fmt.Errorf("message too old: age=%v", now.Sub(msgTime))
+	}
+	return nil
+}
+
+func (s *Signer) fetchPublicKey(sender peer.ID) (crypto.PubKey, time.Time) {
+	if s.h.Network().Connectedness(sender) != network.Connected {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		addrs := s.h.Peerstore().Addrs(sender)
+		if len(addrs) == 0 && s.dht != nil {
+			addrInfo, err := s.dht.FindPeer(ctx, sender)
+			if err == nil {
+				s.h.Peerstore().AddAddrs(addrInfo.ID, addrInfo.Addrs, 10*time.Minute)
+				addrs = addrInfo.Addrs
 			}
-			if len(addrs) > 0 {
-				_ = s.h.Connect(ctx, peer.AddrInfo{ID: sender, Addrs: addrs})
-			}
 		}
-		pk = s.h.Peerstore().PubKey(sender)
-		if pk == nil {
-			return fmt.Errorf("missing public key for sender %s", sender.String())
-		}
-		now = time.Now()
-		if msgTime.After(now.Add(s.effectiveFutureSkewTolerance())) {
-			return fmt.Errorf("timestamp too far in future after key fetch: %v", msgTime)
-		}
-		if now.Sub(msgTime) > maxAge {
-			return fmt.Errorf("message too old after key fetch: age=%v", now.Sub(msgTime))
+		if len(addrs) > 0 {
+			_ = s.h.Connect(ctx, peer.AddrInfo{ID: sender, Addrs: addrs})
 		}
 	}
+	return s.h.Peerstore().PubKey(sender), time.Now()
+}
 
-	ok, err := pk.Verify(unsigned, sig)
+func verifySignatureBytes(pk crypto.PubKey, payload, sig []byte) error {
+	ok, err := pk.Verify(payload, sig)
 	if err != nil {
 		return fmt.Errorf("signature verify error: %w", err)
 	}
 	if !ok {
 		return fmt.Errorf("invalid signature")
-	}
-
-	if s.nonces == nil {
-		return fmt.Errorf("nonce store missing")
-	}
-	nonceSnapshot := make([]byte, len(nonce))
-	copy(nonceSnapshot, nonce)
-	if s.nonces.seenBefore(sender, nonceSnapshot, s.effectiveNonceTTL()) {
-		return errReplay
 	}
 	return nil
 }

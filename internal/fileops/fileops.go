@@ -2,7 +2,6 @@ package fileops
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -14,7 +13,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"dlockss/internal/badbits"
-	"dlockss/internal/common"
 	"dlockss/internal/config"
 	"dlockss/pkg/ipfs"
 	"dlockss/pkg/schema"
@@ -28,7 +26,7 @@ const recentIngestTTL = 30 * time.Second
 // ShardIdentity provides the node's identity and shard membership queries.
 type ShardIdentity interface {
 	PeerID() peer.ID
-	GetShardInfo() (string, int)
+	GetShardInfo() string
 	AnnouncePinned(manifestCID string)
 	AmIResponsibleFor(key string) bool
 	IsLocalNodeIngestor() bool
@@ -120,7 +118,7 @@ func NewFileProcessor(cfg FileProcessorConfig) *FileProcessor {
 		storageMgr:     cfg.Storage,
 		privKey:        cfg.PrivKey,
 		signer:         cfg.Signer,
-		jobQueue:       make(chan string, cfg.Cfg.MaxConcurrentFileProcessing*100),
+		jobQueue:       make(chan string, cfg.Cfg.Files.MaxConcurrentFileProcessing*100),
 		ctx:            ctx,
 		cancel:         cancel,
 		recentIngests:  make(map[string]time.Time),
@@ -134,7 +132,7 @@ func NewFileProcessor(cfg FileProcessorConfig) *FileProcessor {
 }
 
 func (fp *FileProcessor) startWorkers() {
-	for i := 0; i < fp.cfg.MaxConcurrentFileProcessing; i++ {
+	for i := 0; i < fp.cfg.Files.MaxConcurrentFileProcessing; i++ {
 		go fp.workerLoop()
 	}
 }
@@ -247,34 +245,5 @@ func (fp *FileProcessor) EnqueueOrRetry(path string) bool {
 
 // SignProtocolMessage signs a message with the node's private key.
 func (fp *FileProcessor) SignProtocolMessage(msg schema.Signable) error {
-	if fp.signer != nil {
-		return fp.signer.SignProtocolMessage(msg)
-	}
-	if msg == nil {
-		return fmt.Errorf("message is nil")
-	}
-	nonceSize := fp.cfg.NonceSize
-	if nonceSize < 1 {
-		nonceSize = 16
-	}
-	nonce, err := common.NewNonce(nonceSize)
-	if err != nil {
-		return err
-	}
-	env := msg.GetEnvelope()
-	env.SenderID = fp.shardMgr.PeerID()
-	env.Timestamp = time.Now().Unix()
-	env.Nonce = nonce
-	env.Sig = nil
-
-	unsigned, err := msg.MarshalCBORForSigning()
-	if err != nil {
-		return err
-	}
-	sig, err := fp.privKey.Sign(unsigned)
-	if err != nil {
-		return err
-	}
-	env.Sig = sig
-	return nil
+	return fp.signer.SignProtocolMessage(msg)
 }

@@ -50,7 +50,7 @@ type nodeSnap struct {
 	pinnedFiles   int
 }
 
-func (m *Monitor) snapshotNodes(filter func(id string, node *NodeState, shard string) bool) []nodeSnap {
+func (m *Monitor) snapshotNodes(filter func(id string, node *nodeState, shard string) bool) []nodeSnap {
 	m.PruneStaleNodes()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -109,8 +109,7 @@ func (m *Monitor) buildNodeResponse(snapshot []nodeSnap) map[string]interface{} 
 			CurrentShard:  s.currentShard,
 			Role:          s.role,
 			PeersInShard:  s.peersInShard,
-			Storage:       StorageStatus{PinnedFiles: s.pinnedFiles, PinnedInShard: pinnedInShard, KnownFiles: s.knownFiles, KnownCIDs: []string{}},
-			Replication:   ReplicationStatus{},
+			Storage:       StorageStatus{PinnedFiles: s.pinnedFiles, PinnedInShard: pinnedInShard, KnownFiles: s.knownFiles},
 			UptimeSeconds: s.uptimeSeconds,
 		}
 		response[s.id] = map[string]interface{}{
@@ -124,7 +123,7 @@ func (m *Monitor) buildNodeResponse(snapshot []nodeSnap) map[string]interface{} 
 
 func (m *Monitor) handleNodes(w http.ResponseWriter, r *http.Request) {
 	query := strings.ToLower(r.URL.Query().Get("q"))
-	snapshot := m.snapshotNodes(func(id string, node *NodeState, _ string) bool {
+	snapshot := m.snapshotNodes(func(id string, node *nodeState, _ string) bool {
 		if query == "" {
 			return true
 		}
@@ -143,7 +142,7 @@ func (m *Monitor) handleShardTree(w http.ResponseWriter, r *http.Request) {
 
 func (m *Monitor) handleShardNodes(w http.ResponseWriter, r *http.Request) {
 	shardFilter := r.URL.Query().Get("shard")
-	snapshot := m.snapshotNodes(func(_ string, _ *NodeState, shard string) bool {
+	snapshot := m.snapshotNodes(func(_ string, _ *nodeState, shard string) bool {
 		return shard == shardFilter
 	})
 	response := m.buildNodeResponse(snapshot)
@@ -190,11 +189,11 @@ func (m *Monitor) handleNodeFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m.mu.RLock()
-	var entries []CIDEntry
+	var entries []cidEntry
 	if files, ok := m.nodeFiles[peerID]; ok {
 		entries = m.buildCIDEntriesUnlocked(files)
 	} else {
-		entries = []CIDEntry{}
+		entries = []cidEntry{}
 	}
 	m.mu.RUnlock()
 	writeJSON(w, map[string]interface{}{"peer_id": peerID, "cids": entries, "count": len(entries)})
@@ -329,7 +328,7 @@ func (m *Monitor) handleIdentify(w http.ResponseWriter, r *http.Request) {
 		protoStrs = append(protoStrs, string(p))
 	}
 
-	region := m.resolveRegionFromAddrs(m.host.Peerstore().Addrs(pid))
+	region := m.geo.ResolveFromAddrs(m.host.Peerstore().Addrs(pid))
 
 	result := map[string]interface{}{
 		"peer_id":          pid.String(),
@@ -389,7 +388,7 @@ func (m *Monitor) RunStatusLogger(ctx context.Context) {
 
 // Close releases resources held by the monitor (GeoIP database, etc.).
 func (m *Monitor) Close() {
-	if m.geoDB != nil {
-		m.geoDB.Close()
+	if m.geo != nil {
+		m.geo.close()
 	}
 }
