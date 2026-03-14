@@ -26,21 +26,19 @@ GS -> C: Forward message
 B -> B: Add to knownFiles\nIf AmIResponsibleFor(PayloadCID): Pin to cluster, AnnouncePinned
 C -> C: Add to knownFiles\nIf responsible: Pin to cluster, AnnouncePinned
 
-== Replication Request ==
+== Replication Request (handled by replicationManager) ==
 A -> GS: ReplicationRequest(CBOR)\n{manifest_cid, priority, deadline, sender_id, ts, nonce, sig} (shard topic)
 GS -> B: Forward message
 GS -> C: Forward message
-B -> B: targetShard = targetShardForManifest(manifest, topicShard)
-B -> B: If we have file: JoinShard(targetShard), EnsureClusterForShard,\nPin(targetShard), TriggerSync(targetShard)
-alt B has file
-    B -> CRDT: Pin(targetShard) via ClusterManager
-    B -> B: TriggerSync(targetShard)
-else B does not have file
-    B -> IPFS: Fetch PinRecursive(manifestCID)
-    B -> CRDT: Pin(targetShard)
-    B -> B: TriggerSync(targetShard)
+B -> B: repl.handleRequest(msg, rr, shardID)\nverify signature, check legacy manifest
+alt B has file (isPinned)
+    B -> B: EnsureClusterForShard, TriggerSync(shardID)
+else B does not have file (auto-replication)
+    B -> IPFS: PinRecursive(manifestCID) with timeout
+    B -> CRDT: ClusterPinIfAbsent(shardID, cid)
+    B -> B: TriggerSync(shardID)
 end
-C -> C: Same logic (target shard = file's shard by PayloadCID)
+C -> C: Same logic via replicationManager
 
 == Custodial (Tourist) ==
 note over A: Local ingest; we are NOT responsible.\nTarget shard = TargetShardForPayload(PayloadCID, depth)
