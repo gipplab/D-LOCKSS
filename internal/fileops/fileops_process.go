@@ -231,7 +231,7 @@ func (fp *FileProcessor) announceResponsibleFile(manifestCID cid.Cid, manifestCI
 		ShardID:        currentShard,
 	}
 
-	if err := fp.SignProtocolMessage(&im); err != nil {
+	if err := fp.signer.SignProtocolMessage(&im); err != nil {
 		slog.Error("failed to sign IngestMessage", "manifest", manifestCIDStr, "error", err)
 		return
 	}
@@ -299,7 +299,7 @@ func (fp *FileProcessor) announceCustodialFile(manifestCID cid.Cid, manifestCIDS
 		ShardID:        targetShard,
 	}
 
-	if err := fp.SignProtocolMessage(&im); err != nil {
+	if err := fp.signer.SignProtocolMessage(&im); err != nil {
 		slog.Error("failed to sign IngestMessage", "manifest", manifestCIDStr, "error", err)
 	} else if b, err := im.MarshalCBOR(); err != nil {
 		slog.Error("failed to marshal IngestMessage", "manifest", manifestCIDStr, "error", err)

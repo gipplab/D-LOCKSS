@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"dlockss/internal/badbits"
+	"dlockss/internal/trust"
 	"dlockss/pkg/schema"
 
 	"github.com/ipfs-cluster/ipfs-cluster/api"
@@ -25,6 +26,7 @@ type localPinTracker struct {
 	shardID      string
 	onPinSynced  func(cid string)
 	onPinRemoved func(cid string)
+	origin       trust.OriginGate
 
 	// State
 	mu sync.RWMutex
@@ -40,14 +42,8 @@ type localPinTracker struct {
 	trigger chan struct{}
 }
 
-// isLegacyManifest fetches the block for a CID and checks if it's a manifest
-// with a legacy timestamp field. Returns false if the block can't be fetched
-// or decoded (non-manifest CIDs, unavailable blocks).
-func (pt *localPinTracker) isLegacyManifest(c cid.Cid) bool {
-	ctx, cancel := context.WithTimeout(pt.ctx, 5*time.Second)
-	defer cancel()
-	data, err := pt.ipfsClient.GetBlock(ctx, c)
-	if err != nil {
+func isLegacyManifestBlock(data []byte) bool {
+	if len(data) == 0 {
 		return false
 	}
 	var ro schema.ResearchObject
@@ -57,7 +53,7 @@ func (pt *localPinTracker) isLegacyManifest(c cid.Cid) bool {
 	return ro.HasLegacyTimestamp
 }
 
-func newLocalPinTracker(ipfsClient ipfsPinner, shardID string, onPinSynced func(string), onPinRemoved func(string), badBits *badbits.Filter) *localPinTracker {
+func newLocalPinTracker(ipfsClient ipfsPinner, shardID string, onPinSynced func(string), onPinRemoved func(string), badBits *badbits.Filter, origin trust.OriginGate) *localPinTracker {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &localPinTracker{
 		ipfsClient:   ipfsClient,
@@ -65,6 +61,7 @@ func newLocalPinTracker(ipfsClient ipfsPinner, shardID string, onPinSynced func(
 		shardID:      shardID,
 		onPinSynced:  onPinSynced,
 		onPinRemoved: onPinRemoved,
+		origin:       origin,
 		pinnedByUs:   make(map[string]struct{}),
 		ctx:          ctx,
 		cancel:       cancel,
@@ -139,9 +136,19 @@ func (pt *localPinTracker) syncState(consensus consensusClient) {
 			continue
 		}
 
-		// Skip legacy manifests that contain a timestamp field.
-		if pt.isLegacyManifest(c) {
+		block, getErr := pt.ipfsClient.GetBlock(pt.ctx, c)
+		if isLegacyManifestBlock(block) {
 			continue
+		}
+		if pt.origin != nil && pt.origin.RestrictsOrigins() {
+			if getErr != nil {
+				slog.Warn("refusing pin: cannot read manifest for origin check", "shard", pt.shardID, "cid", c, "error", getErr)
+				continue
+			}
+			if _, err := trust.CheckManifestOrigin(block, pt.origin); err != nil {
+				slog.Warn("refusing to store content from untrusted origin", "shard", pt.shardID, "cid", c, "error", err)
+				continue
+			}
 		}
 
 		isPinned, err := pt.ipfsClient.IsPinned(pt.ctx, c)

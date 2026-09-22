@@ -10,6 +10,12 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
+// OriginGate decides whether this node will store data created by a given peer.
+type OriginGate interface {
+	RestrictsOrigins() bool
+	AllowsOrigin(id peer.ID) bool
+}
+
 type TrustManager struct {
 	trustedPeers *common.TrustedPeers
 	trustMode    string
@@ -57,13 +63,46 @@ func (tm *TrustManager) LoadTrustedPeers(path string) error {
 	return nil
 }
 
+// AddOrigins merges extra peer IDs (e.g. DLOCKSS_INGEST_ALLOWLIST) into the
+// trusted set. Invalid IDs are skipped. Restriction is on only when at least
+// one valid peer is present; an empty list is default/open mode.
+func (tm *TrustManager) AddOrigins(raw []string) (added int, invalid []string) {
+	for _, s := range raw {
+		if s == "" {
+			continue
+		}
+		pid, err := peer.Decode(s)
+		if err != nil {
+			invalid = append(invalid, s)
+			continue
+		}
+		tm.trustedPeers.Add(pid)
+		added++
+	}
+	return added, invalid
+}
+
 func (tm *TrustManager) GetTrustedPeers() []peer.ID {
 	return tm.trustedPeers.All()
 }
 
+func (tm *TrustManager) RestrictsOrigins() bool {
+	return tm.trustedPeers.Len() > 0
+}
+
+func (tm *TrustManager) AllowsOrigin(id peer.ID) bool {
+	if !tm.RestrictsOrigins() {
+		return true
+	}
+	if id == "" {
+		return false
+	}
+	return tm.trustedPeers.Has(id)
+}
+
 // AuthorizeIncomingSender enforces:
 // - SenderID must match libp2p's ReceivedFrom (prevents in-message spoofing)
-// - If TrustMode == "allowlist", sender must be present in trust store
+// - If TrustMode == "allowlist" and the list is non-empty, sender must be listed
 func (tm *TrustManager) AuthorizeIncomingSender(receivedFrom peer.ID, peerID peer.ID) error {
 	if peerID == "" {
 		return fmt.Errorf("missing sender_id")
@@ -71,7 +110,7 @@ func (tm *TrustManager) AuthorizeIncomingSender(receivedFrom peer.ID, peerID pee
 	if receivedFrom != "" && peerID != receivedFrom {
 		return fmt.Errorf("sender_id mismatch: sender_id=%s received_from=%s", peerID.String(), receivedFrom.String())
 	}
-	if tm.trustMode == "allowlist" && !tm.trustedPeers.Has(peerID) {
+	if tm.trustMode == "allowlist" && tm.RestrictsOrigins() && !tm.trustedPeers.Has(peerID) {
 		return fmt.Errorf("sender not trusted: %s", peerID.String())
 	}
 	return nil

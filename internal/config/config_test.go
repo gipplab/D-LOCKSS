@@ -131,6 +131,42 @@ func TestLoadFromEnv_ClusterStoreOverride(t *testing.T) {
 	}
 }
 
+func TestLoadFromEnv_TrustStoreDerivedFromDataDir(t *testing.T) {
+	t.Setenv("DLOCKSS_DATA_DIR", "/custom/data")
+	t.Setenv("DLOCKSS_TRUST_STORE", "")
+	cfg := LoadFromEnv()
+	want := filepath.Join("/custom", "trusted_peers.json")
+	if cfg.Security.TrustStorePath != want {
+		t.Errorf("TrustStorePath = %q, want %q", cfg.Security.TrustStorePath, want)
+	}
+}
+
+func TestLoadFromEnv_TrustStoreOverride(t *testing.T) {
+	t.Setenv("DLOCKSS_DATA_DIR", "/custom/data")
+	t.Setenv("DLOCKSS_TRUST_STORE", "/etc/dlockss/trusted_peers.json")
+	cfg := LoadFromEnv()
+	if cfg.Security.TrustStorePath != "/etc/dlockss/trusted_peers.json" {
+		t.Errorf("TrustStorePath = %q, want override", cfg.Security.TrustStorePath)
+	}
+}
+
+func TestLoadFromEnv_IngestAllowlist(t *testing.T) {
+	t.Setenv("DLOCKSS_INGEST_ALLOWLIST", "12D3KooWAAA, 12D3KooWBBB")
+	cfg := LoadFromEnv()
+	if len(cfg.IngestAllowlist) != 2 {
+		t.Fatalf("IngestAllowlist len = %d, want 2", len(cfg.IngestAllowlist))
+	}
+}
+
+func TestValidate_InvalidTrustMode(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Security.TrustMode = "maybe"
+	cfg.Validate()
+	if cfg.Security.TrustMode != "open" {
+		t.Errorf("TrustMode after Validate = %q, want open", cfg.Security.TrustMode)
+	}
+}
+
 func TestLoadFromEnv_IdentityPathOverride(t *testing.T) {
 	t.Setenv("DLOCKSS_DATA_DIR", "/data")
 	t.Setenv("DLOCKSS_IDENTITY_PATH", "/custom/dlockss.key")

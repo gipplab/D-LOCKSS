@@ -19,8 +19,10 @@ func NewTrustedPeers() *TrustedPeers {
 }
 
 func (tp *TrustedPeers) Has(pid peer.ID) bool          { return tp.m.Has(pid) }
+func (tp *TrustedPeers) Add(pid peer.ID)               { tp.m.Upsert(pid, true) }
 func (tp *TrustedPeers) SetAll(peers map[peer.ID]bool) { tp.m.ReplaceAll(peers) }
 func (tp *TrustedPeers) All() []peer.ID                { return tp.m.Keys() }
+func (tp *TrustedPeers) Len() int                      { return tp.m.Len() }
 
 // RateLimiter tracks message rates per peer.
 type RateLimiter struct {

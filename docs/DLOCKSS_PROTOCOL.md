@@ -84,7 +84,6 @@ Messages are propagated over GossipSub. All messages include a signature (`sig`)
 |------|----|---------|-------|
 | `Ingest` | 1 | Announce new file entry | Shard |
 | `ReplicationRequest` | 2 | Request more replicas (under-replicated) | Shard |
-| `UnreplicateRequest` | 4 | Request dropping excess replicas | Shard |
 
 Custodial handoff is done by joining the target shard (pubsub + cluster) and publishing **IngestMessage** to the target shard topic; there is no separate Delegate message in the codebase.
 
@@ -242,9 +241,12 @@ State files are placed in the **parent** of the data directory so the file watch
 # Minimal Docker Compose — D-LOCKSS sharing identity with Kubo
 services:
   ipfs:
-    image: ipfs/kubo:latest
+    image: ipfs/kubo:v0.43.1
+    environment:
+      IPFS_PROFILE: server,unixfs-v1-2025
     volumes:
       - ipfs-data:/data/ipfs
+      - ./docker/ipfs-init.d:/container-init.d:ro
   dlockss:
     image: ghcr.io/gipplab/dlockss-single-node:latest
     depends_on: [ipfs]

@@ -23,8 +23,8 @@
 ### Prerequisites
 *   **OS:** Linux, macOS, WSL, or Windows 10+.
 *   **IPFS:** A running IPFS daemon is required.
-    *   [Install IPFS CLI](https://docs.ipfs.tech/install/command-line/)
-    *   Run: `ipfs daemon`
+    *   [Install IPFS CLI](https://docs.ipfs.tech/install/command-line/) (Kubo **v0.43.1+**)
+    *   Run: `ipfs init --profile=unixfs-v1-2025` (first time) then `ipfs daemon`. Existing repos: `ipfs config profile apply unixfs-v1-2025` then restart the daemon.
 
 ### Usage
 1.  **Start the Node:** Run the binary (see [Building from Source](#building-from-source) to build it):
@@ -59,8 +59,18 @@ export DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/5001"
 # DHT tuning
 export DLOCKSS_MAX_CONCURRENT_DHT_PROVIDES=8 # Limit concurrent DHT provide operations
 
+# Isolated eval / private testnets (skip public DHT bootstrap + AutoRelay)
+export DLOCKSS_PRIVATE_NETWORK=true
+
 # Logging
 export DLOCKSS_VERBOSE_LOGGING=true # Enable detailed metrics and status logs
+
+# Who this node will store data from (libp2p peer IDs).
+# A non-empty trusted_peers.json next to the data directory enables the same gate.
+# Include this node's own peer ID if it should ingest local files.
+export DLOCKSS_INGEST_ALLOWLIST="12D3KooWPublisherA,12D3KooWPublisherB"
+# export DLOCKSS_TRUST_STORE="/data/trusted_peers.json"
+# export DLOCKSS_TRUST_MODE=allowlist   # also restrict protocol/CRDT writers
 ```
 
 #### Node Naming
@@ -101,13 +111,15 @@ services:
     volumes:
       - ./dlockss-files:/data                    # persistent D-LOCKSS data (identity, cluster state, ingested files)
       - ipfs-data:/ipfs-repo:ro                  # read-only access to Kubo config for identity
+      # Place trusted_peers.json at ./dlockss-files/trusted_peers.json
+      # (inside the container: /data/trusted_peers.json). Restart to apply.
     depends_on:
       - ipfs
     labels:
       - com.centurylinklabs.watchtower.enable=true
 
   ipfs:
-    image: ipfs/kubo
+    image: ipfs/kubo:v0.43.1
     restart: unless-stopped
     # Uncomment if you can forward port 4001 (TCP+UDP) for better peering:
     # ports:
@@ -116,8 +128,10 @@ services:
     volumes:
       - ipfs-staging:/export
       - ipfs-data:/data/ipfs
+      # Existing volumes ignore IPFS_PROFILE; this applies unixfs-v1-2025 every start.
+      - ./docker/ipfs-init.d:/container-init.d:ro
     environment:
-      - IPFS_PROFILE=server
+      - IPFS_PROFILE=server,unixfs-v1-2025
     healthcheck:
       test: ["CMD-SHELL", "ipfs id || exit 1"]
       interval: 10s
@@ -139,6 +153,8 @@ volumes:
   ipfs-staging:  # IPFS staging area on /export
   ipfs-data:     # IPFS repo on /data/ipfs (shared read-only with D-LOCKSS for identity)
 ```
+
+Ingest uses the IPIP-0499 **`unixfs-v1-2025`** profile (CIDv1, 1 MiB raw leaves). `IPFS_PROFILE` applies only when the Kubo volume is first initialized; mount `docker/ipfs-init.d` as above so existing volumes get the same import settings. One-shot on a running host: `docker compose exec ipfs ipfs config profile apply unixfs-v1-2025` then restart the `ipfs` service.
 
 See [docs/DLOCKSS_PROTOCOL.md](docs/DLOCKSS_PROTOCOL.md) for protocol details.
 
@@ -211,7 +227,8 @@ go test ./... -v
 
 *   **Signed Messages:** All protocol messages are signed by the sender's Libp2p key.
 *   **Manifest Verification:** ResearchObjects include signatures from the ingester.
-*   **Trust Modes:** Supports `open` (default) or `allowlist` trust models.
+*   **Data origin allowlist:** If `trusted_peers.json` (default: next to the data directory, or `DLOCKSS_TRUST_STORE`) or `DLOCKSS_INGEST_ALLOWLIST` lists at least one valid peer ID, this node stores only files whose manifest `ingester_id` is on that list. Enforced on ingest announcements, CRDT pin sync, and replication fetches. Include this node's own peer ID to ingest locally. An empty or missing list is default/open mode (accept everyone).
+*   **Trust Modes:** `open` (default) or `allowlist`. `allowlist` also restricts signed protocol messages and CRDT writers to the same peer list when that list is non-empty.
 
 ---
 

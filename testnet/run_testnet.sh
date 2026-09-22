@@ -139,7 +139,7 @@ for i in $(seq 1 $NODE_COUNT); do
 
 if [ ! -f "$IPFS_REPO/config" ]; then
         # 1. Init with 'lowpower' profile to keep background overhead low
-        (export IPFS_PATH="$IPFS_REPO" && ipfs init -e --profile=lowpower >/dev/null 2>&1)
+        (export IPFS_PATH="$IPFS_REPO" && ipfs init -e --profile=lowpower,unixfs-v1-2025 >/dev/null 2>&1)
 
         # 2. Connection Limits (Bandwidth Protection)
         #    Reduced for local testnet efficiency
@@ -167,6 +167,8 @@ if [ ! -f "$IPFS_REPO/config" ]; then
         (export IPFS_PATH="$IPFS_REPO" && ipfs config Addresses.Gateway "/ip4/127.0.0.1/tcp/$IPFS_GATEWAY_PORT" >/dev/null)
         (export IPFS_PATH="$IPFS_REPO" && ipfs config Addresses.Swarm --json "[\"/ip4/0.0.0.0/tcp/$IPFS_SWARM_PORT\",\"/ip4/0.0.0.0/udp/$IPFS_SWARM_PORT/quic-v1\"]" >/dev/null)
     fi
+    # Existing testnet repos were inited before unixfs-v1-2025; apply on every start.
+    (export IPFS_PATH="$IPFS_REPO" && ipfs config profile apply unixfs-v1-2025 >/dev/null 2>&1 || true)
 
     # Start daemon in background (log into testnet/testnet_data/)
     (export IPFS_PATH="$IPFS_REPO" && ipfs daemon --enable-gc > "$BASE_DIR/node_$i.ipfs.log" 2>&1 & echo $! >> "$IPFS_PID_FILE")

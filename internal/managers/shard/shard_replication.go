@@ -24,6 +24,7 @@ type replicationOps interface {
 	getPinnedManifests() []string
 	isPinned(key string) bool
 	isLegacyManifest(cidStr string) bool
+	allowsManifestCID(ctx context.Context, c cid.Cid) bool
 	publishCBOR(data []byte, shardID string)
 	ensureCluster(ctx context.Context, shardID string) error
 	clusterPinIfAbsent(ctx context.Context, shardID string, c cid.Cid) error
@@ -180,6 +181,10 @@ func (rm *replicationManager) handleRequest(msg *pubsub.Message, rr *schema.Repl
 
 	if rm.ops.isLegacyManifest(manifestCIDStr) {
 		slog.Info("ignoring legacy manifest in ReplicationRequest", "manifest", manifestCIDStr)
+		return
+	}
+	if !rm.ops.allowsManifestCID(ctx, c) {
+		slog.Warn("ReplicationRequest refused: untrusted data origin", "manifest", manifestCIDStr, "from", msg.GetFrom().String(), "shard", shardID)
 		return
 	}
 

@@ -17,6 +17,7 @@ import (
 	"dlockss/internal/common"
 	"dlockss/internal/config"
 	"dlockss/internal/managers/clusters"
+	"dlockss/internal/trust"
 	"dlockss/pkg/ipfs"
 	"dlockss/pkg/schema"
 )
@@ -100,8 +101,8 @@ type ShardManager struct {
 	rateLimiter *common.RateLimiter
 	nodeName    string
 
-	// Ingest authorization
-	ingestAllowlist map[peer.ID]struct{}
+	// Data-origin gate (trusted_peers.json / ingest allowlist)
+	origin trust.OriginGate
 
 	// Peer tracking
 	peers *peerTracker
@@ -152,20 +153,12 @@ type ShardManagerConfig struct {
 	Signer      MessageAuthenticator
 	RateLimiter *common.RateLimiter
 	Cluster     clusters.ClusterManagerInterface
+	Origin      trust.OriginGate
 	StartShard  string
 	NodeName    string
 }
 
 func NewShardManager(cfg ShardManagerConfig) (*ShardManager, error) {
-	allowlist := make(map[peer.ID]struct{}, len(cfg.Cfg.IngestAllowlist))
-	for _, raw := range cfg.Cfg.IngestAllowlist {
-		pid, err := peer.Decode(raw)
-		if err != nil {
-			slog.Warn("ignoring invalid peer ID in ingest allowlist", "peer", raw, "error", err)
-			continue
-		}
-		allowlist[pid] = struct{}{}
-	}
 	sm := &ShardManager{
 		ctx:                cfg.Ctx,
 		cfg:                cfg.Cfg,
@@ -177,7 +170,7 @@ func NewShardManager(cfg ShardManagerConfig) (*ShardManager, error) {
 		signer:             cfg.Signer,
 		rateLimiter:        cfg.RateLimiter,
 		nodeName:           cfg.NodeName,
-		ingestAllowlist:    allowlist,
+		origin:             cfg.Origin,
 		peers:              newPeerTracker(cfg.Host.ID()),
 		reshardedFiles:     common.NewKnownFiles(),
 		currentShard:       cfg.StartShard,
@@ -304,6 +297,22 @@ func (sm *ShardManager) isLegacyManifest(cidStr string) bool {
 	ctx, cancel := context.WithTimeout(sm.ctx, 5*time.Second)
 	defer cancel()
 	return common.IsLegacyManifest(ctx, sm.ipfsClient, cidStr)
+}
+
+func (sm *ShardManager) allowsManifestCID(ctx context.Context, c cid.Cid) bool {
+	if sm.origin == nil || !sm.origin.RestrictsOrigins() {
+		return true
+	}
+	block, err := sm.ipfsClient.GetBlock(ctx, c)
+	if err != nil {
+		slog.Warn("refusing data: cannot read manifest for origin check", "manifest", c.String(), "error", err)
+		return false
+	}
+	if _, err := trust.CheckManifestOrigin(block, sm.origin); err != nil {
+		slog.Warn("refusing data from untrusted origin", "manifest", c.String(), "error", err)
+		return false
+	}
+	return true
 }
 
 func (sm *ShardManager) moveToShard(fromShard, toShard string, isMergeUp bool) {

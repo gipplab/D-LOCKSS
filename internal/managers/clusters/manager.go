@@ -11,6 +11,7 @@ import (
 
 	"dlockss/internal/badbits"
 	"dlockss/internal/config"
+	"dlockss/internal/trust"
 	"dlockss/pkg/ipfs"
 
 	"github.com/ipfs-cluster/ipfs-cluster/api"
@@ -54,6 +55,7 @@ type ClusterManager struct {
 	dht          routing.Routing
 	datastore    datastore.Datastore
 	trustedPeers []peer.ID
+	origin       trust.OriginGate
 	onPinSynced  func(cid string)
 	onPinRemoved func(cid string)
 	peerProvider ShardPeerProvider
@@ -85,6 +87,7 @@ type ClusterManagerConfig struct {
 	Datastore    datastore.Datastore
 	IPFSClient   ipfs.IPFSClient
 	TrustedPeers []peer.ID
+	Origin       trust.OriginGate
 	BadBits      *badbits.Filter
 	OnPinSynced  func(cid string)
 	OnPinRemoved func(cid string)
@@ -100,6 +103,7 @@ func NewClusterManager(cfg ClusterManagerConfig) *ClusterManager {
 		datastore:    cfg.Datastore,
 		ipfsClient:   cfg.IPFSClient,
 		trustedPeers: cfg.TrustedPeers,
+		origin:       cfg.Origin,
 		onPinSynced:  cfg.OnPinSynced,
 		onPinRemoved: cfg.OnPinRemoved,
 		clusters:     make(map[string]*embeddedCluster),
@@ -125,9 +129,9 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string) error {
 	// Namespace datastore for this shard
 	shardDS := namespace.Wrap(cm.datastore, datastore.NewKey(shardID))
 
-	// Configure CRDT
+	// Configure CRDT. An empty trusted-peer list is default/open (TrustAll).
 	trustAll := true
-	if cm.cfg.Security.TrustMode == "allowlist" {
+	if cm.cfg.Security.TrustMode == "allowlist" && len(cm.trustedPeers) > 0 {
 		trustAll = false
 	}
 
@@ -185,7 +189,7 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string) error {
 
 	subCtx, cancel := context.WithCancel(context.Background())
 
-	tracker := newLocalPinTracker(cm.ipfsClient, shardID, cm.onPinSynced, cm.onPinRemoved, cm.badBits)
+	tracker := newLocalPinTracker(cm.ipfsClient, shardID, cm.onPinSynced, cm.onPinRemoved, cm.badBits, cm.origin)
 	tracker.Start(consensus)
 
 	go func() {

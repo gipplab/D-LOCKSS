@@ -2,10 +2,13 @@ package clusters
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 
 	"dlockss/internal/testutil"
+	"dlockss/internal/trust"
+	"dlockss/pkg/schema"
 
 	"github.com/ipfs-cluster/ipfs-cluster/api"
 	"github.com/ipfs-cluster/ipfs-cluster/state"
@@ -57,6 +60,8 @@ func (m *mockConsensus) Shutdown(ctx context.Context) error { return nil }
 type mockIPFSForTracker struct {
 	mu       sync.Mutex
 	pinCalls []cid.Cid
+	blocks   map[string][]byte
+	blockErr error
 }
 
 func (m *mockIPFSForTracker) IsPinned(ctx context.Context, c cid.Cid) (bool, error) {
@@ -69,13 +74,35 @@ func (m *mockIPFSForTracker) PinRecursive(ctx context.Context, c cid.Cid) error 
 	return nil
 }
 func (m *mockIPFSForTracker) GetBlock(ctx context.Context, c cid.Cid) ([]byte, error) {
+	if m.blockErr != nil {
+		return nil, m.blockErr
+	}
+	if m.blocks != nil {
+		if b, ok := m.blocks[c.String()]; ok {
+			return b, nil
+		}
+	}
 	return nil, nil
+}
+
+func manifestBlock(t *testing.T, ingester peer.ID) (cid.Cid, []byte) {
+	t.Helper()
+	payload, err := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ro := schema.NewResearchObject("file://test", ingester, payload, 12)
+	b, err := ro.MarshalCBOR()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload, b
 }
 func TestPinTracker_allocation_pin(t *testing.T) {
 	ourPeer := testutil.MustPeerID(t, "our")
 	c1, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
 	ipfs := &mockIPFSForTracker{}
-	pt := newLocalPinTracker(ipfs, "1", nil, nil, nil)
+	pt := newLocalPinTracker(ipfs, "1", nil, nil, nil, nil)
 
 	state := &mockState{
 		pins: []api.Pin{
@@ -104,7 +131,7 @@ func TestPinTracker_allocation_skip(t *testing.T) {
 	otherPeer := testutil.MustPeerID(t, "other")
 	c1, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
 	ipfs := &mockIPFSForTracker{}
-	pt := newLocalPinTracker(ipfs, "1", nil, nil, nil)
+	pt := newLocalPinTracker(ipfs, "1", nil, nil, nil, nil)
 
 	state := &mockState{
 		pins: []api.Pin{
@@ -126,7 +153,7 @@ func TestPinTracker_allocation_skip(t *testing.T) {
 func TestPinTracker_empty_allocations_full_replication(t *testing.T) {
 	c1, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
 	ipfs := &mockIPFSForTracker{}
-	pt := newLocalPinTracker(ipfs, "1", nil, nil, nil)
+	pt := newLocalPinTracker(ipfs, "1", nil, nil, nil, nil)
 
 	// Empty Allocations means "pin everywhere" (full replication)
 	state := &mockState{
@@ -155,7 +182,7 @@ func TestPinTracker_tracking_released_when_removed_from_CRDT(t *testing.T) {
 	removed := make([]string, 0)
 	onRemoved := func(cidStr string) { removed = append(removed, cidStr) }
 	ipfs := &mockIPFSForTracker{}
-	pt := newLocalPinTracker(ipfs, "1", nil, onRemoved, nil)
+	pt := newLocalPinTracker(ipfs, "1", nil, onRemoved, nil, nil)
 
 	stateWithPin := &mockState{
 		pins: []api.Pin{
@@ -185,5 +212,64 @@ func TestPinTracker_tracking_released_when_removed_from_CRDT(t *testing.T) {
 	}
 	if len(removed) >= 1 && removed[0] != c1.String() {
 		t.Errorf("onPinRemoved called with %s, want %s", removed[0], c1)
+	}
+}
+
+func TestPinTracker_refusesUntrustedOrigin(t *testing.T) {
+	trusted := testutil.MustPeerID(t, "trusted")
+	untrusted := testutil.MustPeerID(t, "untrusted")
+	c1, block := manifestBlock(t, untrusted)
+
+	tm := trust.NewTrustManager("open")
+	if _, invalid := tm.AddOrigins([]string{trusted.String()}); len(invalid) > 0 {
+		t.Fatalf("trusted peer id not encodable: %v", invalid)
+	}
+
+	ipfs := &mockIPFSForTracker{blocks: map[string][]byte{c1.String(): block}}
+	pt := newLocalPinTracker(ipfs, "1", nil, nil, nil, tm)
+	pt.syncState(&mockConsensus{st: &mockState{pins: []api.Pin{{Cid: api.NewCid(c1)}}}})
+
+	ipfs.mu.Lock()
+	n := len(ipfs.pinCalls)
+	ipfs.mu.Unlock()
+	if n != 0 {
+		t.Errorf("expected no PinRecursive for untrusted origin, got %d", n)
+	}
+}
+
+func TestPinTracker_pinsTrustedOrigin(t *testing.T) {
+	trusted := testutil.MustPeerID(t, "trusted")
+	c1, block := manifestBlock(t, trusted)
+
+	tm := trust.NewTrustManager("open")
+	if _, invalid := tm.AddOrigins([]string{trusted.String()}); len(invalid) > 0 {
+		t.Fatalf("trusted peer id not encodable: %v", invalid)
+	}
+
+	ipfs := &mockIPFSForTracker{blocks: map[string][]byte{c1.String(): block}}
+	pt := newLocalPinTracker(ipfs, "1", nil, nil, nil, tm)
+	pt.syncState(&mockConsensus{st: &mockState{pins: []api.Pin{{Cid: api.NewCid(c1)}}}})
+
+	ipfs.mu.Lock()
+	n := len(ipfs.pinCalls)
+	ipfs.mu.Unlock()
+	if n != 1 {
+		t.Errorf("expected 1 PinRecursive for trusted origin, got %d", n)
+	}
+}
+
+func TestPinTracker_refusesWhenManifestUnreadable(t *testing.T) {
+	tm := trust.NewTrustManager("open")
+	tm.AddOrigins([]string{testutil.MustPeerID(t, "trusted").String()})
+	c1, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
+	ipfs := &mockIPFSForTracker{blockErr: fmt.Errorf("offline")}
+	pt := newLocalPinTracker(ipfs, "1", nil, nil, nil, tm)
+	pt.syncState(&mockConsensus{st: &mockState{pins: []api.Pin{{Cid: api.NewCid(c1)}}}})
+
+	ipfs.mu.Lock()
+	n := len(ipfs.pinCalls)
+	ipfs.mu.Unlock()
+	if n != 0 {
+		t.Errorf("expected no PinRecursive when origin check cannot read manifest, got %d", n)
 	}
 }

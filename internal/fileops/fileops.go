@@ -242,8 +242,3 @@ func (fp *FileProcessor) EnqueueOrRetry(path string) bool {
 	slog.Warn("queue and retry full, dropping file", "path", path)
 	return false
 }
-
-// SignProtocolMessage signs a message with the node's private key.
-func (fp *FileProcessor) SignProtocolMessage(msg schema.Signable) error {
-	return fp.signer.SignProtocolMessage(msg)
-}

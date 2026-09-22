@@ -13,14 +13,13 @@ import (
 	"dlockss/pkg/schema"
 )
 
-// isAuthorizedIngestor returns true if the peer is allowed to publish ingest
-// messages. When the allowlist is empty the topic is open to all.
+// isAuthorizedIngestor returns true if the peer is allowed to introduce files.
+// When no origin gate is configured the topic is open to all.
 func (sm *ShardManager) isAuthorizedIngestor(senderID peer.ID) bool {
-	if len(sm.ingestAllowlist) == 0 {
+	if sm.origin == nil {
 		return true
 	}
-	_, ok := sm.ingestAllowlist[senderID]
-	return ok
+	return sm.origin.AllowsOrigin(senderID)
 }
 
 // IsLocalNodeIngestor returns true if the local node is authorized to ingest
@@ -41,6 +40,10 @@ func (sm *ShardManager) handleIngestMessage(msg *pubsub.Message, im *schema.Inge
 	}
 	if !sm.isAuthorizedIngestor(im.SenderID) {
 		slog.Warn("IngestMessage from unauthorized peer", "sender", im.SenderID, "shard", shardID)
+		return
+	}
+	if !sm.allowsManifestCID(sm.ctx, im.ManifestCID) {
+		slog.Warn("IngestMessage refused: untrusted data origin", "sender", im.SenderID, "manifest", im.ManifestCID.String(), "shard", shardID)
 		return
 	}
 	key := im.ManifestCID.String()

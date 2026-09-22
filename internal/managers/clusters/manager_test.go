@@ -102,24 +102,6 @@ func TestClusterManager_Lifecycle(t *testing.T) {
 	}
 }
 
-func TestDeterministicSecrets(t *testing.T) {
-	shardA := "10"
-	shardB := "10"
-	shardC := "11"
-
-	// Secrets should be deterministic
-	secA, _ := clusters.GenerateClusterSecretHex(shardA)
-	secB, _ := clusters.GenerateClusterSecretHex(shardB)
-	secC, _ := clusters.GenerateClusterSecretHex(shardC)
-
-	if secA != secB {
-		t.Errorf("Secrets for same shard ID should match: %s != %s", secA, secB)
-	}
-	if secA == secC {
-		t.Errorf("Secrets for different shard IDs should differ")
-	}
-}
-
 func TestSelectAllocations(t *testing.T) {
 	// Build deterministic peer list (order will be sorted by peer ID string).
 	pA := testutil.MustPeerID(t, "peerA")

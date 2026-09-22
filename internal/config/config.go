@@ -176,6 +176,9 @@ type Config struct {
 	IdentityPath           string
 	NodeNamePath           string
 	IPFSConfigPath         string
+	// PrivateNetwork skips public DHT bootstrap peers and AutoRelay.
+	// Use for isolated eval testnets (mDNS + unique DiscoveryServiceTag).
+	PrivateNetwork bool
 
 	Sharding    ShardingConfig
 	Replication ReplicationConfig
@@ -241,7 +244,7 @@ func DefaultConfig() *Config {
 		},
 		Security: SecurityConfig{
 			TrustMode:           "open",
-			TrustStorePath:      "trusted_peers.json",
+			TrustStorePath:      filepath.Join(filepath.Dir(dataDir), "trusted_peers.json"),
 			SignatureMode:       "strict",
 			SignatureMaxAge:     10 * time.Minute,
 			NonceSize:           16,
@@ -282,6 +285,7 @@ func LoadFromEnv() *Config {
 	cfg.IdentityPath = identityPath(dataDir)
 	cfg.NodeNamePath = nodeNamePath(dataDir)
 	cfg.IPFSConfigPath = getEnvString("DLOCKSS_IPFS_CONFIG", cfg.IPFSConfigPath)
+	cfg.PrivateNetwork = getEnvBool("DLOCKSS_PRIVATE_NETWORK", cfg.PrivateNetwork)
 
 	// Sharding
 	cfg.Sharding.MaxPeersPerShard = getEnvInt("DLOCKSS_MAX_PEERS_PER_SHARD", cfg.Sharding.MaxPeersPerShard)
@@ -319,7 +323,7 @@ func LoadFromEnv() *Config {
 
 	// Security
 	cfg.Security.TrustMode = getEnvString("DLOCKSS_TRUST_MODE", cfg.Security.TrustMode)
-	cfg.Security.TrustStorePath = getEnvString("DLOCKSS_TRUST_STORE", cfg.Security.TrustStorePath)
+	cfg.Security.TrustStorePath = getEnvString("DLOCKSS_TRUST_STORE", filepath.Join(filepath.Dir(dataDir), "trusted_peers.json"))
 	cfg.Security.SignatureMode = getEnvString("DLOCKSS_SIGNATURE_MODE", cfg.Security.SignatureMode)
 	cfg.Security.SignatureMaxAge = getEnvDuration("DLOCKSS_SIGNATURE_MAX_AGE", cfg.Security.SignatureMaxAge)
 	cfg.Security.NonceSize = getEnvInt("DLOCKSS_NONCE_SIZE", cfg.Security.NonceSize)
@@ -339,6 +343,10 @@ func (c *Config) Validate() {
 	if c.Security.SignatureMode != "off" && c.Security.SignatureMode != "warn" && c.Security.SignatureMode != "strict" {
 		slog.Warn("unknown signature mode, defaulting to strict", "mode", c.Security.SignatureMode)
 		c.Security.SignatureMode = "strict"
+	}
+	if c.Security.TrustMode != "open" && c.Security.TrustMode != "allowlist" {
+		slog.Warn("unknown trust mode, defaulting to open", "mode", c.Security.TrustMode)
+		c.Security.TrustMode = "open"
 	}
 	if c.Files.MaxConcurrentFileProcessing < 1 {
 		slog.Warn("invalid config value, using default", "key", "MaxConcurrentFileProcessing", "value", c.Files.MaxConcurrentFileProcessing, "default", 5)
@@ -377,6 +385,7 @@ func (c *Config) ValidatePathSafetyCheck() string {
 		{"NodeNamePath", c.NodeNamePath},
 		{"IPFSConfigPath (DLOCKSS_IPFS_CONFIG)", c.IPFSConfigPath},
 		{"ClusterStorePath (DLOCKSS_CLUSTER_STORE)", c.ClusterStorePath},
+		{"TrustStorePath (DLOCKSS_TRUST_STORE)", c.Security.TrustStorePath},
 	}
 	var problems []string
 	for _, ck := range checks {
@@ -397,15 +406,11 @@ func (c *Config) ValidatePathSafetyCheck() string {
 func (c *Config) Log() {
 	c.Validate()
 
-	ingestMode := "open"
-	if len(c.IngestAllowlist) > 0 {
-		ingestMode = fmt.Sprintf("allowlist (%d peers)", len(c.IngestAllowlist))
-	}
 	slog.Info("config: network",
 		"discovery_tag", c.DiscoveryServiceTag,
 		"pubsub_prefix", c.PubsubTopicPrefix,
 		"topic_name", c.TopicName,
-		"ingest_mode", ingestMode,
+		"ingest_allowlist_env", len(c.IngestAllowlist),
 		"ipfs_node", c.IPFSNodeAddress,
 		"api_port", c.APIPort,
 		"bootstrap_timeout", c.BootstrapTimeout,

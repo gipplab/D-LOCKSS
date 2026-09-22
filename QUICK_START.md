@@ -14,7 +14,8 @@ ipfs version
 
 ### 1. Start IPFS (separate terminal)
 ```bash
-ipfs init    # first time only
+ipfs init --profile=unixfs-v1-2025    # first time only
+# existing repo: ipfs config profile apply unixfs-v1-2025
 ipfs daemon
 ```
 

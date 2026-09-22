@@ -49,7 +49,9 @@ func NewClient(ipfsNodeAddr string) (*Client, error) {
 	return &Client{api: api}, nil
 }
 
-// ImportFile imports a file into IPFS as UnixFS. ctx unused (go-ipfs-api Add has no cancel).
+// ImportFile imports a file into IPFS using IPIP-0499 unixfs-v1-2025
+// (CIDv1, sha2-256, 1 MiB raw leaves, balanced DAG, 1024 links per file node).
+// ctx unused (go-ipfs-api Add has no cancel).
 func (c *Client) ImportFile(ctx context.Context, filePath string) (cid.Cid, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -57,7 +59,7 @@ func (c *Client) ImportFile(ctx context.Context, filePath string) (cid.Cid, erro
 	}
 	defer file.Close()
 
-	ipfsPath, err := c.api.Add(file, ipfsapi.Pin(true))
+	ipfsPath, err := c.api.Add(file, unixfsV1AddOpts()...)
 	if err != nil {
 		return cid.Cid{}, fmt.Errorf("failed to import file to IPFS: %w", err)
 	}

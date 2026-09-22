@@ -3,10 +3,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -31,6 +33,7 @@ import (
 	"github.com/libp2p/go-libp2p"
 	kaddht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	libp2pmetrics "github.com/libp2p/go-libp2p/core/metrics"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
@@ -97,7 +100,7 @@ func main() {
 	}
 	defer rcm.Close()
 
-	h, err := libp2p.New(
+	hostOpts := []libp2p.Option{
 		libp2p.ResourceManager(rcm),
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings(
@@ -106,27 +109,37 @@ func main() {
 			"/ip4/0.0.0.0/udp/0/quic-v1",
 			"/ip6/::/udp/0/quic-v1",
 		),
-		libp2p.NATPortMap(),
-		libp2p.EnableHolePunching(),
-		libp2p.EnableAutoRelayWithStaticRelays(kaddht.GetDefaultBootstrapPeerAddrInfos()),
-		libp2p.EnableNATService(),
 		libp2p.ChainOptions(
 			libp2p.Security(noise.ID, noise.New),
 		),
-	)
+	}
+	bandwidthCounter := libp2pmetrics.NewBandwidthCounter()
+	hostOpts = append(hostOpts, libp2p.BandwidthReporter(bandwidthCounter))
+	if !cfg.PrivateNetwork {
+		hostOpts = append(hostOpts,
+			libp2p.NATPortMap(),
+			libp2p.EnableHolePunching(),
+			libp2p.EnableAutoRelayWithStaticRelays(kaddht.GetDefaultBootstrapPeerAddrInfos()),
+			libp2p.EnableNATService(),
+		)
+	}
+	h, err := libp2p.New(hostOpts...)
 	if err != nil {
 		log.Fatalf("[Fatal] Failed to create libp2p host: %v", err)
 	}
 	defer h.Close()
 
-	slog.Info("libp2p host created", "peer_id", h.ID().String())
+	slog.Info("libp2p host created", "peer_id", h.ID().String(), "private_network", cfg.PrivateNetwork)
+	if path := os.Getenv("DLOCKSS_BANDWIDTH_PATH"); path != "" {
+		go writeBandwidthSnapshots(ctx, bandwidthCounter, path)
+	}
 
 	ps, err := pubsub.NewGossipSub(ctx, h)
 	if err != nil {
 		log.Fatalf("[Fatal] Failed to create pubsub: %v", err)
 	}
 
-	// DHT for discovery (separate from IPFS daemon; used for dlockss-prod rendezvous).
+	// DHT for discovery (separate from IPFS daemon; used for rendezvous).
 	kademliaDHT, err := kaddht.New(ctx, h)
 	if err != nil {
 		log.Fatalf("[Fatal] Failed to create DHT: %v", err)
@@ -135,29 +148,32 @@ func main() {
 		log.Fatalf("[Fatal] Failed to bootstrap DHT: %v", err)
 	}
 
-	// Connect to default bootstrap peers (non-blocking: proceed after timeout if some fail)
-	var wg sync.WaitGroup
-	for _, peerAddr := range kaddht.DefaultBootstrapPeers {
-		peerinfo, err := peer.AddrInfoFromP2pAddr(peerAddr)
-		if err != nil {
-			continue
+	if !cfg.PrivateNetwork {
+		// Connect to default bootstrap peers (non-blocking: proceed after timeout if some fail)
+		var wg sync.WaitGroup
+		for _, peerAddr := range kaddht.DefaultBootstrapPeers {
+			peerinfo, err := peer.AddrInfoFromP2pAddr(peerAddr)
+			if err != nil {
+				continue
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				h.Connect(ctx, *peerinfo)
+			}()
 		}
-		wg.Add(1)
+		done := make(chan struct{})
 		go func() {
-			defer wg.Done()
-			h.Connect(ctx, *peerinfo)
+			wg.Wait()
+			close(done)
 		}()
-	}
-	// Proceed after BootstrapTimeout or when all connects finish (whichever first)
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(cfg.BootstrapTimeout):
-		slog.Warn("bootstrap timeout, proceeding with partial connectivity", "timeout", cfg.BootstrapTimeout)
+		select {
+		case <-done:
+		case <-time.After(cfg.BootstrapTimeout):
+			slog.Warn("bootstrap timeout, proceeding with partial connectivity", "timeout", cfg.BootstrapTimeout)
+		}
+	} else {
+		slog.Info("private network mode: skipping public DHT bootstrap and AutoRelay")
 	}
 
 	// Setup Routing Discovery
@@ -174,11 +190,27 @@ func main() {
 
 	go discovery.RunPeerFinder(ctx, h, routingDiscovery, cfg.DiscoveryServiceTag)
 
-	// Trust (optional: load peers if file exists)
+	// Trust store: who this node will store data from (and, in allowlist
+	// mode, who may send signed protocol messages / write CRDT pins).
 	trustMgr := trust.NewTrustManager(cfg.Security.TrustMode)
-	if err := trustMgr.LoadTrustedPeers(cfg.Security.TrustStorePath); err != nil && !os.IsNotExist(err) {
-		slog.Warn("trust store load failed", "error", err)
+	if err := trustMgr.LoadTrustedPeers(cfg.Security.TrustStorePath); err != nil {
+		if os.IsNotExist(err) {
+			if cfg.Security.TrustMode == "allowlist" {
+				slog.Info("trust mode is allowlist but trust store is missing; accepting all origins", "path", cfg.Security.TrustStorePath)
+			}
+		} else {
+			log.Fatalf("[Fatal] Failed to load trust store %s: %v", cfg.Security.TrustStorePath, err)
+		}
 	}
+	if added, invalid := trustMgr.AddOrigins(cfg.IngestAllowlist); len(invalid) > 0 {
+		slog.Warn("ignoring invalid peer IDs in DLOCKSS_INGEST_ALLOWLIST", "ids", invalid, "accepted", added)
+	}
+	slog.Info("data origin policy",
+		"restrict", trustMgr.RestrictsOrigins(),
+		"trusted_origins", len(trustMgr.GetTrustedPeers()),
+		"trust_mode", cfg.Security.TrustMode,
+		"trust_store", cfg.Security.TrustStorePath,
+	)
 
 	// Initialize persistent datastore for cluster state
 	// We place this OUTSIDE the FileWatchFolder (ingest dir) to avoid the node trying to ingest its own database files.
@@ -261,6 +293,7 @@ func main() {
 		Datastore:    dstore,
 		IPFSClient:   ipfsClient,
 		TrustedPeers: trustMgr.GetTrustedPeers(),
+		Origin:       trustMgr,
 		BadBits:      badBitsFilter,
 		OnPinSynced:  onPinSynced,
 		OnPinRemoved: onPinRemoved,
@@ -275,6 +308,7 @@ func main() {
 		Signer:      signer,
 		RateLimiter: rateLimiter,
 		Cluster:     clusterMgr,
+		Origin:      trustMgr,
 		NodeName:    nodeName,
 	})
 	if err != nil {
@@ -322,4 +356,50 @@ func main() {
 		slog.Error("shard manager close error", "error", err)
 	}
 	_ = apiServer.Shutdown(context.Background())
+}
+
+type bandwidthSnapshot struct {
+	Total     libp2pmetrics.Stats            `json:"total"`
+	Protocols map[string]libp2pmetrics.Stats `json:"protocols"`
+}
+
+func writeBandwidthSnapshots(ctx context.Context, counter *libp2pmetrics.BandwidthCounter, path string) {
+	write := func() {
+		protocols := make(map[string]libp2pmetrics.Stats)
+		for id, stats := range counter.GetBandwidthByProtocol() {
+			protocols[string(id)] = stats
+		}
+		data, err := json.Marshal(bandwidthSnapshot{
+			Total:     counter.GetBandwidthTotals(),
+			Protocols: protocols,
+		})
+		if err != nil {
+			slog.Warn("failed to marshal bandwidth snapshot", "error", err)
+			return
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			slog.Warn("failed to create bandwidth snapshot directory", "error", err)
+			return
+		}
+		tmp := path + ".tmp"
+		if err := os.WriteFile(tmp, data, 0o644); err != nil {
+			slog.Warn("failed to write bandwidth snapshot", "error", err)
+			return
+		}
+		if err := os.Rename(tmp, path); err != nil {
+			slog.Warn("failed to publish bandwidth snapshot", "error", err)
+		}
+	}
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			write()
+		case <-ctx.Done():
+			write()
+			return
+		}
+	}
 }
