@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"dlockss/internal/keywords"
 	"dlockss/internal/monitor"
 )
 
@@ -60,6 +61,13 @@ func main() {
 
 	m := monitor.NewMonitor(cfg)
 	defer m.Close()
+
+	kwCfg := keywords.ConfigFromEnv()
+	if kwCfg.APIKey != "" {
+		slog.Info("keyword indexing configured", "model", kwCfg.Model, "data_dir", kwCfg.DataDir)
+	}
+	m.SetKeywords(keywords.NewStore(kwCfg))
+	m.StartKeywordIndexer(ctx)
 
 	h, err := monitor.StartLibP2P(ctx, m)
 	if err != nil {

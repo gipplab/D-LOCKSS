@@ -204,6 +204,20 @@ go build -o dlockss-monitor ./cmd/dlockss-monitor
 ```
 Open http://localhost:8080. The `-topic` and `-prefix` flags override the `DLOCKSS_TOPIC_NAME` and `DLOCKSS_PUBSUB_TOPIC_PREFIX` environment variables respectively. The topic is fixed at startup (the dashboard displays it read-only).
 
+Keyword search is optional and uses the same LLM key setup as ipfs-tracker. If no key is present at startup, the dashboard shows a one-time **SAVE KEY** field; after that the key is written to `~/.dlockss-monitor/.api_key` and cannot be changed in the UI. You can also set it before start:
+
+```bash
+# ~/.dlockss-monitor/.api_key  (preferred), or ./.api_key, or:
+export SAIA_API_KEY="..."
+# optional:
+# export DLOCKSS_LLM_MODEL=meta-llama-3.1-8b-instruct
+# export DLOCKSS_LLM_API_BASE=https://chat-ai.academiccloud.de/v1
+# export DLOCKSS_IPFS_GATEWAY=https://ipfs.io
+# export DLOCKSS_MONITOR_DATA_DIR="$HOME/.dlockss-monitor"
+```
+
+Requires `pdftotext` (`poppler-utils`) on the monitor host. Keywords are generated once per PDF at index time and searched locally.
+
 The monitor displays each node's **name** (if configured via `DLOCKSS_NODE_NAME`), falling back to the Peer ID. Names propagate via HEARTBEAT/JOIN messages and appear in the node table, charts, and shard modals. Client-side aliases (EDIT button) override server-side names. Each node has **one peer ID**: when `DLOCKSS_IPFS_CONFIG` is set (e.g. in testnet), D-LOCKSS uses the IPFS repo identity so the same ID appears in the monitor and in `node_x.ipfs.log`.
 
 The monitor bootstrap-subscribes to all shards up to depth 6 (127 shards) so it can see nodes even when started late. Set `DLOCKSS_MONITOR_BOOTSTRAP_SHARD_DEPTH` (0–12) to tune.

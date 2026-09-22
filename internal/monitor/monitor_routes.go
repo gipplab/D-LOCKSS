@@ -32,6 +32,11 @@ func (m *Monitor) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/replication-cids", m.handleReplicationCIDs)
 	mux.HandleFunc("/api/manifest-payload", m.handleManifestPayload)
 	mux.HandleFunc("/api/identify", m.handleIdentify)
+	mux.HandleFunc("/api/keyword-search", m.handleKeywordSearch)
+	mux.HandleFunc("/api/keyword-suggest", m.handleKeywordSuggest)
+	mux.HandleFunc("/api/recent-searches", m.handleRecentSearches)
+	mux.HandleFunc("/api/keyword-stats", m.handleKeywordStats)
+	mux.HandleFunc("/api/keyword-api-key", m.handleKeywordAPIKey)
 	mux.HandleFunc("/", m.handleDashboard)
 }
 

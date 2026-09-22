@@ -16,6 +16,7 @@ testnet/TESTNET_OPTIMIZATIONS.md
 .env
 .env.*
 !.env.example
+.api_key
 *.key
 *.pem
 *.cert

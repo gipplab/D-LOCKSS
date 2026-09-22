@@ -14,6 +14,8 @@ RUN go build -ldflags="-s -w" -o dlockss-monitor ./cmd/dlockss-monitor
 
 FROM alpine:3.21 AS final
 
+RUN apk add --no-cache poppler-utils
+
 COPY --from=builder /build/dlockss-monitor /usr/local/bin/dlockss-monitor
 
 # Return freed memory to OS; cap heap; trigger GC earlier

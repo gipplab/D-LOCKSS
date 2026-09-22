@@ -32,7 +32,7 @@ mkdir -p data
 ./dlockss
 ```
 
-Optional: build the monitor dashboard with `go build -o dlockss-monitor ./cmd/dlockss-monitor` (see [README](README.md)).
+Optional: build the monitor dashboard with `go build -o dlockss-monitor ./cmd/dlockss-monitor` (see [README](README.md)). If no API key is set, the dashboard lets you save one exactly once (`pdftotext` required for indexing).
 
 ## Verify It's Working
 

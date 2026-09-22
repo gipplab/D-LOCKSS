@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"dlockss/internal/config"
+	"dlockss/internal/keywords"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -121,6 +122,7 @@ type Monitor struct {
 	manifestShard       map[string]string // manifest CID → observed shard (from PINNED/IngestMessage announcements)
 	lastSplitTime       time.Time         // when we last detected a split; used to avoid pruning during mesh formation
 	peerLastSiblingMove map[string]siblingMoveRecord
+	keywords            *keywords.Store
 }
 
 // siblingMoveRecord tracks the last sibling shard move for cooldown (reduces 0↔1 oscillation from stale messages).
@@ -213,7 +215,34 @@ func NewMonitor(cfg MonitorConfig) *Monitor {
 		peerShardLastSeen:   make(map[string]map[string]time.Time),
 		manifestShard:       make(map[string]string),
 		peerLastSiblingMove: make(map[string]siblingMoveRecord),
+		keywords:            keywords.NewStore(keywords.Config{}),
 	}
 	go m.runReplicationCleanup()
 	return m
+}
+
+// SetKeywords replaces the (disabled) default keyword store. Call before StartKeywordIndexer.
+func (m *Monitor) SetKeywords(s *keywords.Store) {
+	if s != nil {
+		m.keywords = s
+	}
+}
+
+// StartKeywordIndexer indexes newly announced PDFs in the background when an API key is set.
+func (m *Monitor) StartKeywordIndexer(ctx context.Context) {
+	if m.keywords == nil {
+		return
+	}
+	go m.keywords.Run(ctx, m)
+}
+
+// UniqueCIDList returns manifest CIDs observed on gossip-sub.
+func (m *Monitor) UniqueCIDList() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]string, 0, len(m.uniqueCIDs))
+	for c := range m.uniqueCIDs {
+		out = append(out, c)
+	}
+	return out
 }

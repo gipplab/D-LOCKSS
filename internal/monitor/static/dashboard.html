@@ -59,6 +59,42 @@
 
         .load-spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #ccc; border-top-color: #06A77D; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; }
         @keyframes spin { to { transform: rotate(360deg); } }
+        .keyword-search-section { background: white; padding: 20px; margin: 20px 0; border: 1px solid #333; }
+        .kw-search-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+        .kw-input-wrap { position: relative; flex: 1; max-width: 500px; }
+        .kw-input-wrap input { width: 100%; padding: 10px 12px; border: 1px solid #333; font-family: inherit; font-size: 0.95em; box-sizing: border-box; }
+        .kw-input-wrap input:focus { outline: none; border-color: #06A77D; }
+        .kw-ac { position: absolute; top: 100%; left: 0; right: 0; background: white; border: 1px solid #333; border-top: none; max-height: 220px; overflow-y: auto; z-index: 100; display: none; }
+        .kw-ac-item { padding: 8px 12px; cursor: pointer; display: flex; justify-content: space-between; font-size: 0.85em; }
+        .kw-ac-item:hover, .kw-ac-item.active { background: #f0f0f0; }
+        .kw-ac-count { color: #999; font-size: 0.85em; }
+        .kw-search-btn { padding: 10px 20px !important; font-size: 0.95em !important; }
+        .kw-stats-lbl { font-size: 0.75em; color: #999; white-space: nowrap; }
+        .kw-recent { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+        .kw-recent-label { font-size: 0.75em; color: #999; text-transform: uppercase; margin-right: 4px; }
+        .kw-tag-btn { background: #eee; border: 1px solid #ccc; padding: 3px 10px; font-size: 0.8em; cursor: pointer; text-transform: lowercase; font-family: inherit; }
+        .kw-tag-btn:hover { background: #ddd; border-color: #999; }
+        .kw-results { margin-top: 15px; }
+        .kw-results-hdr { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid #ddd; }
+        .kw-result-item { display: flex; flex-direction: column; gap: 4px; padding: 10px 0; border-bottom: 1px solid #eee; font-size: 0.85em; }
+        .kw-result-top { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+        .kw-result-cid { font-family: monospace; word-break: break-all; flex: 1; min-width: 200px; }
+        .kw-result-meta { color: #666; font-size: 0.9em; }
+        .kw-result-kws { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
+        .kw-kw-tag { background: #e8f5e9; border: 1px solid #a5d6a7; padding: 1px 6px; font-size: 0.8em; border-radius: 2px; cursor: pointer; }
+        .kw-kw-tag:hover { background: #c8e6c9; }
+        .kw-class { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
+        .kw-class-tag { padding: 1px 8px; font-size: 0.8em; border-radius: 2px; cursor: pointer; border: 1px solid; }
+        .kw-class-tag:hover { filter: brightness(0.92); }
+        .kw-field { background: #e3f2fd; border-color: #90caf9; color: #1565c0; }
+        .kw-subtopic { background: #f3e5f5; border-color: #ce93d8; color: #7b1fa2; }
+        .kw-niche { background: #fff3e0; border-color: #ffcc80; color: #e65100; }
+        .kw-pagination { display: flex; justify-content: center; align-items: center; gap: 6px; margin-top: 12px; padding-top: 10px; border-top: 1px solid #eee; }
+        .kw-page-btn { background: #eee; border: 1px solid #ccc; padding: 4px 12px; font-size: 0.85em; cursor: pointer; font-family: inherit; }
+        .kw-page-btn:hover { background: #ddd; border-color: #999; }
+        .kw-page-btn.active { background: #333; color: white; border-color: #333; }
+        .kw-page-btn:disabled { opacity: 0.4; cursor: default; }
+        .kw-page-info { font-size: 0.8em; color: #666; }
     </style>
 </head>
 <body>
@@ -71,6 +107,37 @@
                     Topic: <span id="topic-name-value" style="font-weight:bold;">--</span>
                     <span style="margin-left: 8px;">Prefix: <span id="root-topic-value">--</span></span>
                 </div>
+            </div>
+        </div>
+        <div class="keyword-search-section">
+            <div id="kwSetup" style="display:none;">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <h3 style="margin:0; text-transform:uppercase; font-size:1em;">Keyword Search</h3>
+                    <span class="kw-stats-lbl">API key not set</span>
+                </div>
+                <p style="font-size:0.85em; color:#555; margin:10px 0 0 0;">Set the SAIA API key once. It is saved on this monitor and cannot be changed in the UI afterwards.</p>
+                <div class="kw-search-row">
+                    <div class="kw-input-wrap">
+                        <input type="password" id="kwApiKey" placeholder="SAIA API key" autocomplete="off">
+                    </div>
+                    <button class="btn-text kw-search-btn" id="kwSaveKey">SAVE KEY</button>
+                </div>
+                <div id="kwKeyErr" style="color:#c00; font-size:0.85em; margin-top:8px;"></div>
+            </div>
+            <div id="kwSearchUI" style="display:none;">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <h3 style="margin:0; text-transform:uppercase; font-size:1em;">Keyword Search</h3>
+                    <span id="kwStatsLbl" class="kw-stats-lbl"></span>
+                </div>
+                <div class="kw-search-row">
+                    <div class="kw-input-wrap">
+                        <input type="text" id="kwInput" placeholder="Search documents by keyword..." autocomplete="off">
+                        <div id="kwAC" class="kw-ac"></div>
+                    </div>
+                    <button class="btn-text kw-search-btn" id="kwSearchBtn">SEARCH</button>
+                </div>
+                <div id="kwRecent" class="kw-recent"></div>
+                <div id="kwResults" class="kw-results" style="display:none;"></div>
             </div>
         </div>
         <div class="stats">
@@ -373,6 +440,161 @@
         document.getElementById('identify-modal-close').onclick = hideIdentifyModal;
         document.getElementById('identify-modal').onclick = function(e) { if (e.target === this) hideIdentifyModal(); };
         setupModalFilter('shard-nodes-modal-search', 'shard-nodes-modal-list', '.node-row', function(r) { return r.dataset.search || r.dataset.peerId || ''; });
+        let kwACIndex = -1;
+        let kwACTimeout;
+        const kwInput = document.getElementById('kwInput');
+        const kwAC = document.getElementById('kwAC');
+        const kwSearchBtn = document.getElementById('kwSearchBtn');
+        var kwAllResults = [];
+        var kwCurrentQuery = '';
+        var kwPage = 0;
+        var kwPerPage = 20;
+        function kwDoSearch(query) {
+            if (!query || !query.trim()) return;
+            query = query.trim();
+            kwInput.value = query;
+            kwHideAC();
+            kwCurrentQuery = query;
+            kwPage = 0;
+            document.getElementById('kwResults').style.display = 'block';
+            document.getElementById('kwResults').innerHTML = '<p style="color:#999;">Searching...</p>';
+            fetch('/api/keyword-search?q=' + encodeURIComponent(query) + '&t=' + Date.now()).then(r => r.json()).then(data => {
+                kwAllResults = data.results || [];
+                if (kwAllResults.length === 0) {
+                    document.getElementById('kwResults').innerHTML = '<p style="color:#666;">No documents found for "' + escapeHtml(query) + '".</p>';
+                    return;
+                }
+                kwRenderPage();
+                document.getElementById('kwResults').scrollIntoView({ behavior: 'smooth', block: 'start' });
+                kwLoadRecent();
+            }).catch(() => {
+                document.getElementById('kwResults').innerHTML = '<p style="color:#ff6b6b;">Search failed.</p>';
+            });
+        }
+        function kwRenderPage() {
+            var total = kwAllResults.length;
+            var totalPages = Math.ceil(total / kwPerPage);
+            var start = kwPage * kwPerPage;
+            var end = Math.min(start + kwPerPage, total);
+            var pageResults = kwAllResults.slice(start, end);
+            var html = '<div class="kw-results-hdr"><span>' + total + ' document' + (total !== 1 ? 's' : '') + ' matching "' + escapeHtml(kwCurrentQuery) + '"</span><button class="btn-text" onclick="document.getElementById(\'kwResults\').style.display=\'none\'">CLOSE</button></div>';
+            html += pageResults.map(function(r) {
+                var shard = (r.shard || '') === '' ? 'root' : escapeHtml(r.shard);
+                var kws = (r.keywords || []).map(function(k) { return '<span class="kw-kw-tag" onclick="kwDoSearch(\'' + escapeJs(k) + '\')">' + escapeHtml(k) + '</span>'; }).join('');
+                var title = r.title || '';
+                var payloadUrl = GATEWAY + '/ipfs/' + (r.payload_cid || '') + '/';
+                var titleHtml = title ? '<div style="font-weight:600; margin-bottom:2px;">' + escapeHtml(title) + '</div>' : '';
+                var classHtml = '';
+                var bf = r.broad_field || '', st = r.sub_topic || '', rn = r.research_niche || '';
+                if (bf || st || rn) {
+                    classHtml = '<div class="kw-class">';
+                    if (bf) classHtml += '<span class="kw-class-tag kw-field" onclick="kwDoSearch(\'' + escapeJs(bf) + '\')">' + escapeHtml(bf) + '</span>';
+                    if (st) classHtml += '<span class="kw-class-tag kw-subtopic" onclick="kwDoSearch(\'' + escapeJs(st) + '\')">' + escapeHtml(st) + '</span>';
+                    if (rn) classHtml += '<span class="kw-class-tag kw-niche" onclick="kwDoSearch(\'' + escapeJs(rn) + '\')">' + escapeHtml(rn) + '</span>';
+                    classHtml += '</div>';
+                }
+                return '<div class="kw-result-item">' + titleHtml + classHtml + '<div class="kw-result-top"><div class="kw-result-cid">' + escapeHtml(r.manifest_cid) + '</div><div class="kw-result-meta">Shard: ' + shard + ' | Replicas: ' + (r.replicas || 0) + '</div><a href="' + payloadUrl + '" target="_blank" rel="noopener" class="btn-text">VIEW</a></div><div class="kw-result-kws">' + kws + '</div></div>';
+            }).join('');
+            if (totalPages > 1) {
+                html += '<div class="kw-pagination">';
+                html += '<button class="kw-page-btn" onclick="kwGoPage(' + (kwPage - 1) + ')"' + (kwPage === 0 ? ' disabled' : '') + '>&laquo;</button>';
+                for (var p = 0; p < totalPages; p++) {
+                    html += '<button class="kw-page-btn' + (p === kwPage ? ' active' : '') + '" onclick="kwGoPage(' + p + ')">' + (p + 1) + '</button>';
+                }
+                html += '<button class="kw-page-btn" onclick="kwGoPage(' + (kwPage + 1) + ')"' + (kwPage >= totalPages - 1 ? ' disabled' : '') + '>&raquo;</button>';
+                html += '<span class="kw-page-info">' + (start + 1) + '–' + end + ' of ' + total + '</span>';
+                html += '</div>';
+            }
+            document.getElementById('kwResults').innerHTML = html;
+        }
+        function kwGoPage(p) {
+            var totalPages = Math.ceil(kwAllResults.length / kwPerPage);
+            if (p < 0 || p >= totalPages) return;
+            kwPage = p;
+            kwRenderPage();
+            document.getElementById('kwResults').scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+        function kwShowAC(suggestions) {
+            if (!suggestions || suggestions.length === 0) { kwHideAC(); return; }
+            kwACIndex = -1;
+            kwAC.innerHTML = suggestions.map((s, i) => '<div class="kw-ac-item" data-idx="' + i + '" onmousedown="kwDoSearch(\'' + escapeJs(s.keyword) + '\')">' + escapeHtml(s.keyword) + '<span class="kw-ac-count">' + s.cid_count + ' doc' + (s.cid_count !== 1 ? 's' : '') + '</span></div>').join('');
+            kwAC.style.display = 'block';
+        }
+        function kwHideAC() { kwAC.style.display = 'none'; kwACIndex = -1; }
+        function kwFetchSuggestions() {
+            const q = kwInput.value.trim();
+            if (q.length < 1) { kwHideAC(); return; }
+            fetch('/api/keyword-suggest?q=' + encodeURIComponent(q) + '&t=' + Date.now()).then(r => r.json()).then(data => {
+                kwShowAC(data.suggestions || []);
+            }).catch(() => kwHideAC());
+        }
+        kwInput.addEventListener('input', function() {
+            clearTimeout(kwACTimeout);
+            kwACTimeout = setTimeout(kwFetchSuggestions, 200);
+        });
+        kwInput.addEventListener('keydown', function(e) {
+            const items = kwAC.querySelectorAll('.kw-ac-item');
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                kwACIndex = Math.min(kwACIndex + 1, items.length - 1);
+                items.forEach((el, i) => el.classList.toggle('active', i === kwACIndex));
+                if (kwACIndex >= 0) kwInput.value = items[kwACIndex].textContent.replace(/\d+ docs?$/, '').trim();
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                kwACIndex = Math.max(kwACIndex - 1, -1);
+                items.forEach((el, i) => el.classList.toggle('active', i === kwACIndex));
+                if (kwACIndex >= 0) kwInput.value = items[kwACIndex].textContent.replace(/\d+ docs?$/, '').trim();
+            } else if (e.key === 'Enter') {
+                kwHideAC();
+                kwDoSearch(kwInput.value);
+            } else if (e.key === 'Escape') {
+                kwHideAC();
+            }
+        });
+        kwInput.addEventListener('blur', function() { setTimeout(kwHideAC, 150); });
+        kwSearchBtn.addEventListener('click', function() { kwDoSearch(kwInput.value); });
+        function kwLoadRecent() {
+            fetch('/api/recent-searches?t=' + Date.now()).then(r => r.json()).then(data => {
+                const el = document.getElementById('kwRecent');
+                const searches = data.searches || [];
+                if (searches.length === 0) { el.innerHTML = ''; return; }
+                el.innerHTML = '<span class="kw-recent-label">Recent:</span>' + searches.slice(0, 5).map(s => '<button class="kw-tag-btn" onclick="kwDoSearch(\'' + escapeJs(s.keyword) + '\')">' + escapeHtml(s.keyword) + ' (' + s.result_count + ')</button>').join('');
+            }).catch(() => {});
+        }
+        function kwShowSearchUI(data) {
+            document.getElementById('kwSetup').style.display = 'none';
+            document.getElementById('kwSearchUI').style.display = '';
+            document.getElementById('kwStatsLbl').textContent = 'Indexed: ' + data.indexed + '/' + data.total_cids + ' | Keywords: ' + data.unique_keywords;
+        }
+        function kwLoadStats() {
+            fetch('/api/keyword-stats?t=' + Date.now()).then(r => r.json()).then(data => {
+                if (data.enabled) { kwShowSearchUI(data); return; }
+                document.getElementById('kwSetup').style.display = data.can_set_key ? '' : 'none';
+                document.getElementById('kwSearchUI').style.display = 'none';
+            }).catch(() => {});
+        }
+        document.getElementById('kwSaveKey').addEventListener('click', function() {
+            var key = document.getElementById('kwApiKey').value.trim();
+            var errEl = document.getElementById('kwKeyErr');
+            errEl.textContent = '';
+            if (!key) { errEl.textContent = 'Enter an API key.'; return; }
+            fetch('/api/keyword-api-key', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ api_key: key })
+            }).then(function(r) { return r.json().then(function(data) { return { ok: r.ok, status: r.status, data: data }; }); }).then(function(res) {
+                document.getElementById('kwApiKey').value = '';
+                if (res.ok) { kwLoadStats(); kwLoadRecent(); return; }
+                if (res.status === 409) { errEl.textContent = 'API key is already set.'; kwLoadStats(); return; }
+                errEl.textContent = res.data.error || 'Failed to save API key.';
+            }).catch(function() { errEl.textContent = 'Failed to save API key.'; });
+        });
+        document.getElementById('kwApiKey').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') { document.getElementById('kwSaveKey').click(); }
+        });
+        kwLoadRecent();
+        kwLoadStats();
+        setInterval(kwLoadStats, 10000);
         initCharts(); updateDashboard(); updateShardTree(); loadRootTopic();
         setInterval(() => { if(!document.getElementById('nodeSearch').value && currentlyEditingPeerID === null) { updateDashboard(); updateShardTree(); } }, 5000);
     </script>
