@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"dlockss/internal/keywords"
@@ -55,5 +57,36 @@ func TestKeywordAPIKeyOnce(t *testing.T) {
 	}
 	if rec := post("second"); rec.Code != http.StatusConflict {
 		t.Fatalf("second save status %d, want 409", rec.Code)
+	}
+}
+
+func TestManifestPayloadUsesLocalIndex(t *testing.T) {
+	dir := t.TempDir()
+	idx := map[string]*keywords.CIDKeywordEntry{
+		"bafy-manifest": {ManifestCID: "bafy-manifest", PayloadCID: "bafy-payload", MetaRef: "paper.pdf"},
+	}
+	data, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "keyword_index.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m := NewMonitor(DefaultMonitorConfig())
+	m.SetKeywords(keywords.NewStore(keywords.Config{DataDir: dir, Gateway: "http://127.0.0.1:9"}))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/manifest-payload?cid=bafy-manifest", nil)
+	rec := httptest.NewRecorder()
+	m.handleManifestPayload(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d body %s", rec.Code, rec.Body.String())
+	}
+	var got map[string]interface{}
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got["payload_cid"] != "bafy-payload" {
+		t.Fatalf("payload_cid = %v", got["payload_cid"])
 	}
 }

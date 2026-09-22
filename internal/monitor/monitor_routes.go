@@ -247,8 +247,19 @@ func (m *Monitor) handleManifestPayload(w http.ResponseWriter, r *http.Request) 
 		writeJSONError(w, "missing cid parameter", http.StatusBadRequest)
 		return
 	}
-	reqURL := "https://ipfs.io/ipfs/" + url.PathEscape(manifestCID)
-	resp, err := http.Get(reqURL)
+	if e, ok := m.keywords.Lookup(manifestCID); ok {
+		writeJSON(w, map[string]interface{}{
+			"payload_cid": e.PayloadCID,
+			"manifest": map[string]interface{}{
+				"meta_ref": e.MetaRef,
+				"payload":  e.PayloadCID,
+			},
+		})
+		return
+	}
+	reqURL := m.keywords.Gateway() + "/ipfs/" + url.PathEscape(manifestCID)
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Get(reqURL)
 	if err != nil {
 		writeJSONError(w, err.Error(), http.StatusBadGateway)
 		return

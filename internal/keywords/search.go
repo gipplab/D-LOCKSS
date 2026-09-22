@@ -12,6 +12,28 @@ const (
 	MaxRunesPerKeyword = 56
 )
 
+// Gateway is the IPFS HTTP gateway used for server-side fetches (DLOCKSS_IPFS_GATEWAY).
+func (s *Store) Gateway() string {
+	if s == nil || s.cfg.Gateway == "" {
+		return DefaultGateway
+	}
+	return strings.TrimSuffix(s.cfg.Gateway, "/")
+}
+
+// Lookup returns a locally indexed entry without hitting a gateway.
+func (s *Store) Lookup(manifestCID string) (CIDKeywordEntry, bool) {
+	if s == nil || manifestCID == "" {
+		return CIDKeywordEntry{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, ok := s.cidKeywords[manifestCID]
+	if !ok || e == nil || e.PayloadCID == "" {
+		return CIDKeywordEntry{}, false
+	}
+	return *e, true
+}
+
 func (s *Store) Search(query string) []CIDKeywordEntry {
 	query = strings.ToLower(strings.TrimSpace(query))
 	if query == "" {

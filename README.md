@@ -212,7 +212,10 @@ export SAIA_API_KEY="..."
 # optional:
 # export DLOCKSS_LLM_MODEL=meta-llama-3.1-8b-instruct
 # export DLOCKSS_LLM_API_BASE=https://chat-ai.academiccloud.de/v1
-# export DLOCKSS_IPFS_GATEWAY=https://ipfs.io
+# When the monitor shares a compose network with Kubo (service name "ipfs"):
+# export DLOCKSS_IPFS_GATEWAY=http://ipfs:8080
+# That is Kubo's gateway port inside the network — not the dashboard, and not
+# localhost (Kubo's 8080 is usually unpublished on the host).
 # export DLOCKSS_MONITOR_DATA_DIR="$HOME/.dlockss-monitor"
 ```
 
