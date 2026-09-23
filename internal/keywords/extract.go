@@ -35,6 +35,8 @@ func (e rateLimitedError) Unwrap() error { return errRateLimited }
 const (
 	maxFetchSize           = 20 * 1024 * 1024
 	maxTextLen             = 30_000
+	googleMaxTextLen       = 8_000
+	googleMaxOutputTokens  = 256
 	maxChatResponseBytes   = 2 * 1024 * 1024
 	maxRateLimitRetries    = 5
 	manifestFetchTimeout   = 30 * time.Second
@@ -255,9 +257,7 @@ func convertPDFFromFile(pdfPath string) (string, error) {
 
 func (s *Store) extractKeywordsWithRetry(text, cid string) (*extractionResult, error) {
 	for attempt := 0; attempt <= maxRateLimitRetries; attempt++ {
-		if s.llmLimiter != nil {
-			_ = s.llmLimiter.Wait(context.Background())
-		}
+		s.waitLLM()
 		result, retryAfter, err := s.extractKeywords(text)
 		if err == nil {
 			return result, nil
@@ -355,12 +355,24 @@ func isRetryableExtractNetErr(err error) bool {
 }
 
 func (s *Store) extractKeywords(markdown string) (*extractionResult, time.Duration, error) {
+	cfg := s.snapshotConfig()
+	if cfg.Provider == ProviderGoogle {
+		markdown = trimUTF8(markdown, googleMaxTextLen)
+	}
+	userText := "Document text (between delimiters only):\n---BEGIN_DOCUMENT---\n" + markdown + "\n---END_DOCUMENT---"
+	if cfg.Provider == ProviderGoogle {
+		return geminiExtract(cfg, userText)
+	}
+	return openAIExtract(cfg, userText)
+}
+
+func openAIExtract(cfg Config, userText string) (*extractionResult, time.Duration, error) {
 	temp := 0.1
 	reqBody := chatRequest{
-		Model: s.cfg.Model,
+		Model: cfg.Model,
 		Messages: []chatMessage{
 			{Role: "system", Content: extractionSystemPrompt},
-			{Role: "user", Content: "Document text (between delimiters only):\n---BEGIN_DOCUMENT---\n" + markdown + "\n---END_DOCUMENT---"},
+			{Role: "user", Content: userText},
 		},
 		Temperature: &temp,
 		MaxTokens:   512,
@@ -369,13 +381,131 @@ func (s *Store) extractKeywords(markdown string) (*extractionResult, time.Durati
 	if err != nil {
 		return nil, 0, fmt.Errorf("marshal request: %w", err)
 	}
-	req, err := http.NewRequest("POST", strings.TrimSuffix(s.cfg.APIBase, "/")+"/chat/completions", bytes.NewReader(bodyBytes))
+	req, err := http.NewRequest("POST", strings.TrimSuffix(cfg.APIBase, "/")+"/chat/completions", bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, 0, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+s.cfg.APIKey)
+	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 
+	respBody, retryAfter, err := doLLMRequest(req)
+	if err != nil || retryAfter > 0 {
+		return nil, retryAfter, err
+	}
+
+	var chatResp chatResponse
+	if err := json.Unmarshal(respBody, &chatResp); err != nil {
+		return nil, 0, fmt.Errorf("parse response: %w", err)
+	}
+	if chatResp.Error != nil {
+		return nil, 0, fmt.Errorf("API error: %s", chatResp.Error.Message)
+	}
+	if len(chatResp.Choices) == 0 || chatResp.Choices[0].Message.Content == "" {
+		return nil, 0, fmt.Errorf("empty chat response")
+	}
+	result, err := parseExtraction(chatResp.Choices[0].Message.Content)
+	return result, 0, err
+}
+
+func geminiGenerationConfig() map[string]interface{} {
+	return map[string]interface{}{
+		"temperature":      0.1,
+		"maxOutputTokens":  googleMaxOutputTokens,
+		"responseMimeType": "application/json",
+		"responseSchema": map[string]interface{}{
+			"type": "OBJECT",
+			"properties": map[string]interface{}{
+				"title":          map[string]string{"type": "STRING"},
+				"broad_field":    map[string]string{"type": "STRING"},
+				"sub_topic":      map[string]string{"type": "STRING"},
+				"research_niche": map[string]string{"type": "STRING"},
+				"keywords": map[string]interface{}{
+					"type":  "ARRAY",
+					"items": map[string]string{"type": "STRING"},
+				},
+			},
+			"required": []string{"title", "broad_field", "sub_topic", "research_niche", "keywords"},
+		},
+		// Flash-Lite can spend output budget on hidden reasoning. This task does not need it.
+		"thinkingConfig": map[string]int{"thinkingBudget": 0},
+	}
+}
+
+func trimUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && (s[cut]&0xC0) == 0x80 {
+		cut--
+	}
+	return s[:cut]
+}
+
+func geminiExtract(cfg Config, userText string) (*extractionResult, time.Duration, error) {
+	reqBody := map[string]interface{}{
+		"systemInstruction": map[string]interface{}{
+			"parts": []map[string]string{{"text": extractionSystemPrompt}},
+		},
+		"contents": []map[string]interface{}{
+			{"role": "user", "parts": []map[string]string{{"text": userText}}},
+		},
+		"generationConfig": geminiGenerationConfig(),
+	}
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, 0, fmt.Errorf("marshal request: %w", err)
+	}
+	endpoint := strings.TrimSuffix(cfg.APIBase, "/") + "/models/" + url.PathEscape(cfg.Model) + ":generateContent"
+	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, 0, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", cfg.APIKey)
+
+	respBody, retryAfter, err := doLLMRequest(req)
+	if err != nil || retryAfter > 0 {
+		return nil, retryAfter, err
+	}
+	text, err := geminiResponseText(respBody)
+	if err != nil {
+		return nil, 0, err
+	}
+	result, err := parseExtraction(text)
+	return result, 0, err
+}
+
+func geminiResponseText(respBody []byte) (string, error) {
+	var parsed struct {
+		Candidates []struct {
+			Content struct {
+				Parts []struct {
+					Text string `json:"text"`
+				} `json:"parts"`
+			} `json:"content"`
+		} `json:"candidates"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return "", fmt.Errorf("parse response: %w", err)
+	}
+	if parsed.Error != nil && parsed.Error.Message != "" {
+		return "", fmt.Errorf("API error: %s", parsed.Error.Message)
+	}
+	if len(parsed.Candidates) == 0 || len(parsed.Candidates[0].Content.Parts) == 0 {
+		return "", fmt.Errorf("empty chat response")
+	}
+	text := strings.TrimSpace(parsed.Candidates[0].Content.Parts[0].Text)
+	if text == "" {
+		return "", fmt.Errorf("empty chat response")
+	}
+	return text, nil
+}
+
+func doLLMRequest(req *http.Request) ([]byte, time.Duration, error) {
 	client := &http.Client{Timeout: llmTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -402,19 +532,7 @@ func (s *Store) extractKeywords(markdown string) (*extractionResult, time.Durati
 	if resp.StatusCode != http.StatusOK {
 		return nil, 0, fmt.Errorf("API status %d: %s", resp.StatusCode, truncate(string(respBody), 200))
 	}
-
-	var chatResp chatResponse
-	if err := json.Unmarshal(respBody, &chatResp); err != nil {
-		return nil, 0, fmt.Errorf("parse response: %w", err)
-	}
-	if chatResp.Error != nil {
-		return nil, 0, fmt.Errorf("API error: %s", chatResp.Error.Message)
-	}
-	if len(chatResp.Choices) == 0 || chatResp.Choices[0].Message.Content == "" {
-		return nil, 0, fmt.Errorf("empty chat response")
-	}
-	result, err := parseExtraction(chatResp.Choices[0].Message.Content)
-	return result, 0, err
+	return respBody, 0, nil
 }
 
 func parseExtraction(raw string) (*extractionResult, error) {

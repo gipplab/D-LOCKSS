@@ -73,21 +73,32 @@ func (m *Monitor) handleKeywordAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		APIKey string `json:"api_key"`
+		Password string `json:"password"`
+		Provider string `json:"provider"`
+		APIKey   string `json:"api_key"`
+		APIBase  string `json:"api_base"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSONError(w, "invalid json", http.StatusBadRequest)
 		return
 	}
-	err := m.keywords.SetAPIKeyOnce(body.APIKey)
+	err := m.keywords.ApplySettings(body.Password, body.Provider, body.APIKey, body.APIBase)
 	switch {
 	case errors.Is(err, keywords.ErrAPIKeyEmpty):
 		writeJSONError(w, "api key is empty", http.StatusBadRequest)
-	case errors.Is(err, keywords.ErrAPIKeySet):
-		writeJSONError(w, "api key already set", http.StatusConflict)
+	case errors.Is(err, keywords.ErrSettingsAuth):
+		writeJSONError(w, "password must be the API key currently in use", http.StatusUnauthorized)
+	case errors.Is(err, keywords.ErrUnknownProvider):
+		writeJSONError(w, "unknown provider", http.StatusBadRequest)
 	case err != nil:
-		writeJSONError(w, "failed to save api key", http.StatusInternalServerError)
+		writeJSONError(w, "failed to save settings", http.StatusInternalServerError)
 	default:
-		writeJSON(w, map[string]interface{}{"enabled": true, "can_set_key": false})
+		st := m.keywords.GetStats(0)
+		writeJSON(w, map[string]interface{}{
+			"enabled":     true,
+			"can_set_key": false,
+			"provider":    st.Provider,
+			"model":       st.Model,
+		})
 	}
 }

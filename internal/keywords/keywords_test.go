@@ -1,6 +1,7 @@
 package keywords
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -87,6 +88,74 @@ func TestStatsDisabledWithoutKey(t *testing.T) {
 	st := s.GetStats(10)
 	if st.Enabled || !st.CanSetKey {
 		t.Fatalf("stats = %+v, want enabled=false can_set_key=true", st)
+	}
+}
+
+func TestApplySettingsPasswordAndGoogle(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(Config{DataDir: dir})
+	if err := s.ApplySettings("", "google", "first-key", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ApplySettings("wrong", "google", "next-key", ""); !errors.Is(err, ErrSettingsAuth) {
+		t.Fatalf("wrong password = %v", err)
+	}
+	if err := s.ApplySettings("first-key", "google", "next-key", ""); err != nil {
+		t.Fatal(err)
+	}
+	s2 := NewStore(Config{DataDir: dir})
+	st := s2.GetStats(0)
+	if st.CanSetKey || st.Provider != ProviderGoogle || st.Model != GoogleModel || st.DailyLimit != googleDailyCap {
+		t.Fatalf("reloaded stats = %+v", st)
+	}
+	if got := LoadAPIKey(dir); got != "next-key" {
+		t.Fatalf("persisted key = %q", got)
+	}
+}
+
+func TestGeminiGenerationConfigDisablesThinking(t *testing.T) {
+	cfg := geminiGenerationConfig()
+	if cfg["maxOutputTokens"] != googleMaxOutputTokens {
+		t.Fatalf("maxOutputTokens = %v", cfg["maxOutputTokens"])
+	}
+	think, ok := cfg["thinkingConfig"].(map[string]int)
+	if !ok || think["thinkingBudget"] != 0 {
+		t.Fatalf("thinkingConfig = %#v", cfg["thinkingConfig"])
+	}
+	if _, ok := cfg["responseSchema"]; !ok {
+		t.Fatal("responseSchema missing")
+	}
+}
+
+func TestTrimUTF8KeepsRuneBoundary(t *testing.T) {
+	got := trimUTF8("ab©", 3)
+	if got != "ab" {
+		t.Fatalf("trim = %q", got)
+	}
+}
+
+func TestGeminiResponseText(t *testing.T) {
+	inner := `{"title":"T","broad_field":"CS","sub_topic":"ML","research_niche":"NLP","keywords":["transformer"]}`
+	raw, err := json.Marshal(map[string]interface{}{
+		"candidates": []map[string]interface{}{
+			{"content": map[string]interface{}{
+				"parts": []map[string]string{{"text": inner}},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, err := geminiResponseText(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := parseExtraction(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "T" || len(got.Keywords) != 1 || got.Keywords[0] != "transformer" {
+		t.Fatalf("parsed = %+v", got)
 	}
 }
 

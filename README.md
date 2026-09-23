@@ -204,7 +204,7 @@ go build -o dlockss-monitor ./cmd/dlockss-monitor
 ```
 Open http://localhost:8080. The `-topic` and `-prefix` flags override the `DLOCKSS_TOPIC_NAME` and `DLOCKSS_PUBSUB_TOPIC_PREFIX` environment variables respectively. The topic is fixed at startup (the dashboard displays it read-only).
 
-Keyword search is optional and uses the same LLM key setup as ipfs-tracker. If no key is present at startup, the dashboard shows a one-time **SAVE KEY** field; after that the key is written to `~/.dlockss-monitor/.api_key` and cannot be changed in the UI. You can also set it before start:
+Keyword search is optional. The dashboard **SETTINGS** button chooses the provider and API key. The first key you save is the password for later changes: settings asks for the API key currently in use. Google AI Studio uses `gemini-2.5-flash-lite` (the stable Gemini model with the highest free-tier daily quota, about 1,000 requests per day). Settings are stored in `~/.dlockss-monitor/llm_settings.json`. You can also set a key before start:
 
 ```bash
 # ~/.dlockss-monitor/.api_key  (preferred), or ./.api_key, or:

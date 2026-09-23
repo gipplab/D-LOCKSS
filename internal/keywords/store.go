@@ -21,7 +21,8 @@ const (
 
 	numWorkers      = 2
 	requestSpacing  = time.Second
-	dailyLimit      = 20_000
+	saiaDailyCap    = 20_000
+	googleDailyCap  = 1_000
 	maxRetries      = 3
 	retryCooldown   = 10 * time.Minute
 	batchRetryDelay = time.Minute // ipfs-tracker indexer.RetryDelay
@@ -86,31 +87,43 @@ type KeywordSuggestion struct {
 }
 
 type Stats struct {
-	TotalCIDs      int  `json:"total_cids"`
-	Indexed        int  `json:"indexed"`
-	Failed         int  `json:"failed"`
-	Skipped        int  `json:"skipped"`
-	Pending        int  `json:"pending"`
-	UniqueKeywords int  `json:"unique_keywords"`
-	DailyRemaining int  `json:"daily_remaining"`
-	DailyLimit     int  `json:"daily_limit"`
-	Enabled        bool `json:"enabled"`
-	CanSetKey      bool `json:"can_set_key"`
+	TotalCIDs      int    `json:"total_cids"`
+	Indexed        int    `json:"indexed"`
+	Failed         int    `json:"failed"`
+	Skipped        int    `json:"skipped"`
+	Pending        int    `json:"pending"`
+	UniqueKeywords int    `json:"unique_keywords"`
+	DailyRemaining int    `json:"daily_remaining"`
+	DailyLimit     int    `json:"daily_limit"`
+	Enabled        bool   `json:"enabled"`
+	CanSetKey      bool   `json:"can_set_key"`
+	Provider       string `json:"provider"`
+	Model          string `json:"model"`
 }
 
 func NewStore(cfg Config) *Store {
-	if cfg.APIBase == "" {
-		cfg.APIBase = DefaultAPIBase
-	}
-	if cfg.Model == "" {
-		cfg.Model = DefaultModel
-	}
 	if cfg.Gateway == "" {
 		cfg.Gateway = DefaultGateway
 	}
-	if cfg.APIKey == "" && cfg.DataDir != "" {
-		cfg.APIKey = LoadAPIKey(cfg.DataDir)
+	if cfg.DataDir != "" {
+		if saved, ok := loadSettings(cfg.DataDir); ok {
+			if cfg.APIKey == "" {
+				cfg.APIKey = saved.APIKey
+			}
+			if cfg.Provider == "" {
+				cfg.Provider = saved.Provider
+			}
+			if cfg.APIBase == "" {
+				cfg.APIBase = saved.APIBase
+			}
+			if cfg.Model == "" {
+				cfg.Model = saved.Model
+			}
+		} else if cfg.APIKey == "" {
+			cfg.APIKey = LoadAPIKey(cfg.DataDir)
+		}
 	}
+	cfg = normalizeConfig(cfg)
 	s := &Store{
 		cidKeywords: make(map[string]*CIDKeywordEntry),
 		keywordCIDs: make(map[string]map[string]struct{}),
@@ -121,7 +134,7 @@ func NewStore(cfg Config) *Store {
 		dayStart:    startOfDay(time.Now()),
 		cfg:         cfg,
 		keyReady:    make(chan struct{}),
-		llmLimiter:  rate.NewLimiter(rate.Every(time.Second), 1),
+		llmLimiter:  newLLMLimiter(cfg.Provider),
 	}
 	if cfg.APIKey != "" {
 		s.signalKeyReady()
@@ -142,6 +155,28 @@ func (s *Store) Enabled() bool {
 
 func (s *Store) signalKeyReady() {
 	s.keyOnce.Do(func() { close(s.keyReady) })
+}
+
+func (s *Store) requestCap() int {
+	if s.cfg.Provider == ProviderGoogle {
+		return googleDailyCap
+	}
+	return saiaDailyCap
+}
+
+func (s *Store) snapshotConfig() Config {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg
+}
+
+func (s *Store) waitLLM() {
+	s.mu.RLock()
+	lim := s.llmLimiter
+	s.mu.RUnlock()
+	if lim != nil {
+		_ = lim.Wait(context.Background())
+	}
 }
 
 // SetAPIKeyOnce persists the SAIA key to {DataDir}/.api_key and enables indexing.
@@ -307,7 +342,7 @@ func normalizeKeyword(s string) string {
 // Run waits for an API key if none is set, then indexes newly announced PDFs.
 func (s *Store) Run(ctx context.Context, source CIDSource) {
 	if !s.Enabled() {
-		slog.Info("no API key yet; set it once in the monitor UI or via SAIA_API_KEY / .api_key")
+		slog.Info("no API key yet; set it in the monitor settings or via SAIA_API_KEY / .api_key")
 		select {
 		case <-ctx.Done():
 			return
@@ -321,7 +356,7 @@ func (s *Store) Run(ctx context.Context, source CIDSource) {
 		slog.Warn("pdftotext not found; keyword indexing disabled (install poppler-utils)")
 		return
 	}
-	slog.Info("keyword indexing enabled", "model", s.cfg.Model, "api_base", s.cfg.APIBase, "workers", numWorkers)
+	slog.Info("keyword indexing enabled", "provider", s.cfg.Provider, "model", s.cfg.Model, "api_base", s.cfg.APIBase, "workers", numWorkers)
 
 	work := make(chan string, numWorkers)
 	var wg sync.WaitGroup
@@ -364,7 +399,7 @@ func (s *Store) pickNextCID(source CIDSource) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.resetDayIfNeeded()
-	if s.dailyCount >= dailyLimit {
+	if s.dailyCount >= s.requestCap() {
 		return ""
 	}
 	if !s.pauseUntil.IsZero() && time.Now().Before(s.pauseUntil) {

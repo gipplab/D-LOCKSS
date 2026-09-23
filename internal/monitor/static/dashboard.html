@@ -95,6 +95,8 @@
         .kw-page-btn.active { background: #333; color: white; border-color: #333; }
         .kw-page-btn:disabled { opacity: 0.4; cursor: default; }
         .kw-page-info { font-size: 0.8em; color: #666; }
+        .kw-settings-field { display: flex; flex-direction: column; gap: 4px; margin-top: 12px; font-size: 0.85em; }
+        .kw-settings-field input, .kw-settings-field select { padding: 8px 10px; border: 1px solid #333; font-family: inherit; font-size: 0.95em; }
     </style>
 </head>
 <body>
@@ -102,7 +104,7 @@
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 20px;">
             <h1>D-LOCKSS Monitor</h1>
             <div style="font-size: 0.9em; text-align: right;">
-                <div>SYSTEM STATUS: <span class="status-text status-online">[ONLINE]</span></div>
+                <div>SYSTEM STATUS: <span class="status-text status-online">[ONLINE]</span> <button class="btn-text" id="kwSettingsBtn" style="margin-left:8px;">SETTINGS</button></div>
                 <div id="root-topic-row" style="font-size: 0.75em; color: #666; margin-top: 4px; word-break: break-all;">
                     Topic: <span id="topic-name-value" style="font-weight:bold;">--</span>
                     <span style="margin-left: 8px;">Prefix: <span id="root-topic-value">--</span></span>
@@ -115,14 +117,7 @@
                     <h3 style="margin:0; text-transform:uppercase; font-size:1em;">Keyword Search</h3>
                     <span class="kw-stats-lbl">API key not set</span>
                 </div>
-                <p style="font-size:0.85em; color:#555; margin:10px 0 0 0;">Set the SAIA API key once. It is saved on this monitor and cannot be changed in the UI afterwards.</p>
-                <div class="kw-search-row">
-                    <div class="kw-input-wrap">
-                        <input type="password" id="kwApiKey" placeholder="SAIA API key" autocomplete="off">
-                    </div>
-                    <button class="btn-text kw-search-btn" id="kwSaveKey">SAVE KEY</button>
-                </div>
-                <div id="kwKeyErr" style="color:#c00; font-size:0.85em; margin-top:8px;"></div>
+                <p style="font-size:0.85em; color:#555; margin:10px 0 0 0;">Open SETTINGS to choose Google AI Studio or SAIA. The key you save is the password for later changes.</p>
             </div>
             <div id="kwSearchUI" style="display:none;">
                 <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -189,6 +184,35 @@
         <div class="modal" style="width: 700px;">
             <div class="modal-header"><h3 style="margin:0; text-transform: uppercase; font-size: 1em;" id="identify-modal-title">Peer Identify</h3><button class="btn-text" id="identify-modal-close">CLOSE</button></div>
             <div class="modal-body"><div id="identify-modal-content"></div></div>
+        </div>
+    </div>
+    <div id="kwSettingsModal" class="modal-overlay" style="display:none;">
+        <div class="modal" style="width:480px;">
+            <div class="modal-header">
+                <strong>KEYWORD SETTINGS</strong>
+                <button class="btn-text" id="kwSettingsClose">CLOSE</button>
+            </div>
+            <div class="modal-body">
+                <p id="kwSettingsHelp" style="font-size:0.85em; color:#555; margin:0;"></p>
+                <label class="kw-settings-field" id="kwPasswordRow">Password
+                    <input type="password" id="kwPassword" placeholder="Current API key" autocomplete="off">
+                </label>
+                <label class="kw-settings-field">API
+                    <select id="kwProvider">
+                        <option value="google">Google AI Studio</option>
+                        <option value="saia">SAIA</option>
+                    </select>
+                </label>
+                <p id="kwGoogleNote" style="font-size:0.8em; color:#555; margin:8px 0 0 0;">Uses gemini-2.5-flash-lite, the stable model with the highest free-tier quota (about 15 requests per minute and 1,000 per day).</p>
+                <label class="kw-settings-field" id="kwBaseRow">API base
+                    <input type="text" id="kwAPIBase" placeholder="https://chat-ai.academiccloud.de/v1" autocomplete="off">
+                </label>
+                <label class="kw-settings-field">API key
+                    <input type="password" id="kwApiKey" placeholder="API key" autocomplete="off">
+                </label>
+                <div id="kwKeyErr" style="color:#c00; font-size:0.85em; margin-top:8px;"></div>
+                <div style="margin-top:14px;"><button class="btn-text kw-search-btn" id="kwSaveKey">SAVE</button></div>
+            </div>
         </div>
     </div>
     <script>
@@ -561,35 +585,76 @@
                 el.innerHTML = '<span class="kw-recent-label">Recent:</span>' + searches.slice(0, 5).map(s => '<button class="kw-tag-btn" onclick="kwDoSearch(\'' + escapeJs(s.keyword) + '\')">' + escapeHtml(s.keyword) + ' (' + s.result_count + ')</button>').join('');
             }).catch(() => {});
         }
+        var kwCanSetKey = true;
+        var kwCurrentProvider = 'google';
+        function kwSyncProviderFields() {
+            var google = document.getElementById('kwProvider').value === 'google';
+            document.getElementById('kwGoogleNote').style.display = google ? '' : 'none';
+            document.getElementById('kwBaseRow').style.display = google ? 'none' : '';
+        }
+        function kwOpenSettings() {
+            document.getElementById('kwKeyErr').textContent = '';
+            document.getElementById('kwPassword').value = '';
+            document.getElementById('kwApiKey').value = '';
+            document.getElementById('kwPasswordRow').style.display = kwCanSetKey ? 'none' : '';
+            document.getElementById('kwProvider').value = kwCurrentProvider || 'google';
+            document.getElementById('kwSettingsHelp').textContent = kwCanSetKey
+                ? 'The key you save becomes the password for this dialog.'
+                : 'The password is the API key currently in use.';
+            kwSyncProviderFields();
+            document.getElementById('kwSettingsModal').style.display = 'flex';
+        }
         function kwShowSearchUI(data) {
             document.getElementById('kwSetup').style.display = 'none';
             document.getElementById('kwSearchUI').style.display = '';
-            document.getElementById('kwStatsLbl').textContent = 'Indexed: ' + data.indexed + '/' + data.total_cids + ' | Keywords: ' + data.unique_keywords;
+            var who = data.provider === 'google' ? 'Google' : 'SAIA';
+            document.getElementById('kwStatsLbl').textContent = who + ' | Indexed: ' + data.indexed + '/' + data.total_cids + ' | Keywords: ' + data.unique_keywords;
         }
         function kwLoadStats() {
             fetch('/api/keyword-stats?t=' + Date.now()).then(r => r.json()).then(data => {
+                kwCanSetKey = !!data.can_set_key;
+                if (data.provider) kwCurrentProvider = data.provider;
                 if (data.enabled) { kwShowSearchUI(data); return; }
                 document.getElementById('kwSetup').style.display = data.can_set_key ? '' : 'none';
                 document.getElementById('kwSearchUI').style.display = 'none';
             }).catch(() => {});
         }
+        document.getElementById('kwSettingsBtn').addEventListener('click', kwOpenSettings);
+        document.getElementById('kwSettingsClose').addEventListener('click', function() {
+            document.getElementById('kwSettingsModal').style.display = 'none';
+        });
+        document.getElementById('kwProvider').addEventListener('change', kwSyncProviderFields);
         document.getElementById('kwSaveKey').addEventListener('click', function() {
             var key = document.getElementById('kwApiKey').value.trim();
             var errEl = document.getElementById('kwKeyErr');
             errEl.textContent = '';
             if (!key) { errEl.textContent = 'Enter an API key.'; return; }
+            var body = {
+                provider: document.getElementById('kwProvider').value,
+                api_key: key,
+                api_base: document.getElementById('kwAPIBase').value.trim()
+            };
+            if (!kwCanSetKey) body.password = document.getElementById('kwPassword').value;
             fetch('/api/keyword-api-key', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ api_key: key })
+                body: JSON.stringify(body)
             }).then(function(r) { return r.json().then(function(data) { return { ok: r.ok, status: r.status, data: data }; }); }).then(function(res) {
-                document.getElementById('kwApiKey').value = '';
-                if (res.ok) { kwLoadStats(); kwLoadRecent(); return; }
-                if (res.status === 409) { errEl.textContent = 'API key is already set.'; kwLoadStats(); return; }
-                errEl.textContent = res.data.error || 'Failed to save API key.';
-            }).catch(function() { errEl.textContent = 'Failed to save API key.'; });
+                if (res.ok) {
+                    document.getElementById('kwApiKey').value = '';
+                    document.getElementById('kwPassword').value = '';
+                    document.getElementById('kwSettingsModal').style.display = 'none';
+                    kwLoadStats();
+                    kwLoadRecent();
+                    return;
+                }
+                errEl.textContent = res.data.error || 'Failed to save settings.';
+            }).catch(function() { errEl.textContent = 'Failed to save settings.'; });
         });
         document.getElementById('kwApiKey').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') { document.getElementById('kwSaveKey').click(); }
+        });
+        document.getElementById('kwPassword').addEventListener('keydown', function(e) {
             if (e.key === 'Enter') { document.getElementById('kwSaveKey').click(); }
         });
         kwLoadRecent();

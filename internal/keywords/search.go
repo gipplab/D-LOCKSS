@@ -154,7 +154,8 @@ func (s *Store) GetStats(totalUniqueCIDs int) Stats {
 	if pending < 0 {
 		pending = 0
 	}
-	remaining := dailyLimit - s.dailyCount
+	cap := s.requestCap()
+	remaining := cap - s.dailyCount
 	if remaining < 0 {
 		remaining = 0
 	}
@@ -166,9 +167,11 @@ func (s *Store) GetStats(totalUniqueCIDs int) Stats {
 		Pending:        pending,
 		UniqueKeywords: len(s.keywordCIDs),
 		DailyRemaining: remaining,
-		DailyLimit:     dailyLimit,
+		DailyLimit:     cap,
 		Enabled:        s.cfg.APIKey != "",
 		CanSetKey:      s.cfg.APIKey == "",
+		Provider:       s.cfg.Provider,
+		Model:          s.cfg.Model,
 	}
 }
 

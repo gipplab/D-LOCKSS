@@ -55,8 +55,19 @@ func TestKeywordAPIKeyOnce(t *testing.T) {
 	if rec := post("once-only"); rec.Code != http.StatusOK {
 		t.Fatalf("first save status %d body %s", rec.Code, rec.Body.String())
 	}
-	if rec := post("second"); rec.Code != http.StatusConflict {
-		t.Fatalf("second save status %d, want 409", rec.Code)
+	if rec := post("second"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("second save status %d, want 401", rec.Code)
+	}
+	body, _ := json.Marshal(map[string]string{
+		"password": "once-only",
+		"provider": "google",
+		"api_key":  "google-key",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/keyword-api-key", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	m.handleKeywordAPIKey(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update status %d body %s", rec.Code, rec.Body.String())
 	}
 }
 
