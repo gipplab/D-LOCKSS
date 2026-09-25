@@ -101,3 +101,23 @@ func TestManifestPayloadUsesLocalIndex(t *testing.T) {
 		t.Fatalf("payload_cid = %v", got["payload_cid"])
 	}
 }
+
+func TestIPFSGatewayProxiesKubo(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ipfs/bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy" {
+			t.Errorf("upstream path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write([]byte("%PDF"))
+	}))
+	defer upstream.Close()
+
+	m := NewMonitor(DefaultMonitorConfig())
+	m.SetKeywords(keywords.NewStore(keywords.Config{DataDir: t.TempDir(), Gateway: upstream.URL}))
+	req := httptest.NewRequest(http.MethodGet, "/ipfs/bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy", nil)
+	rec := httptest.NewRecorder()
+	m.handleIPFSGateway(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "%PDF" {
+		t.Fatalf("status %d body %q", rec.Code, rec.Body.String())
+	}
+}

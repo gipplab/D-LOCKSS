@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,7 @@ var (
 	ErrAPIKeySet       = errors.New("api key already set")
 	ErrSettingsAuth    = errors.New("settings password does not match the current api key")
 	ErrUnknownProvider = errors.New("unknown provider")
+	ErrBadGateway      = errors.New("gateway must be an http or https URL")
 )
 
 const (
@@ -25,7 +27,7 @@ const (
 
 	DefaultModel   = "meta-llama-3.1-8b-instruct"
 	DefaultAPIBase = "https://chat-ai.academiccloud.de/v1"
-	DefaultGateway = "https://ipfs.io"
+	DefaultGateway = "http://ipfs:8080"
 
 	// gemini-2.5-flash-lite has the highest published free-tier quota among stable
 	// Gemini models: about 15 requests/minute and 1,000 requests/day.
@@ -50,6 +52,7 @@ type savedSettings struct {
 	APIKey   string `json:"api_key"`
 	APIBase  string `json:"api_base,omitempty"`
 	Model    string `json:"model,omitempty"`
+	Gateway  string `json:"gateway,omitempty"`
 }
 
 func DefaultConfig() Config {
@@ -86,6 +89,9 @@ func ConfigFromEnv() Config {
 		cfg.APIKey = saved.APIKey
 		cfg.APIBase = saved.APIBase
 		cfg.Model = saved.Model
+		if saved.Gateway != "" {
+			cfg.Gateway = saved.Gateway
+		}
 		return normalizeConfig(cfg)
 	}
 	if v := os.Getenv("DLOCKSS_LLM_PROVIDER"); v != "" {
@@ -141,6 +147,18 @@ func normalizeProvider(p string) string {
 	}
 }
 
+func normalizeGateway(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return DefaultGateway, nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return "", ErrBadGateway
+	}
+	return strings.TrimSuffix(raw, "/"), nil
+}
+
 func newLLMLimiter(provider string) *rate.Limiter {
 	if provider == ProviderGoogle {
 		return rate.NewLimiter(rate.Every(4*time.Second), 1)
@@ -173,6 +191,7 @@ func loadSettings(dataDir string) (Config, bool) {
 		APIKey:   saved.APIKey,
 		APIBase:  saved.APIBase,
 		Model:    saved.Model,
+		Gateway:  saved.Gateway,
 	}, true
 }
 
@@ -188,6 +207,7 @@ func saveSettings(dataDir string, cfg Config) error {
 		APIKey:   cfg.APIKey,
 		APIBase:  cfg.APIBase,
 		Model:    cfg.Model,
+		Gateway:  cfg.Gateway,
 	})
 	if err != nil {
 		return err
@@ -204,23 +224,31 @@ func saveSettings(dataDir string, cfg Config) error {
 
 // ApplySettings saves the provider and API key. The first save needs no
 // password. Later saves must pass the API key that is currently in use.
-func (s *Store) ApplySettings(password, provider, apiKey, apiBase string) error {
+func (s *Store) ApplySettings(password, provider, apiKey, apiBase, gateway string) error {
 	apiKey = strings.TrimSpace(apiKey)
-	if apiKey == "" {
-		return ErrAPIKeyEmpty
-	}
 	provider = normalizeProvider(provider)
 	if provider != ProviderSAIA && provider != ProviderGoogle {
 		return ErrUnknownProvider
+	}
+	gateway, err := normalizeGateway(gateway)
+	if err != nil {
+		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.cfg.APIKey != "" && subtle.ConstantTimeCompare([]byte(password), []byte(s.cfg.APIKey)) != 1 {
 		return ErrSettingsAuth
 	}
+	if apiKey == "" {
+		apiKey = s.cfg.APIKey
+	}
+	if apiKey == "" {
+		return ErrAPIKeyEmpty
+	}
 	cfg := s.cfg
 	cfg.Provider = provider
 	cfg.APIKey = apiKey
+	cfg.Gateway = gateway
 	if provider == ProviderGoogle {
 		cfg.APIBase = GoogleAPIBase
 		cfg.Model = GoogleModel

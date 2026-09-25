@@ -94,18 +94,21 @@ func TestStatsDisabledWithoutKey(t *testing.T) {
 func TestApplySettingsPasswordAndGoogle(t *testing.T) {
 	dir := t.TempDir()
 	s := NewStore(Config{DataDir: dir})
-	if err := s.ApplySettings("", "google", "first-key", ""); err != nil {
+	if err := s.ApplySettings("", "google", "first-key", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ApplySettings("wrong", "google", "next-key", ""); !errors.Is(err, ErrSettingsAuth) {
+	if got := s.GetStats(0).Gateway; got != DefaultGateway {
+		t.Fatalf("default gateway = %q", got)
+	}
+	if err := s.ApplySettings("wrong", "google", "next-key", "", "http://ipfs:8081"); !errors.Is(err, ErrSettingsAuth) {
 		t.Fatalf("wrong password = %v", err)
 	}
-	if err := s.ApplySettings("first-key", "google", "next-key", ""); err != nil {
+	if err := s.ApplySettings("first-key", "google", "next-key", "", "http://ipfs:8081"); err != nil {
 		t.Fatal(err)
 	}
 	s2 := NewStore(Config{DataDir: dir})
 	st := s2.GetStats(0)
-	if st.CanSetKey || st.Provider != ProviderGoogle || st.Model != GoogleModel || st.DailyLimit != googleDailyCap {
+	if st.CanSetKey || st.Provider != ProviderGoogle || st.Model != GoogleModel || st.DailyLimit != googleDailyCap || st.Gateway != "http://ipfs:8081" {
 		t.Fatalf("reloaded stats = %+v", st)
 	}
 	if got := LoadAPIKey(dir); got != "next-key" {

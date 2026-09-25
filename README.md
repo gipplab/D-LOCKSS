@@ -212,10 +212,11 @@ export SAIA_API_KEY="..."
 # optional:
 # export DLOCKSS_LLM_MODEL=meta-llama-3.1-8b-instruct
 # export DLOCKSS_LLM_API_BASE=https://chat-ai.academiccloud.de/v1
-# When the monitor shares a compose network with Kubo (service name "ipfs"):
+# Payload fetches use the Kubo gateway on the compose network by default.
+# Change it in the dashboard SETTINGS dialog, or before start:
 # export DLOCKSS_IPFS_GATEWAY=http://ipfs:8080
-# That is Kubo's gateway port inside the network — not the dashboard, and not
-# localhost (Kubo's 8080 is usually unpublished on the host).
+# The browser loads files through the monitor (/ipfs/<cid>), so port 8080
+# stays unpublished. Kubo's 8080 is not the dashboard port.
 # export DLOCKSS_MONITOR_DATA_DIR="$HOME/.dlockss-monitor"
 ```
 

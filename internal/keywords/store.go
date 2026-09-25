@@ -99,12 +99,10 @@ type Stats struct {
 	CanSetKey      bool   `json:"can_set_key"`
 	Provider       string `json:"provider"`
 	Model          string `json:"model"`
+	Gateway        string `json:"gateway"`
 }
 
 func NewStore(cfg Config) *Store {
-	if cfg.Gateway == "" {
-		cfg.Gateway = DefaultGateway
-	}
 	if cfg.DataDir != "" {
 		if saved, ok := loadSettings(cfg.DataDir); ok {
 			if cfg.APIKey == "" {
@@ -118,6 +116,9 @@ func NewStore(cfg Config) *Store {
 			}
 			if cfg.Model == "" {
 				cfg.Model = saved.Model
+			}
+			if cfg.Gateway == "" {
+				cfg.Gateway = saved.Gateway
 			}
 		} else if cfg.APIKey == "" {
 			cfg.APIKey = LoadAPIKey(cfg.DataDir)

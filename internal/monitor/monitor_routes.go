@@ -37,6 +37,7 @@ func (m *Monitor) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/recent-searches", m.handleRecentSearches)
 	mux.HandleFunc("/api/keyword-stats", m.handleKeywordStats)
 	mux.HandleFunc("/api/keyword-api-key", m.handleKeywordAPIKey)
+	mux.HandleFunc("/ipfs/", m.handleIPFSGateway)
 	mux.HandleFunc("/", m.handleDashboard)
 }
 

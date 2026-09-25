@@ -172,6 +172,7 @@ func (s *Store) GetStats(totalUniqueCIDs int) Stats {
 		CanSetKey:      s.cfg.APIKey == "",
 		Provider:       s.cfg.Provider,
 		Model:          s.cfg.Model,
+		Gateway:        s.cfg.Gateway,
 	}
 }
 

@@ -210,6 +210,10 @@
                 <label class="kw-settings-field">API key
                     <input type="password" id="kwApiKey" placeholder="API key" autocomplete="off">
                 </label>
+                <label class="kw-settings-field">IPFS gateway
+                    <input type="text" id="kwGateway" placeholder="http://ipfs:8080" autocomplete="off">
+                </label>
+                <p style="font-size:0.8em; color:#555; margin:8px 0 0 0;">Payloads are loaded through this monitor from that gateway. The default is the Kubo gateway on the Docker network.</p>
                 <div id="kwKeyErr" style="color:#c00; font-size:0.85em; margin-top:8px;"></div>
                 <div style="margin-top:14px;"><button class="btn-text kw-search-btn" id="kwSaveKey">SAVE</button></div>
             </div>
@@ -303,7 +307,7 @@
                 if (d.topic_name) { window._currentTopicName = d.topic_name; document.getElementById('topic-name-value').textContent = d.topic_name; }
             }).catch(() => {});
         }
-        const GATEWAY = 'https://ipfs.io';
+        const GATEWAY = '';
         function showCopyToast() {
             const toast = document.getElementById('copy-toast');
             toast.style.opacity = '1';
@@ -596,6 +600,7 @@
             document.getElementById('kwKeyErr').textContent = '';
             document.getElementById('kwPassword').value = '';
             document.getElementById('kwApiKey').value = '';
+            document.getElementById('kwGateway').value = window._kwGateway || 'http://ipfs:8080';
             document.getElementById('kwPasswordRow').style.display = kwCanSetKey ? 'none' : '';
             document.getElementById('kwProvider').value = kwCurrentProvider || 'google';
             document.getElementById('kwSettingsHelp').textContent = kwCanSetKey
@@ -614,6 +619,7 @@
             fetch('/api/keyword-stats?t=' + Date.now()).then(r => r.json()).then(data => {
                 kwCanSetKey = !!data.can_set_key;
                 if (data.provider) kwCurrentProvider = data.provider;
+                if (data.gateway) window._kwGateway = data.gateway;
                 if (data.enabled) { kwShowSearchUI(data); return; }
                 document.getElementById('kwSetup').style.display = data.can_set_key ? '' : 'none';
                 document.getElementById('kwSearchUI').style.display = 'none';
@@ -628,11 +634,12 @@
             var key = document.getElementById('kwApiKey').value.trim();
             var errEl = document.getElementById('kwKeyErr');
             errEl.textContent = '';
-            if (!key) { errEl.textContent = 'Enter an API key.'; return; }
+            if (!key && kwCanSetKey) { errEl.textContent = 'Enter an API key.'; return; }
             var body = {
                 provider: document.getElementById('kwProvider').value,
                 api_key: key,
-                api_base: document.getElementById('kwAPIBase').value.trim()
+                api_base: document.getElementById('kwAPIBase').value.trim(),
+                gateway: document.getElementById('kwGateway').value.trim()
             };
             if (!kwCanSetKey) body.password = document.getElementById('kwPassword').value;
             fetch('/api/keyword-api-key', {
