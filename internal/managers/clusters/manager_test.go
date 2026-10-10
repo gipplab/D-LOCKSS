@@ -102,6 +102,50 @@ func TestClusterManager_Lifecycle(t *testing.T) {
 	}
 }
 
+// A merge-up returns a node to a parent shard it left at the split, so a
+// shard must be joinable again after LeaveShard.
+func TestClusterManager_RejoinAfterLeave(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatalf("Failed to create libp2p host: %v", err)
+	}
+	defer h.Close()
+	ps, err := pubsub.NewGossipSub(ctx, h)
+	if err != nil {
+		t.Fatalf("Failed to create pubsub: %v", err)
+	}
+	cm := clusters.NewClusterManager(clusters.ClusterManagerConfig{
+		Cfg:        config.DefaultConfig(),
+		Host:       h,
+		PubSub:     ps,
+		DHT:        &testutil.MockDHTProvider{},
+		Datastore:  dssync.MutexWrap(datastore.NewMapDatastore()),
+		IPFSClient: &testutil.MockIPFSClient{},
+	})
+
+	if err := cm.JoinShard(ctx, ""); err != nil {
+		t.Fatalf("initial JoinShard failed: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if err := cm.LeaveShard(""); err != nil {
+		t.Fatalf("LeaveShard failed: %v", err)
+	}
+	if err := cm.JoinShard(ctx, ""); err != nil {
+		t.Fatalf("rejoin after leave failed: %v", err)
+	}
+	testCid, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
+	if err := cm.Pin(ctx, "", testCid, -1, -1); err != nil {
+		t.Errorf("Pin into rejoined shard failed: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+}
+
 func TestSelectAllocations(t *testing.T) {
 	// Build deterministic peer list (order will be sorted by peer ID string).
 	pA := testutil.MustPeerID(t, "peerA")

@@ -62,6 +62,11 @@ type ClusterManager struct {
 
 	mu       sync.RWMutex
 	clusters map[string]*embeddedCluster
+	// signalTopics keeps one pubsub handle per shard signal topic for the
+	// process lifetime. pubsub refuses a second Join of a topic that is still
+	// open, and closing races with subscription teardown, so rejoining a shard
+	// after a merge reuses the handle instead.
+	signalTopics map[string]*pubsub.Topic
 }
 
 type consensusClient interface {
@@ -107,6 +112,7 @@ func NewClusterManager(cfg ClusterManagerConfig) *ClusterManager {
 		onPinSynced:  cfg.OnPinSynced,
 		onPinRemoved: cfg.OnPinRemoved,
 		clusters:     make(map[string]*embeddedCluster),
+		signalTopics: make(map[string]*pubsub.Topic),
 	}
 }
 
@@ -175,14 +181,17 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string) error {
 	// Subscribe to the signal topic before starting the tracker so we can
 	// clean up everything on failure.
 	topicName := cfg.ClusterName
-	topic, err := cm.pubsub.Join(topicName)
-	if err != nil {
-		_ = consensus.Shutdown(context.Background())
-		return fmt.Errorf("failed to join signal topic %s: %w", topicName, err)
+	topic, joined := cm.signalTopics[topicName]
+	if !joined {
+		topic, err = cm.pubsub.Join(topicName)
+		if err != nil {
+			_ = consensus.Shutdown(context.Background())
+			return fmt.Errorf("failed to join signal topic %s: %w", topicName, err)
+		}
+		cm.signalTopics[topicName] = topic
 	}
 	sub, err := topic.Subscribe()
 	if err != nil {
-		_ = topic.Close()
 		_ = consensus.Shutdown(context.Background())
 		return fmt.Errorf("failed to subscribe to signal topic %s: %w", topicName, err)
 	}
@@ -194,7 +203,6 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string) error {
 
 	go func() {
 		defer sub.Cancel()
-		defer topic.Close()
 		for {
 			select {
 			case <-subCtx.Done():
