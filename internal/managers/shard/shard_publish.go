@@ -70,26 +70,54 @@ func (sm *ShardManager) PublishIngestMessageToCurrentAndChildIfSplit(data []byte
 	}
 }
 
-// ResolveTargetShardForCustodial returns child shard if parent has active children, else nominalTargetShard.
+const (
+	resolveProbeTimeout  = 3 * time.Second
+	maxResolveExtraDepth = 8
+)
+
+// ResolveTargetShardForCustodial finds the shard that currently holds the
+// payload's hash range. Shards split and merge independently, so the tree can
+// be deeper or shallower along the payload's path than the ingesting node's
+// own depth. The resolver descends while a deeper shard on the path has active
+// peers; if none does and the nominal shard is empty, it ascends to the
+// nearest ancestor on the path that has active peers.
 func (sm *ShardManager) ResolveTargetShardForCustodial(nominalTargetShard string, payloadCIDStr string) string {
-	child0, child1 := childShards(nominalTargetShard)
-	const probeTimeout = 2 * time.Second
-	n0 := sm.probeShard(child0, probeTimeout)
-	n1 := sm.probeShard(child1, probeTimeout)
-	if n0 < 1 && n1 < 1 {
+	shardAt := func(depth int) (string, bool) {
+		if depth == 0 {
+			return "", true
+		}
+		s, err := common.TargetShardForPayload(payloadCIDStr, depth)
+		if err != nil {
+			slog.Error("failed to compute custodial target shard", "payload", payloadCIDStr, "error", err)
+			return "", false
+		}
+		return s, true
+	}
+	populated := func(s string) bool { return sm.probeShard(s, resolveProbeTimeout) > 0 }
+
+	target := nominalTargetShard
+	for depth := len(nominalTargetShard) + 1; depth <= len(nominalTargetShard)+maxResolveExtraDepth; depth++ {
+		child, ok := shardAt(depth)
+		if !ok || !populated(child) {
+			break
+		}
+		target = child
+	}
+	if target != nominalTargetShard {
+		slog.Info("custodial target resolved to deeper shard", "nominal", nominalTargetShard, "target", target)
+		return target
+	}
+	if populated(nominalTargetShard) {
 		return nominalTargetShard
 	}
-	depth := len(nominalTargetShard) + 1
-	if depth < 1 {
-		depth = 1
+	for depth := len(nominalTargetShard) - 1; depth >= 0; depth-- {
+		ancestor, ok := shardAt(depth)
+		if ok && populated(ancestor) {
+			slog.Info("custodial target resolved to ancestor shard", "nominal", nominalTargetShard, "target", ancestor)
+			return ancestor
+		}
 	}
-	childShard, err := common.TargetShardForPayload(payloadCIDStr, depth)
-	if err != nil {
-		slog.Error("failed to compute custodial target shard", "payload", payloadCIDStr, "error", err)
-		return nominalTargetShard
-	}
-	slog.Info("custodial target resolved to child shard", "parent", nominalTargetShard, "child", childShard)
-	return childShard
+	return nominalTargetShard
 }
 
 func (sm *ShardManager) AmIResponsibleFor(key string) bool {

@@ -11,6 +11,7 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/peer"
 
+	"dlockss/internal/common"
 	"dlockss/internal/config"
 	"dlockss/internal/managers/storage"
 	"dlockss/internal/testutil"
@@ -213,6 +214,335 @@ func TestMergeRefusal_CooldownPreventsEarlyMerge(t *testing.T) {
 	sm.mu.RUnlock()
 	if current != "00" {
 		t.Errorf("expected to stay in shard 00 (cooldown active), but moved to %s", current)
+	}
+}
+
+// peersHashingTo returns n fake peer IDs whose shard prefix is prefix.
+func peersHashingTo(prefix string, n int) []peer.ID {
+	var out []peer.ID
+	for i := 0; len(out) < n; i++ {
+		pid := peer.ID(fmt.Sprintf("hash-peer-%s-%d", prefix, i))
+		if common.GetBinaryPrefix(pid.String(), len(prefix)) == prefix {
+			out = append(out, pid)
+		}
+	}
+	return out
+}
+
+func recordActive(sm *ShardManager, shardID string, peers []peer.ID) {
+	for _, p := range peers {
+		sm.peers.RecordRole(shardID, p, roleActive)
+	}
+}
+
+func currentShardOf(sm *ShardManager) string {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.currentShard
+}
+
+func TestChildCounts(t *testing.T) {
+	self := peer.ID("self-peer")
+	peers := append(peersHashingTo("00", 3), peersHashingTo("01", 2)...)
+	zero, one := childCounts("0", self, peers)
+	if common.GetBinaryPrefix(self.String(), 2) == "00" {
+		zero--
+	} else {
+		one--
+	}
+	if zero != 3 || one != 2 {
+		t.Errorf("expected 3/2 peers per child excluding self, got %d/%d", zero, one)
+	}
+}
+
+func prepareMerge(t *testing.T, sm *ShardManager) {
+	t.Helper()
+	sm.cfg.Sharding.ProbeTimeoutMerge = 100 * time.Millisecond
+	sm.cfg.Sharding.MergeUpCooldown = 50 * time.Millisecond
+	sm.mu.Lock()
+	sm.lastMoveToDeeperShard = time.Now().Add(-1 * time.Minute)
+	sm.mu.Unlock()
+}
+
+func TestMergeUp_SiblingBelowMinPeers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sm := newTestShardManager(t, ctx, "00")
+	prepareMerge(t, sm)
+	min := sm.cfg.Sharding.MinPeersPerShard
+
+	// Pair total is above MinPeersAcrossSiblings, so the old rule kept the
+	// sibling at 2 copies indefinitely.
+	populateFakeActivePeers(sm, "00", min+2)
+	recordActive(sm, "01", peersHashingTo("01", 2))
+
+	sm.lifecycle.checkAndMergeUpIfAlone()
+	if got := currentShardOf(sm); got != "00" {
+		t.Fatalf("expected to wait for a 2nd check, moved to %s", got)
+	}
+	sm.lifecycle.checkAndMergeUpIfAlone()
+	if got := currentShardOf(sm); got != "0" {
+		t.Errorf("expected merge up to 0 because sibling is below min peers, got %s", got)
+	}
+}
+
+func TestMergeRefusal_SplitInProgress(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sm := newTestShardManager(t, ctx, "00")
+	prepareMerge(t, sm)
+	min := sm.cfg.Sharding.MinPeersPerShard
+
+	// The parent still has members that have not descended yet, so the
+	// small sibling is filling up, not depleted.
+	populateFakeActivePeers(sm, "00", min+2)
+	recordActive(sm, "01", peersHashingTo("01", 2))
+	recordActive(sm, "0", peersHashingTo("01", 3))
+
+	sm.lifecycle.checkAndMergeUpIfAlone()
+	sm.lifecycle.checkAndMergeUpIfAlone()
+	if got := currentShardOf(sm); got != "00" {
+		t.Errorf("expected to stay in 00 while the parent still has members, moved to %s", got)
+	}
+}
+
+// A depleted shard 1 merged into the root, next to the subtree 00/01. The
+// root now holds 2 members that cannot descend, so the subtree merges up.
+func TestMergeUp_StrandedAncestor(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sm := newTestShardManager(t, ctx, "00")
+	prepareMerge(t, sm)
+	sm.cfg.Sharding.MinPeersPerShard = 3
+	sm.cfg.Sharding.SiblingEmptyMergeAfter = 50 * time.Millisecond
+
+	populateFakeActivePeers(sm, "00", 4)
+	recordActive(sm, "01", peersHashingTo("01", 3))
+	recordActive(sm, "", peersHashingTo("1", 2))
+
+	sm.lifecycle.checkAndMergeUpIfAlone()
+	if got := currentShardOf(sm); got != "00" {
+		t.Fatalf("expected to wait SiblingEmptyMergeAfter first, moved to %s", got)
+	}
+	time.Sleep(60 * time.Millisecond)
+	sm.lifecycle.checkAndMergeUpIfAlone()
+	if got := currentShardOf(sm); got != "0" {
+		t.Errorf("expected merge up to 0 toward the stranded root, got %s", got)
+	}
+}
+
+func TestMergeRefusal_AncestorAtMinPeers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sm := newTestShardManager(t, ctx, "00")
+	prepareMerge(t, sm)
+	sm.cfg.Sharding.MinPeersPerShard = 3
+	sm.cfg.Sharding.SiblingEmptyMergeAfter = 50 * time.Millisecond
+
+	populateFakeActivePeers(sm, "00", 4)
+	recordActive(sm, "01", peersHashingTo("01", 3))
+	recordActive(sm, "", peersHashingTo("1", 3))
+
+	sm.lifecycle.checkAndMergeUpIfAlone()
+	time.Sleep(60 * time.Millisecond)
+	sm.lifecycle.checkAndMergeUpIfAlone()
+	if got := currentShardOf(sm); got != "00" {
+		t.Errorf("expected to stay in 00: the root holds min peers, moved to %s", got)
+	}
+}
+
+func TestMergeUp_SelfBelowMinPeers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sm := newTestShardManager(t, ctx, "00")
+	prepareMerge(t, sm)
+	min := sm.cfg.Sharding.MinPeersPerShard
+
+	populateFakeActivePeers(sm, "00", 1)
+	recordActive(sm, "01", peersHashingTo("01", min+3))
+
+	sm.lifecycle.checkAndMergeUpIfAlone()
+	sm.lifecycle.checkAndMergeUpIfAlone()
+	if got := currentShardOf(sm); got != "0" {
+		t.Errorf("expected merge up to 0 because this shard is below min peers, got %s", got)
+	}
+}
+
+func TestMergeRefusal_PairAtMinPeers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sm := newTestShardManager(t, ctx, "00")
+	prepareMerge(t, sm)
+	min := sm.cfg.Sharding.MinPeersPerShard
+
+	populateFakeActivePeers(sm, "00", min-1)
+	recordActive(sm, "01", peersHashingTo("01", min))
+
+	sm.lifecycle.checkAndMergeUpIfAlone()
+	sm.lifecycle.checkAndMergeUpIfAlone()
+	if got := currentShardOf(sm); got != "00" {
+		t.Errorf("expected to stay in 00 with both shards at min peers, moved to %s", got)
+	}
+}
+
+// discoveryAtRoot sets up a root node that knows both children, with five
+// peers in its own child and the given sibling and root membership.
+func discoveryAtRoot(t *testing.T, siblingPeers, rootPeers []peer.ID) *ShardManager {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sm := newTestShardManager(t, ctx, "")
+	sm.cfg.Sharding.MinPeersPerShard = 3
+	own := common.GetBinaryPrefix(sm.h.ID().String(), 1)
+	other := getSiblingShard(own)
+	recordActive(sm, own, peersHashingTo(own, 5))
+	recordActive(sm, other, siblingPeers)
+	recordActive(sm, "", rootPeers)
+	sm.lifecycle.mu.Lock()
+	sm.lifecycle.knownChildShards[own] = time.Now()
+	sm.lifecycle.knownChildShards[other] = time.Now()
+	sm.lifecycle.mu.Unlock()
+	return sm
+}
+
+func TestDiscoveryRefusal_MergedPeersCountedOnce(t *testing.T) {
+	if testing.Short() {
+		t.Skip("probes two shards with the discovery timeout")
+	}
+	// Two peers just merged up from the sibling: they are root members and
+	// still look active in the sibling until SeenPeersWindow passes.
+	sm := discoveryAtRoot(t, nil, nil)
+	sib := getSiblingShard(common.GetBinaryPrefix(sm.h.ID().String(), 1))
+	merged := peersHashingTo(sib, 2)
+	recordActive(sm, sib, merged)
+	recordActive(sm, "", merged)
+
+	sm.lifecycle.discoverAndMoveToDeeperShard()
+	if got := currentShardOf(sm); got != "" {
+		t.Errorf("expected to stay at root: the sibling would get only 2 distinct peers, moved to %s", got)
+	}
+}
+
+func TestDiscoveryAllowed_SiblingAtMinPeers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("probes two shards with the discovery timeout")
+	}
+	sm := discoveryAtRoot(t, nil, nil)
+	own := common.GetBinaryPrefix(sm.h.ID().String(), 1)
+	sib := getSiblingShard(own)
+	recordActive(sm, sib, peersHashingTo(sib, 3))
+	sm.cfg.Sharding.MinPeersAcrossSiblings = 2
+
+	sm.lifecycle.discoverAndMoveToDeeperShard()
+	if got := currentShardOf(sm); got != own {
+		t.Errorf("expected to descend into %s with 3 distinct sibling peers, stayed in %q", own, got)
+	}
+}
+
+// payloadWithPrefix returns a payload key whose shard prefix at len(prefix) is prefix.
+func payloadWithPrefix(prefix string) string {
+	for i := 0; ; i++ {
+		p := fmt.Sprintf("payload-%d", i)
+		if s, _ := common.TargetShardForPayload(p, len(prefix)); s == prefix {
+			return p
+		}
+	}
+}
+
+func TestDiscovery_CompletesHalfFinishedSplit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("probes two shards with the discovery timeout")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sm := newTestShardManager(t, ctx, "")
+	sm.cfg.Sharding.MinPeersPerShard = 3
+	own := common.GetBinaryPrefix(sm.h.ID().String(), 1)
+	other := getSiblingShard(own)
+	// The other half already split off; two more root members hash into our
+	// half, so with self our child would hold 3.
+	recordActive(sm, other, peersHashingTo(other, 4))
+	recordActive(sm, "", peersHashingTo(own, 2))
+	sm.lifecycle.mu.Lock()
+	sm.lifecycle.knownChildShards[other] = time.Now()
+	sm.lifecycle.mu.Unlock()
+
+	sm.lifecycle.discoverAndMoveToDeeperShard()
+	if got := currentShardOf(sm); got != own {
+		t.Errorf("expected to create child %s, stayed in %q", own, got)
+	}
+}
+
+func TestDiscovery_HalfFinishedSplitTooSmall(t *testing.T) {
+	if testing.Short() {
+		t.Skip("probes two shards with the discovery timeout")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sm := newTestShardManager(t, ctx, "")
+	sm.cfg.Sharding.MinPeersPerShard = 3
+	own := common.GetBinaryPrefix(sm.h.ID().String(), 1)
+	other := getSiblingShard(own)
+	recordActive(sm, other, peersHashingTo(other, 4))
+	recordActive(sm, "", peersHashingTo(own, 1))
+	sm.lifecycle.mu.Lock()
+	sm.lifecycle.knownChildShards[other] = time.Now()
+	sm.lifecycle.mu.Unlock()
+
+	sm.lifecycle.discoverAndMoveToDeeperShard()
+	if got := currentShardOf(sm); got != "" {
+		t.Errorf("expected to stay at root with only 2 members for our child, moved to %s", got)
+	}
+}
+
+func TestResolveCustodial_ShallowerTree(t *testing.T) {
+	if testing.Short() {
+		t.Skip("probes shards with the resolve timeout")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sm := newTestShardManager(t, ctx, "00")
+	// The payload's range is still held by unsplit shard 1, although the
+	// ingesting node sits at depth 2.
+	recordActive(sm, "1", peersHashingTo("1", 3))
+
+	if got := sm.ResolveTargetShardForCustodial("10", payloadWithPrefix("10")); got != "1" {
+		t.Errorf("expected target 1 (nearest populated ancestor), got %q", got)
+	}
+}
+
+func TestResolveCustodial_DeeperTree(t *testing.T) {
+	if testing.Short() {
+		t.Skip("probes shards with the resolve timeout")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sm := newTestShardManager(t, ctx, "1")
+	// Shard 0 has split; its members now sit in 00 and 01.
+	recordActive(sm, "00", peersHashingTo("00", 3))
+	recordActive(sm, "01", peersHashingTo("01", 3))
+
+	if got := sm.ResolveTargetShardForCustodial("0", payloadWithPrefix("00")); got != "00" {
+		t.Errorf("expected target 00 (deepest populated shard on the path), got %q", got)
+	}
+}
+
+func TestSplitRefusal_ChildWouldBeBelowMinPeers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sm := newTestShardManager(t, ctx, "0")
+	sm.cfg.Sharding.MaxPeersPerShard = 4
+	sm.cfg.Sharding.MinPeersPerShard = 2
+	sm.cfg.Sharding.ShardPeerCheckInterval = time.Nanosecond
+
+	// Six members, all but possibly self hashing into child 00: half of the
+	// shard size passes the old estimate, but child 01 would get at most one peer.
+	recordActive(sm, "0", peersHashingTo("00", 5))
+
+	sm.lifecycle.checkAndSplitIfNeeded()
+	sm.lifecycle.checkAndSplitIfNeeded()
+	if got := currentShardOf(sm); got != "0" {
+		t.Errorf("expected no split with an unbalanced membership, moved to %s", got)
 	}
 }
 

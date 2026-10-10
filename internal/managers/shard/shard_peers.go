@@ -37,6 +37,20 @@ func (sm *ShardManager) getShardPeerCount(useMeshFallback bool) int {
 	return 0
 }
 
+// activePeersInCurrentShard returns the ACTIVE peers (excluding self) seen in the current shard.
+func (sm *ShardManager) activePeersInCurrentShard() []peer.ID {
+	sm.mu.RLock()
+	currentShard := sm.currentShard
+	sm.mu.RUnlock()
+	return sm.activePeersInShard(currentShard)
+}
+
+// activePeersInShard returns the ACTIVE peers (excluding self) recorded for a
+// shard, from membership or from probing it.
+func (sm *ShardManager) activePeersInShard(shardID string) []peer.ID {
+	return sm.peers.GetActiveForShard(shardID, sm.cfg.Sharding.SeenPeersWindow)
+}
+
 func (sm *ShardManager) GetShardInfo() string {
 	sm.mu.RLock()
 	currentShard := sm.currentShard

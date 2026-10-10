@@ -32,6 +32,8 @@ type lifecycleOps interface {
 	localPeerID() peer.ID
 
 	getShardPeerCount(useMeshFallback bool) int
+	activePeersInCurrentShard() []peer.ID
+	activePeersInShard(shardID string) []peer.ID
 	probeShard(shardID string, timeout time.Duration) int
 
 	moveToShard(from, to string, isMergeUp bool)
@@ -52,8 +54,43 @@ type lifecycleManager struct {
 
 	mu                       sync.Mutex
 	splitAboveThresholdCount int
+	underpopulatedPairCount  int
+	strandedAncestorSince    time.Time
 	knownChildShards         map[string]time.Time
 	lastPeerCheck            time.Time
+}
+
+// childCounts returns how many of self and peers hash into each child of parent.
+// Shard membership is a pure function of the peer ID, so this is the exact
+// child size a split would produce from the given membership view.
+func childCounts(parent string, self peer.ID, peers []peer.ID) (zero, one int) {
+	depth := len(parent) + 1
+	count := func(p peer.ID) {
+		if common.GetBinaryPrefix(p.String(), depth) == parent+"0" {
+			zero++
+		} else {
+			one++
+		}
+	}
+	count(self)
+	for _, p := range peers {
+		if p != self {
+			count(p)
+		}
+	}
+	return zero, one
+}
+
+func uniquePeers(peers []peer.ID) []peer.ID {
+	seen := make(map[peer.ID]struct{}, len(peers))
+	out := peers[:0:0]
+	for _, p := range peers {
+		if _, dup := seen[p]; !dup {
+			seen[p] = struct{}{}
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func newLifecycleManager(ctxFn func() context.Context, cfg *config.Config, ops lifecycleOps) *lifecycleManager {
@@ -71,6 +108,8 @@ func (lm *lifecycleManager) onShardTransition() {
 	defer lm.mu.Unlock()
 	lm.knownChildShards = make(map[string]time.Time)
 	lm.splitAboveThresholdCount = 0
+	lm.underpopulatedPairCount = 0
+	lm.strandedAncestorSince = time.Time{}
 	lm.lastPeerCheck = time.Now()
 }
 
@@ -142,9 +181,9 @@ func (lm *lifecycleManager) checkAndSplitIfNeeded() {
 		return
 	}
 
-	estimatedPerChild := peerCount / 2
-	if estimatedPerChild < lm.cfg.Sharding.MinPeersPerShard {
-		slog.Debug("split would leave too few peers per child", "shard", currentShard, "peers", peerCount, "max_peers", lm.cfg.Sharding.MaxPeersPerShard, "estimated_per_child", estimatedPerChild, "min_peers", lm.cfg.Sharding.MinPeersPerShard)
+	child0, child1 := childCounts(currentShard, lm.ops.localPeerID(), lm.ops.activePeersInCurrentShard())
+	if min(child0, child1) < lm.cfg.Sharding.MinPeersPerShard {
+		slog.Debug("split would leave a child below min peers", "shard", currentShard, "peers", peerCount, "max_peers", lm.cfg.Sharding.MaxPeersPerShard, "child0_peers", child0, "child1_peers", child1, "min_peers", lm.cfg.Sharding.MinPeersPerShard)
 		return
 	}
 
@@ -196,6 +235,64 @@ func (lm *lifecycleManager) checkAndMergeUpIfAlone() {
 	siblingPeerCount := lm.ops.probeShard(siblingShard, lm.cfg.Sharding.ProbeTimeoutMerge)
 	siblingsTotal := currentPeerCount + siblingPeerCount
 
+	// A shard below MinPeersPerShard holds fewer copies than the target, and
+	// replication requests never leave the shard, so only a merge restores the
+	// copy count. A depleted shard merges up whatever its sibling looks like,
+	// because the sibling may already have merged. MergeUpCooldown above keeps
+	// a node that just descended into a still-filling child from bouncing back.
+	if currentPeerCount < lm.cfg.Sharding.MinPeersPerShard {
+		slog.Info("shard below min peers, merging up", "shard", currentShard, "peers", currentPeerCount, "sibling", siblingShard, "sibling_peers", siblingPeerCount, "min_peers", lm.cfg.Sharding.MinPeersPerShard, "target", parentShard)
+		lm.ops.moveToShard(currentShard, parentShard, true)
+		return
+	}
+
+	// The sibling of a depleted shard merges up as well, so the merged parent
+	// holds enough copies. Its count comes from a probe, so it must hold for
+	// two checks. While the parent still has members, a split is in progress
+	// and the small sibling may still be filling, so wait until it has emptied.
+	if parentPeerCount == 0 && siblingPeerCount > 0 && siblingPeerCount < lm.cfg.Sharding.MinPeersPerShard {
+		lm.mu.Lock()
+		lm.underpopulatedPairCount++
+		checks := lm.underpopulatedPairCount
+		lm.mu.Unlock()
+		if checks < 2 {
+			slog.Debug("pair has a shard below min peers, waiting for 2nd consecutive check", "shard", currentShard, "peers", currentPeerCount, "sibling", siblingShard, "sibling_peers", siblingPeerCount, "min_peers", lm.cfg.Sharding.MinPeersPerShard)
+			return
+		}
+		slog.Info("pair has a shard below min peers, merging up", "shard", currentShard, "peers", currentPeerCount, "sibling", siblingShard, "sibling_peers", siblingPeerCount, "min_peers", lm.cfg.Sharding.MinPeersPerShard, "target", parentShard)
+		lm.ops.moveToShard(currentShard, parentShard, true)
+		return
+	}
+	lm.mu.Lock()
+	lm.underpopulatedPairCount = 0
+	lm.mu.Unlock()
+
+	// A depleted shard that merged up next to a sibling subtree leaves an
+	// ancestor with fewer than MinPeersPerShard members. Its range then has
+	// too few copies, and its members cannot descend, because their child
+	// would stay below min peers. The nearest populated ancestor tells this
+	// subtree to merge up one level at a time until that ancestor holds
+	// enough members. A split in progress also leaves members in an ancestor
+	// for a while, so the state must persist for SiblingEmptyMergeAfter.
+	if ancestor, n, found := lm.nearestPopulatedAncestor(currentShard, parentPeerCount); found && n < lm.cfg.Sharding.MinPeersPerShard {
+		lm.mu.Lock()
+		if lm.strandedAncestorSince.IsZero() {
+			lm.strandedAncestorSince = time.Now()
+		}
+		since := time.Since(lm.strandedAncestorSince)
+		lm.mu.Unlock()
+		if since < lm.cfg.Sharding.SiblingEmptyMergeAfter {
+			slog.Debug("ancestor below min peers, waiting before merging up", "shard", currentShard, "ancestor", ancestor, "ancestor_peers", n, "waited", since.Round(time.Second))
+			return
+		}
+		slog.Info("ancestor below min peers, merging up", "shard", currentShard, "ancestor", ancestor, "ancestor_peers", n, "min_peers", lm.cfg.Sharding.MinPeersPerShard, "target", parentShard)
+		lm.ops.moveToShard(currentShard, parentShard, true)
+		return
+	}
+	lm.mu.Lock()
+	lm.strandedAncestorSince = time.Time{}
+	lm.mu.Unlock()
+
 	if siblingPeerCount == 0 {
 		if lastMove.IsZero() || time.Since(lastMove) < lm.cfg.Sharding.SiblingEmptyMergeAfter {
 			slog.Debug("sibling empty, possible split in progress", "shard", currentShard, "peers", currentPeerCount, "sibling", siblingShard)
@@ -222,6 +319,23 @@ func (lm *lifecycleManager) checkAndMergeUpIfAlone() {
 	slog.Info("siblings below threshold, merging up", "total", siblingsTotal, "min_across_siblings", lm.cfg.Sharding.MinPeersAcrossSiblings, "shard", currentShard, "peers", currentPeerCount, "sibling", siblingShard, "sibling_peers", siblingPeerCount, "target", parentShard)
 
 	lm.ops.moveToShard(currentShard, parentShard, true)
+}
+
+// nearestPopulatedAncestor walks from the parent toward the root and returns
+// the first ancestor with active peers. parentPeers is the already probed
+// count for the parent.
+func (lm *lifecycleManager) nearestPopulatedAncestor(shard string, parentPeers int) (ancestor string, peers int, found bool) {
+	for depth := len(shard) - 1; depth >= 0; depth-- {
+		a := shard[:depth]
+		n := parentPeers
+		if depth != len(shard)-1 {
+			n = lm.ops.probeShard(a, lm.cfg.Sharding.ProbeTimeoutMerge)
+		}
+		if n > 0 {
+			return a, n, true
+		}
+	}
+	return "", 0, false
 }
 
 // --- Discovery ---
@@ -258,14 +372,46 @@ func (lm *lifecycleManager) discoverAndMoveToDeeperShard() {
 	}
 
 	childPeerCount := lm.ops.probeShard(targetChild, probeTimeoutDiscovery)
+	siblingPeerCount := lm.ops.probeShard(siblingShard, probeTimeoutDiscovery)
 	if childPeerCount < 1 {
+		// Half-finished split: the sibling child exists, but once its members
+		// left, this shard fell below MaxPeersPerShard and the split rule no
+		// longer fires for the members of the other half. Create our child if
+		// enough current members hash into it.
+		zero, one := childCounts(currentShard, lm.ops.localPeerID(), lm.ops.activePeersInCurrentShard())
+		ownChild := zero
+		if strings.HasSuffix(targetChild, "1") {
+			ownChild = one
+		}
+		if siblingPeerCount >= lm.cfg.Sharding.MinPeersPerShard && ownChild >= lm.cfg.Sharding.MinPeersPerShard {
+			slog.Info("completing split, creating child", "shard", currentShard, "child", targetChild, "projected_child_peers", ownChild, "sibling", siblingShard, "sibling_peers", siblingPeerCount)
+			lm.ops.moveToShard(currentShard, targetChild, false)
+			return
+		}
 		if currentShard != "" {
 			slog.Debug("child has too few peers for discovery", "shard", currentShard, "child", targetChild, "child_peers", childPeerCount)
 		}
 		return
 	}
 
-	siblingPeerCount := lm.ops.probeShard(siblingShard, probeTimeoutDiscovery)
+
+	// Every member of the current shard eventually descends by its own hash.
+	// Do not start a descent that would leave either child below min peers;
+	// that would undo a merge of an under-populated pair. Peers that just
+	// merged up still look active in their old child for SeenPeersWindow, so
+	// count distinct peer IDs across the parent and both children.
+	known := append(lm.ops.activePeersInCurrentShard(), lm.ops.activePeersInShard(targetChild)...)
+	known = append(known, lm.ops.activePeersInShard(siblingShard)...)
+	zero, one := childCounts(currentShard, lm.ops.localPeerID(), uniquePeers(known))
+	projectedTarget, projectedSibling := zero, one
+	if strings.HasSuffix(targetChild, "1") {
+		projectedTarget, projectedSibling = one, zero
+	}
+	if min(projectedTarget, projectedSibling) < lm.cfg.Sharding.MinPeersPerShard {
+		slog.Debug("descending would leave a child below min peers", "shard", currentShard, "child", targetChild, "projected_child_peers", projectedTarget, "sibling", siblingShard, "projected_sibling_peers", projectedSibling, "min_peers", lm.cfg.Sharding.MinPeersPerShard)
+		return
+	}
+
 	ourChildAfter := childPeerCount + 1
 	pairTotalAfter := ourChildAfter + siblingPeerCount
 	if pairTotalAfter < lm.cfg.Sharding.MinPeersAcrossSiblings {

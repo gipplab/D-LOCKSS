@@ -274,7 +274,11 @@ func (fp *FileProcessor) announceCustodialFile(manifestCID cid.Cid, manifestCIDS
 	targetShard := fp.shardMgr.ResolveTargetShardForCustodial(nominalTarget, payloadCIDStr)
 
 	if targetShard == currentShard {
-		slog.Error("custodial path target equals current shard", "target_shard", targetShard)
+		// The payload's range is held by this node's own shard after all.
+		if err := fp.shardMgr.PinToCluster(fp.ctx, manifestCID); err != nil {
+			slog.Error("error pinning to cluster", "error", err)
+		}
+		fp.announceResponsibleFile(manifestCID, manifestCIDStr, payloadCIDStr)
 		return
 	}
 
