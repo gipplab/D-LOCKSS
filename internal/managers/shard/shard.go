@@ -203,6 +203,7 @@ func (sm *ShardManager) Run() {
 	go sm.lifecycle.runSplitRebroadcast()
 	go sm.runHeartbeat()
 	go sm.runOrphanUnpinLoop()
+	go sm.runCustodialRetryLoop()
 	go sm.repl.runChecker()
 	go sm.runReannouncePinsLoop()
 	go sm.runReshardedFilesSaveLoop()
