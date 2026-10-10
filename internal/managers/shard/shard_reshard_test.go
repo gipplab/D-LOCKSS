@@ -23,6 +23,7 @@ type recordingStorage struct {
 	pinnedFiles  map[string]bool
 	pinTimes     map[string]time.Time
 	unpinnedKeys []string
+	providers    int // reported by ProviderCount for every key
 }
 
 func newRecordingStorage() *recordingStorage {
@@ -83,6 +84,9 @@ func (s *recordingStorage) AddKnownFile(key string) {
 	s.knownFiles[key] = true
 }
 func (s *recordingStorage) ProvideFile(_ context.Context, _ string) {}
+func (s *recordingStorage) ProviderCount(_ context.Context, _ string, _ peer.ID, limit int) int {
+	return min(s.providers, limit)
+}
 
 type recordingCluster struct {
 	mu       sync.Mutex
@@ -195,6 +199,7 @@ func TestRunReshardPass_FileUnpinnedWhenLeavingShard(t *testing.T) {
 	cluster := &recordingCluster{}
 	sm := buildTestSM(ctx, storage, cluster)
 	sm.signer = nil // no replication request will be sent
+	storage.providers = 10
 
 	// Generate two CID-like keys. We need keys where one maps to "0" and
 	// the other maps to "1" at depth 1, so that a split from "" -> "0"
@@ -228,6 +233,35 @@ func TestRunReshardPass_FileUnpinnedWhenLeavingShard(t *testing.T) {
 		prefix, _ := common.GetHexBinaryPrefix(stableHex, 1)
 		if prefix == "0" {
 			t.Errorf("unpinned CID %s maps to shard 0, should not be unpinned", unpinnedCID)
+		}
+	}
+}
+
+// A file leaving the shard stays pinned until enough other peers advertise
+// it; the handoff request may have been lost.
+func TestRunReshardPass_KeepsFileWithoutConfirmedHandoff(t *testing.T) {
+	ctx := context.Background()
+	storage := newRecordingStorage()
+	cluster := &recordingCluster{}
+	sm := buildTestSM(ctx, storage, cluster)
+	sm.signer = nil
+	storage.providers = sm.cfg.Sharding.MinPeersPerShard - 1
+
+	keys := generateKeysForBothChildShards(t)
+	for _, key := range keys {
+		storage.AddKnownFile(key)
+		storage.PinFile(key)
+	}
+
+	sm.currentShard = "0"
+	sm.RunReshardPass("", "0")
+
+	if len(cluster.unpinned) != 0 {
+		t.Errorf("expected no unpins without confirmed handoff, got %v", cluster.unpinned)
+	}
+	for _, key := range keys {
+		if !storage.IsPinned(key) {
+			t.Errorf("file %s should still be pinned", key)
 		}
 	}
 }

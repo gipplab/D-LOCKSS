@@ -95,7 +95,7 @@ func (sm *ShardManager) orphanHandoffOrUnpin(key, targetChild, currentShard stri
 	}
 
 	readyToUnpin := info != nil && info.count >= minCount && time.Since(info.lastSent) >= sm.cfg.Orphan.HandoffGrace
-	if !readyToUnpin {
+	if !readyToUnpin || !sm.handoffConfirmed(key) {
 		sm.sendOrphanHandoff(key, targetChild, manifestCID)
 		return false
 	}

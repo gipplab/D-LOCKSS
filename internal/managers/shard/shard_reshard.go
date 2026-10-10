@@ -1,14 +1,36 @@
 package shard
 
 import (
+	"context"
 	"log/slog"
 	"time"
 
 	"github.com/ipfs/go-cid"
+	"github.com/libp2p/go-libp2p/core/peer"
 
 	"dlockss/internal/common"
 	"dlockss/pkg/schema"
 )
+
+const handoffConfirmTimeout = 30 * time.Second
+
+// handoffConfirmed reports whether at least MinPeersPerShard other peers
+// advertise the manifest, so dropping the local copy cannot remove the last
+// ones. Handoff messages can be lost (rate limits, a mesh not yet formed), so
+// sending a request alone is no evidence that the target shard took the file.
+func (sm *ShardManager) handoffConfirmed(key string) bool {
+	return sm.otherProvidersAtLeast(key, sm.cfg.Sharding.MinPeersPerShard)
+}
+
+func (sm *ShardManager) otherProvidersAtLeast(key string, need int) bool {
+	var self peer.ID
+	if sm.h != nil {
+		self = sm.h.ID()
+	}
+	ctx, cancel := context.WithTimeout(sm.ctx, handoffConfirmTimeout)
+	defer cancel()
+	return sm.storageMgr.ProviderCount(ctx, key, self, need) >= need
+}
 
 // RunReshardPass migrates or unpins files when moving between shards.
 func (sm *ShardManager) RunReshardPass(oldShard, newShard string) {
@@ -84,12 +106,23 @@ func (sm *ShardManager) RunReshardPass(oldShard, newShard string) {
 						}
 					}
 				}
+				if !sm.handoffConfirmed(key) {
+					slog.Info("reshard: keeping file until its shard holds min copies", "shard", newShard, "target_shard", targetNew, "manifest", key)
+					continue
+				}
 				slog.Info("reshard: unpinning file that no longer belongs to shard", "shard", newShard, "manifest", key)
 				if err := sm.clusterMgr.Unpin(sm.ctx, oldShard, manifestCID); err != nil {
 					slog.Error("reshard: unpin from old shard failed", "manifest", key, "error", err)
 				}
 				if err := sm.ipfsClient.UnpinRecursive(sm.ctx, manifestCID); err != nil {
 					slog.Error("reshard: IPFS unpin failed", "manifest", key, "error", err)
+				}
+				// The reprovide loop pins the payload separately; without this the
+				// node keeps a copy of every range it ever belonged to.
+				if payloadCID, err := cid.Decode(payloadCIDStr); err == nil && payloadCIDStr != key {
+					if err := sm.ipfsClient.UnpinRecursive(sm.ctx, payloadCID); err != nil {
+						slog.Debug("reshard: payload unpin failed", "payload", payloadCIDStr, "error", err)
+					}
 				}
 				sm.storageMgr.UnpinFile(key)
 			}

@@ -37,6 +37,7 @@ type StorageReader interface {
 	GetPinnedManifests() []string
 	GetPinnedCount() int
 	GetNextFileToAnnounce() string
+	ProviderCount(ctx context.Context, key string, self peer.ID, limit int) int
 }
 
 // StorageWriter provides mutating operations on the local pin/file state.

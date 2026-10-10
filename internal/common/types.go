@@ -14,6 +14,7 @@ import (
 type DHTProvider interface {
 	Provide(ctx context.Context, key cid.Cid, broadcast bool) error
 	FindPeer(ctx context.Context, id peer.ID) (peer.AddrInfo, error)
+	FindProvidersAsync(ctx context.Context, key cid.Cid, count int) <-chan peer.AddrInfo
 }
 
 // PinnedSet tracks which files/manifests are currently pinned.

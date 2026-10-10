@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ipfs/go-cid"
+	"github.com/libp2p/go-libp2p/core/peer"
 
 	"dlockss/internal/badbits"
 	"dlockss/internal/common"
@@ -167,6 +168,33 @@ func (sm *StorageManager) ProvideFile(ctx context.Context, key string) {
 }
 
 // GetAllKnownFiles returns a snapshot of all known file keys.
+// ProviderCount returns how many distinct peers other than self advertise key,
+// stopping once limit is reached or ctx ends.
+func (sm *StorageManager) ProviderCount(ctx context.Context, key string, self peer.ID, limit int) int {
+	c, err := cid.Decode(key)
+	if err != nil || sm.dht == nil {
+		return 0
+	}
+	ch := sm.dht.FindProvidersAsync(ctx, c, limit+1)
+	seen := make(map[peer.ID]struct{})
+	for {
+		select {
+		case <-ctx.Done():
+			return len(seen)
+		case pi, ok := <-ch:
+			if !ok {
+				return len(seen)
+			}
+			if pi.ID != self {
+				seen[pi.ID] = struct{}{}
+			}
+			if len(seen) >= limit {
+				return len(seen)
+			}
+		}
+	}
+}
+
 func (sm *StorageManager) GetAllKnownFiles() map[string]bool {
 	return sm.knownFiles.All()
 }
