@@ -18,12 +18,13 @@ import (
 // --- test doubles ---
 
 type recordingStorage struct {
-	mu           sync.Mutex
-	knownFiles   map[string]bool
-	pinnedFiles  map[string]bool
-	pinTimes     map[string]time.Time
-	unpinnedKeys []string
-	providers    int // reported by ProviderCount for every key
+	mu             sync.Mutex
+	knownFiles     map[string]bool
+	pinnedFiles    map[string]bool
+	pinTimes       map[string]time.Time
+	unpinnedKeys   []string
+	providers      int            // reported by ProviderCount for every key
+	providersByKey map[string]int // per-key override; nil keeps providers
 }
 
 func newRecordingStorage() *recordingStorage {
@@ -84,7 +85,12 @@ func (s *recordingStorage) AddKnownFile(key string) {
 	s.knownFiles[key] = true
 }
 func (s *recordingStorage) ProvideFile(_ context.Context, _ string) {}
-func (s *recordingStorage) ProviderCount(_ context.Context, _ string, _ peer.ID, limit int) int {
+func (s *recordingStorage) ProviderCount(_ context.Context, key string, _ peer.ID, limit int) int {
+	if s.providersByKey != nil {
+		if n, ok := s.providersByKey[key]; ok {
+			return min(n, limit)
+		}
+	}
 	return min(s.providers, limit)
 }
 
