@@ -52,6 +52,9 @@ type pinWatcher struct {
 	pending map[string]struct{}
 	// failed holds the time of the last failed ingest per pin.
 	failed map[string]time.Time
+	// blocked is the reason the last poll ingested nothing, so each reason
+	// is logged once rather than on every poll.
+	blocked string
 }
 
 func newPinWatcher(fp *FileProcessor) *pinWatcher {
@@ -83,13 +86,24 @@ func (fp *FileProcessor) WatchPins(ctx context.Context) {
 	}
 }
 
+func (w *pinWatcher) setBlocked(reason string, args ...any) {
+	if reason == w.blocked {
+		return
+	}
+	w.blocked = reason
+	if reason != "" {
+		slog.Warn("pin ingest: "+reason, args...)
+	}
+}
+
 func (w *pinWatcher) poll(ctx context.Context) {
 	if !w.fp.shardMgr.IsLocalNodeIngestor() {
+		w.setBlocked("this node is not on the ingest allowlist; pins are not ingested", "peer", w.fp.shardMgr.PeerID())
 		return
 	}
 	pins, err := w.fp.ipfsClient.RecursivePins(ctx)
 	if err != nil {
-		slog.Warn("pin ingest: listing pins failed", "error", err)
+		w.setBlocked("listing pins failed", "error", err)
 		return
 	}
 
@@ -97,7 +111,7 @@ func (w *pinWatcher) poll(ctx context.Context) {
 	// of a manifest.
 	covered := make(map[string]struct{})
 	classes := make(map[cid.Cid]pinClass, len(pins))
-	unknown := 0
+	var unknown []cid.Cid
 	for c, name := range pins {
 		cl := w.classify(ctx, c, name)
 		classes[c] = cl
@@ -108,16 +122,17 @@ func (w *pinWatcher) poll(ctx context.Context) {
 				covered[string(cl.payload.Hash())] = struct{}{}
 			}
 		case pinUnknown:
-			unknown++
+			unknown = append(unknown, c)
 		}
 	}
 	w.classes = classes
 	// An unreadable pin may be a manifest whose payload would then look like
 	// a user pin.
-	if unknown > 0 {
-		slog.Debug("pin ingest: skipping pass, some pins could not be classified", "unknown", unknown)
+	if len(unknown) > 0 {
+		w.setBlocked("pins that cannot be read block ingest until they can", "count", len(unknown), "example", unknown[0])
 		return
 	}
+	w.setBlocked("")
 
 	now := time.Now()
 	pending := make(map[string]struct{})
@@ -137,6 +152,7 @@ func (w *pinWatcher) poll(ctx context.Context) {
 			continue
 		}
 		if _, seen := w.pending[key]; !seen {
+			slog.Info("pin ingest: new pin found, ingesting on the next poll", "cid", c, "name", pins[c])
 			continue
 		}
 		if ctx.Err() != nil {
