@@ -19,7 +19,6 @@ class ClusterManager {
     + Pin(ctx, shardID, cid, repMin, repMax)
     + Unpin(ctx, shardID, cid)
     + ListPins(ctx, shardID)
-    + GetAllocations(ctx, shardID, cid)
     + GetPeerCount(ctx, shardID)
     + MigratePins(ctx, fromShard, toShard)
     + TriggerSync(shardID)
@@ -306,8 +305,6 @@ class ShardingConfig {
 }
 
 class ReplicationConfig {
-    + MinReplication: int
-    + MaxReplication: int
     + CheckInterval: time.Duration
     + AutoReplicationEnabled: bool
     + AutoReplicationTimeout: time.Duration

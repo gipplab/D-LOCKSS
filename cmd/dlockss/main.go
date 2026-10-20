@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"log/slog"
 	"os"
@@ -42,6 +43,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
+	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	"github.com/pbnjay/memory"
 )
@@ -110,7 +112,11 @@ func main() {
 
 	// This DHT is the node's own, separate from the IPFS daemon's, and is
 	// used for rendezvous.
-	kademliaDHT, err := kaddht.New(ctx, h)
+	var dhtOpts []kaddht.Option
+	if cfg.DHTClient {
+		dhtOpts = append(dhtOpts, kaddht.Mode(kaddht.ModeClient))
+	}
+	kademliaDHT, err := kaddht.New(ctx, h, dhtOpts...)
 	if err != nil {
 		log.Fatalf("[Fatal] Failed to create DHT: %v", err)
 	}
@@ -260,7 +266,12 @@ func newResourceManager() (network.ResourceManager, error) {
 }
 
 func newHost(cfg *config.Config, privKey crypto.PrivKey, rcm network.ResourceManager, bandwidth *libp2pmetrics.BandwidthCounter) (host.Host, error) {
+	cm, err := connmgr.NewConnManager(cfg.ConnLowWater, cfg.ConnHighWater)
+	if err != nil {
+		return nil, fmt.Errorf("connection manager: %w", err)
+	}
 	opts := []libp2p.Option{
+		libp2p.ConnectionManager(cm),
 		libp2p.ResourceManager(rcm),
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings(

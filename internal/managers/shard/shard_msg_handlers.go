@@ -65,7 +65,7 @@ func (sm *ShardManager) handleIngestMessage(msg *pubsub.Message, im *schema.Inge
 		return
 	}
 
-	if err := sm.clusterMgr.PinIfAbsent(sm.ctx, shardID, im.ManifestCID, -1, -1); err != nil {
+	if err := sm.clusterMgr.PinIfAbsent(sm.ctx, shardID, im.ManifestCID); err != nil {
 		slog.Error("failed to pin ingested file to cluster", "manifest", key, "error", err)
 	}
 	sm.clusterMgr.TriggerSync(shardID)

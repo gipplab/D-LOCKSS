@@ -112,10 +112,8 @@ func (pt *localPinTracker) syncState(consensus consensusClient) {
 		_ = st.List(pt.ctx, out)
 	}()
 
-	// Every shard member pins everything in the shard's CRDT. Allocations are
-	// informational (target replication for monitoring) and are ignored here,
-	// so "pin everywhere" pins from PinIfAbsent and pins with explicit
-	// allocations from the ingesting node are treated alike.
+	// Every shard member pins everything in the shard's CRDT. Allocations in
+	// pins written by older versions are ignored.
 	shouldHave := make(map[string]struct{})
 
 	for pin := range out {

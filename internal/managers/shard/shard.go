@@ -316,7 +316,7 @@ func (sm *ShardManager) ensureCluster(ctx context.Context, shardID string) error
 	return sm.EnsureClusterForShard(ctx, shardID)
 }
 func (sm *ShardManager) clusterPinIfAbsent(ctx context.Context, shardID string, c cid.Cid) error {
-	return sm.clusterMgr.PinIfAbsent(ctx, shardID, c, -1, -1)
+	return sm.clusterMgr.PinIfAbsent(ctx, shardID, c)
 }
 func (sm *ShardManager) isLegacyManifest(cidStr string) bool {
 	ctx, cancel := context.WithTimeout(sm.ctx, 5*time.Second)

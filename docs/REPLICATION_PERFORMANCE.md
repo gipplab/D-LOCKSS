@@ -20,8 +20,8 @@ Replication in D-LOCKSS is driven by two complementary mechanisms:
 | Auto-Replication Timeout | 5 minutes | `DLOCKSS_AUTO_REPLICATION_TIMEOUT` | `config.Replication.AutoReplicationTimeout` |
 | Max Concurrent Checks | 5 | `DLOCKSS_MAX_CONCURRENT_CHECKS` | `config.Replication.MaxConcurrentReplicationChecks` |
 | Pin Reannounce Interval | 2 minutes | `DLOCKSS_PIN_REANNOUNCE_INTERVAL` | `config.Replication.PinReannounceInterval` |
-| Min Replication | 5 | `DLOCKSS_MIN_REPLICATION` | `config.Replication.MinReplication` |
-| Max Replication | 10 | `DLOCKSS_MAX_REPLICATION` | `config.Replication.MaxReplication` |
+| Min Peers Per Shard (min copies) | 6 | `DLOCKSS_MIN_PEERS_PER_SHARD` | `config.Sharding.MinPeersPerShard` |
+| Max Peers Per Shard (max copies) | 12 | `DLOCKSS_MAX_PEERS_PER_SHARD` | `config.Sharding.MaxPeersPerShard` |
 
 ## Convergence Timeline
 
@@ -112,7 +112,7 @@ export DLOCKSS_MAX_CONCURRENT_CHECKS=10
 
 The monitor's `replication snapshot` log line reports:
 - `total_manifests`: Number of known manifests
-- `total_at_target`: Files with replica count >= min(MinReplication, shard_peer_count)
+- `total_at_target`: Files with replica count >= min(MinPeersPerShard, shard_peer_count)
 - `avg_replication`: Average replica count across all manifests
 
 Node daemon logs to watch:

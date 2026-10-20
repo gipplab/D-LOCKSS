@@ -56,9 +56,10 @@ export DLOCKSS_NODE_NAME="my-node"            # Human-readable name (shown in mo
 export DLOCKSS_IDENTITY_PATH="/data/dlockss.key"  # Persistent identity key location (fallback if IPFS node config cannot be read)
 export DLOCKSS_IPFS_CONFIG="/path/to/ipfs/config" # Kubo config JSON (derives identity from IPFS repo)
 
-# Replication Targets
-export DLOCKSS_MIN_REPLICATION=5
-export DLOCKSS_MAX_REPLICATION=10
+# Copies per file: every shard member holds every file of its shard, so the
+# shard size bounds the copies (shards split above max and merge below min).
+export DLOCKSS_MIN_PEERS_PER_SHARD=6
+export DLOCKSS_MAX_PEERS_PER_SHARD=12
 
 # Network
 export DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/5001"

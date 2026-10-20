@@ -218,7 +218,7 @@ func (sm *ShardManager) reannounceToOwnShard(key string) bool {
 		return false
 	}
 	currentShard := sm.getCurrentShard()
-	if err := sm.clusterMgr.PinIfAbsent(sm.ctx, currentShard, manifestCID, -1, -1); err != nil {
+	if err := sm.clusterMgr.PinIfAbsent(sm.ctx, currentShard, manifestCID); err != nil {
 		slog.Error("re-announce: failed to pin to own shard", "shard", currentShard, "error", err)
 		return false
 	}
@@ -268,7 +268,7 @@ func (sm *ShardManager) reinjectCustodial(key, payloadCIDStr string) bool {
 		slog.Error("custodial retry: failed to join target cluster", "target_shard", target, "error", err)
 		return false
 	}
-	if err := sm.clusterMgr.Pin(sm.ctx, target, manifestCID, -1, -1); err != nil {
+	if err := sm.clusterMgr.Pin(sm.ctx, target, manifestCID); err != nil {
 		slog.Error("custodial retry: failed to pin to target shard", "target_shard", target, "error", err)
 		return false
 	}

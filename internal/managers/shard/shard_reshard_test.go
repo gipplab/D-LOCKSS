@@ -111,13 +111,13 @@ func (c *recordingCluster) JoinShard(_ context.Context, shardID string) error {
 	return nil
 }
 func (c *recordingCluster) LeaveShard(_ string) error { return nil }
-func (c *recordingCluster) Pin(_ context.Context, _ string, cc cid.Cid, _, _ int) error {
+func (c *recordingCluster) Pin(_ context.Context, _ string, cc cid.Cid) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.pinned = append(c.pinned, cc.String())
 	return nil
 }
-func (c *recordingCluster) PinIfAbsent(_ context.Context, _ string, cc cid.Cid, _, _ int) error {
+func (c *recordingCluster) PinIfAbsent(_ context.Context, _ string, cc cid.Cid) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.pinned = append(c.pinned, cc.String())
@@ -128,9 +128,6 @@ func (c *recordingCluster) Unpin(_ context.Context, _ string, cc cid.Cid) error 
 	defer c.mu.Unlock()
 	c.unpinned = append(c.unpinned, cc.String())
 	return nil
-}
-func (c *recordingCluster) GetAllocations(_ context.Context, _ string, _ cid.Cid) ([]peer.ID, error) {
-	return nil, nil
 }
 func (c *recordingCluster) GetPeerCount(_ context.Context, _ string) (int, error) { return 0, nil }
 func (c *recordingCluster) MigratePins(_ context.Context, _, _ string) error      { return nil }

@@ -29,7 +29,6 @@ const (
 	maxShardDepthForTreeDisplay  = 8
 	defaultNodeCleanupTimeout    = 350 * time.Second
 	replicationAnnounceTTL       = 350 * time.Second
-	monitorMinReplication        = 5
 	replicationCleanupEvery      = 1 * time.Minute
 	identityFileName             = "monitor_identity.key"
 	// Gossip-sub can deliver heartbeats 20-30s late, so a second sibling move
@@ -40,6 +39,10 @@ const (
 	// first heartbeats seen from a node can be stale.
 	unpinGracePeriod = 30 * time.Second
 )
+
+// replicationTarget is the number of copies a file should have: nodes keep at
+// least MinPeersPerShard members per shard, and every member holds every file.
+var replicationTarget = config.DefaultConfig().Sharding.MinPeersPerShard
 
 // Config holds runtime-configurable settings for the monitor,
 // overridable via environment variables.

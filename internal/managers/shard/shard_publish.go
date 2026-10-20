@@ -176,7 +176,7 @@ func (sm *ShardManager) AmIResponsibleFor(key string) bool {
 }
 
 func (sm *ShardManager) PinToCluster(ctx context.Context, c cid.Cid) error {
-	return sm.clusterMgr.Pin(ctx, sm.getCurrentShard(), c, -1, -1)
+	return sm.clusterMgr.Pin(ctx, sm.getCurrentShard(), c)
 }
 
 func (sm *ShardManager) EnsureClusterForShard(ctx context.Context, shardID string) error {
@@ -184,5 +184,5 @@ func (sm *ShardManager) EnsureClusterForShard(ctx context.Context, shardID strin
 }
 
 func (sm *ShardManager) PinToShard(ctx context.Context, shardID string, c cid.Cid) error {
-	return sm.clusterMgr.Pin(ctx, shardID, c, -1, -1)
+	return sm.clusterMgr.Pin(ctx, shardID, c)
 }

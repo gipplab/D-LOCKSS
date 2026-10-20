@@ -4,11 +4,8 @@ package clusters
 
 import (
 	"context"
-	"crypto/sha256"
-	"errors"
 	"fmt"
 	"log/slog"
-	"sort"
 	"sync"
 	"time"
 
@@ -34,17 +31,16 @@ import (
 type ClusterManagerInterface interface {
 	JoinShard(ctx context.Context, shardID string) error
 	LeaveShard(shardID string) error
-	Pin(ctx context.Context, shardID string, c cid.Cid, replicationFactorMin, replicationFactorMax int) error
-	PinIfAbsent(ctx context.Context, shardID string, c cid.Cid, replicationFactorMin, replicationFactorMax int) error
+	Pin(ctx context.Context, shardID string, c cid.Cid) error
+	PinIfAbsent(ctx context.Context, shardID string, c cid.Cid) error
 	Unpin(ctx context.Context, shardID string, c cid.Cid) error
-	GetAllocations(ctx context.Context, shardID string, c cid.Cid) ([]peer.ID, error)
 	GetPeerCount(ctx context.Context, shardID string) (int, error)
 	MigratePins(ctx context.Context, fromShard, toShard string) error
 	TriggerSync(shardID string)
 }
 
 // ShardPeerProvider supplies the peers of a shard (e.g. its pubsub mesh). The
-// CRDT uses them for Peers() and pin allocations.
+// CRDT uses them for Peers().
 type ShardPeerProvider interface {
 	GetPeersForShard(shardID string) []peer.ID
 }
@@ -258,92 +254,36 @@ func (cm *ClusterManager) shardCluster(shardID string) (*embeddedCluster, error)
 	return cluster, nil
 }
 
-// SelectAllocations deterministically chooses n of peers for c, so every node
-// computes the same replica set for the same CID. When n covers all peers,
-// they are returned sorted.
-func SelectAllocations(peers []peer.ID, c cid.Cid, n int) []peer.ID {
-	if n <= 0 || len(peers) == 0 {
-		return nil
-	}
-	sorted := make([]peer.ID, len(peers))
-	copy(sorted, peers)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].String() < sorted[j].String() })
-	if n >= len(sorted) {
-		return sorted
-	}
-	h := sha256.Sum256(c.Bytes())
-	start := (int(h[0])<<8 | int(h[1])) % len(sorted)
-	out := make([]peer.ID, 0, n)
-	for i := 0; i < n; i++ {
-		out = append(out, sorted[(start+i)%len(sorted)])
-	}
-	return out
-}
-
-// Pin submits a pin to the shard's cluster.
-func (cm *ClusterManager) Pin(ctx context.Context, shardID string, c cid.Cid, replicationFactorMin, replicationFactorMax int) error {
+// Pin submits a pin to the shard's cluster. Every shard member pins every
+// file of its shard, so the pin has no allocations and replication factors
+// of -1, which ipfs-cluster reads as "pin everywhere".
+func (cm *ClusterManager) Pin(ctx context.Context, shardID string, c cid.Cid) error {
 	cluster, err := cm.shardCluster(shardID)
 	if err != nil {
 		return err
 	}
-
-	// A negative factor selects the configured default. 0,0 requests full
-	// replication: no allocations are computed and every shard member pins.
-	repMin := replicationFactorMin
-	repMax := replicationFactorMax
-	if repMin < 0 {
-		repMin = cm.cfg.Replication.MinReplication
-	}
-	if repMax < 0 {
-		repMax = cm.cfg.Replication.MaxReplication
-	}
-
-	var allocations []peer.ID
-	if repMin > 0 || repMax > 0 {
-		peers, err := cluster.consensus.Peers(ctx)
-		if err != nil {
-			slog.Warn("failed to get peers, using full replication", "shard", shardID, "error", err)
-		}
-		if n := len(peers); n > 0 {
-			repMax = min(repMax, n)
-			repMin = min(repMin, n)
-		}
-		allocations = SelectAllocations(peers, c, repMax)
-		if len(allocations) == 0 && len(peers) > 0 {
-			allocations = SelectAllocations(peers, c, repMin)
-		}
-	} else {
-		// Full replication (used during migration): record the configured
-		// factors as metadata but leave Allocations empty so all nodes pin.
-		repMin = cm.cfg.Replication.MinReplication
-		repMax = cm.cfg.Replication.MaxReplication
-	}
-
 	pin := api.Pin{
-		Cid:         api.NewCid(c),
-		Type:        api.DataType,
-		Allocations: allocations,
-		MaxDepth:    -1, // Recursive
+		Cid:      api.NewCid(c),
+		Type:     api.DataType,
+		MaxDepth: -1,
 	}
-	pin.ReplicationFactorMin = repMin
-	pin.ReplicationFactorMax = repMax
-
+	pin.ReplicationFactorMin = -1
+	pin.ReplicationFactorMax = -1
 	if err := cluster.consensus.LogPin(ctx, pin); err != nil {
 		return fmt.Errorf("failed to log pin to CRDT: %w", err)
 	}
-
-	slog.Info("pinning to shard", "cid", c, "shard", shardID, "rep_min", repMin, "rep_max", repMax, "allocations", len(allocations))
+	slog.Info("pinning to shard", "cid", c, "shard", shardID)
 	return nil
 }
 
-// PinIfAbsent writes a pin to the CRDT only if the CID is not already tracked.
-// This prevents overwriting allocations computed by the ingesting node when
-// multiple nodes handle the same IngestMessage or ReplicationRequest.
-func (cm *ClusterManager) PinIfAbsent(ctx context.Context, shardID string, c cid.Cid, replicationFactorMin, replicationFactorMax int) error {
-	if _, err := cm.GetAllocations(ctx, shardID, c); err == nil {
+// PinIfAbsent writes a pin to the CRDT only if the CID is not already
+// tracked, so handling the same IngestMessage or ReplicationRequest on
+// several nodes does not rewrite it.
+func (cm *ClusterManager) PinIfAbsent(ctx context.Context, shardID string, c cid.Cid) error {
+	if cm.hasPin(ctx, shardID, c) {
 		return nil
 	}
-	return cm.Pin(ctx, shardID, c, replicationFactorMin, replicationFactorMax)
+	return cm.Pin(ctx, shardID, c)
 }
 
 // Unpin submits an unpin operation to the shard's cluster.
@@ -366,15 +306,16 @@ func (cm *ClusterManager) Unpin(ctx context.Context, shardID string, c cid.Cid) 
 	return nil
 }
 
-// GetAllocations returns the list of peers allocated for a CID in the shard.
-func (cm *ClusterManager) GetAllocations(ctx context.Context, shardID string, c cid.Cid) ([]peer.ID, error) {
+// hasPin reports whether the shard's CRDT state holds a pin for c. A shard
+// this node is not a member of, or unreadable state, counts as no pin.
+func (cm *ClusterManager) hasPin(ctx context.Context, shardID string, c cid.Cid) bool {
 	cluster, err := cm.shardCluster(shardID)
 	if err != nil {
-		return nil, err
+		return false
 	}
 	st, err := cluster.consensus.State(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("consensus state for shard %s: %w", shardID, err)
+		return false
 	}
 
 	// Cancelling listCtx on return unblocks the List goroutine after an early match.
@@ -389,10 +330,10 @@ func (cm *ClusterManager) GetAllocations(ctx context.Context, shardID string, c 
 	want := api.NewCid(c)
 	for pin := range out {
 		if pin.Cid.Equals(want) {
-			return pin.Allocations, nil
+			return true
 		}
 	}
-	return nil, errors.New("pin not found in state")
+	return false
 }
 
 // ListPins returns all pins in the shard's consensus state (CRDT).

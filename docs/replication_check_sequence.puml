@@ -9,7 +9,7 @@ participant "Other Peers" as Peers
 
 == Pinning (Ingest) ==
 
-ClusterMgr -> CRDT: LogPin(pin)  ' pin has Allocations from Peers()
+ClusterMgr -> CRDT: LogPin(pin)  ' no allocations: every shard member pins
 CRDT -> CRDT: Update local Merkle-DAG
 CRDT -> Peers: PubSub Broadcast (dlockss-shard-<id>)
 Peers -> CRDT: Sync State

@@ -37,7 +37,7 @@ func (cm *ClusterManager) MigratePins(ctx context.Context, sourceShardID, destSh
 		if targetPrefix != destShardID {
 			continue
 		}
-		if err := cm.Pin(ctx, destShardID, c, -1, -1); err != nil {
+		if err := cm.Pin(ctx, destShardID, c); err != nil {
 			slog.Error("failed to migrate pin to dest", "cid", c, "error", err)
 			failures++
 			continue

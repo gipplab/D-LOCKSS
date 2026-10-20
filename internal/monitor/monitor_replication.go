@@ -51,12 +51,12 @@ type manifestResult struct {
 }
 
 // minReplicas is the replication target for a shard group of maxRep nodes:
-// monitorMinReplication, capped by the number of nodes when that is known.
+// replicationTarget, capped by the number of nodes when that is known.
 func minReplicas(maxRep int) int {
 	if maxRep > 0 {
-		return min(monitorMinReplication, maxRep)
+		return min(replicationTarget, maxRep)
 	}
-	return monitorMinReplication
+	return replicationTarget
 }
 
 // buildShardCounts returns per-shard replica counts for a manifest,

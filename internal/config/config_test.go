@@ -33,12 +33,6 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.IPFSNodeAddress != "/ip4/127.0.0.1/tcp/5001" {
 		t.Errorf("IPFSNodeAddress = %q, want /ip4/127.0.0.1/tcp/5001", cfg.IPFSNodeAddress)
 	}
-	if cfg.Replication.MinReplication != 5 {
-		t.Errorf("MinReplication = %d, want 5", cfg.Replication.MinReplication)
-	}
-	if cfg.Replication.MaxReplication != 10 {
-		t.Errorf("MaxReplication = %d, want 10", cfg.Replication.MaxReplication)
-	}
 	if cfg.APIPort != 5050 {
 		t.Errorf("APIPort = %d, want 5050", cfg.APIPort)
 	}
@@ -79,8 +73,6 @@ func TestDefaultConfig(t *testing.T) {
 func TestLoadFromEnv(t *testing.T) {
 	t.Setenv("DLOCKSS_DATA_DIR", "/custom/data")
 	t.Setenv("DLOCKSS_DISCOVERY_TAG", "dlockss-test")
-	t.Setenv("DLOCKSS_MIN_REPLICATION", "3")
-	t.Setenv("DLOCKSS_MAX_REPLICATION", "7")
 	t.Setenv("DLOCKSS_API_PORT", "9090")
 	t.Setenv("DLOCKSS_SIGNATURE_MODE", "warn")
 	t.Setenv("DLOCKSS_VERBOSE_LOGGING", "true")
@@ -95,12 +87,6 @@ func TestLoadFromEnv(t *testing.T) {
 	}
 	if cfg.DiscoveryServiceTag != "dlockss-test" {
 		t.Errorf("DiscoveryServiceTag = %q, want dlockss-test", cfg.DiscoveryServiceTag)
-	}
-	if cfg.Replication.MinReplication != 3 {
-		t.Errorf("MinReplication = %d, want 3", cfg.Replication.MinReplication)
-	}
-	if cfg.Replication.MaxReplication != 7 {
-		t.Errorf("MaxReplication = %d, want 7", cfg.Replication.MaxReplication)
 	}
 	if cfg.APIPort != 9090 {
 		t.Errorf("APIPort = %d, want 9090", cfg.APIPort)
@@ -232,16 +218,6 @@ func TestValidate_MinNonceSize(t *testing.T) {
 	cfg.Validate()
 	if cfg.Security.MinNonceSize != 8 {
 		t.Errorf("MinNonceSize = %d, want 8", cfg.Security.MinNonceSize)
-	}
-}
-
-func TestValidate_MinMaxReplicationSwap(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.Replication.MinReplication = 20
-	cfg.Replication.MaxReplication = 5
-	cfg.Validate()
-	if cfg.Replication.MinReplication != 5 || cfg.Replication.MaxReplication != 20 {
-		t.Errorf("Min/MaxReplication not swapped: min=%d max=%d, want min=5 max=20", cfg.Replication.MinReplication, cfg.Replication.MaxReplication)
 	}
 }
 

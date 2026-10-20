@@ -14,7 +14,6 @@ import (
 	dssync "github.com/ipfs/go-datastore/sync"
 	"github.com/libp2p/go-libp2p"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
-	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 func newTestClusterManager(ctx context.Context, t *testing.T) *clusters.ClusterManager {
@@ -59,7 +58,7 @@ func TestClusterManager_Lifecycle(t *testing.T) {
 	}
 
 	testCid, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
-	if err := cm.Pin(ctx, shard1, testCid, 5, 10); err != nil {
+	if err := cm.Pin(ctx, shard1, testCid); err != nil {
 		t.Errorf("Pin failed: %v", err)
 	}
 
@@ -76,7 +75,7 @@ func TestClusterManager_Lifecycle(t *testing.T) {
 		t.Errorf("LeaveShard failed: %v", err)
 	}
 
-	if err := cm.Pin(ctx, shard1, testCid, 5, 10); err == nil {
+	if err := cm.Pin(ctx, shard1, testCid); err == nil {
 		t.Error("Pin should fail for left shard")
 	}
 }
@@ -102,68 +101,8 @@ func TestClusterManager_RejoinAfterLeave(t *testing.T) {
 		t.Fatalf("rejoin after leave failed: %v", err)
 	}
 	testCid, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
-	if err := cm.Pin(ctx, "", testCid, -1, -1); err != nil {
+	if err := cm.Pin(ctx, "", testCid); err != nil {
 		t.Errorf("Pin into rejoined shard failed: %v", err)
 	}
 	time.Sleep(500 * time.Millisecond)
-}
-
-func TestSelectAllocations(t *testing.T) {
-	pA := testutil.MustPeerID(t, "peerA")
-	pB := testutil.MustPeerID(t, "peerB")
-	pC := testutil.MustPeerID(t, "peerC")
-	pD := testutil.MustPeerID(t, "peerD")
-	peers := []peer.ID{pD, pA, pC, pB}
-
-	c1, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
-	c2, _ := cid.Decode("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi")
-
-	if got := clusters.SelectAllocations(peers, c1, 0); got != nil {
-		t.Errorf("SelectAllocations(peers, c1, 0) = %v, want nil", got)
-	}
-	if got := clusters.SelectAllocations(peers, c1, -1); got != nil {
-		t.Errorf("SelectAllocations(peers, c1, -1) = %v, want nil", got)
-	}
-
-	if got := clusters.SelectAllocations(nil, c1, 2); got != nil {
-		t.Errorf("SelectAllocations(nil, c1, 2) = %v, want nil", got)
-	}
-	if got := clusters.SelectAllocations([]peer.ID{}, c1, 2); got != nil {
-		t.Errorf("SelectAllocations([], c1, 2) = %v, want nil", got)
-	}
-
-	// n beyond the peer count returns every peer, sorted by ID string.
-	all := clusters.SelectAllocations(peers, c1, 10)
-	if len(all) != 4 {
-		t.Errorf("SelectAllocations(peers, c1, 10) len = %d, want 4", len(all))
-	}
-	for i := 1; i < len(all); i++ {
-		if all[i].String() < all[i-1].String() {
-			t.Errorf("SelectAllocations(peers, c1, 10) not sorted: %s before %s", all[i-1], all[i])
-		}
-	}
-
-	a1 := clusters.SelectAllocations(peers, c1, 2)
-	a2 := clusters.SelectAllocations(peers, c1, 2)
-	if len(a1) != 2 || len(a2) != 2 {
-		t.Fatalf("expected 2 allocations each, got %d and %d", len(a1), len(a2))
-	}
-	if a1[0] != a2[0] || a1[1] != a2[1] {
-		t.Errorf("same CID must yield same allocations: %v vs %v", a1, a2)
-	}
-
-	for n := 1; n <= 4; n++ {
-		got := clusters.SelectAllocations(peers, c1, n)
-		if len(got) != n {
-			t.Errorf("SelectAllocations(peers, c1, %d) len = %d, want %d", n, len(got), n)
-		}
-	}
-
-	// Different CIDs may legitimately land on the same replicas, so only the
-	// sizes are checked.
-	alloc1 := clusters.SelectAllocations(peers, c1, 2)
-	alloc2 := clusters.SelectAllocations(peers, c2, 2)
-	if len(alloc1) != 2 || len(alloc2) != 2 {
-		t.Errorf("expected 2 allocations for c1 and c2, got %d and %d", len(alloc1), len(alloc2))
-	}
 }

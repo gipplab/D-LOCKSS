@@ -103,8 +103,6 @@ type ShardingConfig struct {
 
 // ReplicationConfig holds parameters for content replication across peers.
 type ReplicationConfig struct {
-	MinReplication                 int
-	MaxReplication                 int
 	CheckInterval                  time.Duration
 	MaxConcurrentReplicationChecks int
 	AutoReplicationEnabled         bool
@@ -169,6 +167,13 @@ type Config struct {
 	// PrivateNetwork skips public DHT bootstrap peers and AutoRelay.
 	// Use for isolated eval testnets (mDNS + unique DiscoveryServiceTag).
 	PrivateNetwork bool
+	// ConnLowWater and ConnHighWater bound the libp2p host's connections:
+	// above high water the connection manager trims down to low water.
+	ConnLowWater  int
+	ConnHighWater int
+	// DHTClient keeps the node's DHT in client mode, so it never answers
+	// DHT queries from the public network. Saves bandwidth on slow links.
+	DHTClient bool
 
 	Sharding    ShardingConfig
 	Replication ReplicationConfig
@@ -191,6 +196,8 @@ func DefaultConfig() *Config {
 		IPFSNodeAddress:        "/ip4/127.0.0.1/tcp/5001",
 		APIPort:                5050,
 		BootstrapTimeout:       15 * time.Second,
+		ConnLowWater:           160,
+		ConnHighWater:          192,
 		HeartbeatInterval:      10 * time.Second,
 		RateLimitWindow:        1 * time.Minute,
 		MaxMessagesPerWindow:   100,
@@ -214,8 +221,6 @@ func DefaultConfig() *Config {
 			SiblingEmptyMergeAfter:        5 * time.Minute,
 		},
 		Replication: ReplicationConfig{
-			MinReplication:                 5,
-			MaxReplication:                 10,
 			CheckInterval:                  1 * time.Minute,
 			MaxConcurrentReplicationChecks: 5,
 			AutoReplicationEnabled:         true,
@@ -278,6 +283,9 @@ func LoadFromEnv() *Config {
 	cfg.NodeNamePath = nodeNamePath(dataDir)
 	cfg.IPFSConfigPath = getEnvString("DLOCKSS_IPFS_CONFIG", cfg.IPFSConfigPath)
 	cfg.PrivateNetwork = getEnvBool("DLOCKSS_PRIVATE_NETWORK", cfg.PrivateNetwork)
+	cfg.ConnLowWater = getEnvInt("DLOCKSS_CONN_LOW_WATER", cfg.ConnLowWater)
+	cfg.ConnHighWater = getEnvInt("DLOCKSS_CONN_HIGH_WATER", cfg.ConnHighWater)
+	cfg.DHTClient = getEnvBool("DLOCKSS_DHT_CLIENT", cfg.DHTClient)
 
 	cfg.Sharding.MaxPeersPerShard = getEnvInt("DLOCKSS_MAX_PEERS_PER_SHARD", cfg.Sharding.MaxPeersPerShard)
 	cfg.Sharding.MinPeersPerShard = getEnvInt("DLOCKSS_MIN_PEERS_PER_SHARD", cfg.Sharding.MinPeersPerShard)
@@ -293,8 +301,11 @@ func LoadFromEnv() *Config {
 	cfg.Sharding.ProbeTimeoutMerge = getEnvDuration("DLOCKSS_PROBE_TIMEOUT_MERGE", cfg.Sharding.ProbeTimeoutMerge)
 	cfg.Sharding.SiblingEmptyMergeAfter = getEnvDuration("DLOCKSS_SIBLING_EMPTY_MERGE_AFTER", cfg.Sharding.SiblingEmptyMergeAfter)
 
-	cfg.Replication.MinReplication = getEnvInt("DLOCKSS_MIN_REPLICATION", cfg.Replication.MinReplication)
-	cfg.Replication.MaxReplication = getEnvInt("DLOCKSS_MAX_REPLICATION", cfg.Replication.MaxReplication)
+	for _, key := range []string{"DLOCKSS_MIN_REPLICATION", "DLOCKSS_MAX_REPLICATION"} {
+		if os.Getenv(key) != "" {
+			slog.Warn("ignoring removed setting: every shard member holds every file of its shard, so the shard limits DLOCKSS_MIN_PEERS_PER_SHARD and DLOCKSS_MAX_PEERS_PER_SHARD bound the copies", "env", key)
+		}
+	}
 	cfg.Replication.CheckInterval = getEnvDuration("DLOCKSS_CHECK_INTERVAL", cfg.Replication.CheckInterval)
 	cfg.Replication.MaxConcurrentReplicationChecks = getEnvInt("DLOCKSS_MAX_CONCURRENT_CHECKS", cfg.Replication.MaxConcurrentReplicationChecks)
 	cfg.Replication.AutoReplicationEnabled = getEnvBool("DLOCKSS_AUTO_REPLICATION_ENABLED", cfg.Replication.AutoReplicationEnabled)
@@ -353,13 +364,13 @@ func (c *Config) Validate() {
 		slog.Warn("invalid config value, using default", "key", "MinNonceSize", "value", c.Security.MinNonceSize, "default", 8)
 		c.Security.MinNonceSize = 8
 	}
-	if c.Replication.MinReplication > c.Replication.MaxReplication {
-		slog.Warn("MinReplication > MaxReplication, swapping", "min", c.Replication.MinReplication, "max", c.Replication.MaxReplication)
-		c.Replication.MinReplication, c.Replication.MaxReplication = c.Replication.MaxReplication, c.Replication.MinReplication
-	}
 	if c.Replication.MaxConcurrentReplicationChecks < 1 {
 		slog.Warn("invalid config value, using default", "key", "MaxConcurrentReplicationChecks", "value", c.Replication.MaxConcurrentReplicationChecks, "default", 5)
 		c.Replication.MaxConcurrentReplicationChecks = 5
+	}
+	if c.ConnLowWater < 1 || c.ConnHighWater <= c.ConnLowWater {
+		slog.Warn("connection water marks need 0 < low < high, using defaults", "low", c.ConnLowWater, "high", c.ConnHighWater, "default_low", 160, "default_high", 192)
+		c.ConnLowWater, c.ConnHighWater = 160, 192
 	}
 	if c.DiskUsageHighWaterMark <= 0 || c.DiskUsageHighWaterMark > 100 {
 		slog.Warn("disk usage high water mark out of range, using default", "value", c.DiskUsageHighWaterMark, "default", 90.0)
@@ -407,6 +418,9 @@ func (c *Config) Log() {
 		"ipfs_node", c.IPFSNodeAddress,
 		"api_port", c.APIPort,
 		"bootstrap_timeout", c.BootstrapTimeout,
+		"conn_low_water", c.ConnLowWater,
+		"conn_high_water", c.ConnHighWater,
+		"dht_client", c.DHTClient,
 	)
 	slog.Info("config: paths",
 		"data_dir", c.FileWatchFolder,
@@ -431,8 +445,6 @@ func (c *Config) Log() {
 		"sibling_empty_merge_after", c.Sharding.SiblingEmptyMergeAfter,
 	)
 	slog.Info("config: replication",
-		"min", c.Replication.MinReplication,
-		"max", c.Replication.MaxReplication,
 		"check_interval", c.Replication.CheckInterval,
 		"max_concurrent_checks", c.Replication.MaxConcurrentReplicationChecks,
 		"auto_enabled", c.Replication.AutoReplicationEnabled,

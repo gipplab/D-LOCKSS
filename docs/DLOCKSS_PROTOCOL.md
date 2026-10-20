@@ -172,7 +172,7 @@ Nodes in any shard (not just root) periodically run discovery to join existing d
 
 Replication is handled by the **Cluster Manager**, **LocalPinTracker**, and **replicationManager** (a delegate of ShardManager):
 
-1.  **Pinning**: When a responsible node ingests or accepts a file, it calls `ClusterManager.Pin(ctx, shardID, cid, ...)` on the shard's embedded cluster. Allocations are chosen deterministically from Peers() (shard mesh via ShardPeerProvider).
+1.  **Pinning**: When a responsible node ingests or accepts a file, it calls `ClusterManager.Pin(ctx, shardID, cid)` on the shard's embedded cluster. The pin carries no allocations: every shard member pins every file of its shard, so the shard size (between MinPeersPerShard and MaxPeersPerShard) is the number of copies.
 2.  **State Sync**: The CRDT (Merkle-DAG based) propagates pin/unpin to all peers in the shard via PubSub (`dlockss-shard-<id>`).
 3.  **Local Pin Tracker**:
     *   Each node runs a `LocalPinTracker` per shard that polls CRDT State() (and on TriggerSync).
