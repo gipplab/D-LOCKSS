@@ -394,7 +394,6 @@ func (lm *lifecycleManager) discoverAndMoveToDeeperShard() {
 		return
 	}
 
-
 	// Every member of the current shard eventually descends by its own hash.
 	// Do not start a descent that would leave either child below min peers;
 	// that would undo a merge of an under-populated pair. Peers that just

@@ -167,7 +167,6 @@ func (sm *StorageManager) ProvideFile(ctx context.Context, key string) {
 	}
 }
 
-// GetAllKnownFiles returns a snapshot of all known file keys.
 // ProviderCount returns how many distinct peers other than self advertise key,
 // stopping once limit is reached or ctx ends.
 func (sm *StorageManager) ProviderCount(ctx context.Context, key string, self peer.ID, limit int) int {
@@ -195,6 +194,7 @@ func (sm *StorageManager) ProviderCount(ctx context.Context, key string, self pe
 	}
 }
 
+// GetAllKnownFiles returns a snapshot of all known file keys.
 func (sm *StorageManager) GetAllKnownFiles() map[string]bool {
 	return sm.knownFiles.All()
 }
