@@ -55,6 +55,7 @@ type pinWatcher struct {
 	// blocked is the reason the last poll ingested nothing, so each reason
 	// is logged once rather than on every poll.
 	blocked string
+	scanned bool
 }
 
 func newPinWatcher(fp *FileProcessor) *pinWatcher {
@@ -109,14 +110,17 @@ func (w *pinWatcher) poll(ctx context.Context) {
 
 	// Keys are multihashes, so a CIDv0 user pin matches the CIDv1 payload
 	// of a manifest.
+	start := time.Now()
 	covered := make(map[string]struct{})
 	classes := make(map[cid.Cid]pinClass, len(pins))
 	var unknown []cid.Cid
+	manifests := 0
 	for c, name := range pins {
 		cl := w.classify(ctx, c, name)
 		classes[c] = cl
 		switch cl.kind {
 		case pinManifest:
+			manifests++
 			covered[string(c.Hash())] = struct{}{}
 			if cl.payload.Defined() {
 				covered[string(cl.payload.Hash())] = struct{}{}
@@ -126,6 +130,11 @@ func (w *pinWatcher) poll(ctx context.Context) {
 		}
 	}
 	w.classes = classes
+	if !w.scanned {
+		w.scanned = true
+		slog.Info("pin ingest: scanned kubo pins", "pins", len(pins), "manifests", manifests,
+			"unreadable", len(unknown), "took", time.Since(start).Round(time.Millisecond))
+	}
 	// An unreadable pin may be a manifest whose payload would then look like
 	// a user pin.
 	if len(unknown) > 0 {
