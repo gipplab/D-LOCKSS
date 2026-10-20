@@ -25,8 +25,13 @@ func (m *MockIPFSClient) GetBlock(ctx context.Context, blockCID cid.Cid) ([]byte
 	return nil, nil
 }
 func (m *MockIPFSClient) PinRecursive(ctx context.Context, c cid.Cid) error     { return nil }
+func (m *MockIPFSClient) PinManifest(ctx context.Context, c cid.Cid) error      { return nil }
 func (m *MockIPFSClient) UnpinRecursive(ctx context.Context, c cid.Cid) error   { return nil }
 func (m *MockIPFSClient) IsPinned(ctx context.Context, c cid.Cid) (bool, error) { return false, nil }
+func (m *MockIPFSClient) RecursivePins(ctx context.Context) (map[cid.Cid]string, error) {
+	return nil, nil
+}
+func (m *MockIPFSClient) DAGSize(ctx context.Context, c cid.Cid) (uint64, error) { return 0, nil }
 
 // MockDHTProvider is a no-op implementation of common.DHTProvider that also
 // satisfies routing.Routing.

@@ -23,6 +23,9 @@ func NewDiskMonitor(path string, highWaterMark float64) *DiskMonitor {
 	return &DiskMonitor{path: path, highWaterMark: highWaterMark}
 }
 
+// CanAcceptCustodialFile reports whether disk usage is below the high-water
+// mark. Usage is re-read at most once per diskUsageCacheTTL; on a read error
+// the last known value is used.
 func (dm *DiskMonitor) CanAcceptCustodialFile() bool {
 	dm.mu.RLock()
 	lastCheck := dm.lastCheck

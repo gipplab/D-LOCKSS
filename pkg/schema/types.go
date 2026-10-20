@@ -1,13 +1,9 @@
 package schema
 
 import (
-	"bytes"
 	"fmt"
 
 	"github.com/ipfs/go-cid"
-	"github.com/ipld/go-ipld-prime/codec/dagcbor"
-	"github.com/ipld/go-ipld-prime/datamodel"
-	"github.com/ipld/go-ipld-prime/node/basicnode"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -17,16 +13,16 @@ import (
 type ResearchObject struct {
 	MetadataRef string  `cbor:"meta_ref"`    // DOI or URL to external metadata
 	IngestedBy  peer.ID `cbor:"ingester_id"` // PeerID of the node that ingested this
-	Signature   []byte  `cbor:"sig"`         // Cryptographic signature
+	Signature   []byte  `cbor:"sig"`
 
 	Payload cid.Cid `cbor:"payload"` // Link to raw UnixFS DAG (file data)
 
 	TotalSize uint64 `cbor:"size"` // Total size in bytes
 
-	// HasLegacyTimestamp is true if the manifest was created with the old format
-	// that included a "ts" field. These manifests produce non-deterministic CIDs
-	// (same content → different ManifestCID on each ingest) and should be ignored.
-	// Not serialized — set during UnmarshalCBOR only.
+	// HasLegacyTimestamp reports that the manifest carries a "ts" field.
+	// Such manifests have non-deterministic CIDs (the same content yields a
+	// different ManifestCID on each ingest) and should be ignored. It is set
+	// by UnmarshalCBOR and never serialized.
 	HasLegacyTimestamp bool `cbor:"-"`
 }
 
@@ -41,165 +37,56 @@ func (ro *ResearchObject) MarshalCBORForSigning() ([]byte, error) {
 }
 
 func (ro *ResearchObject) marshalCBOR(includeSig bool) ([]byte, error) {
-	nb := basicnode.Prototype.Map.NewBuilder()
-	fieldCount := int64(4)
-	if includeSig {
-		fieldCount = 5
+	fields := []cborKV{
+		{"meta_ref", ro.MetadataRef},
+		{"ingester_id", ro.IngestedBy.String()},
 	}
-	ma, err := nb.BeginMap(fieldCount)
+	if includeSig {
+		fields = append(fields, cborKV{"sig", ro.Signature})
+	}
+	fields = append(fields,
+		cborKV{"payload", ro.Payload.String()},
+		cborKV{"size", int64(ro.TotalSize)},
+	)
+	b, err := marshalCBORMap(fields)
 	if err != nil {
-		return nil, fmt.Errorf("failed to begin map: %w", err)
+		return nil, fmt.Errorf("failed to encode research object: %w", err)
 	}
-
-	// MetadataRef
-	metaNode := basicnode.NewString(ro.MetadataRef)
-	if err := ma.AssembleKey().AssignString("meta_ref"); err != nil {
-		return nil, fmt.Errorf("failed to assign meta_ref key: %w", err)
-	}
-	if err := ma.AssembleValue().AssignNode(metaNode); err != nil {
-		return nil, fmt.Errorf("failed to assign meta_ref value: %w", err)
-	}
-
-	// IngestedBy (PeerID as string)
-	ingesterStr := ro.IngestedBy.String()
-	ingesterNode := basicnode.NewString(ingesterStr)
-	if err := ma.AssembleKey().AssignString("ingester_id"); err != nil {
-		return nil, fmt.Errorf("failed to assign ingester_id key: %w", err)
-	}
-	if err := ma.AssembleValue().AssignNode(ingesterNode); err != nil {
-		return nil, fmt.Errorf("failed to assign ingester_id value: %w", err)
-	}
-
-	if includeSig {
-		// Signature (bytes)
-		sigNode := basicnode.NewBytes(ro.Signature)
-		if err := ma.AssembleKey().AssignString("sig"); err != nil {
-			return nil, fmt.Errorf("failed to assign sig key: %w", err)
-		}
-		if err := ma.AssembleValue().AssignNode(sigNode); err != nil {
-			return nil, fmt.Errorf("failed to assign sig value: %w", err)
-		}
-	}
-
-	// Payload (CID as string)
-	payloadStr := ro.Payload.String()
-	payloadNode := basicnode.NewString(payloadStr)
-	if err := ma.AssembleKey().AssignString("payload"); err != nil {
-		return nil, fmt.Errorf("failed to assign payload key: %w", err)
-	}
-	if err := ma.AssembleValue().AssignNode(payloadNode); err != nil {
-		return nil, fmt.Errorf("failed to assign payload value: %w", err)
-	}
-
-	// TotalSize
-	sizeNode := basicnode.NewInt(int64(ro.TotalSize))
-	if err := ma.AssembleKey().AssignString("size"); err != nil {
-		return nil, fmt.Errorf("failed to assign size key: %w", err)
-	}
-	if err := ma.AssembleValue().AssignNode(sizeNode); err != nil {
-		return nil, fmt.Errorf("failed to assign size value: %w", err)
-	}
-
-	if err := ma.Finish(); err != nil {
-		return nil, fmt.Errorf("failed to finish map: %w", err)
-	}
-
-	node := nb.Build()
-
-	// Encode to CBOR
-	var buf bytes.Buffer
-	if err := dagcbor.Encode(node, &buf); err != nil {
-		return nil, fmt.Errorf("failed to encode CBOR: %w", err)
-	}
-
-	return buf.Bytes(), nil
+	return b, nil
 }
 
 // UnmarshalCBOR deserializes a ResearchObject from CBOR format.
 func (ro *ResearchObject) UnmarshalCBOR(data []byte) error {
-	// Decode CBOR to IPLD node
-	nb := basicnode.Prototype.Map.NewBuilder()
-	if err := dagcbor.Decode(nb, bytes.NewReader(data)); err != nil {
+	node, err := decodeCBORMap(data)
+	if err != nil {
 		return fmt.Errorf("failed to decode CBOR: %w", err)
 	}
-	node := nb.Build()
-
-	// Extract fields - node should be a map
-	if node.Kind() != datamodel.Kind_Map {
-		return fmt.Errorf("expected map node, got %v", node.Kind())
+	if ro.MetadataRef, err = readString(node, "meta_ref"); err != nil {
+		return fmt.Errorf("failed to read meta_ref: %w", err)
 	}
-
-	// MetadataRef
-	metaNode, err := node.LookupByString("meta_ref")
-	if err != nil {
-		return fmt.Errorf("failed to get meta_ref: %w", err)
+	if ro.IngestedBy, err = readPeerID(node, "ingester_id"); err != nil {
+		return fmt.Errorf("failed to read ingester_id: %w", err)
 	}
-	ro.MetadataRef, err = metaNode.AsString()
-	if err != nil {
-		return fmt.Errorf("failed to get meta_ref string: %w", err)
+	if ro.Signature, err = readBytes(node, "sig"); err != nil {
+		return fmt.Errorf("failed to read sig: %w", err)
 	}
-
-	// IngestedBy
-	ingesterNode, err := node.LookupByString("ingester_id")
-	if err != nil {
-		return fmt.Errorf("failed to get ingester_id: %w", err)
-	}
-	ingesterStr, err := ingesterNode.AsString()
-	if err != nil {
-		return fmt.Errorf("failed to get ingester_id string: %w", err)
-	}
-	ro.IngestedBy, err = peer.Decode(ingesterStr)
-	if err != nil {
-		return fmt.Errorf("failed to decode peer ID: %w", err)
-	}
-
-	// Signature
-	sigNode, err := node.LookupByString("sig")
-	if err != nil {
-		return fmt.Errorf("failed to get sig: %w", err)
-	}
-	ro.Signature, err = sigNode.AsBytes()
-	if err != nil {
-		return fmt.Errorf("failed to get sig bytes: %w", err)
-	}
-
-	// Timestamp (optional, for backward compatibility with old manifests)
-	// Not stored in the struct, but we flag its presence so callers can
-	// identify and skip legacy manifests with non-deterministic CIDs.
-	if _, tsErr := node.LookupByString("ts"); tsErr == nil {
+	if _, err := node.LookupByString("ts"); err == nil {
 		ro.HasLegacyTimestamp = true
 	}
-
-	// Payload
-	payloadNode, err := node.LookupByString("payload")
-	if err != nil {
-		return fmt.Errorf("failed to get payload: %w", err)
+	if ro.Payload, err = readCID(node, "payload"); err != nil {
+		return fmt.Errorf("failed to read payload: %w", err)
 	}
-	payloadStr, err := payloadNode.AsString()
+	size, err := readInt(node, "size")
 	if err != nil {
-		return fmt.Errorf("failed to get payload string: %w", err)
+		return fmt.Errorf("failed to read size: %w", err)
 	}
-	ro.Payload, err = cid.Decode(payloadStr)
-	if err != nil {
-		return fmt.Errorf("failed to decode payload CID: %w", err)
-	}
-
-	// TotalSize
-	sizeNode, err := node.LookupByString("size")
-	if err != nil {
-		return fmt.Errorf("failed to get size: %w", err)
-	}
-	sizeInt, err := sizeNode.AsInt()
-	if err != nil {
-		return fmt.Errorf("failed to get size int: %w", err)
-	}
-	ro.TotalSize = uint64(sizeInt)
-
+	ro.TotalSize = uint64(size)
 	return nil
 }
 
 // NewResearchObject creates a new ResearchObject with the given parameters.
-// The manifest is deterministic: same (metadataRef, ingesterID, payloadCID, totalSize) → same ManifestCID.
+// The manifest is deterministic: the same (metadataRef, ingesterID,
+// payloadCID, totalSize) always yields the same ManifestCID.
 func NewResearchObject(metadataRef string, ingesterID peer.ID, payloadCID cid.Cid, totalSize uint64) *ResearchObject {
 	return &ResearchObject{
 		MetadataRef: metadataRef,

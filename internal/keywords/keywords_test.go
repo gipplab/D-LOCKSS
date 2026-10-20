@@ -116,6 +116,33 @@ func TestApplySettingsPasswordAndGoogle(t *testing.T) {
 	}
 }
 
+func TestApplySettingsRetriesFailedCIDs(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(Config{DataDir: dir, APIKey: "old-key"})
+	for i := 0; i < maxRetries; i++ {
+		s.recordFailure("cid-a")
+	}
+	s.noteRateLimit(time.Minute)
+
+	reloaded := NewStore(Config{DataDir: dir, APIKey: "old-key"})
+	if got := reloaded.pickNextCID(staticCIDs{"cid-a"}); got != "" {
+		t.Fatalf("a permanent failure survives a restart, picked %q", got)
+	}
+
+	if err := reloaded.ApplySettings("old-key", "google", "new-key", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.pickNextCID(staticCIDs{"cid-a"}); got != "cid-a" {
+		t.Fatalf("after new settings the failed cid must be retried, picked %q", got)
+	}
+	if st := reloaded.GetStats(1); st.Failed != 0 || st.Pending != 1 {
+		t.Fatalf("stats after reset = %+v", st)
+	}
+	if got := NewStore(Config{DataDir: dir}).pickNextCID(staticCIDs{"cid-a"}); got != "cid-a" {
+		t.Fatalf("the reset must be persisted, picked %q", got)
+	}
+}
+
 func TestGeminiGenerationConfigDisablesThinking(t *testing.T) {
 	cfg := geminiGenerationConfig()
 	if cfg["maxOutputTokens"] != googleMaxOutputTokens {
@@ -199,7 +226,7 @@ func TestSuggestAndRecent(t *testing.T) {
 	}
 }
 
-func TestRateLimitWaitMatchesTracker(t *testing.T) {
+func TestRateLimitWaitBackoff(t *testing.T) {
 	// attempt 0: max(1s, 2s) = 2s; attempt 2: max(1s, 8s) = 8s
 	if got := rateLimitWait(time.Second, 0); got != 2*time.Second {
 		t.Fatalf("attempt 0 = %s, want 2s", got)
@@ -233,8 +260,6 @@ func TestPersistRoundTrip(t *testing.T) {
 	s.storeEntry("cid-a", "pay-a", "file://a.pdf", &extractionResult{
 		Title: "T", BroadField: "CS", Keywords: []string{"transformer"},
 	})
-	// give IndexedAt a stable-enough value
-	_ = time.Second
 	s2 := NewStore(Config{DataDir: dir, APIKey: "k"})
 	hits := s2.Search("transformer")
 	if len(hits) != 1 || hits[0].Title != "T" {

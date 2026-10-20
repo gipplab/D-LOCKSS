@@ -3,6 +3,7 @@ package monitor
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -30,22 +31,27 @@ const (
 	replicationAnnounceTTL       = 350 * time.Second
 	monitorMinReplication        = 5
 	replicationCleanupEvery      = 1 * time.Minute
-	MonitorIdentityFile          = "monitor_identity.key"
-	siblingMoveCooldown          = 90 * time.Second // ignore sibling moves within this window (reduces 00↔01, 10↔11 oscillation; gossip-sub can delay 20–30s)
-	unpinGracePeriod             = 30 * time.Second // don't act on pinned=0 until this long after first discovery (avoids stale heartbeats)
+	identityFileName             = "monitor_identity.key"
+	// Gossip-sub can deliver heartbeats 20-30s late, so a second sibling move
+	// within this window is treated as stale to stop nodes oscillating between
+	// sibling shards.
+	siblingMoveCooldown = 90 * time.Second
+	// pinned=0 is ignored until this long after first discovery, since the
+	// first heartbeats seen from a node can be stale.
+	unpinGracePeriod = 30 * time.Second
 )
 
-// MonitorConfig holds runtime-configurable settings for the monitor,
+// Config holds runtime-configurable settings for the monitor,
 // overridable via environment variables.
-type MonitorConfig struct {
+type Config struct {
 	NodeCleanupTimeout  time.Duration
 	BootstrapShardDepth int
 	PubsubTopicPrefix   string
 	TopicName           string
 }
 
-func DefaultMonitorConfig() MonitorConfig {
-	return MonitorConfig{
+func DefaultConfig() Config {
+	return Config{
 		NodeCleanupTimeout:  defaultNodeCleanupTimeout,
 		BootstrapShardDepth: defaultBootstrapShardDepth,
 		PubsubTopicPrefix:   config.DefaultPubsubVersion,
@@ -103,10 +109,8 @@ type ShardTreeNode struct {
 
 type Monitor struct {
 	mu                  sync.RWMutex
-	cfg                 MonitorConfig
-	appCtx              context.Context    // long-lived context from StartLibP2P
-	subCtx              context.Context    // per-generation context
-	subCancel           context.CancelFunc // cancels subCtx
+	cfg                 Config
+	appCtx              context.Context // set by StartLibP2P
 	nodes               map[string]*nodeState
 	splitEvents         []ShardSplitEvent
 	treeCache           *ShardTreeNode
@@ -119,15 +123,10 @@ type Monitor struct {
 	nodeFiles           map[string]map[string]time.Time
 	manifestReplication map[string]map[string]time.Time
 	peerShardLastSeen   map[string]map[string]time.Time
-	manifestShard       map[string]string // manifest CID → observed shard (from PINNED/IngestMessage announcements)
-	lastSplitTime       time.Time         // when we last detected a split; used to avoid pruning during mesh formation
-	peerLastSiblingMove map[string]siblingMoveRecord
+	manifestShard       map[string]string    // manifest CID to the shard it was announced in, preferring descendants
+	lastSplitTime       time.Time            // pruning is suspended for splitGracePeriod after this
+	peerLastSiblingMove map[string]time.Time // peer ID to the time of its last sibling move
 	keywords            *keywords.Store
-}
-
-// siblingMoveRecord tracks the last sibling shard move for cooldown (reduces 0↔1 oscillation from stale messages).
-type siblingMoveRecord struct {
-	when time.Time
 }
 
 func (n *nodeState) EffectiveShard() string {
@@ -147,9 +146,17 @@ func shardLabel(shardID string) string {
 	return shardID
 }
 
-// isDisplayableNode returns false for PROBE nodes and the monitor itself.
+// peerLabel names a peer in log output, including its node name when known.
+func peerLabel(peerID, nodeName string) string {
+	if nodeName == "" {
+		return peerID
+	}
+	return nodeName + " (" + peerID + ")"
+}
+
+// isDisplayableNodeLocked returns false for PROBE nodes and the monitor itself.
 // ACTIVE, PASSIVE, and REPLICATOR nodes appear in the UI.
-func (m *Monitor) isDisplayableNodeUnlocked(peerID string, node *nodeState) bool {
+func (m *Monitor) isDisplayableNodeLocked(peerID string, node *nodeState) bool {
 	if node.Role == "PROBE" {
 		return false
 	}
@@ -159,28 +166,10 @@ func (m *Monitor) isDisplayableNodeUnlocked(peerID string, node *nodeState) bool
 	return true
 }
 
-// getTopicPrefix returns the effective topic prefix (override or config).
-func (m *Monitor) getTopicPrefix() string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.getTopicPrefixUnlocked()
-}
-
-// getTopicPrefixUnlocked returns the topic prefix from config. Call only when holding m.mu.
-func (m *Monitor) getTopicPrefixUnlocked() string {
-	return m.cfg.PubsubTopicPrefix
-}
-
-// getTopicName returns the effective topic name (override or config).
-func (m *Monitor) getTopicName() string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.getTopicNameUnlocked()
-}
-
-// getTopicNameUnlocked returns the topic name from config. Call only when holding m.mu.
-func (m *Monitor) getTopicNameUnlocked() string {
-	return m.cfg.TopicName
+// shardTopic returns the pubsub topic name for shardID. m.cfg is never
+// modified after NewMonitor, so no lock is needed.
+func (m *Monitor) shardTopic(shardID string) string {
+	return fmt.Sprintf("%s-%s-shard-%s", m.cfg.PubsubTopicPrefix, m.cfg.TopicName, shardID)
 }
 
 type cidEntry struct {
@@ -189,21 +178,16 @@ type cidEntry struct {
 	Replicas int    `json:"replicas"`
 }
 
-func (m *Monitor) buildCIDEntriesUnlocked(cids map[string]time.Time) []cidEntry {
+func (m *Monitor) buildCIDEntriesLocked(cids map[string]time.Time) []cidEntry {
 	entries := make([]cidEntry, 0, len(cids))
-	for cidStr := range cids {
-		replicas := 0
-		if peers, ok := m.manifestReplication[cidStr]; ok {
-			replicas = len(peers)
-		}
-		shard := m.manifestShard[cidStr]
-		entries = append(entries, cidEntry{CID: cidStr, Shard: shard, Replicas: replicas})
+	for c := range cids {
+		entries = append(entries, cidEntry{CID: c, Shard: m.manifestShard[c], Replicas: len(m.manifestReplication[c])})
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].CID < entries[j].CID })
 	return entries
 }
 
-func NewMonitor(cfg MonitorConfig) *Monitor {
+func NewMonitor(cfg Config) *Monitor {
 	m := &Monitor{
 		cfg:                 cfg,
 		nodes:               make(map[string]*nodeState),
@@ -214,7 +198,7 @@ func NewMonitor(cfg MonitorConfig) *Monitor {
 		manifestReplication: make(map[string]map[string]time.Time),
 		peerShardLastSeen:   make(map[string]map[string]time.Time),
 		manifestShard:       make(map[string]string),
-		peerLastSiblingMove: make(map[string]siblingMoveRecord),
+		peerLastSiblingMove: make(map[string]time.Time),
 		keywords:            keywords.NewStore(keywords.Config{}),
 	}
 	go m.runReplicationCleanup()
@@ -228,7 +212,7 @@ func (m *Monitor) SetKeywords(s *keywords.Store) {
 	}
 }
 
-// StartKeywordIndexer indexes newly announced PDFs in the background when an API key is set.
+// StartKeywordIndexer indexes newly announced content in the background when an API key is set.
 func (m *Monitor) StartKeywordIndexer(ctx context.Context) {
 	if m.keywords == nil {
 		return

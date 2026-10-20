@@ -27,8 +27,8 @@ type peerRoleInfo struct {
 type peerTracker struct {
 	mu     sync.RWMutex
 	selfID peer.ID
-	seen   map[string]map[peer.ID]time.Time    // shard → peer → lastSeen
-	roles  map[string]map[peer.ID]peerRoleInfo // shard → peer → role
+	seen   map[string]map[peer.ID]time.Time    // last message time by shard and peer
+	roles  map[string]map[peer.ID]peerRoleInfo // announced role by shard and peer
 }
 
 func newPeerTracker(selfID peer.ID) *peerTracker {
@@ -59,25 +59,15 @@ func (pt *peerTracker) RecordRole(shardID string, peerID peer.ID, role peerRole)
 
 func (pt *peerTracker) RemoveRole(shardID string, peerID peer.ID) {
 	pt.mu.Lock()
-	if pt.roles[shardID] != nil {
-		delete(pt.roles[shardID], peerID)
-	}
+	delete(pt.roles[shardID], peerID)
 	pt.mu.Unlock()
 }
 
 func (pt *peerTracker) CountActive(shardID string, includeSelf bool, currentShard string, activeWindow time.Duration) int {
-	pt.mu.RLock()
-	roles, ok := pt.roles[shardID]
-	if !ok {
-		pt.mu.RUnlock()
-		if includeSelf && shardID == currentShard {
-			return 1
-		}
-		return 0
-	}
-	cutoff := time.Now().Add(-activeWindow)
 	n := 0
-	for pid, info := range roles {
+	pt.mu.RLock()
+	cutoff := time.Now().Add(-activeWindow)
+	for pid, info := range pt.roles[shardID] {
 		if (info.role != roleActive && info.role != roleReplicator) || info.lastSeen.Before(cutoff) || pid == pt.selfID {
 			continue
 		}
@@ -113,11 +103,9 @@ func (pt *peerTracker) GetSeenPeers(shardID string, activeWindow time.Duration) 
 	defer pt.mu.RUnlock()
 	cutoff := time.Now().Add(-activeWindow)
 	result := make(map[peer.ID]struct{})
-	if seenMap, ok := pt.seen[shardID]; ok {
-		for p, lastSeen := range seenMap {
-			if lastSeen.After(cutoff) && p != pt.selfID {
-				result[p] = struct{}{}
-			}
+	for p, lastSeen := range pt.seen[shardID] {
+		if lastSeen.After(cutoff) && p != pt.selfID {
+			result[p] = struct{}{}
 		}
 	}
 	return result
@@ -198,8 +186,8 @@ func (sm *ShardManager) getOurRole() peerRole {
 	return roleActive
 }
 
-// processTextProtocolForProbe updates PeerTracker for HEARTBEAT/JOIN/LEAVE/PROBE.
-// Used when probing a shard to collect role info without full message handling.
+// processTextProtocolForProbe records the roles announced by HEARTBEAT, JOIN,
+// LEAVE and PROBE messages while probing a shard, without full message handling.
 func (sm *ShardManager) processTextProtocolForProbe(msg *pubsub.Message, shardID string) {
 	data := msg.Data
 	if len(data) == 0 {

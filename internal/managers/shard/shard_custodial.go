@@ -8,10 +8,50 @@ import (
 	"github.com/ipfs/go-cid"
 
 	"dlockss/internal/common"
-	"dlockss/pkg/schema"
 )
 
-const custodialRetryInterval = 2 * time.Minute
+const (
+	custodialRetryInterval = 2 * time.Minute
+	// custodialLookupsPerPass bounds the DHT provider lookups of one pass. A
+	// lookup for a file with fewer providers than needed runs until
+	// handoffConfirmTimeout, so a pass costs at most this many timeouts.
+	custodialLookupsPerPass = 10
+	// custodialRecheckAfter is how long a file waits after a lookup before
+	// the next one.
+	custodialRecheckAfter = 30 * time.Minute
+)
+
+// custodialCandidate is a pinned file past its grace period whose last lookup,
+// if any, is older than custodialRecheckAfter.
+type custodialCandidate struct {
+	key     string
+	pinTime time.Time
+	checked time.Time
+}
+
+// orderCustodialCandidates puts never-checked files first, then the least
+// recently checked, so every file gets a lookup in turn. Ties go to the oldest
+// pin, then the key.
+func orderCustodialCandidates(due []custodialCandidate) {
+	sort.Slice(due, func(i, j int) bool {
+		ci, cj := due[i].checked, due[j].checked
+		if !ci.Equal(cj) {
+			return ci.Before(cj)
+		}
+		return pinnedEarlier(due[i].pinTime, due[j].pinTime, due[i].key, due[j].key)
+	})
+}
+
+// pinnedEarlier orders files by pin time, unknown pin times first, then by key.
+func pinnedEarlier(ti, tj time.Time, ki, kj string) bool {
+	if ti.IsZero() != tj.IsZero() {
+		return ti.IsZero()
+	}
+	if !ti.Equal(tj) {
+		return ti.Before(tj)
+	}
+	return ki < kj
+}
 
 // custodialKind is what one retry pass should do with a file this node still holds.
 type custodialKind int
@@ -53,14 +93,7 @@ func (sm *ShardManager) custodialRetryBudget() int {
 // cannot exceed the receivers' rate limit. Equal pin times break ties by key.
 func orderCustodialWork(items []custodialItem, budget int) []custodialItem {
 	sort.Slice(items, func(i, j int) bool {
-		ti, tj := items[i].pinTime, items[j].pinTime
-		if ti.IsZero() != tj.IsZero() {
-			return ti.IsZero()
-		}
-		if !ti.Equal(tj) {
-			return ti.Before(tj)
-		}
-		return items[i].key < items[j].key
+		return pinnedEarlier(items[i].pinTime, items[j].pinTime, items[i].key, items[j].key)
 	})
 	if budget < 0 {
 		budget = 0
@@ -88,36 +121,62 @@ func orderCustodialWork(items []custodialItem, budget int) []custodialItem {
 // earlier membership. Sending the ingest is not a handoff. The local copy stays
 // until handoffConfirmed reports at least MinPeersPerShard other providers;
 // until then the file is injected again. The pass sends the oldest files first
-// and at most one rate-limit window of messages, instead of a fixed ten.
+// and at most one rate-limit window of messages.
 // Files of the node's own shard get the same check: an ingest or a pin
 // migration during shard moves can leave a file in one member's CRDT only,
 // so a holder that sees fewer than MinPeersPerShard-1 other providers
 // announces the file to its shard again.
+// Each check is a DHT lookup, so a pass checks at most custodialLookupsPerPass
+// files, never-checked and least recently checked first, and a checked file
+// waits custodialRecheckAfter before its next lookup.
 func (sm *ShardManager) RunCustodialRetryPass() {
 	now := time.Now()
-	var items []custodialItem
+	if sm.custodialChecked == nil {
+		sm.custodialChecked = make(map[string]time.Time)
+	}
+	pinned := make(map[string]struct{})
+	var due []custodialCandidate
 	for key := range sm.storageMgr.GetAllKnownFiles() {
-		if sm.ctx.Err() != nil {
-			return
-		}
 		if !sm.storageMgr.IsPinned(key) {
 			continue
 		}
+		pinned[key] = struct{}{}
 		pinTime := sm.storageMgr.GetPinTime(key)
 		if !pinTime.IsZero() && now.Sub(pinTime) < custodialRetryInterval {
 			continue
 		}
+		checked := sm.custodialChecked[key]
+		if !checked.IsZero() && now.Sub(checked) < custodialRecheckAfter {
+			continue
+		}
+		due = append(due, custodialCandidate{key: key, pinTime: pinTime, checked: checked})
+	}
+	for key := range sm.custodialChecked {
+		if _, ok := pinned[key]; !ok {
+			delete(sm.custodialChecked, key)
+		}
+	}
+	orderCustodialCandidates(due)
+
+	var items []custodialItem
+	lookups := 0
+	for _, c := range due {
+		if lookups >= custodialLookupsPerPass {
+			break
+		}
+		if sm.ctx.Err() != nil {
+			return
+		}
+		key := c.key
+		sm.custodialChecked[key] = now
 		payloadCIDStr, err := common.GetPayloadCIDForShardAssignment(sm.ctx, sm.ipfsClient, key)
 		if err != nil || payloadCIDStr == key {
 			continue
 		}
-		item := custodialItem{key: key, payload: payloadCIDStr, pinTime: pinTime}
+		lookups++
+		item := custodialItem{key: key, payload: payloadCIDStr, pinTime: c.pinTime}
 		if sm.AmIResponsibleFor(payloadCIDStr) {
-			need := sm.cfg.Sharding.MinPeersPerShard - 1
-			if need < 1 {
-				need = 1
-			}
-			if sm.otherProvidersAtLeast(key, need) {
+			if sm.otherProvidersAtLeast(key, max(1, sm.cfg.Sharding.MinPeersPerShard-1)) {
 				continue
 			}
 			item.kind = custodialReannounce
@@ -149,7 +208,7 @@ func (sm *ShardManager) RunCustodialRetryPass() {
 		}
 	}
 	if retried > 0 || released > 0 || reannounced > 0 {
-		slog.Info("custodial retry pass complete", "reinjected", retried, "released", released, "reannounced", reannounced, "backlog", len(items))
+		slog.Info("custodial retry pass complete", "reinjected", retried, "released", released, "reannounced", reannounced, "checked", lookups, "due", len(due))
 	}
 }
 
@@ -158,23 +217,13 @@ func (sm *ShardManager) reannounceToOwnShard(key string) bool {
 	if err != nil {
 		return false
 	}
-	sm.mu.RLock()
-	currentShard := sm.currentShard
-	sm.mu.RUnlock()
+	currentShard := sm.getCurrentShard()
 	if err := sm.clusterMgr.PinIfAbsent(sm.ctx, currentShard, manifestCID, -1, -1); err != nil {
 		slog.Error("re-announce: failed to pin to own shard", "shard", currentShard, "error", err)
 		return false
 	}
 	if sm.signer != nil {
-		im := schema.IngestMessage{
-			SignedEnvelope: schema.SignedEnvelope{Type: schema.MessageTypeIngest, ManifestCID: manifestCID},
-			ShardID:        currentShard,
-		}
-		if err := sm.signer.SignProtocolMessage(&im); err == nil {
-			if b, err := im.MarshalCBOR(); err == nil {
-				sm.PublishToShardCBOR(b, currentShard)
-			}
-		}
+		sm.publishIngest(manifestCID, currentShard)
 	}
 	slog.Info("re-announced under-replicated file to own shard", "shard", currentShard, "manifest", key)
 	return true
@@ -202,9 +251,7 @@ func (sm *ShardManager) reinjectCustodial(key, payloadCIDStr string) bool {
 	if err != nil || sm.ps == nil {
 		return false
 	}
-	sm.mu.RLock()
-	currentShard := sm.currentShard
-	sm.mu.RUnlock()
+	currentShard := sm.getCurrentShard()
 	nominal, err := common.TargetShardForPayload(payloadCIDStr, max(1, len(currentShard)))
 	if err != nil {
 		return false
@@ -226,29 +273,12 @@ func (sm *ShardManager) reinjectCustodial(key, payloadCIDStr string) bool {
 		return false
 	}
 	if sm.signer != nil {
-		im := schema.IngestMessage{
-			SignedEnvelope: schema.SignedEnvelope{Type: schema.MessageTypeIngest, ManifestCID: manifestCID},
-			ShardID:        target,
-		}
-		if err := sm.signer.SignProtocolMessage(&im); err == nil {
-			if b, err := im.MarshalCBOR(); err == nil {
-				sm.PublishToShardCBOR(b, target)
-			}
-		}
+		sm.publishIngest(manifestCID, target)
 	}
 	slog.Info("custodial retry: re-injected file", "target_shard", target, "manifest", key)
 	return true
 }
 
 func (sm *ShardManager) runCustodialRetryLoop() {
-	ticker := time.NewTicker(custodialRetryInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-sm.ctx.Done():
-			return
-		case <-ticker.C:
-			sm.RunCustodialRetryPass()
-		}
-	}
+	sm.runEvery(custodialRetryInterval, sm.RunCustodialRetryPass)
 }

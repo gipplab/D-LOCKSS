@@ -31,27 +31,18 @@ func decodePeerIDWithFallback(s string) (peer.ID, error) {
 }
 
 // shardIDsUpToDepth returns all shard IDs in the binary tree up to the given depth.
-// Depth 0: [""]. Depth 1: ["", "0", "1"]. Depth 2: ["", "0", "1", "00", "01", "10", "11"]. etc.
-// This allows the monitor to bootstrap-subscribe to all potentially populated shards
-// even when joining late (when nodes have already moved to deeper shards).
+// Depth 0: [""]. Depth 1: ["", "0", "1"]. Depth 2: ["", "0", "1", "00", "01", "10", "11"].
+// This lets the monitor bootstrap-subscribe to all potentially populated shards
+// even when it joins after nodes have already moved to deeper shards.
 func shardIDsUpToDepth(depth int) []string {
 	if depth < 0 {
 		return nil
 	}
-	n := 1<<(depth+1) - 1
-	out := make([]string, 0, n)
+	out := make([]string, 0, 1<<(depth+1)-1)
 	out = append(out, "")
 	for level := 1; level <= depth; level++ {
 		for i := 0; i < 1<<level; i++ {
-			var sb strings.Builder
-			for b := level - 1; b >= 0; b-- {
-				if (i>>b)&1 == 1 {
-					sb.WriteByte('1')
-				} else {
-					sb.WriteByte('0')
-				}
-			}
-			out = append(out, sb.String())
+			out = append(out, fmt.Sprintf("%0*b", level, i))
 		}
 	}
 	return out
@@ -63,24 +54,21 @@ func (m *Monitor) ensureShardSubscription(ctx context.Context, shardID string) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.ensureShardSubscriptionUnlocked(ctx, shardID)
+	m.ensureShardSubscriptionLocked(ctx, shardID)
 }
 
-func (m *Monitor) ensureShardSubscriptionUnlocked(ctx context.Context, shardID string) {
-	if m.ps == nil {
+func (m *Monitor) ensureShardSubscriptionLocked(ctx context.Context, shardID string) {
+	if m.ps == nil || len(shardID) > maxShardDepthForSubscription {
 		return
-	}
-	if len(shardID) > maxShardDepthForSubscription {
-		return // Avoid subscribing to very deep shards (e.g. 16-bit IDs)
 	}
 	if _, exists := m.shardTopics[shardID]; exists {
 		return
 	}
-	topicName := fmt.Sprintf("%s-%s-shard-%s", m.getTopicPrefixUnlocked(), m.getTopicNameUnlocked(), shardID)
+	topicName := m.shardTopic(shardID)
 	topic, err := m.ps.Join(topicName)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "context canceled") {
-			return // Normal during shutdown; don't log
+			return // expected during shutdown
 		}
 		slog.Error("failed to join shard topic", "topic", topicName, "error", err)
 		return
@@ -91,12 +79,12 @@ func (m *Monitor) ensureShardSubscriptionUnlocked(ctx context.Context, shardID s
 		return
 	}
 	m.shardTopics[shardID] = &shardSub{topic: topic, sub: sub}
-	// Publish PROBE so D-LOCKSS nodes know we're an observer (don't count us for split/replication)
+	// PROBE marks the monitor as an observer so nodes leave it out of split
+	// and replication counts.
 	if m.host != nil {
-		probeMsg := []byte("PROBE:" + m.host.ID().String())
-		_ = topic.Publish(ctx, probeMsg)
+		_ = topic.Publish(ctx, []byte("PROBE:"+m.host.ID().String()))
 	}
-	go m.handleShardMessages(m.subCtx, sub, shardID, topicName)
+	go m.handleShardMessages(m.appCtx, sub, shardID, topicName)
 	slog.Info("subscribed to shard topic", "shard", shardLabel(shardID))
 }
 
@@ -118,15 +106,11 @@ func (m *Monitor) resolveIPFromPeer(pid peer.ID) string {
 	return preferPublicIP(ips)
 }
 
-// parseRole normalises a role string from a heartbeat/join message.
+// parseRole normalises a role string from a heartbeat or join message.
 func parseRole(s string) string {
-	switch strings.ToUpper(s) {
-	case "PASSIVE":
-		return "PASSIVE"
-	case "PROBE":
-		return "PROBE"
-	case "REPLICATOR":
-		return "REPLICATOR"
+	switch role := strings.ToUpper(s); role {
+	case "PASSIVE", "PROBE", "REPLICATOR":
+		return role
 	default:
 		return "ACTIVE"
 	}
@@ -134,12 +118,6 @@ func parseRole(s string) string {
 
 func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscription, shardID string, expectedTopic string) {
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
 		msg, err := sub.Next(ctx)
 		if err != nil {
 			if ctx.Err() == nil {
@@ -167,7 +145,7 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 			// Ignore probe messages from other monitors.
 
 		case hasPrefix(data, "LEAVE:"):
-			if peerStr := strings.TrimSpace(string(data[6:])); peerStr != "" {
+			if peerStr := strings.TrimSpace(string(data[len("LEAVE:"):])); peerStr != "" {
 				if leaveID, err := decodePeerIDWithFallback(peerStr); err == nil {
 					m.handleLeaveShard(ctx, leaveID, shardID)
 					slog.Info("shard leave", "peer", leaveID.String(), "shard", shardLabel(shardID))
@@ -175,17 +153,17 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 			}
 
 		case hasPrefix(data, "JOIN:"):
-			m.dispatchJoin(ctx, data[5:], senderID, shardID, ip)
+			m.dispatchJoin(ctx, data[len("JOIN:"):], senderID, shardID, ip)
 
 		case hasPrefix(data, "PINNED:"):
-			m.handleHeartbeatWithRole(ctx, senderID, shardID, ip, -1, "", "")
-			if manifestCID, err := cid.Decode(string(data[7:])); err == nil {
+			m.handleHeartbeat(ctx, senderID, shardID, ip, -1, "", "")
+			if manifestCID, err := cid.Decode(string(data[len("PINNED:"):])); err == nil {
 				im := schema.IngestMessage{SignedEnvelope: schema.SignedEnvelope{ManifestCID: manifestCID}, ShardID: shardID}
 				m.handleIngestMessage(ctx, &im, senderID, shardID, ip)
 			}
 
 		default:
-			m.handleHeartbeatWithRole(ctx, senderID, shardID, ip, -1, "", "")
+			m.handleHeartbeat(ctx, senderID, shardID, ip, -1, "", "")
 			var im schema.IngestMessage
 			if err := im.UnmarshalCBOR(data); err == nil {
 				m.dispatchIngestMessage(ctx, &im, senderID, shardID, ip)
@@ -205,7 +183,7 @@ func (m *Monitor) dispatchHeartbeat(ctx context.Context, data []byte, senderID p
 	}
 	parts := strings.SplitN(string(data), ":", 5)
 	if len(parts) < 2 || parts[1] == "" {
-		m.handleHeartbeatWithRole(ctx, senderID, shardID, ip, -1, "", "")
+		m.handleHeartbeat(ctx, senderID, shardID, ip, -1, "", "")
 		return
 	}
 
@@ -229,13 +207,9 @@ func (m *Monitor) dispatchHeartbeat(ctx context.Context, data []byte, senderID p
 	}
 
 	if shardID != "" {
-		logLabel := authorID.String()
-		if nodeName != "" {
-			logLabel = nodeName + " (" + authorID.String() + ")"
-		}
-		slog.Info("heartbeat", "shard", shardID, "author", logLabel, "pinned", pinnedCount, "role", role)
+		slog.Info("heartbeat", "shard", shardID, "author", peerLabel(authorID.String(), nodeName), "pinned", pinnedCount, "role", role)
 	}
-	m.handleHeartbeatWithRole(ctx, authorID, shardID, ip, pinnedCount, role, nodeName)
+	m.handleHeartbeat(ctx, authorID, shardID, ip, pinnedCount, role, nodeName)
 }
 
 // dispatchJoin parses a JOIN:<peerID>:<role>:<name> message (data starts after "JOIN:").
@@ -259,12 +233,8 @@ func (m *Monitor) dispatchJoin(ctx context.Context, data []byte, senderID peer.I
 		nodeName = parts[2]
 	}
 
-	if m.handleHeartbeatWithRole(ctx, joinID, shardID, ip, -1, role, nodeName) {
-		logLabel := joinID.String()
-		if nodeName != "" {
-			logLabel = nodeName + " (" + joinID.String() + ")"
-		}
-		slog.Info("shard join", "peer", logLabel, "shard", shardLabel(shardID), "role", role)
+	if m.handleHeartbeat(ctx, joinID, shardID, ip, -1, role, nodeName) {
+		slog.Info("shard join", "peer", peerLabel(joinID.String(), nodeName), "shard", shardLabel(shardID), "role", role)
 	}
 }
 
@@ -286,7 +256,7 @@ func (m *Monitor) dispatchIngestMessage(ctx context.Context, im *schema.IngestMe
 	}
 	m.handleIngestMessage(ctx, im, authorID, targetShard, ip)
 	m.ensureMinPinnedForPeer(ctx, authorID.String(), 1)
-	m.handleHeartbeatWithRole(ctx, authorID, targetShard, ip, -1, "", "")
+	m.handleHeartbeat(ctx, authorID, targetShard, ip, -1, "", "")
 }
 
 // subscribeToActiveShards runs in the background and periodically subscribes
@@ -309,8 +279,7 @@ func (m *Monitor) subscribeToActiveShardsPass(ctx context.Context) {
 	if m.ps == nil {
 		return
 	}
-	targets := m.collectShardTargets()
-	for shardID := range targets {
+	for shardID := range m.collectShardTargets() {
 		if len(shardID) <= maxShardDepthForSubscription {
 			m.ensureShardSubscription(ctx, shardID)
 		}
@@ -326,11 +295,7 @@ func (m *Monitor) collectShardTargets() map[string]bool {
 
 	targets := make(map[string]bool)
 	for _, node := range m.nodes {
-		if node.CurrentShard != "" {
-			targets[node.CurrentShard] = true
-		} else {
-			targets[""] = true
-		}
+		targets[node.CurrentShard] = true
 		for _, entry := range node.ShardHistory {
 			if time.Since(entry.FirstSeen) < 5*time.Minute {
 				targets[entry.ShardID] = true
@@ -340,23 +305,15 @@ func (m *Monitor) collectShardTargets() map[string]bool {
 	for _, event := range m.splitEvents {
 		targets[event.ParentShard] = true
 		targets[event.ChildShard] = true
-		if event.ParentShard == "" {
-			targets["0"] = true
-			targets["1"] = true
-		}
 	}
-	// Snapshot keys so we can mutate targets while iterating.
+	// Children are added from a snapshot of the keys, so only one level is added.
 	existing := make([]string, 0, len(targets))
 	for k := range targets {
 		existing = append(existing, k)
 	}
 	for _, shardID := range existing {
-		c0, c1 := shardID+"0", shardID+"1"
-		if shardID == "" {
-			c0, c1 = "0", "1"
-		}
-		targets[c0] = true
-		targets[c1] = true
+		targets[shardID+"0"] = true
+		targets[shardID+"1"] = true
 	}
 	return targets
 }
@@ -376,8 +333,7 @@ func isPrivateIP(ipStr string) bool {
 	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 		return true
 	}
-	privateIPBlocks := []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
-	for _, cidr := range privateIPBlocks {
+	for _, cidr := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"} {
 		_, block, _ := net.ParseCIDR(cidr)
 		if block.Contains(ip) {
 			return true

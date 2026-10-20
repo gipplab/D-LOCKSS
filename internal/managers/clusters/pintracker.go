@@ -15,7 +15,7 @@ import (
 )
 
 type ipfsPinner interface {
-	PinRecursive(ctx context.Context, c cid.Cid) error
+	PinManifest(ctx context.Context, c cid.Cid) error
 	IsPinned(ctx context.Context, c cid.Cid) (bool, error)
 	GetBlock(ctx context.Context, c cid.Cid) ([]byte, error)
 }
@@ -28,17 +28,13 @@ type localPinTracker struct {
 	onPinRemoved func(cid string)
 	origin       trust.OriginGate
 
-	// State
 	mu sync.RWMutex
+	// tracked holds the CIDs synced from this shard's CRDT, so tracking can
+	// be released once they leave it.
+	tracked map[string]struct{}
 
-	// pinnedByUs: CIDs we pinned from this shard's CRDT (so we can unpin when no longer allocated)
-	pinnedByUs map[string]struct{}
-
-	// Lifecycle
-	ctx    context.Context
-	cancel context.CancelFunc
-
-	// Trigger channel for event-driven updates
+	ctx     context.Context
+	cancel  context.CancelFunc
 	trigger chan struct{}
 }
 
@@ -62,7 +58,7 @@ func newLocalPinTracker(ipfsClient ipfsPinner, shardID string, onPinSynced func(
 		onPinSynced:  onPinSynced,
 		onPinRemoved: onPinRemoved,
 		origin:       origin,
-		pinnedByUs:   make(map[string]struct{}),
+		tracked:      make(map[string]struct{}),
 		ctx:          ctx,
 		cancel:       cancel,
 		trigger:      make(chan struct{}, 1),
@@ -74,12 +70,11 @@ func (pt *localPinTracker) TriggerSync() {
 	select {
 	case pt.trigger <- struct{}{}:
 	default:
-		// Already triggered
+		// A sync is already pending.
 	}
 }
 
-// Start begins monitoring the consensus state and syncing pins.
-// consensusClient is the CRDT component to watch.
+// Start syncs local pins against the consensus state until Stop is called.
 func (pt *localPinTracker) Start(cc consensusClient) {
 	go pt.syncLoop(cc)
 }
@@ -89,7 +84,7 @@ func (pt *localPinTracker) Stop() {
 }
 
 func (pt *localPinTracker) syncLoop(consensus consensusClient) {
-	ticker := time.NewTicker(10 * time.Second) // Poll state every 10s so peers replicate sooner
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -105,24 +100,22 @@ func (pt *localPinTracker) syncLoop(consensus consensusClient) {
 }
 
 func (pt *localPinTracker) syncState(consensus consensusClient) {
-	// 1. Get Global State
-	state, err := consensus.State(pt.ctx)
+	st, err := consensus.State(pt.ctx)
 	if err != nil {
 		slog.Error("failed to get consensus state", "shard", pt.shardID, "error", err)
 		return
 	}
 
-	// 2. Iterate pins (state.List closes out when done; do not close it here)
+	// List closes out when it is done.
 	out := make(chan api.Pin)
 	go func() {
-		_ = state.List(pt.ctx, out)
+		_ = st.List(pt.ctx, out)
 	}()
 
-	// CIDs we should have pinned — all nodes on a shard pin everything in
-	// the shard's CRDT.  Allocations are informational only (for monitoring
-	// target replication).  We ignore them here so that pins propagated
-	// via PinIfAbsent (with -1,-1 "pin everywhere" allocations) or via
-	// the ingesting node (with specific allocations) are treated equally.
+	// Every shard member pins everything in the shard's CRDT. Allocations are
+	// informational (target replication for monitoring) and are ignored here,
+	// so "pin everywhere" pins from PinIfAbsent and pins with explicit
+	// allocations from the ingesting node are treated alike.
 	shouldHave := make(map[string]struct{})
 
 	for pin := range out {
@@ -130,7 +123,6 @@ func (pt *localPinTracker) syncState(consensus consensusClient) {
 		cStr := c.String()
 		shouldHave[cStr] = struct{}{}
 
-		// Check BadBits before syncing (Compliance Check)
 		if pt.badBits.IsBlocked(cStr) {
 			slog.Warn("refusing to sync blocked content", "shard", pt.shardID, "cid", c)
 			continue
@@ -158,44 +150,41 @@ func (pt *localPinTracker) syncState(consensus consensusClient) {
 		}
 		if !isPinned {
 			slog.Info("syncing pin to local ipfs", "shard", pt.shardID, "cid", c)
-			if err := pt.ipfsClient.PinRecursive(pt.ctx, c); err != nil {
+			if err := pt.ipfsClient.PinManifest(pt.ctx, c); err != nil {
 				slog.Error("failed to pin", "shard", pt.shardID, "cid", c, "error", err)
 				continue
 			}
 		}
 		pt.mu.Lock()
-		_, alreadyTracked := pt.pinnedByUs[cStr]
-		pt.pinnedByUs[cStr] = struct{}{}
+		_, alreadyTracked := pt.tracked[cStr]
+		pt.tracked[cStr] = struct{}{}
 		pt.mu.Unlock()
-		// Only notify on first sync so we don't spam announcements every 10s.
+		// Notify only on the first sync; later syncs repeat every tick.
 		if !alreadyTracked && pt.onPinSynced != nil {
 			pt.onPinSynced(cStr)
 		}
 	}
 
-	// Remove CIDs we previously pinned from this shard but are no longer allocated for.
-	// We intentionally do NOT call ipfsClient.UnpinRecursive here because during a
-	// shard split/migration, the same CID may be migrated to a child shard on this
-	// same node.  If we unpinned from IPFS, the child shard's PinTracker would
-	// have to re-fetch the data (unnecessary churn, risk of loss during GC window).
-	// Actual IPFS-level unpins are handled by the reshard pass (shard_replication.go)
-	// which is migration-aware and calls ipfsClient.UnpinRecursive directly.
+	// CIDs that left the CRDT only lose tracking; their IPFS pins stay. During
+	// a split the same CID may move to a child shard on this node, and
+	// unpinning would force a re-fetch and risk loss in the GC window.
+	// IPFS-level unpins belong to the migration-aware reshard pass.
 	pt.mu.RLock()
-	var toUnpin []string
-	for cidStr := range pt.pinnedByUs {
+	var released []string
+	for cidStr := range pt.tracked {
 		if _, ok := shouldHave[cidStr]; !ok {
-			toUnpin = append(toUnpin, cidStr)
+			released = append(released, cidStr)
 		}
 	}
 	pt.mu.RUnlock()
 
-	for _, cidStr := range toUnpin {
+	for _, cidStr := range released {
 		slog.Info("releasing tracking, no longer in crdt", "shard", pt.shardID, "cid", cidStr)
 		if pt.onPinRemoved != nil {
 			pt.onPinRemoved(cidStr)
 		}
 		pt.mu.Lock()
-		delete(pt.pinnedByUs, cidStr)
+		delete(pt.tracked, cidStr)
 		pt.mu.Unlock()
 	}
 }

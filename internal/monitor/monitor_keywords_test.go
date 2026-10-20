@@ -7,25 +7,30 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"testing"
+	"time"
 
 	"dlockss/internal/keywords"
 )
 
 func TestUniqueCIDList(t *testing.T) {
-	m := NewMonitor(DefaultMonitorConfig())
+	m := NewMonitor(DefaultConfig())
+	now := time.Now()
 	m.mu.Lock()
-	m.uniqueCIDs["aaa"] = m.uniqueCIDs["aaa"]
-	m.uniqueCIDs["bbb"] = m.uniqueCIDs["bbb"]
+	m.uniqueCIDs["aaa"] = now
+	m.uniqueCIDs["bbb"] = now
 	m.mu.Unlock()
 	got := m.UniqueCIDList()
-	if len(got) != 2 {
-		t.Fatalf("UniqueCIDList = %v, want 2 entries", got)
+	sort.Strings(got)
+	if want := []string{"aaa", "bbb"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("UniqueCIDList = %v, want %v", got, want)
 	}
 }
 
 func TestKeywordStatsDisabled(t *testing.T) {
-	m := NewMonitor(DefaultMonitorConfig())
+	m := NewMonitor(DefaultConfig())
 	req := httptest.NewRequest(http.MethodGet, "/api/keyword-stats", nil)
 	rec := httptest.NewRecorder()
 	m.handleKeywordStats(rec, req)
@@ -42,7 +47,7 @@ func TestKeywordStatsDisabled(t *testing.T) {
 }
 
 func TestKeywordAPIKeyOnce(t *testing.T) {
-	m := NewMonitor(DefaultMonitorConfig())
+	m := NewMonitor(DefaultConfig())
 	m.SetKeywords(keywords.NewStore(keywords.Config{DataDir: t.TempDir()}))
 
 	post := func(key string) *httptest.ResponseRecorder {
@@ -84,7 +89,7 @@ func TestManifestPayloadUsesLocalIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m := NewMonitor(DefaultMonitorConfig())
+	m := NewMonitor(DefaultConfig())
 	m.SetKeywords(keywords.NewStore(keywords.Config{DataDir: dir, Gateway: "http://127.0.0.1:9"}))
 
 	req := httptest.NewRequest(http.MethodGet, "/api/manifest-payload?cid=bafy-manifest", nil)
@@ -112,7 +117,7 @@ func TestIPFSGatewayProxiesKubo(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	m := NewMonitor(DefaultMonitorConfig())
+	m := NewMonitor(DefaultConfig())
 	m.SetKeywords(keywords.NewStore(keywords.Config{DataDir: t.TempDir(), Gateway: upstream.URL}))
 	req := httptest.NewRequest(http.MethodGet, "/ipfs/bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy", nil)
 	rec := httptest.NewRecorder()

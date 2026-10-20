@@ -54,11 +54,14 @@ type StorageProvider interface {
 	StorageWriter
 }
 
-const migratePinsFlushDelay = 250 * time.Millisecond
-const rootPeerCheckInterval = 30 * time.Second
-const rootReplicationCheckInterval = 20 * time.Second
-const replicationRequestCooldownDuration = 5 * time.Minute
-const maxReplicationRequestsPerCycle = 50
+const (
+	migratePinsFlushDelay              = 250 * time.Millisecond
+	rootPeerCheckInterval              = 30 * time.Second
+	rootReplicationCheckInterval       = 20 * time.Second
+	replicationRequestCooldownDuration = 5 * time.Minute
+	maxReplicationRequestsPerCycle     = 50
+	maxProbeTopicCache                 = 4
+)
 
 const (
 	msgPrefixHeartbeat = "HEARTBEAT:"
@@ -89,8 +92,15 @@ type shardSubscription struct {
 	observerOnly bool
 }
 
+func (s *shardSubscription) close() {
+	s.cancel()
+	s.sub.Cancel()
+	if s.topic != nil {
+		_ = s.topic.Close()
+	}
+}
+
 type ShardManager struct {
-	// Dependencies
 	ctx         context.Context
 	cfg         *config.Config
 	h           host.Host
@@ -102,39 +112,31 @@ type ShardManager struct {
 	rateLimiter *common.RateLimiter
 	nodeName    string
 
-	// Data-origin gate (trusted_peers.json / ingest allowlist)
+	// origin is the data-origin gate (trusted_peers.json / ingest allowlist).
 	origin trust.OriginGate
 
-	// Peer tracking
 	peers *peerTracker
 
-	// Shard membership (protected by mu)
-	mu           sync.RWMutex
-	currentShard string
-
-	// PubSub topic management (protected by mu)
-	shardSubs          map[string]*shardSubscription
-	probeTopicCache    map[string]*pubsub.Topic
-	observerOnlyShards map[string]struct{}
-
-	// Shard transition timestamps (protected by mu)
+	// mu guards the fields in this block.
+	mu                    sync.RWMutex
+	currentShard          string
+	shardSubs             map[string]*shardSubscription
+	probeTopicCache       map[string]*pubsub.Topic
+	observerOnlyShards    map[string]struct{}
 	lastMoveToDeeperShard time.Time
 	lastMergeUpTime       time.Time
-	lastShardMove         time.Time // set on ANY shard transition (split, merge, discovery)
-
-	// Message handling (protected by mu)
+	lastShardMove         time.Time // set on any shard transition (split, merge, discovery)
 	lastMessageTime       time.Time
 	lastProbeResponseTime time.Time
 
-	// Replication state
 	reshardedFiles    *common.KnownFiles
 	orphanHandoffSent map[string]map[string]*orphanHandoffInfo
 	reprovideInFlight atomic.Bool
+	// custodialChecked is the time of each pinned file's last custodial
+	// provider lookup. Only RunCustodialRetryPass uses it.
+	custodialChecked map[string]time.Time
 
-	// Replication: request sending and handling (delegated)
-	repl *replicationManager
-
-	// Lifecycle: split/merge/discovery (delegated)
+	repl      *replicationManager
 	lifecycle *lifecycleManager
 }
 
@@ -220,11 +222,7 @@ func (sm *ShardManager) Close() error {
 	defer sm.mu.Unlock()
 
 	for _, sub := range sm.shardSubs {
-		sub.cancel()
-		sub.sub.Cancel()
-		if sub.topic != nil {
-			_ = sub.topic.Close()
-		}
+		sub.close()
 	}
 	sm.shardSubs = make(map[string]*shardSubscription)
 
@@ -235,7 +233,34 @@ func (sm *ShardManager) Close() error {
 	return firstErr
 }
 
-// --- lifecycleOps implementation ---
+// sleep waits for d and reports false if the manager's context ends first.
+func (sm *ShardManager) sleep(d time.Duration) bool {
+	select {
+	case <-sm.ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
+// runEvery calls fn every interval until the manager's context ends.
+func (sm *ShardManager) runEvery(interval time.Duration, fn func()) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-sm.ctx.Done():
+			return
+		case <-ticker.C:
+			fn()
+		}
+	}
+}
+
+var (
+	_ lifecycleOps   = (*ShardManager)(nil)
+	_ replicationOps = (*ShardManager)(nil)
+)
 
 func (sm *ShardManager) getCurrentShard() string {
 	sm.mu.RLock()
@@ -275,8 +300,6 @@ func (sm *ShardManager) pruneStaleSeenPeers() {
 	sm.peers.PruneStale(sm.cfg.Sharding.PruneStalePeersInterval)
 }
 
-// --- replicationOps implementation ---
-
 func (sm *ShardManager) replicationContext() context.Context { return sm.ctx }
 func (sm *ShardManager) replicationConfig() *config.Config   { return sm.cfg }
 func (sm *ShardManager) getPinnedManifests() []string        { return sm.storageMgr.GetPinnedManifests() }
@@ -286,8 +309,8 @@ func (sm *ShardManager) publishCBOR(data []byte, shardID string) {
 }
 func (sm *ShardManager) replicationSigner() MessageAuthenticator { return sm.signer }
 func (sm *ShardManager) clusterTriggerSync(shardID string)       { sm.clusterMgr.TriggerSync(shardID) }
-func (sm *ShardManager) ipfsPinRecursive(ctx context.Context, c cid.Cid) error {
-	return sm.ipfsClient.PinRecursive(ctx, c)
+func (sm *ShardManager) ipfsPinManifest(ctx context.Context, c cid.Cid) error {
+	return sm.ipfsClient.PinManifest(ctx, c)
 }
 func (sm *ShardManager) ensureCluster(ctx context.Context, shardID string) error {
 	return sm.EnsureClusterForShard(ctx, shardID)
@@ -344,55 +367,44 @@ func (sm *ShardManager) moveToShard(fromShard, toShard string, isMergeUp bool) {
 	}
 
 	go sm.schedulePinMigration(fromShard, toShard)
-	go sm.scheduleDelayedLeave(fromShard, toShard)
+	go sm.scheduleDelayedLeave(fromShard)
 	go sm.scheduleReshardPass(fromShard, toShard)
 }
 
-// publishLeaveFromShard announces departure immediately so peers drop us from
-// their active counts, even though the topic stays open for ShardOverlapDuration.
+// publishLeaveFromShard announces departure immediately so peers stop counting
+// this node as active, even though the topic stays open for ShardOverlapDuration.
 func (sm *ShardManager) publishLeaveFromShard(fromShard string) {
 	sm.mu.RLock()
 	fromSub, exists := sm.shardSubs[fromShard]
 	sm.mu.RUnlock()
 	if exists && fromSub.topic != nil && !fromSub.observerOnly {
-		leaveMsg := []byte(msgPrefixLeave + sm.h.ID().String())
-		_ = fromSub.topic.Publish(sm.ctx, leaveMsg)
+		_ = fromSub.topic.Publish(sm.ctx, []byte(msgPrefixLeave+sm.h.ID().String()))
 	}
 }
 
+// schedulePinMigration migrates pins to toShard, or to the shard below it the
+// node has moved on to in the meantime.
 func (sm *ShardManager) schedulePinMigration(fromShard, toShard string) {
-	select {
-	case <-sm.ctx.Done():
+	if !sm.sleep(migratePinsFlushDelay) {
 		return
-	case <-time.After(migratePinsFlushDelay):
 	}
-	sm.mu.RLock()
-	current := sm.currentShard
-	sm.mu.RUnlock()
-	if current != toShard {
-		if strings.HasPrefix(current, toShard) {
-			slog.Info("migration redirect", "from", fromShard, "to", current, "intermediate", toShard)
-			if err := sm.clusterMgr.MigratePins(sm.ctx, fromShard, current); err != nil {
-				slog.Error("migration failed", "from", fromShard, "to", current, "error", err)
-			}
+	target := sm.getCurrentShard()
+	if target != toShard {
+		if !strings.HasPrefix(target, toShard) {
+			return
 		}
-		return
+		slog.Info("migration redirect", "from", fromShard, "to", target, "intermediate", toShard)
 	}
-	if err := sm.clusterMgr.MigratePins(sm.ctx, fromShard, toShard); err != nil {
-		slog.Error("migration failed", "from", fromShard, "to", toShard, "error", err)
+	if err := sm.clusterMgr.MigratePins(sm.ctx, fromShard, target); err != nil {
+		slog.Error("migration failed", "from", fromShard, "to", target, "error", err)
 	}
 }
 
-func (sm *ShardManager) scheduleDelayedLeave(fromShard, toShard string) {
-	select {
-	case <-sm.ctx.Done():
+func (sm *ShardManager) scheduleDelayedLeave(fromShard string) {
+	if !sm.sleep(sm.cfg.Sharding.ShardOverlapDuration) {
 		return
-	case <-time.After(sm.cfg.Sharding.ShardOverlapDuration):
 	}
-	sm.mu.RLock()
-	current := sm.currentShard
-	sm.mu.RUnlock()
-	if current == fromShard {
+	if sm.getCurrentShard() == fromShard {
 		return
 	}
 	sm.LeaveShard(fromShard)
@@ -402,15 +414,10 @@ func (sm *ShardManager) scheduleDelayedLeave(fromShard, toShard string) {
 }
 
 func (sm *ShardManager) scheduleReshardPass(fromShard, toShard string) {
-	select {
-	case <-sm.ctx.Done():
+	if !sm.sleep(sm.cfg.Files.ReshardDelay) {
 		return
-	case <-time.After(sm.cfg.Files.ReshardDelay):
 	}
-	sm.mu.RLock()
-	current := sm.currentShard
-	sm.mu.RUnlock()
-	if current != toShard {
+	if sm.getCurrentShard() != toShard {
 		return
 	}
 	sm.RunReshardPass(fromShard, toShard)

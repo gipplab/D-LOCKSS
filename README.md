@@ -34,8 +34,15 @@
     *(Windows: `dlockss.exe`)*
 
 2.  **Add Files:**
-    Copy any file (e.g., PDF) into the data directory (default `./data` or `DLOCKSS_DATA_DIR`).
-    The node will automatically detect, ingest, pin, and replicate the file.
+    Either pin content in the node's Kubo (`ipfs pin add <cid>`, or "Set pinning" in the Kubo WebUI / IPFS Desktop),
+    or copy any file (e.g., PDF) into the data directory (default `./data` or `DLOCKSS_DATA_DIR`).
+    The node will automatically detect, ingest, pin, and replicate it.
+
+    A pinned directory is ingested as one object. A pin name (`ipfs pin add --name paper.pdf <cid>`) becomes the
+    metadata reference, otherwise `ipfs://<cid>`. Files that are only in the WebUI's *Files* view (MFS) are not
+    pinned and are not ingested. D-LOCKSS labels its own manifest pins `dlockss:manifest` and never ingests them
+    or the payloads they reference. Unpinning in Kubo does not remove ingested content from D-LOCKSS.
+    Disable with `DLOCKSS_PIN_INGEST=false`; the poll interval is `DLOCKSS_PIN_INGEST_INTERVAL` (default `1m`).
 
 ### Configuration
 Configure via environment variables:
@@ -167,7 +174,7 @@ D-LOCKSS acts as a self-healing, sharded storage cluster using the IPFS/Libp2p s
 ### Key Components
 1.  **Shard Manager:** Dynamically splits responsibilities based on peer count to maintain scalability. Delegates lifecycle decisions (split/merge/discovery) to a `lifecycleManager` and replication to a `replicationManager`.
 2.  **Cluster Manager:** Manages embedded **IPFS Cluster** instances (one per shard) using **CRDTs** for state consensus; nodes in a shard sync and pin content assigned to that shard.
-3.  **File Watcher:** Monitors the data directory to automatically ingest content (via `handleWatcherEvent` / `handleNewDirectory`).
+3.  **File Watcher:** Monitors the data directory to automatically ingest content (via `handleWatcherEvent` / `handleNewDirectory`), and polls Kubo's recursive pins to ingest those created by users (`WatchPins`).
 4.  **Storage Monitor:** Protects nodes from disk exhaustion by rejecting custodial requests when full.
 5.  **BadBits Manager:** Enforces content blocking (e.g., DMCA) based on configured country codes.
 
@@ -220,7 +227,14 @@ export SAIA_API_KEY="..."
 # export DLOCKSS_MONITOR_DATA_DIR="$HOME/.dlockss-monitor"
 ```
 
-Requires `pdftotext` (`poppler-utils`) on the monitor host. Keywords are generated once per PDF at index time and searched locally.
+Keywords are generated once per item at index time and searched locally. The indexer reads:
+
+*   PDFs (needs `pdftotext` from `poppler-utils` on the monitor host; without it PDFs are skipped)
+*   Word, Excel, PowerPoint, OpenDocument, and EPUB files
+*   text formats such as plain text, Markdown, CSV/TSV, JSON, XML, HTML, YAML, LaTeX, BibTeX, and source code
+*   directories, from their file listing plus excerpts of up to five readable files
+
+Images, audio, video, archives, other binaries, and files over 20 MB that need a full download (PDF and office formats) are skipped.
 
 The monitor displays each node's **name** (if configured via `DLOCKSS_NODE_NAME`), falling back to the Peer ID. Names propagate via HEARTBEAT/JOIN messages and appear in the node table, charts, and shard modals. Client-side aliases (EDIT button) override server-side names. Each node has **one peer ID**: when `DLOCKSS_IPFS_CONFIG` is set (e.g. in testnet), D-LOCKSS uses the IPFS repo identity so the same ID appears in the monitor and in `node_x.ipfs.log`.
 
@@ -236,8 +250,8 @@ From `testnet/`: `./run_testnet.sh` starts multiple D-LOCKSS nodes and IPFS daem
 go test ./... -v
 ```
 
-### Project Status
-*   **Current Phase:** Production — structural refactoring complete (see [Code Elegance Plan](docs/CODE_ELEGANCE_PLAN.md)). Config uses nested sub-structs (`Sharding`, `Replication`, `Files`, `Security`, `Orphan`). ShardManager delegates to `replicationManager` and `lifecycleManager`.
+### Code Layout
+Configuration is grouped into nested structs (`Sharding`, `Replication`, `Files`, `Security`, `Orphan`). `ShardManager` delegates replication to `replicationManager` and split/merge/discovery to `lifecycleManager`.
 
 ---
 

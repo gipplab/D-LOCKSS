@@ -26,7 +26,8 @@ func NewPinnedSet() *PinnedSet {
 	return &PinnedSet{m: syncmap.New[string, time.Time]()}
 }
 
-// Add pins a key (always refreshes timestamp). Returns true if key was new.
+// Add records key with the current time, refreshing the time of an existing
+// key. It reports whether key was new.
 func (ps *PinnedSet) Add(key string) bool { return ps.m.Upsert(key, time.Now()) }
 func (ps *PinnedSet) Has(key string) bool { return ps.m.Has(key) }
 func (ps *PinnedSet) Size() int           { return ps.m.Len() }
@@ -37,7 +38,8 @@ func (ps *PinnedSet) GetPinTime(key string) time.Time {
 	return v
 }
 
-// RemoveIfPresent atomically checks, removes, and returns the pin time.
+// RemoveIfPresent atomically removes key, returning its pin time and whether
+// it was present.
 func (ps *PinnedSet) RemoveIfPresent(key string) (time.Time, bool) {
 	return ps.m.DeleteAndGet(key)
 }

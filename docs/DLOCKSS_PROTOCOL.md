@@ -176,18 +176,18 @@ Replication is handled by the **Cluster Manager**, **LocalPinTracker**, and **re
 2.  **State Sync**: The CRDT (Merkle-DAG based) propagates pin/unpin to all peers in the shard via PubSub (`dlockss-shard-<id>`).
 3.  **Local Pin Tracker**:
     *   Each node runs a `LocalPinTracker` per shard that polls CRDT State() (and on TriggerSync).
-    *   For each pin in state, if this node is in **Allocations** (or Allocations is empty), it pins the ManifestCID locally via IPFS. The **onPinSynced** callback then: (a) registers the file with StorageManager, (b) announces PINNED, (c) resolves the PayloadCID from the manifest, (d) **pins the PayloadCID as its own root** so Kubo's reprovider (`pinned` strategy) re-announces it, and (e) provides both ManifestCID and PayloadCID to the DHT. On the ingesting node the payload is already a pin root from `ImportFile`; on replicas only the ManifestCID was pinned, so step (d) adds the missing pin entry — blocks are already local from the manifest's recursive pin so this returns quickly.
-    *   Pins no longer in state or no longer allocated are unpinned locally and onPinRemoved is called.
+    *   Every pin in state is pinned locally via IPFS as a manifest pin named `dlockss:manifest` (allocations are ignored; every shard member holds every file). The **onPinSynced** callback then: (a) registers the file with StorageManager, (b) announces PINNED, (c) resolves the PayloadCID from the manifest, (d) **pins the PayloadCID as its own root** so Kubo's reprovider (`pinned` strategy) re-announces it, and (e) provides both ManifestCID and PayloadCID to the DHT. On the ingesting node the payload is already a pin root from `ImportFile`; on replicas only the ManifestCID was pinned, so step (d) adds the missing pin entry. The blocks are already local from the manifest's recursive pin, so this returns quickly.
+    *   Pins that leave the state are no longer tracked and onPinRemoved is called. The IPFS pin is kept, because during a split the same node may hold the file for the child shard; reshard and orphan handling remove it once the target shard holds enough copies.
 4.  **Repair (replicationManager)**: The `replicationManager` (in `shard_replication.go`) periodically broadcasts `ReplicationRequest` messages for all pinned manifests (cooldown: 5 minutes per manifest). Receiving peers handle requests as follows:
     *   **Already pinned**: Ensure cluster membership and trigger CRDT sync.
-    *   **Not pinned (auto-replication)**: Fetch the manifest via `PinRecursive` (timeout: 5 minutes), add to cluster via `ClusterPinIfAbsent`, and trigger sync. Concurrency is bounded by a semaphore (default: 5 concurrent auto-replications).
+    *   **Not pinned (auto-replication)**: Fetch and pin the manifest via `PinManifest` (timeout: 5 minutes), add to cluster via `ClusterPinIfAbsent`, and trigger sync. Concurrency is bounded by a semaphore (default: 5 concurrent auto-replications).
     *   Legacy manifests (containing a `ts` field) are silently ignored.
 
 ### 6.2.1 Heartbeat-Driven Re-Pin and Re-Provide
 
 Each heartbeat cycle (~10s), every node picks **one** pinned manifest CID (round-robin) and:
 
-1. **Re-pins the ManifestCID recursively** (`PinRecursive`, 2min timeout). This is idempotent — returns instantly when the DAG is already complete locally, and incrementally fetches missing blocks otherwise. On resource-constrained nodes (e.g. Raspberry Pis) where the initial `PinRecursive` may have timed out or been OOM-killed before completing the full DAG, this gradually fills in the missing blocks over successive heartbeats.
+1. **Re-pins the ManifestCID recursively** (`PinManifest`, 2min timeout). This is idempotent: it returns instantly when the DAG is already complete locally and fetches missing blocks otherwise. It also names manifest pins created before pins were named. On resource-constrained nodes (e.g. Raspberry Pis) where the initial pin may have timed out or been OOM-killed before completing the full DAG, this gradually fills in the missing blocks over successive heartbeats.
 2. **Pins the PayloadCID as its own root** so Kubo's reprovider (`pinned` strategy) re-announces it. Blocks are already local from step 1, so this returns quickly.
 3. **Provides the manifest CID and its payload CID to the DHT** (only if the re-pin succeeded).
 
@@ -238,7 +238,7 @@ State files are placed in the **parent** of the data directory so the file watch
 **Docker / remote Kubo:** Mount the Kubo config JSON read-only and set `DLOCKSS_IPFS_CONFIG` to its path inside the container. This lets D-LOCKSS derive its identity from the IPFS daemon without mounting the entire repo. Alternatively, mount a persistent volume, point `DLOCKSS_DATA_DIR` to a subdirectory on it, and optionally set `DLOCKSS_IDENTITY_PATH` explicitly.
 
 ```yaml
-# Minimal Docker Compose — D-LOCKSS sharing identity with Kubo
+# Minimal Docker Compose: D-LOCKSS sharing identity with Kubo
 services:
   ipfs:
     image: ipfs/kubo:v0.43.1

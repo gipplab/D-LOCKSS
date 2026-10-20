@@ -19,10 +19,6 @@ import (
 	"dlockss/pkg/schema"
 )
 
-// ---------------------------------------------------------------------------
-// Mock: IPFSClient
-// ---------------------------------------------------------------------------
-
 type mockIPFS struct {
 	importFileFn func(ctx context.Context, path string) (cid.Cid, error)
 	putDagFn     func(ctx context.Context, block []byte) (cid.Cid, error)
@@ -42,12 +38,13 @@ func (m *mockIPFS) PutDagCBOR(ctx context.Context, block []byte) (cid.Cid, error
 }
 func (m *mockIPFS) GetBlock(context.Context, cid.Cid) ([]byte, error) { return nil, nil }
 func (m *mockIPFS) PinRecursive(context.Context, cid.Cid) error       { return nil }
+func (m *mockIPFS) PinManifest(context.Context, cid.Cid) error        { return nil }
 func (m *mockIPFS) UnpinRecursive(context.Context, cid.Cid) error     { return nil }
 func (m *mockIPFS) IsPinned(context.Context, cid.Cid) (bool, error)   { return false, nil }
-
-// ---------------------------------------------------------------------------
-// Mock: ShardCoordinator (ShardIdentity + ShardPublisher + CustodialInjector)
-// ---------------------------------------------------------------------------
+func (m *mockIPFS) RecursivePins(context.Context) (map[cid.Cid]string, error) {
+	return nil, nil
+}
+func (m *mockIPFS) DAGSize(context.Context, cid.Cid) (uint64, error) { return 0, nil }
 
 type mockShardCoordinator struct {
 	peerID      peer.ID
@@ -93,10 +90,6 @@ func (m *mockShardCoordinator) EnsureClusterForShard(context.Context, string) er
 func (m *mockShardCoordinator) PinToShard(context.Context, string, cid.Cid) error   { return nil }
 func (m *mockShardCoordinator) PublishToShardCBOR([]byte, string)                   {}
 
-// ---------------------------------------------------------------------------
-// Mock: StorageTracker
-// ---------------------------------------------------------------------------
-
 type mockStorage struct {
 	mu       sync.Mutex
 	pinned   map[string]bool
@@ -130,10 +123,6 @@ func (m *mockStorage) ProvideFile(_ context.Context, key string) {
 	m.provided = append(m.provided, key)
 }
 
-// ---------------------------------------------------------------------------
-// Mock: MessageSigner
-// ---------------------------------------------------------------------------
-
 type mockSigner struct {
 	calls atomic.Int64
 }
@@ -145,10 +134,6 @@ func (m *mockSigner) SignProtocolMessage(msg schema.Signable) error {
 	env.Sig = []byte("test-sig")
 	return nil
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 func fakeCID(label string) cid.Cid {
 	hash, _ := mh.Sum([]byte(label), mh.SHA2_256, -1)
@@ -185,10 +170,6 @@ func newTestProcessor(t *testing.T, cfg *config.Config, ipfsMock *mockIPFS, shar
 	return fp
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 func TestNewFileProcessorAndStop(t *testing.T) {
 	cfg := testConfig(t)
 	ipfsMock := &mockIPFS{}
@@ -205,15 +186,13 @@ func TestNewFileProcessorAndStop(t *testing.T) {
 
 func TestTryEnqueue_AcceptsFiles(t *testing.T) {
 	cfg := testConfig(t)
-	// Large concurrency * 100 = buffer size; we just need a few slots.
 	ipfsMock := &mockIPFS{}
 	shardMock := &mockShardCoordinator{peerID: "test-peer", shardID: "0", responsible: true}
 	storageMock := newMockStorage()
 	signerMock := &mockSigner{}
 
 	fp := newTestProcessor(t, cfg, ipfsMock, shardMock, storageMock, signerMock)
-	// Stop workers so jobs stay in the queue.
-	fp.Stop()
+	fp.Stop() // stop workers so jobs stay in the queue
 
 	ok := fp.TryEnqueue("/some/file.txt")
 	if !ok {
@@ -260,7 +239,7 @@ func TestEnqueueOrRetry_FallsBackToRetryQueue(t *testing.T) {
 		fp.TryEnqueue("/fill")
 	}
 
-	// Main queue full — EnqueueOrRetry should still succeed (goes to retry queue).
+	// With the main queue full, EnqueueOrRetry falls back to the retry queue.
 	ok := fp.EnqueueOrRetry("/retry-file")
 	if !ok {
 		t.Fatal("EnqueueOrRetry should succeed by adding to retry queue")
@@ -366,13 +345,12 @@ func TestScanExistingFiles(t *testing.T) {
 	storageMock := newMockStorage()
 	signerMock := &mockSigner{}
 
-	// Populate the watch folder with files.
 	for _, name := range []string{"a.txt", "b.txt", "c.dat"} {
 		if err := os.WriteFile(filepath.Join(cfg.FileWatchFolder, name), []byte("data-"+name), 0644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// Also place a .tmp file that should be ignored by processNewFile.
+	// processNewFile ignores .tmp files.
 	if err := os.WriteFile(filepath.Join(cfg.FileWatchFolder, "skip.tmp"), []byte("tmp"), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +359,6 @@ func TestScanExistingFiles(t *testing.T) {
 
 	fp.ScanExistingFiles()
 
-	// Wait for workers to pick up jobs.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if imported.Load() >= 3 {
@@ -436,7 +413,7 @@ func TestScanExistingFiles_IncludesSubdirectories(t *testing.T) {
 	}
 }
 
-func TestShouldProcessFileEvent_Deduplication(t *testing.T) {
+func TestTryEnqueue_SameFileTwice(t *testing.T) {
 	cfg := testConfig(t)
 	var imported atomic.Int64
 	ipfsMock := &mockIPFS{
@@ -456,22 +433,12 @@ func TestShouldProcessFileEvent_Deduplication(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The watcher calls WatchFolder which is hard to unit-test directly.
-	// Instead, we exercise shouldProcessFileEvent through the exported API:
-	// enqueue the same file twice rapidly — the second should still be enqueued
-	// (dedup happens in shouldProcessFileEvent, not TryEnqueue), but processNewFile
-	// has its own recent-ingest guard for CID-level dedup.
+	// TryEnqueue bypasses shouldProcessFileEvent, so both jobs reach
+	// processNewFile and ImportFile; the recent-ingest guard runs after import.
 	fp.TryEnqueue(testFile)
 	fp.TryEnqueue(testFile)
-
-	// Wait for processing.
 	time.Sleep(500 * time.Millisecond)
 
-	// Both enqueues reach processNewFile; the second import will be deduped by
-	// recentIngests (same CID within TTL), so only 1 should actually be imported
-	// past the CID dedup guard. But ImportFile will be called for each since
-	// validateFilePath passes for both — the recentIngests check happens after
-	// ImportFile. We verify ImportFile was called at least once.
 	if imported.Load() < 1 {
 		t.Error("expected at least one import call")
 	}
@@ -558,7 +525,7 @@ func TestProcessNewFile_CIDDedup(t *testing.T) {
 
 	fp := newTestProcessor(t, cfg, ipfsMock, shardMock, storageMock, signerMock)
 
-	// Create two distinct files that produce the same CID.
+	// Two distinct files whose imports yield the same CID.
 	f1 := filepath.Join(cfg.FileWatchFolder, "file1.txt")
 	f2 := filepath.Join(cfg.FileWatchFolder, "file2.txt")
 	if err := os.WriteFile(f1, []byte("same"), 0644); err != nil {
@@ -569,18 +536,16 @@ func TestProcessNewFile_CIDDedup(t *testing.T) {
 	}
 
 	fp.TryEnqueue(f1)
-	// Small delay to ensure the first processes before the second.
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond) // let the first finish before the second
 	fp.TryEnqueue(f2)
 	time.Sleep(500 * time.Millisecond)
 
-	// ImportFile is called for both, but the second should hit recentIngests dedup.
+	// ImportFile runs for both; the second hits the recent-ingest guard.
 	imports := callCount.Load()
 	if imports < 2 {
 		t.Errorf("expected ImportFile called twice, got %d", imports)
 	}
 
-	// PinFile should only be called once since the second file is deduped by CID.
 	storageMock.mu.Lock()
 	pinnedCount := len(storageMock.pinned)
 	storageMock.mu.Unlock()
@@ -618,7 +583,6 @@ func TestProcessNewFile_NilIPFSClient(t *testing.T) {
 	fp.TryEnqueue(testFile)
 	time.Sleep(200 * time.Millisecond)
 
-	// Should not panic; processNewFile bails when ipfsClient is nil.
 	storageMock.mu.Lock()
 	defer storageMock.mu.Unlock()
 	if len(storageMock.pinned) != 0 {
@@ -642,13 +606,11 @@ func TestWatchFolder_ContextCancellation(t *testing.T) {
 		close(done)
 	}()
 
-	// Allow the watcher to start.
 	time.Sleep(200 * time.Millisecond)
 	cancel()
 
 	select {
 	case <-done:
-		// WatchFolder returned cleanly.
 	case <-time.After(10 * time.Second):
 		t.Fatal("WatchFolder did not return after context cancellation")
 	}

@@ -58,8 +58,6 @@ func (m *Monitor) handleIPFSGateway(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	if rc := http.NewResponseController(w); rc != nil {
-		_ = rc.SetWriteDeadline(time.Now().Add(2 * time.Minute))
-	}
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(2 * time.Minute))
 	_, _ = io.Copy(w, io.LimitReader(resp.Body, gatewayProxyLimit))
 }

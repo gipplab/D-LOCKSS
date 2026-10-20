@@ -7,12 +7,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ipfs/go-cid"
-	"github.com/libp2p/go-libp2p/core/peer"
-
 	"dlockss/internal/badbits"
 	"dlockss/internal/common"
 	"dlockss/internal/config"
+
+	"github.com/ipfs/go-cid"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 // StorageManager handles local file state and DHT announcements.
@@ -53,7 +53,8 @@ func (sm *StorageManager) CanAcceptCustodialFile() bool {
 	return sm.disk.CanAcceptCustodialFile()
 }
 
-// GetNextFileToAnnounce returns next file key for round-robin PINNED announcements.
+// GetNextFileToAnnounce returns the next pinned key in round-robin order, or
+// "" when nothing is pinned.
 func (sm *StorageManager) GetNextFileToAnnounce() string {
 	sm.announceMu.Lock()
 	defer sm.announceMu.Unlock()
@@ -74,55 +75,50 @@ func (sm *StorageManager) GetNextFileToAnnounce() string {
 }
 
 func (sm *StorageManager) rebuildAnnounceKeys() {
+	sm.announceKeysDirty = false
 	keys := sm.pinnedFiles.Keys()
 	if len(keys) == 0 {
 		sm.announceKeys = nil
-		sm.announceKeysDirty = false
 		return
 	}
 	sort.Strings(keys)
 	sm.announceKeys = keys
-	sm.announceKeysDirty = false
-	sm.announceIndex = sm.announceIndex % len(keys)
-	if sm.announceIndex < 0 {
-		sm.announceIndex = 0
-	}
+	sm.announceIndex %= len(keys)
 }
 
-// GetPinnedManifests returns all manifest CID strings currently pinned (for replication check).
+func (sm *StorageManager) invalidateAnnounceKeys() {
+	sm.announceMu.Lock()
+	sm.announceKeysDirty = true
+	sm.announceMu.Unlock()
+}
+
+// GetPinnedManifests returns the manifest CIDs currently pinned.
 func (sm *StorageManager) GetPinnedManifests() []string {
 	return sm.pinnedFiles.Keys()
 }
 
-// PinFile pins a file using its ManifestCID string.
-// It tracks the ManifestCID in our internal state and announces to DHT.
+// PinFile records manifestCIDStr as pinned, refreshing its pin time if it
+// already was. It returns false if the CID is on the bad-bits list.
 func (sm *StorageManager) PinFile(manifestCIDStr string) bool {
-	// Check BadBits
 	if sm.badBits.IsBlocked(manifestCIDStr) {
 		slog.Warn("refused to pin blocked cid", "manifest", manifestCIDStr)
 		return false
 	}
 
-	wasNew := sm.pinnedFiles.Add(manifestCIDStr)
-	if wasNew {
-		sm.announceMu.Lock()
-		sm.announceKeysDirty = true
-		sm.announceMu.Unlock()
+	if sm.pinnedFiles.Add(manifestCIDStr) {
+		sm.invalidateAnnounceKeys()
 		slog.Info("pinned manifest", "manifest", manifestCIDStr, "total", sm.pinnedFiles.Size())
 	} else {
 		slog.Debug("manifest already pinned, timestamp updated", "manifest", manifestCIDStr, "total", sm.pinnedFiles.Size())
 	}
-
 	return true
 }
 
 // UnpinFile removes a file/manifest from the pinned set.
 func (sm *StorageManager) UnpinFile(key string) {
-	pinTime, was := sm.pinnedFiles.RemoveIfPresent(key)
-	if was {
-		sm.announceMu.Lock()
-		sm.announceKeysDirty = true
-		sm.announceMu.Unlock()
+	pinTime, ok := sm.pinnedFiles.RemoveIfPresent(key)
+	if ok {
+		sm.invalidateAnnounceKeys()
 		slog.Info("unpinned file", "key", key, "pinned_for", time.Since(pinTime), "remaining", sm.pinnedFiles.Size())
 	} else {
 		slog.Warn("attempted to unpin file that was not pinned", "key", key)
@@ -141,8 +137,8 @@ func (sm *StorageManager) AddKnownFile(key string) {
 
 // ProvideFile announces a file/manifest to the DHT.
 // Concurrency is bounded by MaxConcurrentDHTProvides. If all slots are busy
-// the call returns immediately — the heartbeat re-provide loop will pick up
-// any files that were skipped during bulk syncs.
+// the call returns immediately; the heartbeat re-provide loop picks up any
+// files skipped during bulk syncs.
 func (sm *StorageManager) ProvideFile(ctx context.Context, key string) {
 	if sm.dht == nil {
 		return
@@ -163,7 +159,6 @@ func (sm *StorageManager) ProvideFile(ctx context.Context, key string) {
 
 	if err := sm.dht.Provide(ctx, c, true); err != nil {
 		slog.Warn("failed to provide file to DHT", "key", key, "error", err)
-		return
 	}
 }
 

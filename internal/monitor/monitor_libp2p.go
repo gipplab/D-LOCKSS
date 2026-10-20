@@ -28,48 +28,48 @@ const (
 	bootstrapConnectTimeout = 15 * time.Second
 )
 
-func getMonitorIdentityPath() string {
+// identityPath prefers an identity file in the working directory and
+// otherwise uses ~/.dlockss-monitor.
+func identityPath() string {
 	if cwd, err := os.Getwd(); err == nil {
-		path := filepath.Join(cwd, MonitorIdentityFile)
+		path := filepath.Join(cwd, identityFileName)
 		if _, err := os.Stat(path); err == nil {
 			return path
 		}
 	}
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		return MonitorIdentityFile
+		return identityFileName
 	}
 	monitorDir := filepath.Join(homeDir, ".dlockss-monitor")
 	os.MkdirAll(monitorDir, 0700)
-	return filepath.Join(monitorDir, MonitorIdentityFile)
+	return filepath.Join(monitorDir, identityFileName)
 }
 
-func loadOrCreateMonitorIdentity() (crypto.PrivKey, error) {
-	identityPath := getMonitorIdentityPath()
-	if data, err := os.ReadFile(identityPath); err == nil {
-		privKey, err := crypto.UnmarshalPrivateKey(data)
-		if err == nil {
-			slog.Info("loaded persistent identity", "path", identityPath)
+func loadOrCreateIdentity() (crypto.PrivKey, error) {
+	path := identityPath()
+	if data, err := os.ReadFile(path); err == nil {
+		if privKey, err := crypto.UnmarshalPrivateKey(data); err == nil {
+			slog.Info("loaded persistent identity", "path", path)
 			return privKey, nil
 		}
 	}
 	slog.Info("generating new persistent identity")
 	privKey, _, err := crypto.GenerateKeyPair(crypto.Ed25519, 0)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate identity: %w", err)
+		return nil, fmt.Errorf("generate identity: %w", err)
 	}
-	keyBytes, err := crypto.MarshalPrivateKey(privKey)
-	if err == nil {
-		os.WriteFile(identityPath, keyBytes, 0600)
-		slog.Info("saved persistent identity", "path", identityPath)
+	if keyBytes, err := crypto.MarshalPrivateKey(privKey); err == nil {
+		os.WriteFile(path, keyBytes, 0600)
+		slog.Info("saved persistent identity", "path", path)
 	}
 	return privKey, nil
 }
 
 func StartLibP2P(ctx context.Context, monitor *Monitor) (host.Host, error) {
-	privKey, err := loadOrCreateMonitorIdentity()
+	privKey, err := loadOrCreateIdentity()
 	if err != nil {
-		return nil, fmt.Errorf("failed to load/create identity: %w", err)
+		return nil, fmt.Errorf("load identity: %w", err)
 	}
 	h, err := libp2p.New(
 		libp2p.Identity(privKey),
@@ -84,17 +84,16 @@ func StartLibP2P(ctx context.Context, monitor *Monitor) (host.Host, error) {
 		libp2p.EnableHolePunching(),
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create libp2p host: %w", err)
 	}
 	slog.Info("libp2p started", "peer_id", h.ID().String())
 	ps, err := pubsub.NewGossipSub(ctx, h)
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize PubSub: %w", err)
+		return nil, fmt.Errorf("init pubsub: %w", err)
 	}
 	monitor.ps = ps
 	monitor.host = h
 	monitor.appCtx = ctx
-	monitor.subCtx, monitor.subCancel = context.WithCancel(ctx)
 	go monitor.cleanupStaleCIDs(ctx)
 	monitor.resubscribeBootstrap()
 	slog.Info("bootstrap subscribed", "shards", 1<<(monitor.cfg.BootstrapShardDepth+1)-1, "depth", monitor.cfg.BootstrapShardDepth)
@@ -102,10 +101,10 @@ func StartLibP2P(ctx context.Context, monitor *Monitor) (host.Host, error) {
 
 	kademliaDHT, err := dht.New(ctx, h)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create DHT: %w", err)
+		return nil, fmt.Errorf("create DHT: %w", err)
 	}
 	if err = kademliaDHT.Bootstrap(ctx); err != nil {
-		return nil, fmt.Errorf("failed to bootstrap DHT: %w", err)
+		return nil, fmt.Errorf("bootstrap DHT: %w", err)
 	}
 
 	var wg sync.WaitGroup
@@ -114,11 +113,9 @@ func StartLibP2P(ctx context.Context, monitor *Monitor) (host.Host, error) {
 		if err != nil {
 			continue
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			h.Connect(ctx, *peerinfo)
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -139,10 +136,9 @@ func StartLibP2P(ctx context.Context, monitor *Monitor) (host.Host, error) {
 }
 
 // runMeshMaintenance periodically re-bootstraps the DHT, reconnects to
-// bootstrap peers, and re-advertises the service tag. This recovers from
-// GossipSub mesh degradation that can accumulate over days of runtime —
-// without it the monitor silently stops receiving heartbeats and prunes
-// all nodes, requiring a full restart to recover.
+// bootstrap peers, and re-advertises the service tag. GossipSub mesh
+// degradation accumulates over days of runtime; without this the monitor
+// stops receiving heartbeats, prunes every node and only recovers on restart.
 func runMeshMaintenance(ctx context.Context, h host.Host, kademliaDHT *dht.IpfsDHT, rd *routing.RoutingDiscovery) {
 	ticker := time.NewTicker(meshMaintenanceInterval)
 	defer ticker.Stop()

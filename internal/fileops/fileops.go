@@ -18,10 +18,11 @@ import (
 	"dlockss/pkg/schema"
 )
 
-const maxRetryQueueSize = 1000
-const retryDrainInterval = 10 * time.Second
-
-const recentIngestTTL = 30 * time.Second
+const (
+	maxRetryQueueSize  = 1000
+	retryDrainInterval = 10 * time.Second
+	recentIngestTTL    = 30 * time.Second
+)
 
 // ShardIdentity provides the node's identity and shard membership queries.
 type ShardIdentity interface {
@@ -86,11 +87,11 @@ type FileProcessor struct {
 	recentIngestMu sync.Mutex
 	recentIngests  map[string]time.Time
 
-	// File event deduplication (watcher)
 	deduperMu   sync.Mutex
 	deduperInfo map[string]fileEventInfo
 
-	// Stability tracking: files waiting for size to settle before ingest
+	// stabilityPath and stabilityTimer track files whose size must settle
+	// before they are enqueued.
 	stabilityMu    sync.Mutex
 	stabilityPath  map[string]int64
 	stabilityTimer map[string]*time.Timer
@@ -175,9 +176,7 @@ func (fp *FileProcessor) drainRetryQueue() {
 
 	var stillPending []string
 	for _, path := range toRetry {
-		if fp.TryEnqueue(path) {
-			// success
-		} else {
+		if !fp.TryEnqueue(path) {
 			stillPending = append(stillPending, path)
 		}
 	}

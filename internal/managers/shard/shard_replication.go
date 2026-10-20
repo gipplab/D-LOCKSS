@@ -29,7 +29,7 @@ type replicationOps interface {
 	ensureCluster(ctx context.Context, shardID string) error
 	clusterPinIfAbsent(ctx context.Context, shardID string, c cid.Cid) error
 	clusterTriggerSync(shardID string)
-	ipfsPinRecursive(ctx context.Context, c cid.Cid) error
+	ipfsPinManifest(ctx context.Context, c cid.Cid) error
 	replicationSigner() MessageAuthenticator
 }
 
@@ -101,13 +101,9 @@ func (rm *replicationManager) runChecker() {
 }
 
 func (rm *replicationManager) sendReplicationRequests(ctx context.Context, cfg *config.Config, currentShard string, manifests []string) {
-	maxConc := cfg.Replication.MaxConcurrentReplicationChecks
-	if maxConc < 1 {
-		maxConc = 1
-	}
-	sem := make(chan struct{}, maxConc)
+	sem := make(chan struct{}, max(1, cfg.Replication.MaxConcurrentReplicationChecks))
 	var wg sync.WaitGroup
-	var sentThisCycle int32
+	var sentThisCycle atomic.Int32
 
 	for _, manifestCIDStr := range manifests {
 		select {
@@ -116,7 +112,7 @@ func (rm *replicationManager) sendReplicationRequests(ctx context.Context, cfg *
 			return
 		case sem <- struct{}{}:
 		}
-		if atomic.LoadInt32(&sentThisCycle) >= maxReplicationRequestsPerCycle {
+		if sentThisCycle.Load() >= maxReplicationRequestsPerCycle {
 			<-sem
 			continue
 		}
@@ -128,7 +124,7 @@ func (rm *replicationManager) sendReplicationRequests(ctx context.Context, cfg *
 			if err != nil {
 				return
 			}
-			if atomic.LoadInt32(&sentThisCycle) >= maxReplicationRequestsPerCycle {
+			if sentThisCycle.Load() >= maxReplicationRequestsPerCycle {
 				return
 			}
 			rm.mu.Lock()
@@ -156,7 +152,7 @@ func (rm *replicationManager) sendReplicationRequests(ctx context.Context, cfg *
 				return
 			}
 			rm.ops.publishCBOR(b, currentShard)
-			atomic.AddInt32(&sentThisCycle, 1)
+			sentThisCycle.Add(1)
 			slog.Debug("ReplicationRequest sent", "manifest", manifestCIDStr, "shard", currentShard)
 		}(manifestCIDStr)
 	}
@@ -176,8 +172,8 @@ func (rm *replicationManager) handleRequest(msg *pubsub.Message, rr *schema.Repl
 		slog.Warn("ReplicationRequest rejected", "manifest", rr.ManifestCID.String(), "from", msg.GetFrom().String(), "shard", shardID)
 		return
 	}
-	manifestCIDStr := rr.ManifestCID.String()
 	c := rr.ManifestCID
+	manifestCIDStr := c.String()
 
 	if rm.ops.isLegacyManifest(manifestCIDStr) {
 		slog.Info("ignoring legacy manifest in ReplicationRequest", "manifest", manifestCIDStr)
@@ -208,12 +204,12 @@ func (rm *replicationManager) handleRequest(msg *pubsub.Message, rr *schema.Repl
 	go func() {
 		defer func() { <-rm.sem }()
 		fetchCtx, cancelFetch := context.WithTimeout(ctx, cfg.Replication.AutoReplicationTimeout)
-		if err := rm.ops.ipfsPinRecursive(fetchCtx, c); err != nil {
-			cancelFetch()
+		err := rm.ops.ipfsPinManifest(fetchCtx, c)
+		cancelFetch()
+		if err != nil {
 			slog.Error("auto-replication: failed to fetch/pin", "manifest", manifestCIDStr, "error", err)
 			return
 		}
-		cancelFetch()
 		if err := rm.ops.ensureCluster(ctx, shardID); err != nil {
 			slog.Error("auto-replication: failed to ensure cluster for shard", "shard", shardID, "error", err)
 			return

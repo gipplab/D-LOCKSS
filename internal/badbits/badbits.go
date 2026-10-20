@@ -30,26 +30,25 @@ func NewFilter(path string) (*Filter, error) {
 	}
 	defer file.Close()
 
-	reader := csv.NewReader(file)
-	records, err := reader.ReadAll()
+	records, err := csv.NewReader(file).ReadAll()
 	if err != nil {
 		return f, err
 	}
-
-	if len(records) < 1 {
+	if len(records) == 0 {
 		slog.Info("badbits file empty", "path", path)
 		return f, nil
 	}
 
 	for i, record := range records {
-		if len(record) < 1 {
+		if len(record) == 0 {
 			continue
 		}
 		val := strings.TrimSpace(record[0])
 		if val == "" {
 			continue
 		}
-		if i == 0 && !strings.HasPrefix(val, "bafy") && !strings.HasPrefix(val, "Qm") && !strings.HasPrefix(val, "bafk") {
+		// The first row is a header unless it holds a CID.
+		if i == 0 && !looksLikeCID(val) {
 			continue
 		}
 		f.cids[val] = true
@@ -58,6 +57,10 @@ func NewFilter(path string) (*Filter, error) {
 	f.loaded = true
 	slog.Info("loaded blocked cids", "count", len(f.cids), "path", path)
 	return f, nil
+}
+
+func looksLikeCID(s string) bool {
+	return strings.HasPrefix(s, "bafy") || strings.HasPrefix(s, "Qm") || strings.HasPrefix(s, "bafk")
 }
 
 // IsBlocked returns true if the given CID is in the block list.

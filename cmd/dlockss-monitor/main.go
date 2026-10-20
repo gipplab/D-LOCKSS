@@ -6,7 +6,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
 	"log/slog"
 	"net/http"
 	"os"
@@ -29,38 +28,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	cfg := monitor.DefaultMonitorConfig()
-	if v := os.Getenv("DLOCKSS_MONITOR_NODE_CLEANUP_TIMEOUT"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			cfg.NodeCleanupTimeout = d
-			slog.Info("node cleanup timeout from env", "timeout", cfg.NodeCleanupTimeout)
-		}
-	}
-	if v := os.Getenv("DLOCKSS_MONITOR_BOOTSTRAP_SHARD_DEPTH"); v != "" {
-		if d, err := strconv.Atoi(v); err == nil && d >= 0 && d <= 12 {
-			cfg.BootstrapShardDepth = d
-			slog.Info("bootstrap shard depth from env", "depth", cfg.BootstrapShardDepth)
-		}
-	}
-	if v := os.Getenv("DLOCKSS_PUBSUB_TOPIC_PREFIX"); v != "" {
-		cfg.PubsubTopicPrefix = v
-		slog.Info("pubsub topic prefix from env", "prefix", cfg.PubsubTopicPrefix)
-	}
-	if v := os.Getenv("DLOCKSS_TOPIC_NAME"); v != "" {
-		cfg.TopicName = v
-		slog.Info("topic name from env", "topic", cfg.TopicName)
-	}
-	if *topicFlag != "" {
-		cfg.TopicName = *topicFlag
-		slog.Info("topic name from flag", "topic", cfg.TopicName)
-	}
-	if *prefixFlag != "" {
-		cfg.PubsubTopicPrefix = *prefixFlag
-		slog.Info("pubsub topic prefix from flag", "prefix", cfg.PubsubTopicPrefix)
-	}
-
-	m := monitor.NewMonitor(cfg)
-	defer m.Close()
+	m := monitor.NewMonitor(monitorConfig(*topicFlag, *prefixFlag))
 
 	kwCfg := keywords.ConfigFromEnv()
 	if kwCfg.APIKey != "" {
@@ -71,7 +39,8 @@ func main() {
 
 	h, err := monitor.StartLibP2P(ctx, m)
 	if err != nil {
-		log.Fatalf("P2P error: %v", err)
+		slog.Error("p2p error", "error", err)
+		os.Exit(1)
 	}
 	defer h.Close()
 
@@ -102,4 +71,39 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("http shutdown error", "error", err)
 	}
+}
+
+// monitorConfig applies environment overrides to the defaults, then the
+// command-line flags, which take precedence.
+func monitorConfig(topicFlag, prefixFlag string) monitor.Config {
+	cfg := monitor.DefaultConfig()
+	if v := os.Getenv("DLOCKSS_MONITOR_NODE_CLEANUP_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			cfg.NodeCleanupTimeout = d
+			slog.Info("node cleanup timeout from env", "timeout", cfg.NodeCleanupTimeout)
+		}
+	}
+	if v := os.Getenv("DLOCKSS_MONITOR_BOOTSTRAP_SHARD_DEPTH"); v != "" {
+		if d, err := strconv.Atoi(v); err == nil && d >= 0 && d <= 12 {
+			cfg.BootstrapShardDepth = d
+			slog.Info("bootstrap shard depth from env", "depth", cfg.BootstrapShardDepth)
+		}
+	}
+	if v := os.Getenv("DLOCKSS_PUBSUB_TOPIC_PREFIX"); v != "" {
+		cfg.PubsubTopicPrefix = v
+		slog.Info("pubsub topic prefix from env", "prefix", cfg.PubsubTopicPrefix)
+	}
+	if v := os.Getenv("DLOCKSS_TOPIC_NAME"); v != "" {
+		cfg.TopicName = v
+		slog.Info("topic name from env", "topic", cfg.TopicName)
+	}
+	if topicFlag != "" {
+		cfg.TopicName = topicFlag
+		slog.Info("topic name from flag", "topic", cfg.TopicName)
+	}
+	if prefixFlag != "" {
+		cfg.PubsubTopicPrefix = prefixFlag
+		slog.Info("pubsub topic prefix from flag", "prefix", cfg.PubsubTopicPrefix)
+	}
+	return cfg
 }

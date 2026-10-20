@@ -71,10 +71,7 @@ func (e *SignedEnvelope) unmarshalEnvelope(node datamodel.Node) error {
 		return err
 	}
 	e.Sig, err = readBytes(node, "sig")
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
 
 // Signable is implemented by all signed protocol messages.
@@ -107,8 +104,6 @@ func marshalFields(env *SignedEnvelope, specific []cborKV, includeSig bool) ([]b
 	return marshalCBORMap(fields)
 }
 
-// --- IngestMessage CBOR ---
-
 func (m *IngestMessage) MarshalCBOR() ([]byte, error) {
 	return marshalFields(&m.SignedEnvelope, m.specificFields(), true)
 }
@@ -132,13 +127,8 @@ func (m *IngestMessage) UnmarshalCBOR(data []byte) error {
 		return err
 	}
 	m.ShardID, err = readString(node, "shard_id")
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
-
-// --- ReplicationRequest CBOR ---
 
 func (m *ReplicationRequest) MarshalCBOR() ([]byte, error) {
 	return marshalFields(&m.SignedEnvelope, m.specificFields(), true)
@@ -157,8 +147,5 @@ func (m *ReplicationRequest) UnmarshalCBOR(data []byte) error {
 	if err != nil {
 		return err
 	}
-	if err := m.unmarshalEnvelope(node); err != nil {
-		return err
-	}
-	return nil
+	return m.unmarshalEnvelope(node)
 }

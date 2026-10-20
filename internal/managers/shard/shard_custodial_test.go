@@ -15,11 +15,9 @@ import (
 	"dlockss/pkg/schema"
 )
 
-// manifestIPFS serves one manifest block and records unpins.
+// manifestIPFS serves manifest blocks and records unpins.
 type manifestIPFS struct {
 	testutil.MockIPFSClient
-	manifest cid.Cid
-	block    []byte
 	blocks   map[string][]byte
 	mu       sync.Mutex
 	unpinned []string
@@ -28,9 +26,6 @@ type manifestIPFS struct {
 func (m *manifestIPFS) GetBlock(_ context.Context, c cid.Cid) ([]byte, error) {
 	if b, ok := m.blocks[c.String()]; ok {
 		return b, nil
-	}
-	if m.manifest.Defined() && c.Equals(m.manifest) {
-		return m.block, nil
 	}
 	return nil, fmt.Errorf("not found")
 }
@@ -51,47 +46,21 @@ func testCID(t *testing.T, s string) cid.Cid {
 	return cid.NewCidV1(cid.Raw, h)
 }
 
-// payloadInShard returns a payload CID whose depth-1 shard is shard.
-func payloadInShard(t *testing.T, shard string) cid.Cid {
-	t.Helper()
-	for i := 0; ; i++ {
-		c := testCID(t, fmt.Sprintf("payload-%d", i))
-		if s, _ := common.TargetShardForPayload(c.String(), 1); s == shard {
-			return c
-		}
-	}
-}
-
+// custodialSetup pins one manifest, pinned an hour ago, whose payload belongs
+// to payloadShard, on a node in shard 0.
 func custodialSetup(t *testing.T, payloadShard string, providers int) (*ShardManager, *recordingStorage, *manifestIPFS, string) {
 	t.Helper()
-	storage := newRecordingStorage()
-	storage.providers = providers
-	sm := buildTestSM(context.Background(), storage, &recordingCluster{})
-	sm.signer = nil
-	sm.currentShard = "0"
-
-	payload := payloadInShard(t, payloadShard)
-	ro := schema.ResearchObject{MetadataRef: "file://x", IngestedBy: testutil.MustPeerID(t, "ingester"), Payload: payload, TotalSize: 1}
-	block, err := ro.MarshalCBOR()
-	if err != nil {
-		t.Fatal(err)
+	sm, storage, ipfs := newCustodialRig(t, providers)
+	payload, _ := nextPayloadInShard(t, payloadShard, 0)
+	key := pinManifest(t, storage, ipfs, payload, "manifest", time.Now().Add(-time.Hour))
+	if p, err := common.GetPayloadCIDForShardAssignment(context.Background(), sm.ipfsClient, key); err != nil || p == key {
+		t.Fatalf("test manifest does not resolve to a payload: %q, %v", p, err)
 	}
-	manifest := testCID(t, "manifest")
-	ipfs := &manifestIPFS{manifest: manifest, block: block}
-	sm.ipfsClient = ipfs
-
-	key := manifest.String()
-	storage.AddKnownFile(key)
-	storage.PinFile(key)
-	storage.pinTimes[key] = time.Now().Add(-time.Hour)
 	return sm, storage, ipfs, key
 }
 
 func TestCustodialRetry_ReleasesConfirmedCopy(t *testing.T) {
 	sm, storage, ipfs, key := custodialSetup(t, "1", 10)
-	if p, err := common.GetPayloadCIDForShardAssignment(context.Background(), sm.ipfsClient, key); err != nil || p == key {
-		t.Fatalf("test manifest does not resolve to a payload: %q, %v", p, err)
-	}
 
 	sm.RunCustodialRetryPass()
 
@@ -105,9 +74,6 @@ func TestCustodialRetry_ReleasesConfirmedCopy(t *testing.T) {
 
 func TestCustodialRetry_SkipsOwnShard(t *testing.T) {
 	sm, storage, ipfs, key := custodialSetup(t, "0", 10)
-	if p, err := common.GetPayloadCIDForShardAssignment(context.Background(), sm.ipfsClient, key); err != nil || p == key {
-		t.Fatalf("test manifest does not resolve to a payload: %q, %v", p, err)
-	}
 
 	sm.RunCustodialRetryPass()
 
@@ -223,6 +189,77 @@ func TestCustodialRetry_KeepsUnconfirmedCustody(t *testing.T) {
 
 	if !storage.IsPinned(key) || len(ipfs.unpinned) != 0 {
 		t.Error("an unconfirmed tourist copy must stay pinned until the target shard confirms")
+	}
+}
+
+func TestCustodialRetry_BoundsLookupsPerPassAndRotates(t *testing.T) {
+	sm, storage, ipfs := newCustodialRig(t, 0)
+	now := time.Now()
+	total := custodialLookupsPerPass + 5
+	keys := make([]string, total)
+	start := 0
+	for i := range keys {
+		var payload cid.Cid
+		payload, start = nextPayloadInShard(t, "0", start)
+		keys[i] = pinManifest(t, storage, ipfs, payload, fmt.Sprintf("own-%d", i), now.Add(-time.Duration(total-i)*time.Hour))
+	}
+	cluster := sm.clusterMgr.(*recordingCluster)
+
+	sm.RunCustodialRetryPass()
+	if storage.lookups != custodialLookupsPerPass {
+		t.Fatalf("first pass: %d lookups, want %d", storage.lookups, custodialLookupsPerPass)
+	}
+	if len(cluster.pinned) != custodialLookupsPerPass || cluster.pinned[0] != keys[0] {
+		t.Fatalf("first pass should reannounce the %d oldest, got %v", custodialLookupsPerPass, cluster.pinned)
+	}
+
+	sm.RunCustodialRetryPass()
+	if storage.lookups != total {
+		t.Fatalf("second pass should check only the %d unchecked files, total lookups %d", total-custodialLookupsPerPass, storage.lookups)
+	}
+	for i, key := range cluster.pinned[custodialLookupsPerPass:] {
+		if key != keys[custodialLookupsPerPass+i] {
+			t.Fatalf("second pass reannounced %v, want the remaining files %v", cluster.pinned[custodialLookupsPerPass:], keys[custodialLookupsPerPass:])
+		}
+	}
+
+	sm.RunCustodialRetryPass()
+	if storage.lookups != total {
+		t.Fatalf("files checked within custodialRecheckAfter must not be looked up again, total lookups %d", storage.lookups)
+	}
+}
+
+func TestCustodialRetry_RechecksAfterInterval(t *testing.T) {
+	sm, storage, ipfs := newCustodialRig(t, 10)
+	payload, _ := nextPayloadInShard(t, "0", 0)
+	key := pinManifest(t, storage, ipfs, payload, "own", time.Now().Add(-time.Hour))
+
+	sm.RunCustodialRetryPass()
+	sm.RunCustodialRetryPass()
+	if storage.lookups != 1 {
+		t.Fatalf("a well-replicated file checked moments ago needs no lookup, got %d", storage.lookups)
+	}
+
+	sm.custodialChecked[key] = time.Now().Add(-custodialRecheckAfter - time.Minute)
+	sm.RunCustodialRetryPass()
+	if storage.lookups != 2 {
+		t.Fatalf("file should be checked again after custodialRecheckAfter, got %d lookups", storage.lookups)
+	}
+	if len(sm.clusterMgr.(*recordingCluster).pinned) != 0 {
+		t.Error("a file with enough providers must not be reannounced")
+	}
+}
+
+func TestCustodialRetry_ForgetsUnpinnedFiles(t *testing.T) {
+	sm, storage, ipfs := newCustodialRig(t, 10)
+	payload, _ := nextPayloadInShard(t, "0", 0)
+	key := pinManifest(t, storage, ipfs, payload, "own", time.Now().Add(-time.Hour))
+
+	sm.RunCustodialRetryPass()
+	storage.UnpinFile(key)
+	sm.RunCustodialRetryPass()
+	if _, ok := sm.custodialChecked[key]; ok {
+		t.Error("lookup time of an unpinned file should be dropped")
 	}
 }
 

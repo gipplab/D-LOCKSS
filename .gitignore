@@ -3,6 +3,7 @@
 /dlockss-monitor
 main
 bin/
+*.test
 
 # Testnet
 testnet/dlockss-node

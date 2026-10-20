@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"dlockss/internal/common"
-	"dlockss/internal/config"
 )
 
 func TestPruneOrphanHandoffSent(t *testing.T) {
@@ -14,14 +13,12 @@ func TestPruneOrphanHandoffSent(t *testing.T) {
 	storage := newRecordingStorage()
 	cluster := &recordingCluster{}
 	sm := buildTestSM(ctx, storage, cluster)
-
-	cfg := config.DefaultConfig()
-	sm.cfg = cfg
-	cfg.Orphan.HandoffGrace = 100 * time.Millisecond
+	grace := 100 * time.Millisecond
+	sm.cfg.Orphan.HandoffGrace = grace
 
 	now := time.Now()
-	old := now.Add(-5 * cfg.Orphan.HandoffGrace)
-	recent := now.Add(-cfg.Orphan.HandoffGrace / 2)
+	old := now.Add(-5 * grace)
+	recent := now.Add(-grace / 2)
 
 	sm.orphanHandoffSent = map[string]map[string]*orphanHandoffInfo{
 		"old-manifest": {
@@ -92,12 +89,11 @@ func TestCleanupLegacyManifests_SkipsNonLegacy(t *testing.T) {
 
 	key := "bafkreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	storage.PinFile(key)
-	storage.pinnedFiles[key] = true
 
 	sm.cleanupLegacyManifests()
 
 	if len(cluster.unpinned) != 0 {
-		t.Error("non-legacy manifest should not be unpinned (GetBlock returns nil → not legacy)")
+		t.Error("non-legacy manifest should not be unpinned (GetBlock returns nil, so not legacy)")
 	}
 }
 
@@ -112,7 +108,6 @@ func TestCleanupLegacyManifests_ContextCancelled(t *testing.T) {
 
 	key := "bafkreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	storage.PinFile(key)
-	storage.pinnedFiles[key] = true
 
 	sm.cleanupLegacyManifests()
 

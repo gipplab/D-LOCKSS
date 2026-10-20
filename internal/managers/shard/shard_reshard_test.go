@@ -15,8 +15,6 @@ import (
 	"dlockss/internal/testutil"
 )
 
-// --- test doubles ---
-
 type recordingStorage struct {
 	mu             sync.Mutex
 	knownFiles     map[string]bool
@@ -25,6 +23,7 @@ type recordingStorage struct {
 	unpinnedKeys   []string
 	providers      int            // reported by ProviderCount for every key
 	providersByKey map[string]int // per-key override; nil keeps providers
+	lookups        int            // ProviderCount calls
 }
 
 func newRecordingStorage() *recordingStorage {
@@ -86,6 +85,9 @@ func (s *recordingStorage) AddKnownFile(key string) {
 }
 func (s *recordingStorage) ProvideFile(_ context.Context, _ string) {}
 func (s *recordingStorage) ProviderCount(_ context.Context, key string, _ peer.ID, limit int) int {
+	s.mu.Lock()
+	s.lookups++
+	s.mu.Unlock()
 	if s.providersByKey != nil {
 		if n, ok := s.providersByKey[key]; ok {
 			return min(n, limit)
@@ -98,18 +100,18 @@ type recordingCluster struct {
 	mu       sync.Mutex
 	unpinned []string
 	pinned   []string
-	joinedSh []string
+	joined   []string
 	synced   []string
 }
 
 func (c *recordingCluster) JoinShard(_ context.Context, shardID string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.joinedSh = append(c.joinedSh, shardID)
+	c.joined = append(c.joined, shardID)
 	return nil
 }
 func (c *recordingCluster) LeaveShard(_ string) error { return nil }
-func (c *recordingCluster) Pin(_ context.Context, shardID string, cc cid.Cid, _, _ int) error {
+func (c *recordingCluster) Pin(_ context.Context, _ string, cc cid.Cid, _, _ int) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.pinned = append(c.pinned, cc.String())
@@ -158,8 +160,6 @@ func buildTestSM(ctx context.Context, storage *recordingStorage, cluster *record
 	return sm
 }
 
-// --- RunReshardPass tests ---
-
 func TestRunReshardPass_NoFiles(t *testing.T) {
 	ctx := context.Background()
 	storage := newRecordingStorage()
@@ -207,9 +207,8 @@ func TestRunReshardPass_FileUnpinnedWhenLeavingShard(t *testing.T) {
 	sm.signer = nil // no replication request will be sent
 	storage.providers = 10
 
-	// Generate two CID-like keys. We need keys where one maps to "0" and
-	// the other maps to "1" at depth 1, so that a split from "" -> "0"
-	// causes one to leave.
+	// One key maps to shard 0 and one to shard 1, so moving from the root to
+	// shard 0 takes the second key out of the node's range.
 	keys := generateKeysForBothChildShards(t)
 
 	for _, key := range keys {
@@ -223,21 +222,8 @@ func TestRunReshardPass_FileUnpinnedWhenLeavingShard(t *testing.T) {
 	if len(cluster.unpinned) == 0 {
 		t.Fatal("expected at least one file to be unpinned during reshard")
 	}
-
 	for _, unpinnedCID := range cluster.unpinned {
-		found := false
-		for _, k := range keys {
-			if k == unpinnedCID {
-				found = true
-				break
-			}
-		}
-		if found {
-			continue
-		}
-		stableHex := common.KeyToStableHex(unpinnedCID)
-		prefix, _ := common.GetHexBinaryPrefix(stableHex, 1)
-		if prefix == "0" {
+		if prefix, _ := common.GetHexBinaryPrefix(common.KeyToStableHex(unpinnedCID), 1); prefix == "0" {
 			t.Errorf("unpinned CID %s maps to shard 0, should not be unpinned", unpinnedCID)
 		}
 	}

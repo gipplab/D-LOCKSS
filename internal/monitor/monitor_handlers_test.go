@@ -6,7 +6,7 @@ import (
 )
 
 func TestUpdateNodeShardLocked_CrossBranchRejected(t *testing.T) {
-	m := NewMonitor(DefaultMonitorConfig())
+	m := NewMonitor(DefaultConfig())
 	peerID := "12D3KooWTestCrossBranch123"
 	now := time.Now()
 
@@ -31,9 +31,6 @@ func TestUpdateNodeShardLocked_CrossBranchRejected(t *testing.T) {
 			}
 			m.mu.Lock()
 			m.nodes[peerID] = node
-			m.mu.Unlock()
-
-			m.mu.Lock()
 			m.updateNodeShardLocked(node, tt.newShard, now)
 			m.mu.Unlock()
 
@@ -49,7 +46,7 @@ func TestUpdateNodeShardLocked_CrossBranchRejected(t *testing.T) {
 }
 
 func TestUpdateNodeShardLocked_ValidMovesAccepted(t *testing.T) {
-	m := NewMonitor(DefaultMonitorConfig())
+	m := NewMonitor(DefaultConfig())
 	now := time.Now()
 
 	t.Run("split_0_to_00", func(t *testing.T) {
@@ -61,9 +58,6 @@ func TestUpdateNodeShardLocked_ValidMovesAccepted(t *testing.T) {
 		}
 		m.mu.Lock()
 		m.nodes[peerID] = node
-		m.mu.Unlock()
-
-		m.mu.Lock()
 		m.updateNodeShardLocked(node, "00", now)
 		m.mu.Unlock()
 
@@ -84,9 +78,6 @@ func TestUpdateNodeShardLocked_ValidMovesAccepted(t *testing.T) {
 		}
 		m.mu.Lock()
 		m.nodes[peerID] = node
-		m.mu.Unlock()
-
-		m.mu.Lock()
 		m.updateNodeShardLocked(node, "1", now)
 		m.mu.Unlock()
 

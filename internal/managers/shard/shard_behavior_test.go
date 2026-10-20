@@ -9,6 +9,7 @@ import (
 
 	"github.com/libp2p/go-libp2p"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"dlockss/internal/common"
@@ -17,40 +18,50 @@ import (
 	"dlockss/internal/testutil"
 )
 
-// newTestShardManager creates a ShardManager for tests.
-// It uses a real libp2p host and gossipsub, starting in the given shard.
+// newTestShardManager creates a ShardManager on a real libp2p host and
+// gossipsub, starting in the given shard.
 func newTestShardManager(t *testing.T, ctx context.Context, startShard string) *ShardManager {
 	t.Helper()
-	h, err := libp2p.New()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { h.Close() })
+	h := newTestHost(t)
+	return newTestShardManagerOn(t, ctx, h, newTestGossipSub(t, ctx, h), startShard)
+}
 
-	ps, err := pubsub.NewGossipSub(ctx, h)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	dht := &testutil.MockDHTProvider{}
+func newTestShardManagerOn(t *testing.T, ctx context.Context, h host.Host, ps *pubsub.PubSub, startShard string) *ShardManager {
+	t.Helper()
 	cfg := config.DefaultConfig()
-	storageMgr := storage.NewStorageManager(cfg, dht, nil)
-	clusterMgr := &testutil.MockClusterManager{}
-
 	sm, err := NewShardManager(ShardManagerConfig{
 		Cfg:        cfg,
 		Ctx:        ctx,
 		Host:       h,
 		PubSub:     ps,
 		IPFSClient: &testutil.MockIPFSClient{},
-		Storage:    storageMgr,
-		Cluster:    clusterMgr,
+		Storage:    storage.NewStorageManager(cfg, &testutil.MockDHTProvider{}, nil),
+		Cluster:    &testutil.MockClusterManager{},
 		StartShard: startShard,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return sm
+}
+
+func newTestHost(t *testing.T) host.Host {
+	t.Helper()
+	h, err := libp2p.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { h.Close() })
+	return h
+}
+
+func newTestGossipSub(t *testing.T, ctx context.Context, h host.Host) *pubsub.PubSub {
+	t.Helper()
+	ps, err := pubsub.NewGossipSub(ctx, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ps
 }
 
 // populateFakeActivePeers injects fake ACTIVE peer entries via PeerTracker.
@@ -64,8 +75,6 @@ func populateFakeActivePeers(sm *ShardManager, shardID string, count int) []peer
 	return peers
 }
 
-// --- countActivePeers tests ---
-
 func TestCountActivePeers_OnlyCountsActive(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -77,13 +86,11 @@ func TestCountActivePeers_OnlyCountsActive(t *testing.T) {
 	sm.peers.RecordRole(shard, "peer-passive-1", rolePassive)
 	sm.peers.RecordRole(shard, "peer-probe-1", roleProbe)
 
-	// includeSelf=true: should count 2 active peers + self = 3
 	count := sm.peers.CountActive(shard, true, "0", sm.cfg.Sharding.SeenPeersWindow)
 	if count != 3 {
 		t.Errorf("expected 3 (2 active + self), got %d", count)
 	}
 
-	// includeSelf=false: should count only 2 active peers
 	count = sm.peers.CountActive(shard, false, "0", sm.cfg.Sharding.SeenPeersWindow)
 	if count != 2 {
 		t.Errorf("expected 2 active peers, got %d", count)
@@ -102,13 +109,11 @@ func TestCountActivePeers_ExcludesStaleEntries(t *testing.T) {
 	sm.peers.roles[shard]["peer-stale"] = peerRoleInfo{role: roleActive, lastSeen: now.Add(-10 * time.Minute)}
 	sm.peers.mu.Unlock()
 
-	// With a 5-minute window, only the fresh peer should count
 	count := sm.peers.CountActive(shard, false, "0", 5*time.Minute)
 	if count != 1 {
 		t.Errorf("expected 1 (only fresh peer), got %d", count)
 	}
 
-	// With a 15-minute window, both should count
 	count = sm.peers.CountActive(shard, false, "0", 15*time.Minute)
 	if count != 2 {
 		t.Errorf("expected 2 (both within window), got %d", count)
@@ -125,8 +130,7 @@ func TestCountActivePeers_ExcludesSelf(t *testing.T) {
 	sm.peers.RecordRole(shard, selfID, roleActive)
 	sm.peers.RecordRole(shard, "other-peer", roleActive)
 
-	// Self should not be double-counted. With includeSelf=true, self is added once
-	// by the function, not counted from the map.
+	// With includeSelf, self is added once by CountActive, never counted from the map.
 	count := sm.peers.CountActive(shard, true, "0", sm.cfg.Sharding.SeenPeersWindow)
 	if count != 2 {
 		t.Errorf("expected 2 (1 other + 1 self), got %d", count)
@@ -137,8 +141,6 @@ func TestCountActivePeers_ExcludesSelf(t *testing.T) {
 		t.Errorf("expected 1 (only other peer), got %d", count)
 	}
 }
-
-// --- Merge behavior tests ---
 
 func TestMergeRefusal_HealthyShardEmptySibling(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -151,7 +153,7 @@ func TestMergeRefusal_HealthyShardEmptySibling(t *testing.T) {
 
 	populateFakeActivePeers(sm, "00", sm.cfg.Sharding.MinPeersPerShard+2)
 
-	// Set lastMoveToDeeperShard far enough in the past to pass both cooldown and siblingEmptyMergeAfter
+	// Past both MergeUpCooldown and SiblingEmptyMergeAfter.
 	sm.mu.Lock()
 	sm.lastMoveToDeeperShard = time.Now().Add(-1 * time.Minute)
 	sm.mu.Unlock()
@@ -179,7 +181,6 @@ func TestMergeAllowed_UnderstaffedShardEmptySibling(t *testing.T) {
 		populateFakeActivePeers(sm, "00", sm.cfg.Sharding.MinPeersPerShard-2)
 	}
 
-	// Set lastMoveToDeeperShard far enough in the past
 	sm.mu.Lock()
 	sm.lastMoveToDeeperShard = time.Now().Add(-1 * time.Minute)
 	sm.mu.Unlock()
@@ -202,7 +203,6 @@ func TestMergeRefusal_CooldownPreventsEarlyMerge(t *testing.T) {
 	sm.cfg.Sharding.ProbeTimeoutMerge = 100 * time.Millisecond
 	sm.cfg.Sharding.MergeUpCooldown = 10 * time.Minute
 
-	// Set lastMoveToDeeperShard to very recently (within cooldown)
 	sm.mu.Lock()
 	sm.lastMoveToDeeperShard = time.Now().Add(-1 * time.Second)
 	sm.mu.Unlock()
@@ -269,11 +269,11 @@ func TestMergeUp_SiblingBelowMinPeers(t *testing.T) {
 	defer cancel()
 	sm := newTestShardManager(t, ctx, "00")
 	prepareMerge(t, sm)
-	min := sm.cfg.Sharding.MinPeersPerShard
+	minPeers := sm.cfg.Sharding.MinPeersPerShard
 
-	// Pair total is above MinPeersAcrossSiblings, so the old rule kept the
-	// sibling at 2 copies indefinitely.
-	populateFakeActivePeers(sm, "00", min+2)
+	// The pair total is above MinPeersAcrossSiblings, so only the min-peers
+	// rule keeps the sibling from holding 2 copies indefinitely.
+	populateFakeActivePeers(sm, "00", minPeers+2)
 	recordActive(sm, "01", peersHashingTo("01", 2))
 
 	sm.lifecycle.checkAndMergeUpIfAlone()
@@ -291,11 +291,11 @@ func TestMergeRefusal_SplitInProgress(t *testing.T) {
 	defer cancel()
 	sm := newTestShardManager(t, ctx, "00")
 	prepareMerge(t, sm)
-	min := sm.cfg.Sharding.MinPeersPerShard
+	minPeers := sm.cfg.Sharding.MinPeersPerShard
 
 	// The parent still has members that have not descended yet, so the
 	// small sibling is filling up, not depleted.
-	populateFakeActivePeers(sm, "00", min+2)
+	populateFakeActivePeers(sm, "00", minPeers+2)
 	recordActive(sm, "01", peersHashingTo("01", 2))
 	recordActive(sm, "0", peersHashingTo("01", 3))
 
@@ -356,10 +356,10 @@ func TestMergeUp_SelfBelowMinPeers(t *testing.T) {
 	defer cancel()
 	sm := newTestShardManager(t, ctx, "00")
 	prepareMerge(t, sm)
-	min := sm.cfg.Sharding.MinPeersPerShard
+	minPeers := sm.cfg.Sharding.MinPeersPerShard
 
 	populateFakeActivePeers(sm, "00", 1)
-	recordActive(sm, "01", peersHashingTo("01", min+3))
+	recordActive(sm, "01", peersHashingTo("01", minPeers+3))
 
 	sm.lifecycle.checkAndMergeUpIfAlone()
 	sm.lifecycle.checkAndMergeUpIfAlone()
@@ -373,10 +373,10 @@ func TestMergeRefusal_PairAtMinPeers(t *testing.T) {
 	defer cancel()
 	sm := newTestShardManager(t, ctx, "00")
 	prepareMerge(t, sm)
-	min := sm.cfg.Sharding.MinPeersPerShard
+	minPeers := sm.cfg.Sharding.MinPeersPerShard
 
-	populateFakeActivePeers(sm, "00", min-1)
-	recordActive(sm, "01", peersHashingTo("01", min))
+	populateFakeActivePeers(sm, "00", minPeers-1)
+	recordActive(sm, "01", peersHashingTo("01", minPeers))
 
 	sm.lifecycle.checkAndMergeUpIfAlone()
 	sm.lifecycle.checkAndMergeUpIfAlone()
@@ -459,8 +459,8 @@ func TestDiscovery_CompletesHalfFinishedSplit(t *testing.T) {
 	sm.cfg.Sharding.MinPeersPerShard = 3
 	own := common.GetBinaryPrefix(sm.h.ID().String(), 1)
 	other := getSiblingShard(own)
-	// The other half already split off; two more root members hash into our
-	// half, so with self our child would hold 3.
+	// The other half already split off; two more root members hash into the
+	// node's half, so with the node itself its child would hold 3.
 	recordActive(sm, other, peersHashingTo(other, 4))
 	recordActive(sm, "", peersHashingTo(own, 2))
 	sm.lifecycle.mu.Lock()
@@ -536,7 +536,7 @@ func TestSplitRefusal_ChildWouldBeBelowMinPeers(t *testing.T) {
 	sm.cfg.Sharding.ShardPeerCheckInterval = time.Nanosecond
 
 	// Six members, all but possibly self hashing into child 00: half of the
-	// shard size passes the old estimate, but child 01 would get at most one peer.
+	// shard size would suffice, but child 01 would get at most one peer.
 	recordActive(sm, "0", peersHashingTo("00", 5))
 
 	sm.lifecycle.checkAndSplitIfNeeded()
@@ -546,213 +546,92 @@ func TestSplitRefusal_ChildWouldBeBelowMinPeers(t *testing.T) {
 	}
 }
 
-// --- moveToShard LEAVE test ---
+// shardObserver is a second host subscribed to the topic of shard "0".
+type shardObserver struct {
+	id    peer.ID
+	topic *pubsub.Topic
+	sub   *pubsub.Subscription
+}
+
+// newObservedShardManager starts a ShardManager in shard "0" and connects a
+// second host that subscribes to that shard's topic.
+func newObservedShardManager(t *testing.T, ctx context.Context) (*ShardManager, *shardObserver) {
+	t.Helper()
+	h1 := newTestHost(t)
+	h2 := newTestHost(t)
+	h2.Peerstore().AddAddrs(h1.ID(), h1.Addrs(), time.Hour)
+	if err := h2.Connect(ctx, peer.AddrInfo{ID: h1.ID(), Addrs: h1.Addrs()}); err != nil {
+		t.Fatal(err)
+	}
+	ps1 := newTestGossipSub(t, ctx, h1)
+	ps2 := newTestGossipSub(t, ctx, h2)
+
+	sm := newTestShardManagerOn(t, ctx, h1, ps1, "0")
+
+	topicName := fmt.Sprintf("%s-%s-shard-%s", sm.cfg.PubsubTopicPrefix, sm.cfg.TopicName, "0")
+	topic, err := ps2.Join(topicName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := topic.Subscribe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Let the gossipsub mesh form.
+	time.Sleep(500 * time.Millisecond)
+	return sm, &shardObserver{id: h2.ID(), topic: topic, sub: sub}
+}
+
+// await reports whether a message from another peer starting with prefix
+// arrives within timeout.
+func (o *shardObserver) await(ctx context.Context, prefix string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		msgCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+		msg, err := o.sub.Next(msgCtx)
+		cancel()
+		if err != nil {
+			continue
+		}
+		if msg.GetFrom() != o.id && strings.HasPrefix(string(msg.Data), prefix) {
+			return true
+		}
+	}
+	return false
+}
 
 func TestMoveToShard_PublishesLeave(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	sm, observer := newObservedShardManager(t, ctx)
 
-	// Create two connected hosts so the second can receive messages from the first
-	h1, err := libp2p.New()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer h1.Close()
-
-	h2, err := libp2p.New()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer h2.Close()
-
-	// Connect h2 to h1
-	h2.Peerstore().AddAddrs(h1.ID(), h1.Addrs(), time.Hour)
-	if err := h2.Connect(ctx, peer.AddrInfo{ID: h1.ID(), Addrs: h1.Addrs()}); err != nil {
-		t.Fatal(err)
-	}
-
-	ps1, err := pubsub.NewGossipSub(ctx, h1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ps2, err := pubsub.NewGossipSub(ctx, h2)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Set up ShardManager on h1 starting in shard "0"
-	dht := &testutil.MockDHTProvider{}
-	cfg1 := config.DefaultConfig()
-	storageMgr := storage.NewStorageManager(cfg1, dht, nil)
-	clusterMgr := &testutil.MockClusterManager{}
-	sm, err := NewShardManager(ShardManagerConfig{
-		Cfg:        cfg1,
-		Ctx:        ctx,
-		Host:       h1,
-		PubSub:     ps1,
-		IPFSClient: &testutil.MockIPFSClient{},
-		Storage:    storageMgr,
-		Cluster:    clusterMgr,
-		StartShard: "0",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = sm
-
-	// h2 subscribes to shard "0" topic to catch the LEAVE
-	topicName := fmt.Sprintf("%s-%s-shard-%s", cfg1.PubsubTopicPrefix, cfg1.TopicName, "0")
-	topic2, err := ps2.Join(topicName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sub2, err := topic2.Subscribe()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Give gossipsub meshes time to form
-	time.Sleep(500 * time.Millisecond)
-
-	// Trigger moveToShard: "0" -> "1"
 	sm.moveToShard("0", "1", false)
 
-	// Read messages on h2 and look for LEAVE from h1
-	deadline := time.After(3 * time.Second)
-	foundLeave := false
-	expectedPrefix := "LEAVE:" + h1.ID().String()
-	for !foundLeave {
-		select {
-		case <-deadline:
-			t.Error("timed out waiting for LEAVE message from moveToShard")
-			return
-		default:
-		}
-		msgCtx, msgCancel := context.WithTimeout(ctx, 200*time.Millisecond)
-		msg, err := sub2.Next(msgCtx)
-		msgCancel()
-		if err != nil {
-			continue
-		}
-		if msg.GetFrom() == h2.ID() {
-			continue
-		}
-		if strings.HasPrefix(string(msg.Data), expectedPrefix) {
-			foundLeave = true
-		}
-	}
-	if !foundLeave {
-		t.Error("did not receive LEAVE message after moveToShard")
+	if !observer.await(ctx, "LEAVE:"+sm.h.ID().String(), 3*time.Second) {
+		t.Error("timed out waiting for LEAVE message from moveToShard")
 	}
 }
-
-// --- PROBE response test ---
 
 func TestProcessMessage_ProbeTriggersHeartbeat(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	sm, observer := newObservedShardManager(t, ctx)
 
-	h1, err := libp2p.New()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer h1.Close()
-
-	h2, err := libp2p.New()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer h2.Close()
-
-	h2.Peerstore().AddAddrs(h1.ID(), h1.Addrs(), time.Hour)
-	if err := h2.Connect(ctx, peer.AddrInfo{ID: h1.ID(), Addrs: h1.Addrs()}); err != nil {
-		t.Fatal(err)
-	}
-
-	ps1, err := pubsub.NewGossipSub(ctx, h1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ps2, err := pubsub.NewGossipSub(ctx, h2)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Set up ShardManager on h1 in shard "0"
-	dht := &testutil.MockDHTProvider{}
-	cfg2 := config.DefaultConfig()
-	storageMgr := storage.NewStorageManager(cfg2, dht, nil)
-	clusterMgr := &testutil.MockClusterManager{}
-	sm, err := NewShardManager(ShardManagerConfig{
-		Cfg:        cfg2,
-		Ctx:        ctx,
-		Host:       h1,
-		PubSub:     ps1,
-		IPFSClient: &testutil.MockIPFSClient{},
-		Storage:    storageMgr,
-		Cluster:    clusterMgr,
-		StartShard: "0",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = sm
-
-	// h2 subscribes to shard "0"
-	topicName := fmt.Sprintf("%s-%s-shard-%s", cfg2.PubsubTopicPrefix, cfg2.TopicName, "0")
-	topic2, err := ps2.Join(topicName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sub2, err := topic2.Subscribe()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Wait for mesh formation
-	time.Sleep(500 * time.Millisecond)
-
-	// Drain any initial JOIN/HEARTBEAT messages from sm joining
+	// Drain the JOIN and HEARTBEAT that sm published when joining.
 	drainCtx, drainCancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	for {
-		_, err := sub2.Next(drainCtx)
-		if err != nil {
+		if _, err := observer.sub.Next(drainCtx); err != nil {
 			break
 		}
 	}
 	drainCancel()
 
-	// h2 publishes a PROBE message
-	probeMsg := []byte("PROBE:" + h2.ID().String())
-	if err := topic2.Publish(ctx, probeMsg); err != nil {
+	if err := observer.topic.Publish(ctx, []byte("PROBE:"+observer.id.String())); err != nil {
 		t.Fatal(err)
 	}
 
-	// Wait for HEARTBEAT response from h1
-	deadline := time.After(3 * time.Second)
-	foundHeartbeat := false
-	expectedPrefix := "HEARTBEAT:" + h1.ID().String()
-	for !foundHeartbeat {
-		select {
-		case <-deadline:
-			t.Error("timed out waiting for HEARTBEAT response to PROBE")
-			return
-		default:
-		}
-		msgCtx, msgCancel := context.WithTimeout(ctx, 200*time.Millisecond)
-		msg, err := sub2.Next(msgCtx)
-		msgCancel()
-		if err != nil {
-			continue
-		}
-		if msg.GetFrom() == h2.ID() {
-			continue
-		}
-		if strings.HasPrefix(string(msg.Data), expectedPrefix) {
-			foundHeartbeat = true
-		}
-	}
-	if !foundHeartbeat {
-		t.Error("did not receive HEARTBEAT response to PROBE from ShardManager")
+	if !observer.await(ctx, "HEARTBEAT:"+sm.h.ID().String(), 3*time.Second) {
+		t.Error("timed out waiting for HEARTBEAT response to PROBE")
 	}
 }

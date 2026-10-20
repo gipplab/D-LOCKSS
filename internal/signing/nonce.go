@@ -9,6 +9,10 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
+// nonceCleanupInterval is the number of seenBefore calls between sweeps of
+// expired nonces.
+const nonceCleanupInterval = 256
+
 func newNonce(n int) ([]byte, error) {
 	b := make([]byte, n)
 	_, err := rand.Read(b)
@@ -37,9 +41,8 @@ func (ns *nonceStore) seenBefore(sender peer.ID, nonce []byte, ttl time.Duration
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
 
-	const cleanupEveryN = 256
 	ns.cleanupCounter++
-	if ns.cleanupCounter%cleanupEveryN == 0 {
+	if ns.cleanupCounter%nonceCleanupInterval == 0 {
 		for k, exp := range ns.entries {
 			if now.After(exp) {
 				delete(ns.entries, k)

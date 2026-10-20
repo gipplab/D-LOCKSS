@@ -6,7 +6,7 @@ import (
 )
 
 // announceSplit publishes SPLIT:child0:child1 on the parent topic.
-func (sm *ShardManager) announceSplit(parentShard string, targetChild string) {
+func (sm *ShardManager) announceSplit(parentShard, targetChild string) {
 	sibling := getSiblingShard(targetChild)
 	sm.mu.RLock()
 	sub, exists := sm.shardSubs[parentShard]
@@ -19,7 +19,8 @@ func (sm *ShardManager) announceSplit(parentShard string, targetChild string) {
 	slog.Info("announced split", "shard", parentShard, "child0", targetChild, "child1", sibling)
 }
 
-// publishSplitToAncestor joins the ancestor shard as observer, publishes SPLIT:child0:child1, then leaves.
+// publishSplitToAncestor joins the ancestor shard as observer, publishes
+// SPLIT:child0:child1, then leaves.
 func (sm *ShardManager) publishSplitToAncestor(ancestorShard string) {
 	child0, child1 := childShards(ancestorShard)
 	if !sm.JoinShardAsObserver(ancestorShard) {
@@ -40,19 +41,11 @@ func (sm *ShardManager) publishSplitToAncestor(ancestorShard string) {
 	slog.Info("re-broadcast split to ancestor", "ancestor", ancestorShard, "child0", child0, "child1", child1)
 }
 
-// rebroadcastSplitToAncestors publishes SPLIT to each ancestor shard (parent, grandparent, ..., root).
+// rebroadcastSplitToAncestors publishes SPLIT to each ancestor shard, from the
+// parent up to the root.
 func (sm *ShardManager) rebroadcastSplitToAncestors() {
-	sm.mu.RLock()
-	currentShard := sm.currentShard
-	sm.mu.RUnlock()
-	if currentShard == "" {
-		return
-	}
-	for ancestor := currentShard[:len(currentShard)-1]; ; {
-		sm.publishSplitToAncestor(ancestor)
-		if ancestor == "" {
-			break
-		}
-		ancestor = ancestor[:len(ancestor)-1]
+	currentShard := sm.getCurrentShard()
+	for depth := len(currentShard) - 1; depth >= 0; depth-- {
+		sm.publishSplitToAncestor(currentShard[:depth])
 	}
 }

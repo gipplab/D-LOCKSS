@@ -2,17 +2,17 @@
 
 [*] --> Discovered: File detected in ./data
 
-Discovered --> Pinned: PinRecursive(ManifestCID)\nPinFile(ManifestCID)
+Discovered --> Pinned: PinManifest(ManifestCID)\nPinFile(ManifestCID)
 
 Pinned --> Responsible: AmIResponsibleFor(PayloadCID) == true\nPinToCluster(currentShard)\nPublish IngestMessage
 Pinned --> Custodial: AmIResponsibleFor(PayloadCID) == false\nJoinShard(targetShard)\nPinToShard(targetShard)\nPublish IngestMessage to target shard
 
 Custodial --> InTargetCluster: CRDT syncs; responsible nodes\nLocalPinTracker pin locally
 
-Responsible --> InCluster: Pin in CRDT; LocalPinTracker\nsyncs to self and peers (allocations)
+Responsible --> InCluster: Pin in CRDT; LocalPinTracker\nsyncs to every shard member
 
 InCluster --> UnderReplicated: repl.runChecker():\nunder target replication
-UnderReplicated --> InCluster: ReplicationRequest -> peers\nauto-replication: PinRecursive, ClusterPinIfAbsent, TriggerSync
+UnderReplicated --> InCluster: ReplicationRequest -> peers\nauto-replication: PinManifest, ClusterPinIfAbsent, TriggerSync
 
 InCluster --> Removed: RunReshardPass: we split/moved\nfile belongs to other shard
 Removed --> [*]: Unpin from cluster\nUnpinRecursive, UnpinFile
@@ -28,7 +28,7 @@ end note
 note right of InCluster
     File lives in exactly one cluster
     (shard by PayloadCID).
-    LocalPinTracker allocation-aware.
+    Every shard member pins it; allocations are ignored.
 end note
 
 @enduml

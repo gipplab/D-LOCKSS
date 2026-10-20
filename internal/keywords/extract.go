@@ -11,8 +11,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -20,7 +18,10 @@ import (
 	"dlockss/pkg/schema"
 )
 
-var errRateLimited = errors.New("rate limited")
+var (
+	errRateLimited       = errors.New("rate limited")
+	errEmptyChatResponse = errors.New("empty chat response")
+)
 
 type rateLimitedError struct {
 	after time.Duration
@@ -33,16 +34,16 @@ func (e rateLimitedError) Error() string {
 func (e rateLimitedError) Unwrap() error { return errRateLimited }
 
 const (
-	maxFetchSize           = 20 * 1024 * 1024
 	maxTextLen             = 30_000
 	googleMaxTextLen       = 8_000
 	googleMaxOutputTokens  = 256
 	maxChatResponseBytes   = 2 * 1024 * 1024
 	maxRateLimitRetries    = 5
+	maxRateLimitPause      = 5 * time.Minute
+	maxKeywords            = 10
 	manifestFetchTimeout   = 30 * time.Second
-	pdfFetchTimeout        = 90 * time.Second
 	llmTimeout             = 120 * time.Second
-	extractionSystemPrompt = `The user message contains document text between ---BEGIN_DOCUMENT--- and ---END_DOCUMENT---. Respond with one JSON object only: {"title","broad_field","sub_topic","research_niche","keywords"} where keywords is an array of 10 lowercase strings.`
+	extractionSystemPrompt = `The user message describes an archived item (a document, a dataset, source code, or a directory) and contains its text or an excerpt between ---BEGIN_DOCUMENT--- and ---END_DOCUMENT---. Respond with one JSON object only: {"title","broad_field","sub_topic","research_niche","keywords"} where keywords is an array of 10 lowercase strings describing the item's subject. If the item has no title, write a short descriptive one.`
 )
 
 type chatRequest struct {
@@ -85,34 +86,25 @@ func (s *Store) processCID(manifestCID string) {
 		return
 	}
 
-	slog.Info("indexing cid", "manifest", manifestCID, "step", "fetch-pdf", "payload", payloadCID)
-	tmpPath, size, isPDF, err := s.fetchToTempFile(payloadCID)
-	if tmpPath != "" {
-		defer func() { _ = os.Remove(tmpPath) }()
+	slog.Info("indexing cid", "manifest", manifestCID, "step", "fetch-content", "payload", payloadCID)
+	c, err := s.loadContent(payloadCID, itemName(metaRef))
+	if errors.Is(err, errUnsupported) {
+		slog.Info("skipping content that cannot be indexed", "manifest", manifestCID, "meta_ref", metaRef, "reason", err)
+		s.markSkipped(manifestCID)
+		return
 	}
 	if s.handleFetchErr(manifestCID, err) {
 		return
 	}
-	if !isPDF && !looksLikePDF(metaRef) {
-		slog.Debug("skipping non-pdf", "manifest", manifestCID, "meta_ref", metaRef)
-		s.markSkipped(manifestCID)
-		return
-	}
-	if !isPDF {
-		slog.Error("meta_ref looks like PDF but payload is not", "manifest", manifestCID)
-		s.recordFailure(manifestCID)
-		return
-	}
 
-	text, err := convertPDFFromFile(tmpPath)
-	if err != nil {
-		slog.Error("pdftotext failed", "manifest", manifestCID, "bytes", size, "error", err)
-		s.recordFailure(manifestCID)
+	slog.Info("extracting keywords", "manifest", manifestCID, "format", c.format, "text_len", len(c.text))
+	result, err := s.extractKeywordsWithRetry(c, manifestCID)
+	if errors.Is(err, errRateLimited) {
+		// A provider quota is no fault of the file; it stays pending.
+		s.noteRateLimit(maxRateLimitPause)
+		slog.Warn("llm rate limited; pausing indexer", "manifest", manifestCID, "error", err)
 		return
 	}
-
-	slog.Info("extracting keywords", "manifest", manifestCID, "text_len", len(text))
-	result, err := s.extractKeywordsWithRetry(text, manifestCID)
 	if err != nil {
 		slog.Error("keyword extract failed", "manifest", manifestCID, "error", err)
 		s.recordFailure(manifestCID)
@@ -146,22 +138,31 @@ func (s *Store) storeEntry(manifestCID, payloadCID, metaRef string, result *extr
 	slog.Info("indexed", "manifest", manifestCID, "title", entry.Title, "keywords", len(entry.Keywords))
 }
 
-func (s *Store) resolveManifest(manifestCID string) (payloadCID, metaRef string, err error) {
-	reqURL := strings.TrimSuffix(s.cfg.Gateway, "/") + "/ipfs/" + url.PathEscape(manifestCID)
-	client := &http.Client{Timeout: manifestFetchTimeout}
-	resp, err := client.Get(reqURL)
+// gatewayGet fetches /ipfs/<ipfsPath> from the configured gateway. ipfsPath
+// must already be escaped. On success the caller must close the response body.
+func (s *Store) gatewayGet(ipfsPath string, timeout time.Duration) (*http.Response, error) {
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Get(s.Gateway() + "/ipfs/" + ipfsPath)
 	if err != nil {
-		return "", "", fmt.Errorf("gateway fetch: %w", err)
+		return nil, fmt.Errorf("gateway request: %w", err)
+	}
+	if resp.StatusCode == http.StatusOK {
+		return resp, nil
 	}
 	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 	if resp.StatusCode == http.StatusTooManyRequests {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
-		return "", "", rateLimitedError{after: retryAfterFrom(resp)}
+		return nil, rateLimitedError{after: retryAfterFrom(resp)}
 	}
-	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
-		return "", "", fmt.Errorf("gateway status: %s", resp.Status)
+	return nil, fmt.Errorf("gateway status: %s", resp.Status)
+}
+
+func (s *Store) resolveManifest(manifestCID string) (payloadCID, metaRef string, err error) {
+	resp, err := s.gatewayGet(gatewayPath(manifestCID), manifestFetchTimeout)
+	if err != nil {
+		return "", "", err
 	}
+	defer resp.Body.Close()
 	block, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return "", "", fmt.Errorf("read body: %w", err)
@@ -171,111 +172,32 @@ func (s *Store) resolveManifest(manifestCID string) (payloadCID, metaRef string,
 		return "", "", fmt.Errorf("unmarshal CBOR: %w", err)
 	}
 	if !ro.Payload.Defined() {
-		return "", "", fmt.Errorf("manifest has no payload CID")
+		return "", "", errors.New("manifest has no payload CID")
 	}
 	return ro.Payload.String(), ro.MetadataRef, nil
 }
 
-func (s *Store) fetchToTempFile(cid string) (tmpPath string, size int64, isPDF bool, err error) {
-	reqURL := strings.TrimSuffix(s.cfg.Gateway, "/") + "/ipfs/" + url.PathEscape(cid)
-	client := &http.Client{Timeout: pdfFetchTimeout}
-	resp, err := client.Get(reqURL)
-	if err != nil {
-		return "", 0, false, fmt.Errorf("gateway request: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusTooManyRequests {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
-		return "", 0, false, rateLimitedError{after: retryAfterFrom(resp)}
-	}
-	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
-		return "", 0, false, fmt.Errorf("gateway returned %s", resp.Status)
-	}
-
-	header := make([]byte, 4)
-	n, err := io.ReadFull(resp.Body, header)
-	if err != nil && err != io.ErrUnexpectedEOF {
-		return "", 0, false, fmt.Errorf("read header: %w", err)
-	}
-	if n < 4 || string(header[:4]) != "%PDF" {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxFetchSize))
-		return "", 0, false, nil
-	}
-
-	tmpFile, err := os.CreateTemp("", "dlockss-pdf-*.pdf")
-	if err != nil {
-		return "", 0, false, fmt.Errorf("create temp file: %w", err)
-	}
-	tmpPath = tmpFile.Name()
-	if _, err := tmpFile.Write(header); err != nil {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpPath)
-		return "", 0, false, fmt.Errorf("write header: %w", err)
-	}
-	written, err := io.Copy(tmpFile, io.LimitReader(resp.Body, maxFetchSize-3))
-	_ = tmpFile.Close()
-	if err != nil {
-		_ = os.Remove(tmpPath)
-		return "", 0, false, fmt.Errorf("stream body: %w", err)
-	}
-	total := written + 4
-	if total > maxFetchSize {
-		_ = os.Remove(tmpPath)
-		return "", 0, false, fmt.Errorf("file exceeds %d MB limit", maxFetchSize/(1024*1024))
-	}
-	return tmpPath, total, true, nil
-}
-
-func convertPDFFromFile(pdfPath string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "pdftotext", "-layout", "-enc", "UTF-8", pdfPath, "-")
-	out := bytes.NewBuffer(make([]byte, 0, maxTextLen+1024))
-	var stderr bytes.Buffer
-	cmd.Stdout = out
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return "", fmt.Errorf("pdftotext timeout: %w", ctx.Err())
-		}
-		msg := strings.TrimSpace(stderr.String())
-		if msg != "" {
-			return "", fmt.Errorf("pdftotext: %w: %s", err, truncate(msg, 500))
-		}
-		return "", fmt.Errorf("pdftotext: %w", err)
-	}
-	text := strings.TrimSpace(out.String())
-	if text == "" {
-		return "", fmt.Errorf("PDF produced no text (possibly image-only)")
-	}
-	if len(text) > maxTextLen {
-		text = text[:maxTextLen]
-	}
-	return text, nil
-}
-
-func (s *Store) extractKeywordsWithRetry(text, cid string) (*extractionResult, error) {
+func (s *Store) extractKeywordsWithRetry(c *content, manifestCID string) (*extractionResult, error) {
 	for attempt := 0; attempt <= maxRateLimitRetries; attempt++ {
 		s.waitLLM()
-		result, retryAfter, err := s.extractKeywords(text)
+		result, retryAfter, err := s.extractKeywords(c)
 		if err == nil {
 			return result, nil
 		}
 		if retryAfter > 0 {
 			wait := rateLimitWait(retryAfter, attempt)
-			slog.Warn("rate limited on extract, backing off", "cid", cid, "attempt", attempt+1, "wait", wait)
+			slog.Warn("rate limited on extract, backing off", "manifest", manifestCID, "attempt", attempt+1, "wait", wait)
 			time.Sleep(wait)
 			continue
 		}
 		if isRetryableExtractNetErr(err) && attempt < 3 {
-			slog.Warn("network error on extract, retrying", "cid", cid, "attempt", attempt+1, "wait", 20*time.Second, "error", err)
+			slog.Warn("network error on extract, retrying", "manifest", manifestCID, "attempt", attempt+1, "wait", 20*time.Second, "error", err)
 			time.Sleep(20 * time.Second)
 			continue
 		}
 		return nil, err
 	}
-	return nil, fmt.Errorf("rate limited after %d retries", maxRateLimitRetries)
+	return nil, fmt.Errorf("after %d retries: %w", maxRateLimitRetries, errRateLimited)
 }
 
 func (s *Store) handleFetchErr(manifestCID string, err error) bool {
@@ -288,20 +210,15 @@ func (s *Store) handleFetchErr(manifestCID string, err error) bool {
 		slog.Warn("gateway rate limited; pausing indexer", "manifest", manifestCID, "error", err)
 		return true
 	}
-	slog.Error("fetch failed", "manifest", manifestCID, "error", err)
+	slog.Error("failed to load content", "manifest", manifestCID, "error", err)
 	s.recordFailure(manifestCID)
 	return true
 }
 
+// noteRateLimit pauses the indexer for retryAfter, clamped to
+// [batchRetryDelay, maxRateLimitPause]. An existing longer pause is kept.
 func (s *Store) noteRateLimit(retryAfter time.Duration) {
-	wait := retryAfter
-	if wait < batchRetryDelay {
-		wait = batchRetryDelay
-	}
-	if wait > 5*time.Minute {
-		wait = 5 * time.Minute
-	}
-	until := time.Now().Add(wait)
+	until := time.Now().Add(min(max(retryAfter, batchRetryDelay), maxRateLimitPause))
 	s.mu.Lock()
 	if until.After(s.pauseUntil) {
 		s.pauseUntil = until
@@ -312,7 +229,7 @@ func (s *Store) noteRateLimit(retryAfter time.Duration) {
 func (s *Store) rateLimited() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return !s.pauseUntil.IsZero() && time.Now().Before(s.pauseUntil)
+	return time.Now().Before(s.pauseUntil)
 }
 
 func retryAfterFrom(resp *http.Response) time.Duration {
@@ -325,22 +242,11 @@ func retryAfterFrom(resp *http.Response) time.Duration {
 	return d
 }
 
+// rateLimitWait is the larger of retryAfter and an exponential backoff
+// (2s doubling per attempt, at most a minute), capped at maxRateLimitPause.
 func rateLimitWait(retryAfter time.Duration, attempt int) time.Duration {
-	exp := 2 * time.Second
-	for i := 0; i < attempt; i++ {
-		exp *= 2
-	}
-	if exp > 60*time.Second {
-		exp = 60 * time.Second
-	}
-	wait := retryAfter
-	if exp > wait {
-		wait = exp
-	}
-	if wait > 5*time.Minute {
-		wait = 5 * time.Minute
-	}
-	return wait
+	backoff := min(2*time.Second<<attempt, time.Minute)
+	return min(max(retryAfter, backoff), maxRateLimitPause)
 }
 
 func isRetryableExtractNetErr(err error) bool {
@@ -354,16 +260,24 @@ func isRetryableExtractNetErr(err error) bool {
 	return opErr.Timeout() || opErr.Op == "dial"
 }
 
-func (s *Store) extractKeywords(markdown string) (*extractionResult, time.Duration, error) {
+func (s *Store) extractKeywords(c *content) (*extractionResult, time.Duration, error) {
 	cfg := s.snapshotConfig()
 	if cfg.Provider == ProviderGoogle {
-		markdown = trimUTF8(markdown, googleMaxTextLen)
+		return geminiExtract(cfg, documentPrompt(c, googleMaxTextLen))
 	}
-	userText := "Document text (between delimiters only):\n---BEGIN_DOCUMENT---\n" + markdown + "\n---END_DOCUMENT---"
-	if cfg.Provider == ProviderGoogle {
-		return geminiExtract(cfg, userText)
+	return openAIExtract(cfg, documentPrompt(c, maxTextLen))
+}
+
+func documentPrompt(c *content, limit int) string {
+	var b strings.Builder
+	if c.name != "" {
+		b.WriteString("Name: " + c.name + "\n")
 	}
-	return openAIExtract(cfg, userText)
+	b.WriteString("Format: " + c.format + "\n")
+	b.WriteString("Content (between delimiters only):\n---BEGIN_DOCUMENT---\n")
+	b.WriteString(trimUTF8(c.text, limit))
+	b.WriteString("\n---END_DOCUMENT---")
+	return b.String()
 }
 
 func openAIExtract(cfg Config, userText string) (*extractionResult, time.Duration, error) {
@@ -381,7 +295,7 @@ func openAIExtract(cfg Config, userText string) (*extractionResult, time.Duratio
 	if err != nil {
 		return nil, 0, fmt.Errorf("marshal request: %w", err)
 	}
-	req, err := http.NewRequest("POST", strings.TrimSuffix(cfg.APIBase, "/")+"/chat/completions", bytes.NewReader(bodyBytes))
+	req, err := http.NewRequest(http.MethodPost, strings.TrimSuffix(cfg.APIBase, "/")+"/chat/completions", bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, 0, fmt.Errorf("build request: %w", err)
 	}
@@ -401,7 +315,7 @@ func openAIExtract(cfg Config, userText string) (*extractionResult, time.Duratio
 		return nil, 0, fmt.Errorf("API error: %s", chatResp.Error.Message)
 	}
 	if len(chatResp.Choices) == 0 || chatResp.Choices[0].Message.Content == "" {
-		return nil, 0, fmt.Errorf("empty chat response")
+		return nil, 0, errEmptyChatResponse
 	}
 	result, err := parseExtraction(chatResp.Choices[0].Message.Content)
 	return result, 0, err
@@ -431,11 +345,12 @@ func geminiGenerationConfig() map[string]interface{} {
 	}
 }
 
-func trimUTF8(s string, max int) string {
-	if len(s) <= max {
+// trimUTF8 truncates s to at most n bytes without splitting a UTF-8 sequence.
+func trimUTF8(s string, n int) string {
+	if len(s) <= n {
 		return s
 	}
-	cut := max
+	cut := n
 	for cut > 0 && (s[cut]&0xC0) == 0x80 {
 		cut--
 	}
@@ -457,7 +372,7 @@ func geminiExtract(cfg Config, userText string) (*extractionResult, time.Duratio
 		return nil, 0, fmt.Errorf("marshal request: %w", err)
 	}
 	endpoint := strings.TrimSuffix(cfg.APIBase, "/") + "/models/" + url.PathEscape(cfg.Model) + ":generateContent"
-	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(bodyBytes))
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, 0, fmt.Errorf("build request: %w", err)
 	}
@@ -496,11 +411,11 @@ func geminiResponseText(respBody []byte) (string, error) {
 		return "", fmt.Errorf("API error: %s", parsed.Error.Message)
 	}
 	if len(parsed.Candidates) == 0 || len(parsed.Candidates[0].Content.Parts) == 0 {
-		return "", fmt.Errorf("empty chat response")
+		return "", errEmptyChatResponse
 	}
 	text := strings.TrimSpace(parsed.Candidates[0].Content.Parts[0].Text)
 	if text == "" {
-		return "", fmt.Errorf("empty chat response")
+		return "", errEmptyChatResponse
 	}
 	return text, nil
 }
@@ -518,16 +433,10 @@ func doLLMRequest(req *http.Request) ([]byte, time.Duration, error) {
 		return nil, 0, fmt.Errorf("read response: %w", err)
 	}
 	if len(respBody) > maxChatResponseBytes {
-		return nil, 0, fmt.Errorf("chat response too large")
+		return nil, 0, errors.New("chat response too large")
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
-		retryAfter := time.Second
-		if v := resp.Header.Get("Retry-After"); v != "" {
-			if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
-				retryAfter = time.Duration(secs) * time.Second
-			}
-		}
-		return nil, retryAfter, fmt.Errorf("rate limited (429)")
+		return nil, retryAfterFrom(resp), errors.New("rate limited (429)")
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, 0, fmt.Errorf("API status %d: %s", resp.StatusCode, truncate(string(respBody), 200))
@@ -540,16 +449,53 @@ func parseExtraction(raw string) (*extractionResult, error) {
 	text = strings.TrimPrefix(text, "```json")
 	text = strings.TrimPrefix(text, "```")
 	text = strings.TrimSuffix(text, "```")
-	text = strings.TrimSpace(text)
-	start := strings.Index(text, "{")
-	if start == -1 {
-		return nil, fmt.Errorf("no JSON object in response")
+	obj, err := firstJSONObject(strings.TrimSpace(text))
+	if err != nil {
+		return nil, err
+	}
+	var result extractionResult
+	if err := json.Unmarshal([]byte(obj), &result); err != nil {
+		return nil, fmt.Errorf("parse JSON: %w", err)
+	}
+	result.Title = strings.TrimSpace(result.Title)
+	result.BroadField = strings.TrimSpace(result.BroadField)
+	result.SubTopic = strings.TrimSpace(result.SubTopic)
+	result.ResearchNiche = strings.TrimSpace(result.ResearchNiche)
+
+	cleaned := make([]string, 0, maxKeywords)
+	seen := make(map[string]struct{})
+	for _, kw := range result.Keywords {
+		kw = strings.ToLower(strings.TrimSpace(kw))
+		if !AcceptableKeyword(kw) {
+			continue
+		}
+		if _, ok := seen[kw]; ok {
+			continue
+		}
+		seen[kw] = struct{}{}
+		cleaned = append(cleaned, kw)
+		if len(cleaned) == maxKeywords {
+			break
+		}
+	}
+	if len(cleaned) == 0 {
+		return nil, errors.New("no keywords extracted")
+	}
+	result.Keywords = cleaned
+	return &result, nil
+}
+
+// firstJSONObject returns the first balanced {...} object in s, skipping
+// braces inside JSON strings.
+func firstJSONObject(s string) (string, error) {
+	start := strings.IndexByte(s, '{')
+	if start < 0 {
+		return "", errors.New("no JSON object in response")
 	}
 	depth := 0
 	inString := false
-	jsonEnd := -1
-	for i := start; i < len(text); i++ {
-		ch := text[i]
+	for i := start; i < len(s); i++ {
+		ch := s[i]
 		if inString {
 			switch ch {
 			case '\\':
@@ -567,46 +513,11 @@ func parseExtraction(raw string) (*extractionResult, error) {
 		case '}':
 			depth--
 			if depth == 0 {
-				jsonEnd = i + 1
+				return s[start : i+1], nil
 			}
 		}
-		if jsonEnd >= 0 {
-			break
-		}
 	}
-	if jsonEnd < 0 {
-		return nil, fmt.Errorf("no complete JSON object in response")
-	}
-	var result extractionResult
-	if err := json.Unmarshal([]byte(text[start:jsonEnd]), &result); err != nil {
-		return nil, fmt.Errorf("parse JSON: %w", err)
-	}
-	result.Title = strings.TrimSpace(result.Title)
-	result.BroadField = strings.TrimSpace(result.BroadField)
-	result.SubTopic = strings.TrimSpace(result.SubTopic)
-	result.ResearchNiche = strings.TrimSpace(result.ResearchNiche)
-
-	cleaned := make([]string, 0, 10)
-	seen := make(map[string]struct{})
-	for _, kw := range result.Keywords {
-		kw = strings.ToLower(strings.TrimSpace(kw))
-		if kw == "" || !AcceptableKeyword(kw) {
-			continue
-		}
-		if _, ok := seen[kw]; ok {
-			continue
-		}
-		seen[kw] = struct{}{}
-		cleaned = append(cleaned, kw)
-		if len(cleaned) == 10 {
-			break
-		}
-	}
-	if len(cleaned) == 0 {
-		return nil, fmt.Errorf("no keywords extracted")
-	}
-	result.Keywords = cleaned
-	return &result, nil
+	return "", errors.New("no complete JSON object in response")
 }
 
 func truncate(s string, n int) string {

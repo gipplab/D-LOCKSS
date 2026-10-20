@@ -23,7 +23,7 @@ loop For each Pin in State
     Note over PinTracker: All nodes in a shard pin everything\nin the shard's CRDT (allocations are informational only)
     PinTracker -> IPFS: IsPinned(CID)?
     alt Not Pinned Locally
-        PinTracker -> IPFS: PinRecursive(ManifestCID)
+        PinTracker -> IPFS: PinManifest(ManifestCID)
     end
     alt First sync for this CID
         PinTracker -> Storage: onPinSynced(manifestCID)
@@ -33,7 +33,7 @@ end
 
 == Tracking removal (no longer in CRDT) ==
 
-PinTracker -> PinTracker: CID in pinnedByUs but not in CRDT state
+PinTracker -> PinTracker: CID tracked but not in CRDT state
 PinTracker -> Storage: onPinRemoved(cid)
 Note over PinTracker: Does NOT call UnpinRecursive.\nActual IPFS unpin is handled by the\nreshard pass (shard_reshard.go) which\nis migration-aware.
 

@@ -41,7 +41,7 @@ func (m *mockState) Get(ctx context.Context, c api.Cid) (api.Pin, error) {
 	return api.Pin{}, state.ErrNotFound
 }
 
-// mockConsensus implements ConsensusClient for tests.
+// mockConsensus implements consensusClient for tests.
 type mockConsensus struct {
 	st state.ReadOnly
 }
@@ -67,7 +67,7 @@ type mockIPFSForTracker struct {
 func (m *mockIPFSForTracker) IsPinned(ctx context.Context, c cid.Cid) (bool, error) {
 	return false, nil
 }
-func (m *mockIPFSForTracker) PinRecursive(ctx context.Context, c cid.Cid) error {
+func (m *mockIPFSForTracker) PinManifest(ctx context.Context, c cid.Cid) error {
 	m.mu.Lock()
 	m.pinCalls = append(m.pinCalls, c)
 	m.mu.Unlock()
@@ -85,6 +85,12 @@ func (m *mockIPFSForTracker) GetBlock(ctx context.Context, c cid.Cid) ([]byte, e
 	return nil, nil
 }
 
+func (m *mockIPFSForTracker) pinCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.pinCalls)
+}
+
 func manifestBlock(t *testing.T, ingester peer.ID) (cid.Cid, []byte) {
 	t.Helper()
 	payload, err := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
@@ -98,55 +104,46 @@ func manifestBlock(t *testing.T, ingester peer.ID) (cid.Cid, []byte) {
 	}
 	return payload, b
 }
+
 func TestPinTracker_allocation_pin(t *testing.T) {
 	ourPeer := testutil.MustPeerID(t, "our")
 	c1, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
 	ipfs := &mockIPFSForTracker{}
 	pt := newLocalPinTracker(ipfs, "1", nil, nil, nil, nil)
 
-	state := &mockState{
+	st := &mockState{
 		pins: []api.Pin{
 			{Cid: api.NewCid(c1), Allocations: []peer.ID{ourPeer}},
 		},
 	}
-	consensus := &mockConsensus{st: state}
+	pt.syncState(&mockConsensus{st: st})
 
-	pt.syncState(consensus)
-
-	ipfs.mu.Lock()
-	n := len(ipfs.pinCalls)
-	ipfs.mu.Unlock()
+	n := ipfs.pinCount()
 	if n != 1 {
-		t.Errorf("expected 1 PinRecursive call, got %d", n)
+		t.Errorf("expected 1 PinManifest call, got %d", n)
 	}
 	if n >= 1 && ipfs.pinCalls[0] != c1 {
-		t.Errorf("PinRecursive called with %s, want %s", ipfs.pinCalls[0], c1)
+		t.Errorf("PinManifest called with %s, want %s", ipfs.pinCalls[0], c1)
 	}
 }
 
-func TestPinTracker_allocation_skip(t *testing.T) {
-	// Since v0.0.3, allocations are ignored — all nodes on a shard pin
-	// everything in the shard's CRDT. This test verifies that a pin
-	// allocated to another peer is still synced locally.
+// Allocations are informational: a pin allocated to another peer is still
+// synced locally.
+func TestPinTracker_allocation_to_other_peer_still_pinned(t *testing.T) {
 	otherPeer := testutil.MustPeerID(t, "other")
 	c1, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
 	ipfs := &mockIPFSForTracker{}
 	pt := newLocalPinTracker(ipfs, "1", nil, nil, nil, nil)
 
-	state := &mockState{
+	st := &mockState{
 		pins: []api.Pin{
 			{Cid: api.NewCid(c1), Allocations: []peer.ID{otherPeer}},
 		},
 	}
-	consensus := &mockConsensus{st: state}
+	pt.syncState(&mockConsensus{st: st})
 
-	pt.syncState(consensus)
-
-	ipfs.mu.Lock()
-	n := len(ipfs.pinCalls)
-	ipfs.mu.Unlock()
-	if n != 1 {
-		t.Errorf("expected 1 PinRecursive call (allocations ignored, pin everything), got %d", n)
+	if n := ipfs.pinCount(); n != 1 {
+		t.Errorf("expected 1 PinManifest call (allocations ignored, pin everything), got %d", n)
 	}
 }
 
@@ -155,58 +152,41 @@ func TestPinTracker_empty_allocations_full_replication(t *testing.T) {
 	ipfs := &mockIPFSForTracker{}
 	pt := newLocalPinTracker(ipfs, "1", nil, nil, nil, nil)
 
-	// Empty Allocations means "pin everywhere" (full replication)
-	state := &mockState{
+	st := &mockState{
 		pins: []api.Pin{
 			{Cid: api.NewCid(c1), Allocations: nil},
 		},
 	}
-	consensus := &mockConsensus{st: state}
+	pt.syncState(&mockConsensus{st: st})
 
-	pt.syncState(consensus)
-
-	ipfs.mu.Lock()
-	n := len(ipfs.pinCalls)
-	ipfs.mu.Unlock()
-	if n != 1 {
-		t.Errorf("expected 1 PinRecursive call for empty Allocations (full replication), got %d", n)
+	if n := ipfs.pinCount(); n != 1 {
+		t.Errorf("expected 1 PinManifest call for empty Allocations (full replication), got %d", n)
 	}
 }
 
+// A pin removed from the CRDT only releases tracking. ipfsPinner has no unpin
+// method, so the IPFS pin is left for the migration-aware reshard pass.
 func TestPinTracker_tracking_released_when_removed_from_CRDT(t *testing.T) {
-	// Since v0.0.3, PinTracker does NOT call UnpinRecursive — it only
-	// releases tracking. Actual IPFS unpins are handled by the reshard
-	// pass which is migration-aware.
 	ourPeer := testutil.MustPeerID(t, "our")
 	c1, _ := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
-	removed := make([]string, 0)
+	var removed []string
 	onRemoved := func(cidStr string) { removed = append(removed, cidStr) }
 	ipfs := &mockIPFSForTracker{}
 	pt := newLocalPinTracker(ipfs, "1", nil, onRemoved, nil, nil)
 
-	stateWithPin := &mockState{
+	withPin := &mockState{
 		pins: []api.Pin{
 			{Cid: api.NewCid(c1), Allocations: []peer.ID{ourPeer}},
 		},
 	}
-	consensusWithPin := &mockConsensus{st: stateWithPin}
-	pt.syncState(consensusWithPin)
+	pt.syncState(&mockConsensus{st: withPin})
 
-	ipfs.mu.Lock()
-	pinCalls := len(ipfs.pinCalls)
-	ipfs.mu.Unlock()
-	if pinCalls != 1 {
-		t.Fatalf("after first sync: expected 1 PinRecursive, got %d", pinCalls)
+	if n := ipfs.pinCount(); n != 1 {
+		t.Fatalf("after first sync: expected 1 PinManifest, got %d", n)
 	}
 
-	// Second sync: state has no pins (removed from CRDT)
-	stateEmpty := &mockState{pins: nil}
-	consensusEmpty := &mockConsensus{st: stateEmpty}
-	pt.syncState(consensusEmpty)
+	pt.syncState(&mockConsensus{st: &mockState{}})
 
-	// PinTracker should NOT call UnpinRecursive (migration-safe);
-	// the ipfsPinner interface doesn't even include UnpinRecursive.
-	// But onPinRemoved callback should have been called.
 	if len(removed) != 1 {
 		t.Errorf("expected onPinRemoved called once, got %d", len(removed))
 	}
@@ -229,11 +209,8 @@ func TestPinTracker_refusesUntrustedOrigin(t *testing.T) {
 	pt := newLocalPinTracker(ipfs, "1", nil, nil, nil, tm)
 	pt.syncState(&mockConsensus{st: &mockState{pins: []api.Pin{{Cid: api.NewCid(c1)}}}})
 
-	ipfs.mu.Lock()
-	n := len(ipfs.pinCalls)
-	ipfs.mu.Unlock()
-	if n != 0 {
-		t.Errorf("expected no PinRecursive for untrusted origin, got %d", n)
+	if n := ipfs.pinCount(); n != 0 {
+		t.Errorf("expected no PinManifest for untrusted origin, got %d", n)
 	}
 }
 
@@ -250,11 +227,8 @@ func TestPinTracker_pinsTrustedOrigin(t *testing.T) {
 	pt := newLocalPinTracker(ipfs, "1", nil, nil, nil, tm)
 	pt.syncState(&mockConsensus{st: &mockState{pins: []api.Pin{{Cid: api.NewCid(c1)}}}})
 
-	ipfs.mu.Lock()
-	n := len(ipfs.pinCalls)
-	ipfs.mu.Unlock()
-	if n != 1 {
-		t.Errorf("expected 1 PinRecursive for trusted origin, got %d", n)
+	if n := ipfs.pinCount(); n != 1 {
+		t.Errorf("expected 1 PinManifest for trusted origin, got %d", n)
 	}
 }
 
@@ -266,10 +240,7 @@ func TestPinTracker_refusesWhenManifestUnreadable(t *testing.T) {
 	pt := newLocalPinTracker(ipfs, "1", nil, nil, nil, tm)
 	pt.syncState(&mockConsensus{st: &mockState{pins: []api.Pin{{Cid: api.NewCid(c1)}}}})
 
-	ipfs.mu.Lock()
-	n := len(ipfs.pinCalls)
-	ipfs.mu.Unlock()
-	if n != 0 {
-		t.Errorf("expected no PinRecursive when origin check cannot read manifest, got %d", n)
+	if n := ipfs.pinCount(); n != 0 {
+		t.Errorf("expected no PinManifest when origin check cannot read manifest, got %d", n)
 	}
 }

@@ -25,7 +25,7 @@ const (
 	googleDailyCap  = 1_000
 	maxRetries      = 3
 	retryCooldown   = 10 * time.Minute
-	batchRetryDelay = time.Minute // ipfs-tracker indexer.RetryDelay
+	batchRetryDelay = time.Minute // shortest indexer pause after a rate limit
 	maxRecentItems  = 30
 )
 
@@ -34,7 +34,8 @@ type CIDSource interface {
 	UniqueCIDList() []string
 }
 
-// Store indexes PDFs announced on the network and answers keyword searches.
+// Store indexes documents and datasets announced on the network and answers
+// keyword searches.
 type Store struct {
 	mu sync.RWMutex
 
@@ -56,6 +57,8 @@ type Store struct {
 	keyOnce    sync.Once
 	llmLimiter *rate.Limiter
 	pauseUntil time.Time
+	// pdfToText is set once by Run before the workers start.
+	pdfToText bool
 }
 
 type CIDKeywordEntry struct {
@@ -158,6 +161,7 @@ func (s *Store) signalKeyReady() {
 	s.keyOnce.Do(func() { close(s.keyReady) })
 }
 
+// requestCap returns the provider's daily request limit. The caller holds s.mu.
 func (s *Store) requestCap() int {
 	if s.cfg.Provider == ProviderGoogle {
 		return googleDailyCap
@@ -192,17 +196,13 @@ func (s *Store) SetAPIKeyOnce(key string) error {
 	if s.cfg.APIKey != "" {
 		return ErrAPIKeySet
 	}
-	dataDir := s.cfg.DataDir
-	if dataDir == "" {
-		dataDir = DefaultDataDir()
-		s.cfg.DataDir = dataDir
-	}
-	if err := saveAPIKey(dataDir, key); err != nil {
+	s.cfg.DataDir = dataDirOrDefault(s.cfg.DataDir)
+	if err := saveAPIKey(s.cfg.DataDir, key); err != nil {
 		return err
 	}
 	s.cfg.APIKey = key
 	s.signalKeyReady()
-	slog.Info("api key saved once", "path", apiKeyPath(dataDir))
+	slog.Info("api key saved once", "path", apiKeyPath(s.cfg.DataDir))
 	return nil
 }
 
@@ -301,6 +301,20 @@ func (s *Store) saveFailures() {
 	atomicWrite(s.failuresPath(), data)
 }
 
+// resetFailuresLocked forgets all failures, including those saved as
+// permanent, so files that failed under the previous provider or key are
+// tried again. The caller holds s.mu.
+func (s *Store) resetFailuresLocked() {
+	s.failures = make(map[string]*failureRecord)
+	s.totalFail = 0
+	if s.cfg.DataDir == "" {
+		return
+	}
+	if err := os.Remove(s.failuresPath()); err != nil && !os.IsNotExist(err) {
+		slog.Warn("failed to remove keyword failures", "path", s.failuresPath(), "error", err)
+	}
+}
+
 func atomicWrite(path string, data []byte) {
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
@@ -340,7 +354,7 @@ func normalizeKeyword(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
 }
 
-// Run waits for an API key if none is set, then indexes newly announced PDFs.
+// Run waits for an API key if none is set, then indexes newly announced content.
 func (s *Store) Run(ctx context.Context, source CIDSource) {
 	if !s.Enabled() {
 		slog.Info("no API key yet; set it in the monitor settings or via SAIA_API_KEY / .api_key")
@@ -353,11 +367,13 @@ func (s *Store) Run(ctx context.Context, source CIDSource) {
 			return
 		}
 	}
-	if _, err := exec.LookPath("pdftotext"); err != nil {
-		slog.Warn("pdftotext not found; keyword indexing disabled (install poppler-utils)")
-		return
+	if _, err := exec.LookPath("pdftotext"); err == nil {
+		s.pdfToText = true
+	} else {
+		slog.Warn("pdftotext not found; PDFs are not indexed (install poppler-utils)")
 	}
-	slog.Info("keyword indexing enabled", "provider", s.cfg.Provider, "model", s.cfg.Model, "api_base", s.cfg.APIBase, "workers", numWorkers)
+	cfg := s.snapshotConfig()
+	slog.Info("keyword indexing enabled", "provider", cfg.Provider, "model", cfg.Model, "api_base", cfg.APIBase, "workers", numWorkers)
 
 	work := make(chan string, numWorkers)
 	var wg sync.WaitGroup
@@ -400,13 +416,10 @@ func (s *Store) pickNextCID(source CIDSource) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.resetDayIfNeeded()
-	if s.dailyCount >= s.requestCap() {
-		return ""
-	}
-	if !s.pauseUntil.IsZero() && time.Now().Before(s.pauseUntil) {
-		return ""
-	}
 	now := time.Now()
+	if s.dailyCount >= s.requestCap() || now.Before(s.pauseUntil) {
+		return ""
+	}
 	for _, c := range candidates {
 		if s.processed[c] || s.inflight[c] {
 			continue
@@ -465,8 +478,4 @@ func (s *Store) resetDayIfNeeded() {
 func startOfDay(t time.Time) time.Time {
 	t = t.UTC()
 	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
-}
-
-func looksLikePDF(metaRef string) bool {
-	return strings.HasSuffix(strings.ToLower(metaRef), ".pdf")
 }

@@ -27,7 +27,7 @@ type ipfsConfig struct {
 }
 
 // LoadKey returns the node's private key. It tries, in order:
-//  1. DLOCKSS_IPFS_CONFIG — read Identity.PrivKey from the Kubo config JSON.
+//  1. Identity.PrivKey from the Kubo config JSON named by DLOCKSS_IPFS_CONFIG.
 //  2. A persisted key at config.IdentityPath.
 //  3. A legacy key at ./dlockss.key (migrated to config.IdentityPath).
 //  4. A freshly generated Ed25519 key (persisted to config.IdentityPath).
@@ -82,20 +82,18 @@ func loadOrCreate(cfg *config.Config) (crypto.PrivKey, error) {
 		return priv, nil
 	}
 
-	// Migrate legacy key from CWD if it exists there but not at the configured path.
+	// A legacy key in the working directory is copied to the configured path.
+	// If it cannot be read or copied, a new key is generated instead.
 	if legacyPath := "dlockss.key"; legacyPath != identityPath {
-		if _, err := os.Stat(legacyPath); err == nil {
-			data, err := os.ReadFile(legacyPath)
-			if err == nil {
-				ensureDir(identityPath)
-				if err := os.WriteFile(identityPath, data, 0600); err == nil {
-					slog.Info("migrated legacy identity", "from", legacyPath, "to", identityPath)
-					priv, err := crypto.UnmarshalPrivateKey(data)
-					if err != nil {
-						return nil, fmt.Errorf("failed to unmarshal migrated identity: %w", err)
-					}
-					return priv, nil
+		if data, err := os.ReadFile(legacyPath); err == nil {
+			ensureDir(identityPath)
+			if err := os.WriteFile(identityPath, data, 0600); err == nil {
+				slog.Info("migrated legacy identity", "from", legacyPath, "to", identityPath)
+				priv, err := crypto.UnmarshalPrivateKey(data)
+				if err != nil {
+					return nil, fmt.Errorf("failed to unmarshal migrated identity: %w", err)
 				}
+				return priv, nil
 			}
 		}
 	}

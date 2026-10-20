@@ -24,19 +24,19 @@ func (tp *TrustedPeers) SetAll(peers map[peer.ID]bool) { tp.m.ReplaceAll(peers) 
 func (tp *TrustedPeers) All() []peer.ID                { return tp.m.Keys() }
 func (tp *TrustedPeers) Len() int                      { return tp.m.Len() }
 
-// RateLimiter tracks message rates per peer.
+// RateLimiter enforces a sliding-window message limit per peer.
 type RateLimiter struct {
-	mu                   sync.RWMutex
-	peers                map[peer.ID]*peerRateLimit
-	rateLimitWindow      time.Duration
-	maxMessagesPerWindow int
+	mu          sync.RWMutex
+	peers       map[peer.ID]*peerRateLimit
+	window      time.Duration
+	maxMessages int
 }
 
 func NewRateLimiter(window time.Duration, maxMessages int) *RateLimiter {
 	return &RateLimiter{
-		peers:                make(map[peer.ID]*peerRateLimit),
-		rateLimitWindow:      window,
-		maxMessagesPerWindow: maxMessages,
+		peers:       make(map[peer.ID]*peerRateLimit),
+		window:      window,
+		maxMessages: maxMessages,
 	}
 }
 
@@ -46,14 +46,14 @@ func (rl *RateLimiter) getOrCreate(peerID peer.ID) *peerRateLimit {
 
 	prl, exists := rl.peers[peerID]
 	if !exists {
-		prl = &peerRateLimit{
-			messages: make([]time.Time, 0),
-		}
+		prl = &peerRateLimit{}
 		rl.peers[peerID] = prl
 	}
 	return prl
 }
 
+// Check reports whether a message from peerID is within the limit and, if
+// so, counts it. Rejected messages do not count against the window.
 func (rl *RateLimiter) Check(peerID peer.ID) bool {
 	prl := rl.getOrCreate(peerID)
 
@@ -61,25 +61,23 @@ func (rl *RateLimiter) Check(peerID peer.ID) bool {
 	defer prl.mu.Unlock()
 
 	now := time.Now()
-	cutoff := now.Add(-rl.rateLimitWindow)
+	cutoff := now.Add(-rl.window)
 
-	validMessages := make([]time.Time, 0, len(prl.messages))
-	for _, msgTime := range prl.messages {
-		if msgTime.After(cutoff) {
-			validMessages = append(validMessages, msgTime)
+	recent := make([]time.Time, 0, len(prl.messages))
+	for _, t := range prl.messages {
+		if t.After(cutoff) {
+			recent = append(recent, t)
 		}
 	}
 
-	if len(validMessages) >= rl.maxMessagesPerWindow {
+	if len(recent) >= rl.maxMessages {
 		return false
 	}
-
-	validMessages = append(validMessages, now)
-	prl.messages = validMessages
+	prl.messages = append(recent, now)
 	return true
 }
 
 type peerRateLimit struct {
-	messages []time.Time
 	mu       sync.Mutex
+	messages []time.Time
 }

@@ -32,6 +32,9 @@ type trustedPeersFile struct {
 	Peers []string `json:"peers"`
 }
 
+// LoadTrustedPeers replaces the trusted set with the peers listed in the JSON
+// trust store at path. Read errors are returned unwrapped so callers can test
+// them with os.IsNotExist.
 func (tm *TrustManager) LoadTrustedPeers(path string) error {
 	if path == "" {
 		return fmt.Errorf("trust store path is empty")
@@ -101,9 +104,9 @@ func (tm *TrustManager) AllowsOrigin(id peer.ID) bool {
 }
 
 // AuthorizeIncomingSender enforces:
-// - SenderID must match libp2p's ReceivedFrom (prevents in-message spoofing)
-// - If TrustMode == "allowlist" and the list is non-empty, sender must be listed
-func (tm *TrustManager) AuthorizeIncomingSender(receivedFrom peer.ID, peerID peer.ID) error {
+//   - SenderID must match libp2p's ReceivedFrom (prevents in-message spoofing).
+//   - If TrustMode is "allowlist" and the list is non-empty, the sender must be listed.
+func (tm *TrustManager) AuthorizeIncomingSender(receivedFrom, peerID peer.ID) error {
 	if peerID == "" {
 		return fmt.Errorf("missing sender_id")
 	}

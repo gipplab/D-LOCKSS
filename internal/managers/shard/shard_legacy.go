@@ -12,23 +12,11 @@ import (
 const legacyCleanupInterval = 5 * time.Minute
 
 func (sm *ShardManager) runLegacyManifestCleanup() {
-	select {
-	case <-sm.ctx.Done():
+	if !sm.sleep(30 * time.Second) {
 		return
-	case <-time.After(30 * time.Second):
 	}
 	sm.cleanupLegacyManifests()
-
-	ticker := time.NewTicker(legacyCleanupInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-sm.ctx.Done():
-			return
-		case <-ticker.C:
-			sm.cleanupLegacyManifests()
-		}
-	}
+	sm.runEvery(legacyCleanupInterval, sm.cleanupLegacyManifests)
 }
 
 func (sm *ShardManager) cleanupLegacyManifests() {
@@ -37,16 +25,11 @@ func (sm *ShardManager) cleanupLegacyManifests() {
 		return
 	}
 
-	sm.mu.RLock()
-	currentShard := sm.currentShard
-	sm.mu.RUnlock()
-
+	currentShard := sm.getCurrentShard()
 	removed := 0
 	for _, manifestCIDStr := range manifests {
-		select {
-		case <-sm.ctx.Done():
+		if sm.ctx.Err() != nil {
 			return
-		default:
 		}
 		if !common.IsLegacyManifest(sm.ctx, sm.ipfsClient, manifestCIDStr) {
 			continue

@@ -21,59 +21,46 @@ func getEnvString(key, defaultValue string) string {
 	return defaultValue
 }
 
-func getEnvInt(key string, defaultValue int) int {
-	if value := os.Getenv(key); value != "" {
-		if intValue, err := strconv.Atoi(value); err == nil {
-			return intValue
-		}
-		slog.Warn("invalid env integer, using default", "key", key, "default", defaultValue)
+// getEnvParsed returns the parsed value of key, or defaultValue when key is
+// unset or does not parse as kind.
+func getEnvParsed[T any](key string, defaultValue T, kind string, parse func(string) (T, error)) T {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
 	}
+	if parsed, err := parse(value); err == nil {
+		return parsed
+	}
+	slog.Warn("invalid env "+kind+", using default", "key", key, "default", defaultValue)
 	return defaultValue
+}
+
+func getEnvInt(key string, defaultValue int) int {
+	return getEnvParsed(key, defaultValue, "integer", strconv.Atoi)
 }
 
 func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
-	if value := os.Getenv(key); value != "" {
-		if duration, err := time.ParseDuration(value); err == nil {
-			return duration
-		}
-		slog.Warn("invalid env duration, using default", "key", key, "default", defaultValue)
-	}
-	return defaultValue
+	return getEnvParsed(key, defaultValue, "duration", time.ParseDuration)
 }
 
 func getEnvFloat(key string, defaultValue float64) float64 {
-	if value := os.Getenv(key); value != "" {
-		if floatValue, err := strconv.ParseFloat(value, 64); err == nil {
-			return floatValue
-		}
-		slog.Warn("invalid env float, using default", "key", key, "default", defaultValue)
-	}
-	return defaultValue
+	return getEnvParsed(key, defaultValue, "float", func(s string) (float64, error) {
+		return strconv.ParseFloat(s, 64)
+	})
 }
 
 func getEnvBool(key string, defaultValue bool) bool {
-	if value := os.Getenv(key); value != "" {
-		if boolValue, err := strconv.ParseBool(value); err == nil {
-			return boolValue
-		}
-		slog.Warn("invalid env boolean, using default", "key", key, "default", defaultValue)
-	}
-	return defaultValue
+	return getEnvParsed(key, defaultValue, "boolean", strconv.ParseBool)
 }
 
 func getEnvStringSlice(key string) []string {
-	if value := os.Getenv(key); value != "" {
-		parts := strings.Split(value, ",")
-		var result []string
-		for _, p := range parts {
-			p = strings.TrimSpace(p)
-			if p != "" {
-				result = append(result, p)
-			}
+	var result []string
+	for _, p := range strings.Split(os.Getenv(key), ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			result = append(result, p)
 		}
-		return result
 	}
-	return nil
+	return result
 }
 
 func clusterStorePath(dataDir string) string {
@@ -135,6 +122,9 @@ type FileConfig struct {
 	MaxConcurrentFileProcessing int
 	ReshardDelay                time.Duration
 	ReshardHandoffDelay         time.Duration
+	// PinIngestEnabled ingests recursive pins that users create in Kubo.
+	PinIngestEnabled  bool
+	PinIngestInterval time.Duration
 }
 
 // SecurityConfig holds trust, signing, and nonce parameters.
@@ -241,6 +231,8 @@ func DefaultConfig() *Config {
 			MaxConcurrentFileProcessing: 5,
 			ReshardDelay:                5 * time.Second,
 			ReshardHandoffDelay:         3 * time.Second,
+			PinIngestEnabled:            true,
+			PinIngestInterval:           time.Minute,
 		},
 		Security: SecurityConfig{
 			TrustMode:           "open",
@@ -287,7 +279,6 @@ func LoadFromEnv() *Config {
 	cfg.IPFSConfigPath = getEnvString("DLOCKSS_IPFS_CONFIG", cfg.IPFSConfigPath)
 	cfg.PrivateNetwork = getEnvBool("DLOCKSS_PRIVATE_NETWORK", cfg.PrivateNetwork)
 
-	// Sharding
 	cfg.Sharding.MaxPeersPerShard = getEnvInt("DLOCKSS_MAX_PEERS_PER_SHARD", cfg.Sharding.MaxPeersPerShard)
 	cfg.Sharding.MinPeersPerShard = getEnvInt("DLOCKSS_MIN_PEERS_PER_SHARD", cfg.Sharding.MinPeersPerShard)
 	cfg.Sharding.MinPeersAcrossSiblings = getEnvInt("DLOCKSS_MIN_PEERS_ACROSS_SIBLINGS", cfg.Sharding.MinPeersAcrossSiblings)
@@ -302,7 +293,6 @@ func LoadFromEnv() *Config {
 	cfg.Sharding.ProbeTimeoutMerge = getEnvDuration("DLOCKSS_PROBE_TIMEOUT_MERGE", cfg.Sharding.ProbeTimeoutMerge)
 	cfg.Sharding.SiblingEmptyMergeAfter = getEnvDuration("DLOCKSS_SIBLING_EMPTY_MERGE_AFTER", cfg.Sharding.SiblingEmptyMergeAfter)
 
-	// Replication
 	cfg.Replication.MinReplication = getEnvInt("DLOCKSS_MIN_REPLICATION", cfg.Replication.MinReplication)
 	cfg.Replication.MaxReplication = getEnvInt("DLOCKSS_MAX_REPLICATION", cfg.Replication.MaxReplication)
 	cfg.Replication.CheckInterval = getEnvDuration("DLOCKSS_CHECK_INTERVAL", cfg.Replication.CheckInterval)
@@ -311,7 +301,6 @@ func LoadFromEnv() *Config {
 	cfg.Replication.AutoReplicationTimeout = getEnvDuration("DLOCKSS_AUTO_REPLICATION_TIMEOUT", cfg.Replication.AutoReplicationTimeout)
 	cfg.Replication.PinReannounceInterval = getEnvDuration("DLOCKSS_PIN_REANNOUNCE_INTERVAL", cfg.Replication.PinReannounceInterval)
 
-	// Files
 	cfg.Files.FileImportTimeout = getEnvDuration("DLOCKSS_FILE_IMPORT_TIMEOUT", cfg.Files.FileImportTimeout)
 	cfg.Files.DHTProvideTimeout = getEnvDuration("DLOCKSS_DHT_PROVIDE_TIMEOUT", cfg.Files.DHTProvideTimeout)
 	cfg.Files.MaxConcurrentDHTProvides = getEnvInt("DLOCKSS_MAX_CONCURRENT_DHT_PROVIDES", cfg.Files.MaxConcurrentDHTProvides)
@@ -320,8 +309,9 @@ func LoadFromEnv() *Config {
 	cfg.Files.MaxConcurrentFileProcessing = getEnvInt("DLOCKSS_MAX_CONCURRENT_FILE_PROCESSING", cfg.Files.MaxConcurrentFileProcessing)
 	cfg.Files.ReshardDelay = getEnvDuration("DLOCKSS_RESHARD_DELAY", cfg.Files.ReshardDelay)
 	cfg.Files.ReshardHandoffDelay = getEnvDuration("DLOCKSS_RESHARD_HANDOFF_DELAY", cfg.Files.ReshardHandoffDelay)
+	cfg.Files.PinIngestEnabled = getEnvBool("DLOCKSS_PIN_INGEST", cfg.Files.PinIngestEnabled)
+	cfg.Files.PinIngestInterval = getEnvDuration("DLOCKSS_PIN_INGEST_INTERVAL", cfg.Files.PinIngestInterval)
 
-	// Security
 	cfg.Security.TrustMode = getEnvString("DLOCKSS_TRUST_MODE", cfg.Security.TrustMode)
 	cfg.Security.TrustStorePath = getEnvString("DLOCKSS_TRUST_STORE", filepath.Join(filepath.Dir(dataDir), "trusted_peers.json"))
 	cfg.Security.SignatureMode = getEnvString("DLOCKSS_SIGNATURE_MODE", cfg.Security.SignatureMode)
@@ -330,7 +320,6 @@ func LoadFromEnv() *Config {
 	cfg.Security.MinNonceSize = getEnvInt("DLOCKSS_MIN_NONCE_SIZE", cfg.Security.MinNonceSize)
 	cfg.Security.FutureSkewTolerance = getEnvDuration("DLOCKSS_FUTURE_SKEW_TOLERANCE", cfg.Security.FutureSkewTolerance)
 
-	// Orphan
 	cfg.Orphan.UnpinGracePeriod = getEnvDuration("DLOCKSS_ORPHAN_UNPIN_GRACE", cfg.Orphan.UnpinGracePeriod)
 	cfg.Orphan.HandoffGrace = getEnvDuration("DLOCKSS_ORPHAN_HANDOFF_GRACE", cfg.Orphan.HandoffGrace)
 	cfg.Orphan.UnpinMinHandoffCnt = getEnvInt("DLOCKSS_ORPHAN_MIN_HANDOFF_COUNT", cfg.Orphan.UnpinMinHandoffCnt)
@@ -340,11 +329,15 @@ func LoadFromEnv() *Config {
 
 // Validate checks and corrects invalid configuration values.
 func (c *Config) Validate() {
-	if c.Security.SignatureMode != "off" && c.Security.SignatureMode != "warn" && c.Security.SignatureMode != "strict" {
+	switch c.Security.SignatureMode {
+	case "off", "warn", "strict":
+	default:
 		slog.Warn("unknown signature mode, defaulting to strict", "mode", c.Security.SignatureMode)
 		c.Security.SignatureMode = "strict"
 	}
-	if c.Security.TrustMode != "open" && c.Security.TrustMode != "allowlist" {
+	switch c.Security.TrustMode {
+	case "open", "allowlist":
+	default:
 		slog.Warn("unknown trust mode, defaulting to open", "mode", c.Security.TrustMode)
 		c.Security.TrustMode = "open"
 	}
@@ -455,6 +448,8 @@ func (c *Config) Log() {
 		"max_concurrent", c.Files.MaxConcurrentFileProcessing,
 		"reshard_delay", c.Files.ReshardDelay,
 		"reshard_handoff_delay", c.Files.ReshardHandoffDelay,
+		"pin_ingest", c.Files.PinIngestEnabled,
+		"pin_ingest_interval", c.Files.PinIngestInterval,
 	)
 	slog.Info("config: orphan",
 		"unpin_grace", c.Orphan.UnpinGracePeriod,

@@ -37,17 +37,16 @@ func (sm *ShardManager) loadReshardedFiles() error {
 
 func (sm *ShardManager) saveReshardedFiles() error {
 	path := sm.reshardedFilesPath()
-	keys := sm.reshardedFiles.All()
-	arr := make([]string, 0, len(keys))
-	for k := range keys {
-		arr = append(arr, k)
+	all := sm.reshardedFiles.All()
+	keys := make([]string, 0, len(all))
+	for k := range all {
+		keys = append(keys, k)
 	}
-	data, err := json.Marshal(arr)
+	data, err := json.Marshal(keys)
 	if err != nil {
 		return fmt.Errorf("marshal resharded files: %w", err)
 	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return fmt.Errorf("create directory for resharded files: %w", err)
 	}
 	if err := os.WriteFile(path, data, 0600); err != nil {
@@ -57,16 +56,9 @@ func (sm *ShardManager) saveReshardedFiles() error {
 }
 
 func (sm *ShardManager) runReshardedFilesSaveLoop() {
-	ticker := time.NewTicker(reshardedFilesSaveInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-sm.ctx.Done():
-			return
-		case <-ticker.C:
-			if err := sm.saveReshardedFiles(); err != nil {
-				slog.Error("failed to save resharded files", "error", err)
-			}
+	sm.runEvery(reshardedFilesSaveInterval, func() {
+		if err := sm.saveReshardedFiles(); err != nil {
+			slog.Error("failed to save resharded files", "error", err)
 		}
-	}
+	})
 }

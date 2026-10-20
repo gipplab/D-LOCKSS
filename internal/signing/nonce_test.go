@@ -52,11 +52,9 @@ func TestSeenBefore_RejectsSameNonceTwice(t *testing.T) {
 	nonce := []byte("fixed-nonce-for-replay-test")
 	ttl := 10 * time.Minute
 
-	// First call: not seen before, records it
 	if ns.seenBefore(pid, nonce, ttl) {
 		t.Error("first seenBefore should return false (fresh nonce)")
 	}
-	// Second call: replay detected
 	if !ns.seenBefore(pid, nonce, ttl) {
 		t.Error("second seenBefore should return true (replay)")
 	}
@@ -81,22 +79,18 @@ func TestSeenBefore_NonceCacheEviction(t *testing.T) {
 	pid := testutil.MustPeerID(t, "sender-evict")
 	ttl := -1 * time.Hour // expired immediately
 
-	// Record one nonce that will be expired
 	nonce := []byte("expired-nonce")
 	if ns.seenBefore(pid, nonce, ttl) {
 		t.Error("first seenBefore should return false")
 	}
 
-	// Trigger cleanup: cleanup runs every 256 calls
-	const cleanupEveryN = 256
-	for i := 0; i < cleanupEveryN; i++ {
+	for i := 0; i < nonceCleanupInterval; i++ {
 		dummyNonce := make([]byte, 8)
 		dummyNonce[0] = byte(i)
 		ns.seenBefore(pid, dummyNonce, ttl)
 	}
 
-	// The expired nonce should have been evicted. Seeing it again should
-	// return false (not seen before) since it was removed.
+	// The sweep has evicted the expired nonce, so it reads as fresh again.
 	if ns.seenBefore(pid, nonce, 10*time.Minute) {
 		t.Error("evicted nonce should be treated as fresh (seenBefore=false)")
 	}

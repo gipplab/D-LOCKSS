@@ -20,60 +20,17 @@ import (
 
 var errReplay = errors.New("replay detected")
 
-const maxNonceSize = 64
-const minNonceSizeFloor = 1
+const (
+	maxNonceSize      = 64
+	minNonceSizeFloor = 1
 
-func (s *Signer) effectiveMinNonceSize() int {
-	n := s.cfg.Security.MinNonceSize
-	if n < minNonceSizeFloor {
-		n = minNonceSizeFloor
-	}
-	if n > maxNonceSize {
-		return maxNonceSize
-	}
-	return n
-}
+	defaultSignatureMaxAge     = 10 * time.Minute
+	defaultFutureSkewTolerance = 30 * time.Second
+	maxFutureSkewCap           = 5 * time.Minute
+)
 
-func (s *Signer) effectiveNonceSizeForSigning() int {
-	n := s.cfg.Security.NonceSize
-	minSize := s.effectiveMinNonceSize()
-	if n < minSize {
-		n = minSize
-	}
-	if n > maxNonceSize {
-		n = maxNonceSize
-	}
-	return n
-}
-
-func (s *Signer) effectiveSignatureMaxAge() time.Duration {
-	if s.cfg.Security.SignatureMaxAge > 0 {
-		return s.cfg.Security.SignatureMaxAge
-	}
-	return 10 * time.Minute
-}
-
-const maxFutureSkewCap = 5 * time.Minute
-
-func (s *Signer) effectiveFutureSkewTolerance() time.Duration {
-	d := s.cfg.Security.FutureSkewTolerance
-	if d <= 0 {
-		return 30 * time.Second
-	}
-	if d > maxFutureSkewCap {
-		return maxFutureSkewCap
-	}
-	return d
-}
-
-func (s *Signer) effectiveNonceTTL() time.Duration {
-	ttl := s.cfg.Security.SignatureMaxAge
-	if ttl <= 0 {
-		ttl = 10 * time.Minute
-	}
-	return ttl
-}
-
+// Signer signs outgoing protocol messages and verifies incoming ones
+// according to the configured signature mode.
 type Signer struct {
 	cfg      *config.Config
 	h        host.Host
@@ -106,9 +63,40 @@ func NewSigner(cfg SignerConfig) *Signer {
 	}
 }
 
+func (s *Signer) effectiveMinNonceSize() int {
+	return min(max(s.cfg.Security.MinNonceSize, minNonceSizeFloor), maxNonceSize)
+}
+
+func (s *Signer) effectiveNonceSizeForSigning() int {
+	return min(max(s.cfg.Security.NonceSize, s.effectiveMinNonceSize()), maxNonceSize)
+}
+
+func (s *Signer) effectiveSignatureMaxAge() time.Duration {
+	if s.cfg.Security.SignatureMaxAge > 0 {
+		return s.cfg.Security.SignatureMaxAge
+	}
+	return defaultSignatureMaxAge
+}
+
+func (s *Signer) effectiveFutureSkewTolerance() time.Duration {
+	d := s.cfg.Security.FutureSkewTolerance
+	if d <= 0 {
+		return defaultFutureSkewTolerance
+	}
+	return min(d, maxFutureSkewCap)
+}
+
+// effectiveNonceTTL matches the signature max age: a nonce evicted earlier
+// could be replayed while its message is still fresh enough to be accepted.
+func (s *Signer) effectiveNonceTTL() time.Duration {
+	return s.effectiveSignatureMaxAge()
+}
+
+// shouldEnforceSignatures is true for "strict" and for any unrecognised mode,
+// so a misconfigured mode fails closed.
 func (s *Signer) shouldEnforceSignatures() bool {
-	return s.cfg.Security.SignatureMode == "strict" ||
-		(s.cfg.Security.SignatureMode != "off" && s.cfg.Security.SignatureMode != "warn")
+	mode := s.cfg.Security.SignatureMode
+	return mode != "off" && mode != "warn"
 }
 func (s *Signer) shouldWarnOnBadSignatures() bool { return s.cfg.Security.SignatureMode == "warn" }
 func (s *Signer) signaturesDisabled() bool        { return s.cfg.Security.SignatureMode == "off" }
@@ -130,6 +118,8 @@ func (s *Signer) signMessageEnvelope(marshalForSigning func() ([]byte, error), s
 	return nil
 }
 
+// SignProtocolMessage stamps msg's envelope with this node's sender ID, the
+// current time and a fresh nonce, then signs it.
 func (s *Signer) SignProtocolMessage(msg schema.Signable) error {
 	if msg == nil {
 		return fmt.Errorf("message is nil")
@@ -149,7 +139,7 @@ func (s *Signer) SignProtocolMessage(msg schema.Signable) error {
 	)
 }
 
-func (s *Signer) verifySignedMessage(receivedFrom peer.ID, sender peer.ID, ts int64, nonce []byte, sig []byte, unsigned []byte) error {
+func (s *Signer) verifySignedMessage(receivedFrom, sender peer.ID, ts int64, nonce, sig, unsigned []byte) error {
 	if s.signaturesDisabled() {
 		return nil
 	}
@@ -157,19 +147,16 @@ func (s *Signer) verifySignedMessage(receivedFrom peer.ID, sender peer.ID, ts in
 		return err
 	}
 
-	maxAge := s.effectiveSignatureMaxAge()
-	now := time.Now()
-	msgTime := time.Unix(ts, 0)
-
 	pk := s.h.Peerstore().PubKey(sender)
 	if pk == nil {
-		pk, now = s.fetchPublicKey(sender)
+		pk = s.fetchPublicKey(sender)
 		if pk == nil {
 			return fmt.Errorf("missing public key for sender %s", sender.String())
 		}
 	}
 
-	if err := s.checkTimestamp(msgTime, now, maxAge); err != nil {
+	// Read the clock after the key lookup, which may block on the network.
+	if err := s.checkTimestamp(time.Unix(ts, 0), time.Now(), s.effectiveSignatureMaxAge()); err != nil {
 		return err
 	}
 	if err := verifySignatureBytes(pk, unsigned, sig); err != nil {
@@ -179,9 +166,7 @@ func (s *Signer) verifySignedMessage(receivedFrom peer.ID, sender peer.ID, ts in
 	if s.nonces == nil {
 		return fmt.Errorf("nonce store missing")
 	}
-	nonceSnapshot := make([]byte, len(nonce))
-	copy(nonceSnapshot, nonce)
-	if s.nonces.seenBefore(sender, nonceSnapshot, s.effectiveNonceTTL()) {
+	if s.nonces.seenBefore(sender, nonce, s.effectiveNonceTTL()) {
 		return errReplay
 	}
 	return nil
@@ -228,7 +213,9 @@ func (s *Signer) checkTimestamp(msgTime, now time.Time, maxAge time.Duration) er
 	return nil
 }
 
-func (s *Signer) fetchPublicKey(sender peer.ID) (crypto.PubKey, time.Time) {
+// fetchPublicKey connects to an unconnected sender, looking up its addresses
+// in the DHT if needed, so the identify protocol can fill in its public key.
+func (s *Signer) fetchPublicKey(sender peer.ID) crypto.PubKey {
 	if s.h.Network().Connectedness(sender) != network.Connected {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -244,7 +231,7 @@ func (s *Signer) fetchPublicKey(sender peer.ID) (crypto.PubKey, time.Time) {
 			_ = s.h.Connect(ctx, peer.AddrInfo{ID: sender, Addrs: addrs})
 		}
 	}
-	return s.h.Peerstore().PubKey(sender), time.Now()
+	return s.h.Peerstore().PubKey(sender)
 }
 
 func verifySignatureBytes(pk crypto.PubKey, payload, sig []byte) error {
@@ -258,15 +245,13 @@ func verifySignatureBytes(pk crypto.PubKey, payload, sig []byte) error {
 	return nil
 }
 
+// handleSignatureError logs a verification failure and reports whether the
+// message must be dropped. Replays are dropped in every mode.
 func (s *Signer) handleSignatureError(logContext string, err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, errReplay) {
-		slog.Warn("message dropped", "context", logContext, "error", err)
-		return true
-	}
-	if s.shouldEnforceSignatures() {
+	if errors.Is(err, errReplay) || s.shouldEnforceSignatures() {
 		slog.Warn("message dropped", "context", logContext, "error", err)
 		return true
 	}
@@ -277,7 +262,7 @@ func (s *Signer) handleSignatureError(logContext string, err error) bool {
 }
 
 // ShouldDropMessage returns true if the message should be dropped (auth/signature failed).
-func (s *Signer) ShouldDropMessage(receivedFrom peer.ID, senderID peer.ID, timestamp int64, nonce []byte, sig []byte, marshalForSigning func() ([]byte, error), logContext string) bool {
+func (s *Signer) ShouldDropMessage(receivedFrom, senderID peer.ID, timestamp int64, nonce, sig []byte, marshalForSigning func() ([]byte, error), logContext string) bool {
 	if s.trustMgr == nil {
 		slog.Warn("message dropped: trust manager missing", "context", logContext)
 		return true
@@ -299,9 +284,5 @@ func (s *Signer) ShouldDropMessage(receivedFrom peer.ID, senderID peer.ID, times
 		slog.Warn("message dropped: marshal failed", "context", logContext, "error", err)
 		return true
 	}
-	if s.handleSignatureError(logContext, s.verifySignedMessage(receivedFrom, senderID, timestamp, nonce, sig, unsigned)) {
-		return true
-	}
-
-	return false
+	return s.handleSignatureError(logContext, s.verifySignedMessage(receivedFrom, senderID, timestamp, nonce, sig, unsigned))
 }

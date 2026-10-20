@@ -18,13 +18,9 @@ func mustGetHexBinaryPrefix(hexStr string, depth int) string {
 }
 
 func TestGetBinaryPrefix(t *testing.T) {
-	// Known SHA256 outputs for verification at various depths.
-	// SHA256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-	// First byte 0xe3 = 11100011 in binary (MSB first)
 	emptyHash := sha256.Sum256([]byte(""))
 	emptyHex := hex.EncodeToString(emptyHash[:])
 
-	// SHA256("hello") = 2cf24dba5fb0a30e26e83b2c5e9e4e1b6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e - verify
 	helloHash := sha256.Sum256([]byte("hello"))
 	helloHex := hex.EncodeToString(helloHash[:])
 
@@ -53,7 +49,7 @@ func TestGetBinaryPrefix(t *testing.T) {
 		})
 	}
 
-	// Verify known SHA256("") first 8 bits: 0xe3 = 11100011
+	// SHA-256("") starts with 0xe3.
 	got := GetBinaryPrefix("", 8)
 	want := "11100011"
 	if got != want {
@@ -62,7 +58,7 @@ func TestGetBinaryPrefix(t *testing.T) {
 }
 
 func TestGetHexBinaryPrefix(t *testing.T) {
-	// Valid hex: SHA256 of "" = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+	// SHA-256 of "".
 	validHex := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 	tests := []struct {
@@ -94,21 +90,18 @@ func TestGetHexBinaryPrefix(t *testing.T) {
 }
 
 func TestKeyToStableHex(t *testing.T) {
-	// Deterministic: same input must produce same output
 	key := "QmSomeCIDv1"
 	got1 := KeyToStableHex(key)
 	got2 := KeyToStableHex(key)
 	if got1 != got2 {
 		t.Errorf("KeyToStableHex(%q) not deterministic: %q vs %q", key, got1, got2)
 	}
-	// Output must be 64-char hex (SHA256)
 	if len(got1) != 64 {
 		t.Errorf("KeyToStableHex(%q) len = %d, want 64", key, len(got1))
 	}
 	if _, err := hex.DecodeString(got1); err != nil {
 		t.Errorf("KeyToStableHex(%q) = %q is not valid hex", key, got1)
 	}
-	// Different keys produce different output
 	other := KeyToStableHex("QmOtherCIDv1")
 	if got1 == other {
 		t.Errorf("KeyToStableHex different keys produced same output")
@@ -118,7 +111,6 @@ func TestKeyToStableHex(t *testing.T) {
 func TestTargetShardForPayload(t *testing.T) {
 	payload := "QmPayloadCID123"
 
-	// Consistency: same input produces same output
 	got1, err := TargetShardForPayload(payload, 8)
 	if err != nil {
 		t.Fatalf("TargetShardForPayload error: %v", err)
@@ -140,7 +132,6 @@ func TestTargetShardForPayload(t *testing.T) {
 		t.Errorf("TargetShardForPayload(payload, -5) = %q, want same as depth 1: %q", gotNeg, got1depth)
 	}
 
-	// depth 1 returns single bit
 	if len(got1depth) != 1 {
 		t.Errorf("TargetShardForPayload(_, 1) len = %d, want 1", len(got1depth))
 	}
@@ -148,7 +139,6 @@ func TestTargetShardForPayload(t *testing.T) {
 		t.Errorf("TargetShardForPayload(_, 1) = %q, want \"0\" or \"1\"", got1depth)
 	}
 
-	// depth 8 returns 8 bits
 	got8, _ := TargetShardForPayload(payload, 8)
 	if len(got8) != 8 {
 		t.Errorf("TargetShardForPayload(_, 8) len = %d, want 8", len(got8))

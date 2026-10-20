@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -14,7 +15,12 @@ const (
 
 // Gateway is the IPFS HTTP gateway used for server-side fetches (DLOCKSS_IPFS_GATEWAY).
 func (s *Store) Gateway() string {
-	if s == nil || s.cfg.Gateway == "" {
+	if s == nil {
+		return DefaultGateway
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.cfg.Gateway == "" {
 		return DefaultGateway
 	}
 	return strings.TrimSuffix(s.cfg.Gateway, "/")
@@ -143,31 +149,22 @@ func (s *Store) GetStats(totalUniqueCIDs int) Stats {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	pending := totalUniqueCIDs - s.totalOK - s.totalSkipped
 	permanentFails := 0
 	for _, f := range s.failures {
 		if f.Count >= maxRetries {
 			permanentFails++
 		}
 	}
-	pending -= permanentFails
-	if pending < 0 {
-		pending = 0
-	}
-	cap := s.requestCap()
-	remaining := cap - s.dailyCount
-	if remaining < 0 {
-		remaining = 0
-	}
+	limit := s.requestCap()
 	return Stats{
 		TotalCIDs:      totalUniqueCIDs,
 		Indexed:        s.totalOK,
 		Failed:         s.totalFail + permanentFails,
 		Skipped:        s.totalSkipped,
-		Pending:        pending,
+		Pending:        max(totalUniqueCIDs-s.totalOK-s.totalSkipped-permanentFails, 0),
 		UniqueKeywords: len(s.keywordCIDs),
-		DailyRemaining: remaining,
-		DailyLimit:     cap,
+		DailyRemaining: max(limit-s.dailyCount, 0),
+		DailyLimit:     limit,
 		Enabled:        s.cfg.APIKey != "",
 		CanSetKey:      s.cfg.APIKey == "",
 		Provider:       s.cfg.Provider,
@@ -181,7 +178,7 @@ func AcceptableKeyword(s string) bool {
 	if s == "" {
 		return false
 	}
-	if len([]rune(s)) > MaxRunesPerKeyword {
+	if utf8.RuneCountInString(s) > MaxRunesPerKeyword {
 		return false
 	}
 	toks := keywordSplit(s)
@@ -194,9 +191,7 @@ func keywordSplit(s string) []string {
 	})
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		p = strings.Trim(p, `"'`+"`")
-		if p != "" {
+		if p = strings.Trim(p, "\"'`"); p != "" {
 			out = append(out, p)
 		}
 	}

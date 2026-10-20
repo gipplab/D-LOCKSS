@@ -22,7 +22,7 @@ const (
 )
 
 // lifecycleOps is the narrow interface that lifecycleManager uses to query
-// shard state and execute transitions.  ShardManager implements it.
+// shard state and execute transitions. ShardManager implements it.
 type lifecycleOps interface {
 	getCurrentShard() string
 	getLastShardMove() time.Time
@@ -44,7 +44,7 @@ type lifecycleOps interface {
 }
 
 // lifecycleManager encapsulates shard lifecycle decisions: split, merge-up,
-// and discovery.  It owns the state needed for those decisions and delegates
+// and discovery. It owns the state needed for those decisions and delegates
 // execution (topic operations, cluster joins, pin migration) back to the
 // ShardManager through the lifecycleOps interface.
 type lifecycleManager struct {
@@ -141,8 +141,6 @@ func (lm *lifecycleManager) hasKnownChildren(currentShard string) bool {
 	return targetKnown || siblingKnown
 }
 
-// --- Split ---
-
 func (lm *lifecycleManager) checkAndSplitIfNeeded() {
 	now := time.Now()
 	currentShard := lm.ops.getCurrentShard()
@@ -192,11 +190,10 @@ func (lm *lifecycleManager) checkAndSplitIfNeeded() {
 	childPeerCount := lm.ops.probeShard(targetChild, probeTimeoutForSplitChild)
 
 	canJoinExisting := childPeerCount >= 1
-	minParentToCreate := 2 * lm.cfg.Sharding.MinPeersPerShard
-	minParentToCreateNew := minParentToCreate + 2
-	canCreateChild := childPeerCount == 0 && peerCount >= minParentToCreateNew
+	minParentToCreate := 2*lm.cfg.Sharding.MinPeersPerShard + 2
+	canCreateChild := childPeerCount == 0 && peerCount >= minParentToCreate
 	if !canJoinExisting && !canCreateChild {
-		slog.Debug("shard at limit but not splitting", "shard", currentShard, "peers", peerCount, "child", targetChild, "child_peers", childPeerCount, "min_parent_to_create", minParentToCreateNew)
+		slog.Debug("shard at limit but not splitting", "shard", currentShard, "peers", peerCount, "child", targetChild, "child_peers", childPeerCount, "min_parent_to_create", minParentToCreate)
 		return
 	}
 
@@ -204,8 +201,6 @@ func (lm *lifecycleManager) checkAndSplitIfNeeded() {
 	lm.ops.announceSplit(currentShard, targetChild)
 	lm.ops.moveToShard(currentShard, targetChild, false)
 }
-
-// --- Merge ---
 
 func (lm *lifecycleManager) checkAndMergeUpIfAlone() {
 	currentShard := lm.ops.getCurrentShard()
@@ -338,8 +333,6 @@ func (lm *lifecycleManager) nearestPopulatedAncestor(shard string, parentPeers i
 	return "", 0, false
 }
 
-// --- Discovery ---
-
 func (lm *lifecycleManager) discoverAndMoveToDeeperShard() {
 	currentShard := lm.ops.getCurrentShard()
 
@@ -357,14 +350,7 @@ func (lm *lifecycleManager) discoverAndMoveToDeeperShard() {
 	nextDepth := len(currentShard) + 1
 	targetChild := common.GetBinaryPrefix(lm.ops.localPeerID().String(), nextDepth)
 	siblingShard := getSiblingShard(targetChild)
-
-	lm.mu.Lock()
-	_, targetKnown := lm.knownChildShards[targetChild]
-	_, siblingKnown := lm.knownChildShards[siblingShard]
-	lm.mu.Unlock()
-	splitAnnounced := targetKnown || siblingKnown
-
-	if !splitAnnounced {
+	if !lm.hasKnownChildren(currentShard) {
 		if currentShard != "" {
 			slog.Debug("no split announcement, skipping discovery", "shard", currentShard, "child", targetChild, "sibling", siblingShard)
 		}
@@ -376,8 +362,8 @@ func (lm *lifecycleManager) discoverAndMoveToDeeperShard() {
 	if childPeerCount < 1 {
 		// Half-finished split: the sibling child exists, but once its members
 		// left, this shard fell below MaxPeersPerShard and the split rule no
-		// longer fires for the members of the other half. Create our child if
-		// enough current members hash into it.
+		// longer fires for the members of the other half. The node creates its
+		// own child if enough current members hash into it.
 		zero, one := childCounts(currentShard, lm.ops.localPeerID(), lm.ops.activePeersInCurrentShard())
 		ownChild := zero
 		if strings.HasSuffix(targetChild, "1") {
@@ -428,8 +414,6 @@ func (lm *lifecycleManager) discoverAndMoveToDeeperShard() {
 	lm.ops.moveToShard(currentShard, targetChild, false)
 }
 
-// --- Loops ---
-
 func (lm *lifecycleManager) runPeerCountChecker() {
 	ticker := time.NewTicker(rootPeerCheckInterval)
 	defer ticker.Stop()
@@ -466,10 +450,8 @@ func (lm *lifecycleManager) runShardDiscovery() {
 		}
 
 		currentShard = lm.ops.getCurrentShard()
-		isIdle := func() bool {
-			lt := lm.ops.getLastMessageTime()
-			return lt.IsZero() || time.Since(lt) > 1*time.Minute
-		}()
+		lastMessage := lm.ops.getLastMessageTime()
+		isIdle := lastMessage.IsZero() || time.Since(lastMessage) > time.Minute
 		peerCount := lm.ops.getShardPeerCount(false)
 		fewPeersInShard := peerCount <= lm.cfg.Sharding.MaxPeersPerShard
 		onRoot := currentShard == ""
@@ -485,10 +467,7 @@ func (lm *lifecycleManager) runShardDiscovery() {
 }
 
 func (lm *lifecycleManager) runSplitRebroadcast() {
-	jitterRange := lm.cfg.Sharding.ShardSplitRebroadcastInterval / 2
-	if jitterRange < time.Second {
-		jitterRange = time.Second
-	}
+	jitterRange := max(lm.cfg.Sharding.ShardSplitRebroadcastInterval/2, time.Second)
 	for {
 		delay := lm.cfg.Sharding.ShardSplitRebroadcastInterval + time.Duration(rand.Int63n(int64(jitterRange)))
 		t := time.NewTimer(delay)

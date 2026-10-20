@@ -16,9 +16,6 @@ func (m *Monitor) handleKeywordSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	results := m.keywords.Search(query)
-	if results == nil {
-		results = []keywords.CIDKeywordEntry{}
-	}
 
 	type enrichedResult struct {
 		keywords.CIDKeywordEntry
@@ -28,14 +25,10 @@ func (m *Monitor) handleKeywordSearch(w http.ResponseWriter, r *http.Request) {
 	m.mu.RLock()
 	enriched := make([]enrichedResult, 0, len(results))
 	for _, res := range results {
-		replicas := 0
-		if peers, ok := m.manifestReplication[res.ManifestCID]; ok {
-			replicas = len(peers)
-		}
 		enriched = append(enriched, enrichedResult{
 			CIDKeywordEntry: res,
 			Shard:           m.manifestShard[res.ManifestCID],
-			Replicas:        replicas,
+			Replicas:        len(m.manifestReplication[res.ManifestCID]),
 		})
 	}
 	m.mu.RUnlock()
@@ -52,7 +45,7 @@ func (m *Monitor) handleKeywordSuggest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{"suggestions": suggestions})
 }
 
-func (m *Monitor) handleRecentSearches(w http.ResponseWriter, r *http.Request) {
+func (m *Monitor) handleRecentSearches(w http.ResponseWriter, _ *http.Request) {
 	recent := m.keywords.GetRecentSearches()
 	if recent == nil {
 		recent = []keywords.RecentSearch{}
@@ -60,7 +53,7 @@ func (m *Monitor) handleRecentSearches(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{"searches": recent})
 }
 
-func (m *Monitor) handleKeywordStats(w http.ResponseWriter, r *http.Request) {
+func (m *Monitor) handleKeywordStats(w http.ResponseWriter, _ *http.Request) {
 	m.mu.RLock()
 	totalCIDs := len(m.uniqueCIDs)
 	m.mu.RUnlock()

@@ -35,9 +35,10 @@ const (
 	GoogleAPIBase = "https://generativelanguage.googleapis.com/v1beta"
 
 	settingsFileName = "llm_settings.json"
+	apiKeyFileName   = ".api_key"
 )
 
-// Config is the LLM + persistence setup for keyword indexing.
+// Config is the LLM and persistence setup for keyword indexing.
 type Config struct {
 	Provider string
 	APIKey   string
@@ -75,7 +76,14 @@ func DefaultDataDir() string {
 	return filepath.Join(home, ".dlockss-monitor")
 }
 
-// ConfigFromEnv loads saved monitor settings, then SAIA / tracker-style env.
+func dataDirOrDefault(dir string) string {
+	if dir == "" {
+		return DefaultDataDir()
+	}
+	return dir
+}
+
+// ConfigFromEnv loads saved monitor settings, then SAIA and TRACKER_* env vars.
 // A settings file written by the UI wins over the environment so a restart
 // keeps the provider and key chosen in the dashboard.
 func ConfigFromEnv() Config {
@@ -137,13 +145,13 @@ func normalizeConfig(cfg Config) Config {
 }
 
 func normalizeProvider(p string) string {
-	switch strings.ToLower(strings.TrimSpace(p)) {
+	switch p = strings.ToLower(strings.TrimSpace(p)); p {
 	case ProviderGoogle, "gemini", "aistudio", "ai-studio":
 		return ProviderGoogle
 	case "", ProviderSAIA, "openai":
 		return ProviderSAIA
 	default:
-		return strings.ToLower(strings.TrimSpace(p))
+		return p
 	}
 }
 
@@ -167,10 +175,7 @@ func newLLMLimiter(provider string) *rate.Limiter {
 }
 
 func settingsPath(dataDir string) string {
-	if dataDir == "" {
-		dataDir = DefaultDataDir()
-	}
-	return filepath.Join(dataDir, settingsFileName)
+	return filepath.Join(dataDirOrDefault(dataDir), settingsFileName)
 }
 
 func loadSettings(dataDir string) (Config, bool) {
@@ -196,12 +201,6 @@ func loadSettings(dataDir string) (Config, bool) {
 }
 
 func saveSettings(dataDir string, cfg Config) error {
-	if dataDir == "" {
-		dataDir = DefaultDataDir()
-	}
-	if err := os.MkdirAll(dataDir, 0o700); err != nil {
-		return err
-	}
 	body, err := json.Marshal(savedSettings{
 		Provider: cfg.Provider,
 		APIKey:   cfg.APIKey,
@@ -212,11 +211,7 @@ func saveSettings(dataDir string, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	tmp := settingsPath(dataDir) + ".tmp"
-	if err := os.WriteFile(tmp, append(body, '\n'), 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, settingsPath(dataDir)); err != nil {
+	if err := writePrivateFile(dataDir, settingsFileName, append(body, '\n')); err != nil {
 		return err
 	}
 	return saveAPIKey(dataDir, cfg.APIKey)
@@ -259,28 +254,26 @@ func (s *Store) ApplySettings(password, provider, apiKey, apiBase, gateway strin
 		}
 	}
 	cfg = normalizeConfig(cfg)
-	dataDir := cfg.DataDir
-	if dataDir == "" {
-		dataDir = DefaultDataDir()
-		cfg.DataDir = dataDir
-	}
-	if err := saveSettings(dataDir, cfg); err != nil {
+	cfg.DataDir = dataDirOrDefault(cfg.DataDir)
+	if err := saveSettings(cfg.DataDir, cfg); err != nil {
 		return err
 	}
 	s.cfg = cfg
 	s.llmLimiter = newLLMLimiter(cfg.Provider)
+	s.pauseUntil = time.Time{}
+	s.resetFailuresLocked()
 	s.signalKeyReady()
 	return nil
 }
 
-// LoadAPIKey matches ipfs-tracker: .api_key files first, then SAIA_API_KEY.
+// LoadAPIKey returns the key from the first non-empty .api_key file in dirs,
+// falling back to the SAIA_API_KEY environment variable.
 func LoadAPIKey(dirs ...string) string {
 	for _, dir := range dirs {
 		if dir == "" {
 			continue
 		}
-		path := filepath.Join(dir, ".api_key")
-		data, err := os.ReadFile(path)
+		data, err := os.ReadFile(filepath.Join(dir, apiKeyFileName))
 		if err != nil {
 			continue
 		}
@@ -292,22 +285,23 @@ func LoadAPIKey(dirs ...string) string {
 }
 
 func apiKeyPath(dataDir string) string {
-	if dataDir == "" {
-		dataDir = DefaultDataDir()
-	}
-	return filepath.Join(dataDir, ".api_key")
+	return filepath.Join(dataDirOrDefault(dataDir), apiKeyFileName)
 }
 
 func saveAPIKey(dataDir, key string) error {
-	if dataDir == "" {
-		dataDir = DefaultDataDir()
-	}
+	return writePrivateFile(dataDir, apiKeyFileName, []byte(key+"\n"))
+}
+
+// writePrivateFile replaces dataDir/name atomically with an owner-only file.
+func writePrivateFile(dataDir, name string, data []byte) error {
+	dataDir = dataDirOrDefault(dataDir)
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return err
 	}
-	tmp := apiKeyPath(dataDir) + ".tmp"
-	if err := os.WriteFile(tmp, []byte(key+"\n"), 0o600); err != nil {
+	path := filepath.Join(dataDir, name)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, apiKeyPath(dataDir))
+	return os.Rename(tmp, path)
 }

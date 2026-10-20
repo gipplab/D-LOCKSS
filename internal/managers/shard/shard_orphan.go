@@ -7,7 +7,6 @@ import (
 	"github.com/ipfs/go-cid"
 
 	"dlockss/internal/common"
-	"dlockss/pkg/schema"
 )
 
 const orphanUnpinInterval = 2 * time.Minute
@@ -15,10 +14,7 @@ const orphanUnpinInterval = 2 * time.Minute
 func (sm *ShardManager) RunOrphanUnpinPass() {
 	sm.pruneOrphanHandoffSent()
 
-	sm.mu.RLock()
-	currentShard := sm.currentShard
-	sm.mu.RUnlock()
-
+	currentShard := sm.getCurrentShard()
 	files := sm.storageMgr.GetAllKnownFiles()
 	if len(files) == 0 {
 		return
@@ -62,16 +58,13 @@ func (sm *ShardManager) RunOrphanUnpinPass() {
 }
 
 func (sm *ShardManager) collectActiveChildShards(currentShard string) map[string]struct{} {
-	child0, child1 := childShards(currentShard)
-	probeTimeout := 4 * time.Second
-	n0 := sm.probeShard(child0, probeTimeout)
-	n1 := sm.probeShard(child1, probeTimeout)
-
+	const probeTimeout = 4 * time.Second
 	active := make(map[string]struct{})
-	if n0 >= 1 {
+	child0, child1 := childShards(currentShard)
+	if sm.probeShard(child0, probeTimeout) >= 1 {
 		active[child0] = struct{}{}
 	}
-	if n1 >= 1 {
+	if sm.probeShard(child1, probeTimeout) >= 1 {
 		active[child1] = struct{}{}
 	}
 	return active
@@ -79,41 +72,40 @@ func (sm *ShardManager) collectActiveChildShards(currentShard string) map[string
 
 func (sm *ShardManager) orphanHandoffOrUnpin(key, targetChild, currentShard string, manifestCID cid.Cid) bool {
 	sm.mu.Lock()
-	var info *orphanHandoffInfo
-	if sm.orphanHandoffSent[key] != nil {
-		info = sm.orphanHandoffSent[key][targetChild]
-	}
+	info := sm.orphanHandoffSent[key][targetChild]
 	sm.mu.Unlock()
 
 	if info != nil && time.Since(info.lastSent) < sm.cfg.Orphan.HandoffGrace {
 		return false
 	}
 
-	minCount := sm.cfg.Orphan.UnpinMinHandoffCnt
-	if minCount < 1 {
-		minCount = 1
-	}
-
-	readyToUnpin := info != nil && info.count >= minCount && time.Since(info.lastSent) >= sm.cfg.Orphan.HandoffGrace
+	minCount := max(1, sm.cfg.Orphan.UnpinMinHandoffCnt)
+	readyToUnpin := info != nil && info.count >= minCount
 	if !readyToUnpin || !sm.handoffConfirmed(key) {
 		sm.sendOrphanHandoff(key, targetChild, manifestCID)
 		return false
 	}
 
 	slog.Info("orphan unpin", "manifest", key, "child", targetChild)
+	payloadCIDStr, payloadErr := common.GetPayloadCIDForShardAssignment(sm.ctx, sm.ipfsClient, key)
 	if err := sm.clusterMgr.Unpin(sm.ctx, currentShard, manifestCID); err != nil {
 		slog.Error("orphan unpin: cluster unpin failed", "manifest", key, "error", err)
 	}
 	if err := sm.ipfsClient.UnpinRecursive(sm.ctx, manifestCID); err != nil {
 		slog.Error("orphan unpin: IPFS unpin failed", "manifest", key, "error", err)
 	}
+	// The payload has its own pin; left behind it would look like a user pin
+	// to pin ingest.
+	if payloadCID, err := cid.Decode(payloadCIDStr); payloadErr == nil && err == nil && payloadCIDStr != key {
+		if err := sm.ipfsClient.UnpinRecursive(sm.ctx, payloadCID); err != nil {
+			slog.Debug("orphan unpin: payload unpin failed", "payload", payloadCIDStr, "error", err)
+		}
+	}
 	sm.storageMgr.UnpinFile(key)
 	sm.mu.Lock()
-	if sm.orphanHandoffSent[key] != nil {
-		delete(sm.orphanHandoffSent[key], targetChild)
-		if len(sm.orphanHandoffSent[key]) == 0 {
-			delete(sm.orphanHandoffSent, key)
-		}
+	delete(sm.orphanHandoffSent[key], targetChild)
+	if len(sm.orphanHandoffSent[key]) == 0 {
+		delete(sm.orphanHandoffSent, key)
 	}
 	sm.mu.Unlock()
 	return true
@@ -123,34 +115,27 @@ func (sm *ShardManager) sendOrphanHandoff(key, targetChild string, manifestCID c
 	if sm.signer == nil {
 		return
 	}
-	rr := &schema.ReplicationRequest{
-		SignedEnvelope: schema.SignedEnvelope{Type: schema.MessageTypeReplicationRequest, ManifestCID: manifestCID},
-	}
-	if err := sm.signer.SignProtocolMessage(rr); err != nil {
+	b, err := sm.signedReplicationRequest(manifestCID)
+	if err != nil || !sm.publishAsObserver(b, targetChild) {
 		return
 	}
-	b, err := rr.MarshalCBOR()
-	if err != nil {
-		return
-	}
-	if !sm.JoinShardAsObserver(targetChild) {
-		return
-	}
-	sm.PublishToShardCBOR(b, targetChild)
-	sm.LeaveShardAsObserver(targetChild)
 
 	sm.mu.Lock()
-	if sm.orphanHandoffSent[key] == nil {
-		sm.orphanHandoffSent[key] = make(map[string]*orphanHandoffInfo)
+	children := sm.orphanHandoffSent[key]
+	if children == nil {
+		children = make(map[string]*orphanHandoffInfo)
+		sm.orphanHandoffSent[key] = children
 	}
-	if sm.orphanHandoffSent[key][targetChild] == nil {
-		sm.orphanHandoffSent[key][targetChild] = &orphanHandoffInfo{}
+	info := children[targetChild]
+	if info == nil {
+		info = &orphanHandoffInfo{}
+		children[targetChild] = info
 	}
-	ho := sm.orphanHandoffSent[key][targetChild]
-	ho.lastSent = time.Now()
-	ho.count++
+	info.lastSent = time.Now()
+	info.count++
+	count := info.count
 	sm.mu.Unlock()
-	slog.Info("orphan handoff: sent ReplicationRequest to child", "child", targetChild, "manifest", key, "count", ho.count)
+	slog.Info("orphan handoff: sent ReplicationRequest to child", "child", targetChild, "manifest", key, "count", count)
 }
 
 func (sm *ShardManager) pruneOrphanHandoffSent() {
@@ -170,14 +155,5 @@ func (sm *ShardManager) pruneOrphanHandoffSent() {
 }
 
 func (sm *ShardManager) runOrphanUnpinLoop() {
-	ticker := time.NewTicker(orphanUnpinInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-sm.ctx.Done():
-			return
-		case <-ticker.C:
-			sm.RunOrphanUnpinPass()
-		}
-	}
+	sm.runEvery(orphanUnpinInterval, sm.RunOrphanUnpinPass)
 }

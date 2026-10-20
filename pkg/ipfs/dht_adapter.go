@@ -1,12 +1,13 @@
 package ipfs
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/ipfs/go-cid"
@@ -16,26 +17,25 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
-// provideRequest represents a queued provide operation
+var errAdapterClosed = errors.New("DHT adapter is closed")
+
 type provideRequest struct {
-	ctx       context.Context
-	key       cid.Cid
-	broadcast bool
-	resultCh  chan error
+	ctx      context.Context
+	key      cid.Cid
+	resultCh chan error
 }
 
-// IPFSDHTAdapter implements DHTProvider using IPFS's DHT via HTTP API
-// It also implements routing.Routing to be compatible with libp2p/ipfs-cluster.
+// IPFSDHTAdapter implements common.DHTProvider on top of the Kubo RPC API.
+// It also implements routing.Routing for use by libp2p and ipfs-cluster.
+// Provides are serialized through a single worker goroutine.
 type IPFSDHTAdapter struct {
 	api            *ipfsapi.Shell
 	retryAttempts  int
 	retryDelay     time.Duration
-	provideTimeout time.Duration // Timeout for provide operations
+	provideTimeout time.Duration
 	provideQueue   chan *provideRequest
 	workerCtx      context.Context
 	workerCancel   context.CancelFunc
-	workerStarted  bool
-	workerMu       sync.Mutex
 }
 
 var _ routing.Routing = (*IPFSDHTAdapter)(nil)
@@ -45,7 +45,7 @@ var _ routing.Routing = (*IPFSDHTAdapter)(nil)
 func NewIPFSDHTAdapterFromClient(c *Client) *IPFSDHTAdapter {
 	ctx, cancel := context.WithCancel(context.Background())
 	adapter := &IPFSDHTAdapter{
-		api:            c.shell(),
+		api:            c.api,
 		retryAttempts:  3,
 		retryDelay:     500 * time.Millisecond,
 		provideTimeout: 60 * time.Second,
@@ -53,24 +53,10 @@ func NewIPFSDHTAdapterFromClient(c *Client) *IPFSDHTAdapter {
 		workerCtx:      ctx,
 		workerCancel:   cancel,
 	}
-	adapter.startWorker()
+	go adapter.worker()
 	return adapter
 }
 
-// startWorker starts the worker goroutine that processes provide operations one at a time
-func (a *IPFSDHTAdapter) startWorker() {
-	a.workerMu.Lock()
-	defer a.workerMu.Unlock()
-
-	if a.workerStarted {
-		return
-	}
-
-	go a.worker()
-	a.workerStarted = true
-}
-
-// worker processes provide operations from the queue one at a time
 func (a *IPFSDHTAdapter) worker() {
 	for {
 		select {
@@ -83,21 +69,16 @@ func (a *IPFSDHTAdapter) worker() {
 }
 
 func (a *IPFSDHTAdapter) processProvideRequest(req *provideRequest) {
+	// A request without a deadline, or with little time left after waiting in
+	// the queue, runs detached under provideTimeout.
 	opCtx := req.ctx
-	if deadline, ok := req.ctx.Deadline(); ok {
-		remaining := time.Until(deadline)
-		if remaining < a.provideTimeout/2 {
-			var cancel context.CancelFunc
-			opCtx, cancel = context.WithTimeout(context.Background(), a.provideTimeout)
-			defer cancel()
-		}
-	} else {
+	if deadline, ok := req.ctx.Deadline(); !ok || time.Until(deadline) < a.provideTimeout/2 {
 		var cancel context.CancelFunc
 		opCtx, cancel = context.WithTimeout(context.Background(), a.provideTimeout)
 		defer cancel()
 	}
 
-	err := a.provideInternal(opCtx, req.key, req.broadcast)
+	err := a.provideWithRetry(opCtx, req.key)
 
 	select {
 	case req.resultCh <- err:
@@ -105,62 +86,92 @@ func (a *IPFSDHTAdapter) processProvideRequest(req *provideRequest) {
 	}
 }
 
-// FindProvidersAsync finds providers of a CID using IPFS DHT
+// routingEvent is one line of the newline-delimited JSON stream returned by
+// routing/findprovs and routing/findpeer. Most lines report query progress
+// and list closer peers; only Provider and FinalPeer events carry answers.
+type routingEvent struct {
+	Type      routing.QueryEventType `json:"Type"`
+	Responses []struct {
+		ID    string   `json:"ID"`
+		Addrs []string `json:"Addrs"`
+	} `json:"Responses"`
+}
+
+// streamRoutingEvents passes each event of req's response to fn until the
+// stream ends or fn returns false.
+func streamRoutingEvents(ctx context.Context, req *ipfsapi.RequestBuilder, fn func(routingEvent) bool) error {
+	res, err := req.Send(ctx)
+	if err != nil {
+		return err
+	}
+	defer res.Close()
+	if res.Error != nil {
+		return res.Error
+	}
+	dec := json.NewDecoder(res.Output)
+	for {
+		var ev routingEvent
+		if err := dec.Decode(&ev); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+		if !fn(ev) {
+			return nil
+		}
+	}
+}
+
+func parseAddrInfo(id string, addrStrs []string) (peer.AddrInfo, bool) {
+	peerID, err := peer.Decode(id)
+	if err != nil {
+		return peer.AddrInfo{}, false
+	}
+	var addrs []ma.Multiaddr
+	for _, s := range addrStrs {
+		if addr, err := ma.NewMultiaddr(s); err == nil {
+			addrs = append(addrs, addr)
+		}
+	}
+	return peer.AddrInfo{ID: peerID, Addrs: addrs}, true
+}
+
+// FindProvidersAsync streams the providers of key that Kubo finds.
 func (a *IPFSDHTAdapter) FindProvidersAsync(ctx context.Context, key cid.Cid, count int) <-chan peer.AddrInfo {
 	ch := make(chan peer.AddrInfo, 10)
 
 	go func() {
 		defer close(ch)
 
-		var result struct {
-			Responses []struct {
-				ID    string   `json:"ID"`
-				Addrs []string `json:"Addrs"`
-			} `json:"Responses"`
-		}
-
 		req := a.api.Request("routing/findprovs", key.String())
 		if count > 0 {
 			req.Option("num-providers", count)
 		}
 
-		if err := req.Exec(ctx, &result); err != nil {
-			req2 := a.api.Request("dht/findprovs", key.String())
-			if count > 0 {
-				req2.Option("num-providers", count)
+		_ = streamRoutingEvents(ctx, req, func(ev routingEvent) bool {
+			if ev.Type != routing.Provider {
+				return true
 			}
-			if err2 := req2.Exec(ctx, &result); err2 != nil {
-				return
-			}
-		}
-
-		for _, resp := range result.Responses {
-			peerID, err := peer.Decode(resp.ID)
-			if err != nil {
-				continue
-			}
-
-			var addrs []ma.Multiaddr
-			for _, addrStr := range resp.Addrs {
-				addr, err := ma.NewMultiaddr(addrStr)
-				if err != nil {
+			for _, resp := range ev.Responses {
+				info, ok := parseAddrInfo(resp.ID, resp.Addrs)
+				if !ok {
 					continue
 				}
-				addrs = append(addrs, addr)
+				select {
+				case ch <- info:
+				case <-ctx.Done():
+					return false
+				}
 			}
-
-			select {
-			case ch <- peer.AddrInfo{ID: peerID, Addrs: addrs}:
-			case <-ctx.Done():
-				return
-			}
-		}
+			return true
+		})
 	}()
 
 	return ch
 }
 
-func (a *IPFSDHTAdapter) isTransientError(err error) bool {
+func isTransientError(err error) bool {
 	if err == nil {
 		return false
 	}
@@ -171,28 +182,24 @@ func (a *IPFSDHTAdapter) isTransientError(err error) bool {
 	if strings.Contains(errStr, "eof") {
 		return true
 	}
-	if strings.Contains(errStr, "connection") &&
-		(strings.Contains(errStr, "reset") || strings.Contains(errStr, "closed") || strings.Contains(errStr, "refused")) {
-		return true
-	}
-	return false
+	return strings.Contains(errStr, "connection") &&
+		(strings.Contains(errStr, "reset") || strings.Contains(errStr, "closed") || strings.Contains(errStr, "refused"))
 }
 
-// Provide announces that this node provides a CID using IPFS DHT
+// Provide asks Kubo to announce key to the DHT and waits for its reply.
+// broadcast is ignored.
 func (a *IPFSDHTAdapter) Provide(ctx context.Context, key cid.Cid, broadcast bool) error {
-	a.startWorker()
 	req := &provideRequest{
-		ctx:       ctx,
-		key:       key,
-		broadcast: broadcast,
-		resultCh:  make(chan error, 1),
+		ctx:      ctx,
+		key:      key,
+		resultCh: make(chan error, 1),
 	}
 	select {
 	case a.provideQueue <- req:
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-a.workerCtx.Done():
-		return fmt.Errorf("DHT adapter is closed")
+		return errAdapterClosed
 	}
 	select {
 	case err := <-req.resultCh:
@@ -200,26 +207,17 @@ func (a *IPFSDHTAdapter) Provide(ctx context.Context, key cid.Cid, broadcast boo
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-a.workerCtx.Done():
-		return fmt.Errorf("DHT adapter is closed")
+		return errAdapterClosed
 	}
 }
 
-// provideInternal performs the actual provide operation (called by worker)
-func (a *IPFSDHTAdapter) provideInternal(ctx context.Context, key cid.Cid, broadcast bool) error {
-	var result struct {
-		Extra string `json:"Extra"`
-	}
-
+// provideWithRetry retries transient failures with exponential backoff
+// capped at 5s.
+func (a *IPFSDHTAdapter) provideWithRetry(ctx context.Context, key cid.Cid) error {
 	var lastErr error
-	var lastErr2 error
-
 	for attempt := 0; attempt <= a.retryAttempts; attempt++ {
 		if attempt > 0 {
-			backoffMultiplier := 1 << uint(attempt-1)
-			backoffDelay := time.Duration(int64(a.retryDelay) * int64(backoffMultiplier))
-			if backoffDelay > 5*time.Second {
-				backoffDelay = 5 * time.Second
-			}
+			backoffDelay := min(a.retryDelay<<(attempt-1), 5*time.Second)
 			if deadline, ok := ctx.Deadline(); ok {
 				timeRemaining := time.Until(deadline)
 				if timeRemaining < backoffDelay*2 {
@@ -233,101 +231,65 @@ func (a *IPFSDHTAdapter) provideInternal(ctx context.Context, key cid.Cid, broad
 			}
 		}
 
-		req := a.api.Request("routing/provide", key.String())
-		if broadcast {
-			req.Option("recursive", false)
-		}
-
-		err := req.Exec(ctx, &result)
+		err := a.provideOnce(ctx, key)
 		if err == nil {
 			return nil
 		}
-
 		lastErr = err
-
-		if a.isTransientError(err) && attempt < a.retryAttempts {
-			continue
-		}
-
-		req2 := a.api.Request("dht/provide", key.String())
-		if broadcast {
-			req2.Option("recursive", false)
-		}
-		err2 := req2.Exec(ctx, &result)
-		if err2 == nil {
-			return nil
-		}
-
-		lastErr2 = err2
-
-		if a.isTransientError(err2) && attempt < a.retryAttempts {
-			continue
-		}
-
-		if !a.isTransientError(err) && !a.isTransientError(err2) {
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				return err
-			}
-			return fmt.Errorf("both routing/provide and dht/provide failed: routing=%w, dht=%w", err, err2)
+		if !isTransientError(err) {
+			return err
 		}
 	}
-	return fmt.Errorf("both routing/provide and dht/provide failed after %d retries: routing=%w, dht=%w", a.retryAttempts, lastErr, lastErr2)
+	return fmt.Errorf("provide failed after %d retries: %w", a.retryAttempts, lastErr)
 }
 
-// FindPeer finds a peer by ID using IPFS DHT
+// provideOnce uses 'provide once', which queues the CID with Kubo's provider
+// and returns. Kubo releases without it only have routing/provide, which
+// announces synchronously. Both reply with an empty body on success, so the
+// response must not be decoded.
+func (a *IPFSDHTAdapter) provideOnce(ctx context.Context, key cid.Cid) error {
+	err := a.api.Request("provide/once", key.String()).Exec(ctx, nil)
+	if err == nil || ctx.Err() != nil || isTransientError(err) {
+		return err
+	}
+	if err2 := a.api.Request("routing/provide", key.String()).Exec(ctx, nil); err2 != nil {
+		return fmt.Errorf("provide/once: %w; routing/provide: %w", err, err2)
+	}
+	return nil
+}
+
+// FindPeer looks up the addresses of id through Kubo.
 func (a *IPFSDHTAdapter) FindPeer(ctx context.Context, id peer.ID) (peer.AddrInfo, error) {
-	var result struct {
-		Responses []struct {
-			ID    string   `json:"ID"`
-			Addrs []string `json:"Addrs"`
-		} `json:"Responses"`
-		Extra string `json:"Extra,omitempty"`
-	}
-
+	var found peer.AddrInfo
 	req := a.api.Request("routing/findpeer", id.String())
-	if err := req.Exec(ctx, &result); err != nil {
-		req2 := a.api.Request("dht/findpeer", id.String())
-		if err2 := req2.Exec(ctx, &result); err2 != nil {
-			return peer.AddrInfo{}, fmt.Errorf("peer lookup failed: %w (routing: %w)", err2, err)
+	err := streamRoutingEvents(ctx, req, func(ev routingEvent) bool {
+		if ev.Type != routing.FinalPeer {
+			return true
 		}
-	}
-
-	if len(result.Responses) == 0 {
-		return peer.AddrInfo{}, fmt.Errorf("peer not found")
-	}
-
-	resp := result.Responses[0]
-	peerID, err := peer.Decode(resp.ID)
+		for _, resp := range ev.Responses {
+			if info, ok := parseAddrInfo(resp.ID, resp.Addrs); ok && info.ID == id && len(info.Addrs) > 0 {
+				found = info
+				return false
+			}
+		}
+		return true
+	})
 	if err != nil {
-		return peer.AddrInfo{}, fmt.Errorf("invalid peer ID in response: %w", err)
+		return peer.AddrInfo{}, fmt.Errorf("peer lookup failed: %w", err)
 	}
-
-	var addrs []ma.Multiaddr
-	for _, addrStr := range resp.Addrs {
-		addr, err := ma.NewMultiaddr(addrStr)
-		if err != nil {
-			continue
-		}
-		addrs = append(addrs, addr)
+	if found.ID == "" {
+		return peer.AddrInfo{}, errors.New("peer not found")
 	}
-
-	if len(addrs) == 0 {
-		return peer.AddrInfo{}, fmt.Errorf("no valid addresses found for peer")
-	}
-
-	return peer.AddrInfo{ID: peerID, Addrs: addrs}, nil
+	return found, nil
 }
 
-// PutValue implements routing.ValueStore.
+// PutValue implements routing.ValueStore. opts are ignored.
 func (a *IPFSDHTAdapter) PutValue(ctx context.Context, key string, val []byte, opts ...routing.Option) error {
-	// IPFS API dht/put
-	// opts ignored for now
-	return a.api.Request("dht/put", key).Body(strings.NewReader(string(val))).Exec(ctx, nil)
+	return a.api.Request("dht/put", key).Body(bytes.NewReader(val)).Exec(ctx, nil)
 }
 
-// GetValue implements routing.ValueStore.
+// GetValue implements routing.ValueStore. It returns the first value found.
 func (a *IPFSDHTAdapter) GetValue(ctx context.Context, key string, opts ...routing.Option) ([]byte, error) {
-	// IPFS API dht/get
 	var result struct {
 		Values [][]byte `json:"Values"`
 	}
@@ -337,11 +299,11 @@ func (a *IPFSDHTAdapter) GetValue(ctx context.Context, key string, opts ...routi
 	if len(result.Values) == 0 {
 		return nil, routing.ErrNotFound
 	}
-	// Return first value
 	return result.Values[0], nil
 }
 
-// SearchValue implements routing.ValueStore. Wraps GetValue in a channel for compatibility.
+// SearchValue implements routing.ValueStore by delivering the GetValue result
+// on a channel.
 func (a *IPFSDHTAdapter) SearchValue(ctx context.Context, key string, opts ...routing.Option) (<-chan []byte, error) {
 	out := make(chan []byte, 1)
 	go func() {

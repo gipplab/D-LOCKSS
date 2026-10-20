@@ -4,9 +4,9 @@
 
 Replication in D-LOCKSS is driven by two complementary mechanisms:
 
-1. **CRDT Cluster Sync** — Each shard runs an embedded IPFS Cluster with CRDT consensus. When a file is pinned to a shard's cluster, the `LocalPinTracker` on every peer in that shard automatically syncs and pins the content locally.
+1. **CRDT Cluster Sync:** Each shard runs an embedded IPFS Cluster with CRDT consensus. When a file is pinned to a shard's cluster, the `LocalPinTracker` on every peer in that shard automatically syncs and pins the content locally.
 
-2. **ReplicationRequest Protocol** — The `replicationManager` (extracted from `ShardManager`) periodically broadcasts `ReplicationRequest` messages for pinned manifests. Peers that don't yet have the file perform **auto-replication**: fetch via `PinRecursive` and add to the cluster.
+2. **ReplicationRequest Protocol:** The `replicationManager`, a delegate of `ShardManager`, periodically broadcasts `ReplicationRequest` messages for pinned manifests. Peers that don't yet have the file perform **auto-replication**: fetch and pin via `PinManifest` and add to the cluster.
 
 ## Key Constants and Defaults
 
@@ -28,9 +28,9 @@ Replication in D-LOCKSS is driven by two complementary mechanisms:
 For a newly ingested file to reach full replication across a shard:
 
 1. **Ingest** (immediate): File pinned locally, `IngestMessage` broadcast to shard, cluster `Pin()` called.
-2. **CRDT Sync** (seconds): Cluster state propagates to peers via PubSub; `LocalPinTracker` detects new pin and starts `PinRecursive`.
+2. **CRDT Sync** (seconds): Cluster state propagates to peers via PubSub; `LocalPinTracker` detects new pin and starts `PinManifest`.
 3. **First Replication Check** (up to 20s at root, 1m elsewhere): `replicationManager.runChecker()` sends `ReplicationRequest` for all pinned manifests.
-4. **Auto-Replication** (seconds to minutes): Peers receiving the request that don't have the file fetch it via `PinRecursive` (up to 5-minute timeout).
+4. **Auto-Replication** (seconds to minutes): Peers receiving the request that don't have the file fetch it via `PinManifest` (up to 5-minute timeout).
 5. **Cooldown** (5 minutes): After sending a request for a manifest, no new request is sent for that manifest for 5 minutes.
 
 **Typical convergence**: Most files replicate within 1-2 minutes via CRDT sync alone. Files that fail the initial sync (large DAGs, slow block propagation) recover on the next replication cycle after the 5-minute cooldown.
@@ -39,13 +39,13 @@ For a newly ingested file to reach full replication across a shard:
 
 ### 1. Request Cooldown (5 minutes)
 
-Once a `ReplicationRequest` is sent for a manifest, `replicationRequestCooldownDuration` prevents resending for 5 minutes. If the first request fails (e.g., the receiving peer's `PinRecursive` times out), the file appears "stuck" until the cooldown expires.
+Once a `ReplicationRequest` is sent for a manifest, `replicationRequestCooldownDuration` prevents resending for 5 minutes. If the first request fails (e.g., the receiving peer's `PinManifest` times out), the file appears "stuck" until the cooldown expires.
 
 **Mitigation**: The cooldown prevents flooding but causes visible delays for files that fail on the first attempt.
 
 ### 2. Auto-Replication Timeout (5 minutes)
 
-`PinRecursive` for large files or over slow links may hit the `AutoReplicationTimeout`. The file remains unreplicated until the next replication cycle.
+`PinManifest` for large files or over slow links may hit the `AutoReplicationTimeout`. The file remains unreplicated until the next replication cycle.
 
 **Mitigation**: Heartbeat-driven re-pin gradually fills in missing blocks (see below).
 
@@ -65,13 +65,13 @@ At most 50 `ReplicationRequest` messages are sent per checker cycle. With thousa
 
 Every heartbeat (~10s), each node picks **one** pinned manifest CID (round-robin) and:
 
-1. **Re-pins the ManifestCID recursively** (`PinRecursive`, 2-minute timeout). Idempotent — returns instantly when the DAG is already complete locally, and incrementally fetches missing blocks otherwise.
+1. **Re-pins the ManifestCID recursively** (`PinManifest`, 2-minute timeout). Idempotent: it returns instantly when the DAG is already complete locally and fetches missing blocks otherwise.
 2. **Pins the PayloadCID as its own root** so Kubo's reprovider (`pinned` strategy) re-announces it.
 3. **Provides both CIDs to the DHT** (only if the re-pin succeeded).
 
 A `CompareAndSwap` guard prevents concurrent re-provides from piling up.
 
-**Impact**: Resource-constrained nodes (e.g., Raspberry Pis) that failed the initial `PinRecursive` gradually complete the DAG over successive heartbeats without manual intervention. DHT provider records (which expire after ~24h) are kept fresh.
+**Impact**: Resource-constrained nodes (e.g., Raspberry Pis) that failed the initial pin gradually complete the DAG over successive heartbeats without manual intervention. DHT provider records (which expire after ~24h) are kept fresh.
 
 ## Optimization Options
 
@@ -116,7 +116,7 @@ The monitor's `replication snapshot` log line reports:
 - `avg_replication`: Average replica count across all manifests
 
 Node daemon logs to watch:
-- `"auto-replication: fetched and pinned"` — successful auto-replication
-- `"auto-replication: failed to fetch/pin"` — `PinRecursive` timeout or failure
-- `"auto-replication skipped, concurrency limit reached"` — semaphore full
-- `"ReplicationRequest sent"` — outbound request (debug level)
+- `"auto-replication: fetched and pinned"`: successful auto-replication
+- `"auto-replication: failed to fetch/pin"`: pin timeout or failure
+- `"auto-replication skipped, concurrency limit reached"`: semaphore full
+- `"ReplicationRequest sent"`: outbound request (debug level)

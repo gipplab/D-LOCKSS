@@ -41,8 +41,6 @@ func (m *Monitor) handleIngestMessage(ctx context.Context, im *schema.IngestMess
 		ns = &nodeState{
 			PeerID:         peerIDStr,
 			CurrentShard:   shardID,
-			PinnedFiles:    0,
-			KnownFiles:     0,
 			LastSeen:       now,
 			ShardHistory:   []ShardHistoryEntry{{ShardID: shardID, FirstSeen: now}},
 			IPAddress:      ip,
@@ -67,9 +65,7 @@ func (m *Monitor) handleIngestMessage(ctx context.Context, im *schema.IngestMess
 	m.nodeFiles[peerIDStr][manifestCIDStr] = now
 
 	ns.KnownFiles = len(ns.announcedFiles)
-	if n := len(ns.announcedFiles); n > ns.PinnedFiles {
-		ns.PinnedFiles = n
-	}
+	ns.PinnedFiles = max(ns.PinnedFiles, len(ns.announcedFiles))
 	m.uniqueCIDs[manifestCIDStr] = now
 
 	if m.manifestReplication[manifestCIDStr] == nil {
@@ -79,13 +75,10 @@ func (m *Monitor) handleIngestMessage(ctx context.Context, im *schema.IngestMess
 	if existing, ok := m.manifestShard[manifestCIDStr]; !ok || (len(shardID) > len(existing) && strings.HasPrefix(shardID, existing)) {
 		m.manifestShard[manifestCIDStr] = shardID
 	}
-	m.setPeerShardLastSeenUnlocked(peerIDStr, shardID, now)
+	m.setPeerShardLastSeenLocked(peerIDStr, shardID, now)
+	m.ensureShardSubscriptionLocked(context.Background(), shardID)
 
-	if m.ps != nil {
-		m.ensureShardSubscriptionUnlocked(context.Background(), shardID)
-	}
-
-	if ip != "" && ip != ns.IPAddress {
+	if ip != "" {
 		ns.IPAddress = ip
 	}
 }
@@ -94,18 +87,36 @@ func isSiblingShard(a, b string) bool {
 	if len(a) != len(b) || len(a) == 0 {
 		return false
 	}
-	parent := a[:len(a)-1]
-	return parent == b[:len(b)-1] && a != b
+	return a != b && a[:len(a)-1] == b[:len(b)-1]
 }
 
-func (m *Monitor) setPeerShardLastSeenUnlocked(peerIDStr, shardID string, t time.Time) {
+func (m *Monitor) setPeerShardLastSeenLocked(peerIDStr, shardID string, t time.Time) {
 	if m.peerShardLastSeen[peerIDStr] == nil {
 		m.peerShardLastSeen[peerIDStr] = make(map[string]time.Time)
 	}
 	m.peerShardLastSeen[peerIDStr][shardID] = t
 }
 
-func (m *Monitor) handleHeartbeatWithRole(ctx context.Context, senderID peer.ID, shardID string, ip string, pinnedCount int, role string, nodeName string) (shardUpdated bool) {
+// dropPeerReplicasLocked removes peerIDStr from every manifest for which drop
+// returns true and reports how many manifests it was removed from.
+func (m *Monitor) dropPeerReplicasLocked(peerIDStr string, drop func(manifest string) bool) int {
+	removed := 0
+	for manifest, peers := range m.manifestReplication {
+		if _, ok := peers[peerIDStr]; !ok || !drop(manifest) {
+			continue
+		}
+		delete(peers, peerIDStr)
+		removed++
+		if len(peers) == 0 {
+			delete(m.manifestReplication, manifest)
+		}
+	}
+	return removed
+}
+
+// handleHeartbeat records that a peer is alive in shardID. A negative
+// pinnedCount means the message carried no pin count.
+func (m *Monitor) handleHeartbeat(ctx context.Context, senderID peer.ID, shardID string, ip string, pinnedCount int, role string, nodeName string) (shardUpdated bool) {
 	now := time.Now()
 	peerIDStr := senderID.String()
 	if role == "" {
@@ -118,28 +129,22 @@ func (m *Monitor) handleHeartbeatWithRole(ctx context.Context, senderID peer.ID,
 		return false
 	}
 
-	m.setPeerShardLastSeenUnlocked(peerIDStr, shardID, now)
+	m.setPeerShardLastSeenLocked(peerIDStr, shardID, now)
 
 	ns, exists := m.nodes[peerIDStr]
 	if !exists {
-		logName := peerIDStr
-		if nodeName != "" {
-			logName = nodeName + " (" + peerIDStr + ")"
-		}
-		slog.Info("new node discovered via heartbeat", "peer", logName, "shard", shardLabel(shardID), "pinned", pinnedCount, "role", role)
-		ns = &nodeState{
+		slog.Info("new node discovered via heartbeat", "peer", peerLabel(peerIDStr, nodeName), "shard", shardLabel(shardID), "pinned", pinnedCount, "role", role)
+		m.nodes[peerIDStr] = &nodeState{
 			PeerID:         peerIDStr,
 			NodeName:       nodeName,
 			CurrentShard:   shardID,
 			Role:           role,
 			PinnedFiles:    pinnedCount,
-			KnownFiles:     0,
 			LastSeen:       now,
 			ShardHistory:   []ShardHistoryEntry{{ShardID: shardID, FirstSeen: now}},
 			IPAddress:      ip,
 			announcedFiles: make(map[string]time.Time),
 		}
-		m.nodes[peerIDStr] = ns
 		m.treeDirty = true
 		return true
 	}
@@ -148,33 +153,24 @@ func (m *Monitor) handleHeartbeatWithRole(ctx context.Context, senderID peer.ID,
 	if nodeName != "" {
 		ns.NodeName = nodeName
 	}
-	if pinnedCount >= 0 {
+	switch {
+	case pinnedCount == 0:
+		ns.PinnedFiles = 0
+		firstSeen := now
+		if len(ns.ShardHistory) > 0 {
+			firstSeen = ns.ShardHistory[0].FirstSeen
+		}
+		if now.Sub(firstSeen) >= unpinGracePeriod {
+			removed := m.dropPeerReplicasLocked(peerIDStr, func(string) bool { return true })
+			if removed > 0 {
+				slog.Info("unpin all", "peer", peerIDStr, "shard", shardLabel(shardID), "removed_manifests", removed)
+			}
+		}
+	case pinnedCount > 0:
 		ns.PinnedFiles = pinnedCount
-		if pinnedCount == 0 {
-			firstSeen := now
-			if len(ns.ShardHistory) > 0 {
-				firstSeen = ns.ShardHistory[0].FirstSeen
-			}
-			if now.Sub(firstSeen) >= unpinGracePeriod {
-				removedFromManifests := 0
-				for manifest, peers := range m.manifestReplication {
-					if _, had := peers[peerIDStr]; had {
-						delete(peers, peerIDStr)
-						removedFromManifests++
-						if len(peers) == 0 {
-							delete(m.manifestReplication, manifest)
-						}
-					}
-				}
-				if removedFromManifests > 0 {
-					slog.Info("unpin all", "peer", peerIDStr, "shard", shardLabel(shardID), "removed_manifests", removedFromManifests)
-				}
-			}
-		} else {
-			for _, peers := range m.manifestReplication {
-				if _, ok := peers[peerIDStr]; ok {
-					peers[peerIDStr] = now
-				}
+		for _, peers := range m.manifestReplication {
+			if _, ok := peers[peerIDStr]; ok {
+				peers[peerIDStr] = now
 			}
 		}
 	}
@@ -186,7 +182,7 @@ func (m *Monitor) handleHeartbeatWithRole(ctx context.Context, senderID peer.ID,
 	} else {
 		shardUpdated = m.updateNodeShardLocked(ns, shardID, now)
 	}
-	if ip != "" && ip != ns.IPAddress {
+	if ip != "" {
 		ns.IPAddress = ip
 	}
 	return shardUpdated
@@ -204,10 +200,12 @@ func (m *Monitor) handleLeaveShard(ctx context.Context, peerID peer.ID, shardID 
 		return
 	}
 	now := time.Now()
-	m.setPeerShardLastSeenUnlocked(peerIDStr, shardID, now)
+	m.setPeerShardLastSeenLocked(peerIDStr, shardID, now)
 	if node.CurrentShard == shardID {
 		node.CurrentShard = ""
-		node.LastSeen = now // Refresh TTL: node is alive and transitioning; gives time to JOIN new shard
+		// The node is alive and moving; refreshing LastSeen gives it time to
+		// JOIN its new shard before it is pruned.
+		node.LastSeen = now
 		m.treeDirty = true
 	}
 }
@@ -217,23 +215,18 @@ func (m *Monitor) updateNodeShardLocked(node *nodeState, newShard string, timest
 		return false
 	}
 	lastShard := node.ShardHistory[len(node.ShardHistory)-1].ShardID
-
 	if lastShard == newShard {
 		return false
 	}
-	// Stale parent heartbeat: node already moved to a child shard.
-	if len(newShard) < len(lastShard) && strings.HasPrefix(lastShard, newShard) {
+	// A node only moves down into a child shard (a split) or across to a
+	// sibling. A parent shard or another branch (such as 10 to 0) comes from a
+	// delayed message about an earlier position.
+	isSplit := strings.HasPrefix(newShard, lastShard)
+	if !isSplit && !isSiblingShard(lastShard, newShard) {
 		return false
 	}
-	// Cross-branch moves (e.g. 10→0) are always stale; only ancestor, descendant
-	// and sibling transitions are valid.
-	if !isSiblingShard(lastShard, newShard) &&
-		!strings.HasPrefix(lastShard, newShard) && !strings.HasPrefix(newShard, lastShard) {
-		return false
-	}
-	// Throttle sibling moves (e.g. 0↔1) to suppress oscillation from delayed heartbeats.
-	if isSiblingShard(lastShard, newShard) {
-		if r, ok := m.peerLastSiblingMove[node.PeerID]; ok && timestamp.Sub(r.when) < siblingMoveCooldown {
+	if !isSplit {
+		if last, ok := m.peerLastSiblingMove[node.PeerID]; ok && timestamp.Sub(last) < siblingMoveCooldown {
 			return false
 		}
 	}
@@ -241,7 +234,6 @@ func (m *Monitor) updateNodeShardLocked(node *nodeState, newShard string, timest
 	m.treeDirty = true
 	slog.Info("shard move", "peer", node.PeerID, "from", shardLabel(lastShard), "to", shardLabel(newShard))
 
-	isSplit := len(newShard) > len(lastShard) && strings.HasPrefix(newShard, lastShard)
 	if isSplit {
 		if !m.hasSplitEvent(lastShard, newShard) {
 			slog.Info("detected shard split", "parent", shardLabel(lastShard), "child", newShard, "peer", node.PeerID)
@@ -252,49 +244,29 @@ func (m *Monitor) updateNodeShardLocked(node *nodeState, newShard string, timest
 			ChildShard:  newShard,
 			Timestamp:   timestamp,
 		})
-		if m.ps != nil {
-			m.ensureShardSubscriptionUnlocked(context.Background(), newShard)
+	}
+	m.ensureShardSubscriptionLocked(context.Background(), newShard)
+	if lastShard == "" && (newShard == "0" || newShard == "1") {
+		sibling := "1"
+		if newShard == "1" {
+			sibling = "0"
 		}
-		if lastShard == "" && (newShard == "0" || newShard == "1") {
-			siblingShard := "1"
-			if newShard == "1" {
-				siblingShard = "0"
-			}
-			m.ensureShardSubscriptionUnlocked(context.Background(), siblingShard)
-		}
-	} else {
-		if m.ps != nil {
-			m.ensureShardSubscriptionUnlocked(context.Background(), newShard)
-		}
+		m.ensureShardSubscriptionLocked(context.Background(), sibling)
 	}
 	node.CurrentShard = newShard
 	node.ShardHistory = append(node.ShardHistory, ShardHistoryEntry{ShardID: newShard, FirstSeen: timestamp})
 
-	peerIDStr := node.PeerID
-	removed := 0
-	for manifest, peers := range m.manifestReplication {
-		if _, had := peers[peerIDStr]; !had {
-			continue
-		}
-		// Remove peer from manifests whose shard is incompatible with the
-		// peer's new shard (neither is an ancestor of the other).
-		observedShard := m.manifestShard[manifest]
-		compatible := observedShard == newShard ||
-			strings.HasPrefix(newShard, observedShard) ||
-			strings.HasPrefix(observedShard, newShard)
-		if !compatible {
-			delete(peers, peerIDStr)
-			removed++
-			if len(peers) == 0 {
-				delete(m.manifestReplication, manifest)
-			}
-		}
-	}
+	// The peer no longer replicates manifests whose shard is neither an
+	// ancestor nor a descendant of its new shard.
+	removed := m.dropPeerReplicasLocked(node.PeerID, func(manifest string) bool {
+		observed := m.manifestShard[manifest]
+		return !strings.HasPrefix(newShard, observed) && !strings.HasPrefix(observed, newShard)
+	})
 	if removed > 0 {
-		slog.Info("shard move removed peer from manifests", "peer", peerIDStr, "removed_manifests", removed, "shard", shardLabel(newShard))
+		slog.Info("shard move removed peer from manifests", "peer", node.PeerID, "removed_manifests", removed, "shard", shardLabel(newShard))
 	}
-	if isSiblingShard(lastShard, newShard) {
-		m.peerLastSiblingMove[peerIDStr] = siblingMoveRecord{when: timestamp}
+	if !isSplit {
+		m.peerLastSiblingMove[node.PeerID] = timestamp
 	}
 	return true
 }
@@ -319,29 +291,21 @@ func (m *Monitor) getPinnedInShardForNode(peerIDStr, nodeShard string) int {
 	}
 	count := 0
 	for manifest, peers := range m.manifestReplication {
-		if _, ok := peers[peerIDStr]; !ok {
-			continue
+		if _, ok := peers[peerIDStr]; ok && m.manifestShard[manifest] == nodeShard {
+			count++
 		}
-		if m.manifestShard[manifest] != nodeShard {
-			continue
-		}
-		count++
 	}
 	return count
 }
 
-func (m *Monitor) ensureMinPinnedForPeer(ctx context.Context, peerIDStr string, min int) {
+func (m *Monitor) ensureMinPinnedForPeer(ctx context.Context, peerIDStr string, minPinned int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if ctx.Err() != nil {
 		return
 	}
-	node, ok := m.nodes[peerIDStr]
-	if !ok {
-		return
-	}
-	if node.PinnedFiles < min {
-		node.PinnedFiles = min
+	if node, ok := m.nodes[peerIDStr]; ok {
+		node.PinnedFiles = max(node.PinnedFiles, minPinned)
 	}
 }
 
@@ -350,13 +314,14 @@ func (m *Monitor) getShardMembership() map[string][]string {
 	defer m.mu.RUnlock()
 	shardToPeers := make(map[string][]string)
 	for peerIDStr, node := range m.nodes {
-		if !m.isDisplayableNodeUnlocked(peerIDStr, node) {
+		if !m.isDisplayableNodeLocked(peerIDStr, node) {
 			continue
 		}
-		shardToPeers[node.EffectiveShard()] = append(shardToPeers[node.EffectiveShard()], peerIDStr)
+		shard := node.EffectiveShard()
+		shardToPeers[shard] = append(shardToPeers[shard], peerIDStr)
 	}
-	for shard := range shardToPeers {
-		sort.Strings(shardToPeers[shard])
+	for _, peers := range shardToPeers {
+		sort.Strings(peers)
 	}
 	return shardToPeers
 }

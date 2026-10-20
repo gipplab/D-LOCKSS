@@ -109,28 +109,20 @@ func (fp *FileProcessor) enqueueWithStabilityCheck(path string) {
 // WatchFolder watches the data directory for new files.
 func (fp *FileProcessor) WatchFolder(ctx context.Context) {
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			slog.Info("context cancelled, stopping file watcher")
 			return
-		default:
-			if err := fp.runWatcher(ctx); err != nil {
-				slog.Error("watcher exited with error, restarting in 5s", "error", err)
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(5 * time.Second):
-					slog.Info("restarting file watcher")
-				}
-			} else {
-				slog.Info("watcher exited normally, restarting in 5s")
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(5 * time.Second):
-					slog.Info("restarting file watcher")
-				}
-			}
+		}
+		if err := fp.runWatcher(ctx); err != nil {
+			slog.Error("watcher exited with error, restarting in 5s", "error", err)
+		} else {
+			slog.Info("watcher exited normally, restarting in 5s")
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+			slog.Info("restarting file watcher")
 		}
 	}
 }
@@ -151,20 +143,16 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 		return fmt.Errorf("failed to watch data directory: %w", err)
 	}
 
-	watchedDirs := make(map[string]bool)
-	watchedDirs[fp.cfg.FileWatchFolder] = true
+	watchedDirs := map[string]bool{fp.cfg.FileWatchFolder: true}
+	var watchedDirsMu sync.RWMutex
 
 	err = filepath.Walk(fp.cfg.FileWatchFolder, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if info.IsDir() {
-			if !watchedDirs[path] {
-				if err := watcher.Add(path); err != nil {
-					slog.Error("failed to watch subdirectory", "path", path, "error", err)
-				} else {
-					watchedDirs[path] = true
-				}
+			if _, err := watchDir(watcher, watchedDirs, &watchedDirsMu, path); err != nil {
+				slog.Error("failed to watch subdirectory", "path", path, "error", err)
 			}
 		}
 		return nil
@@ -174,8 +162,6 @@ func (fp *FileProcessor) runWatcher(ctx context.Context) error {
 	}
 
 	slog.Info("watching for new files", "dir", fp.cfg.FileWatchFolder)
-
-	var watchedDirsMu sync.RWMutex
 
 	for {
 		select {
@@ -220,20 +206,29 @@ func (fp *FileProcessor) handleWatcherEvent(event fsnotify.Event, watcher *fsnot
 	}
 }
 
-func (fp *FileProcessor) handleNewDirectory(dirPath string, watcher *fsnotify.Watcher, watchedDirs map[string]bool, mu *sync.RWMutex) {
+// watchDir adds dir to watcher unless watchedDirs already holds it, and
+// reports whether a watch was added.
+func watchDir(watcher *fsnotify.Watcher, watchedDirs map[string]bool, mu *sync.RWMutex, dir string) (bool, error) {
 	mu.RLock()
-	alreadyWatched := watchedDirs[dirPath]
+	seen := watchedDirs[dir]
 	mu.RUnlock()
+	if seen {
+		return false, nil
+	}
+	if err := watcher.Add(dir); err != nil {
+		return false, err
+	}
+	mu.Lock()
+	watchedDirs[dir] = true
+	mu.Unlock()
+	return true, nil
+}
 
-	if !alreadyWatched {
-		if err := watcher.Add(dirPath); err != nil {
-			slog.Error("failed to watch new directory", "path", dirPath, "error", err)
-		} else {
-			mu.Lock()
-			watchedDirs[dirPath] = true
-			mu.Unlock()
-			slog.Debug("added watch for new directory", "path", dirPath)
-		}
+func (fp *FileProcessor) handleNewDirectory(dirPath string, watcher *fsnotify.Watcher, watchedDirs map[string]bool, mu *sync.RWMutex) {
+	if added, err := watchDir(watcher, watchedDirs, mu, dirPath); err != nil {
+		slog.Error("failed to watch new directory", "path", dirPath, "error", err)
+	} else if added {
+		slog.Debug("added watch for new directory", "path", dirPath)
 	}
 
 	go func() {
@@ -246,20 +241,13 @@ func (fp *FileProcessor) handleNewDirectory(dirPath string, watcher *fsnotify.Wa
 				return nil
 			}
 			if info.IsDir() {
-				if path != dirPath {
-					mu.RLock()
-					seen := watchedDirs[path]
-					mu.RUnlock()
-					if !seen {
-						if err := watcher.Add(path); err != nil {
-							slog.Error("failed to watch nested directory", "path", path, "error", err)
-						} else {
-							mu.Lock()
-							watchedDirs[path] = true
-							mu.Unlock()
-							dirCount++
-						}
-					}
+				if path == dirPath {
+					return nil
+				}
+				if added, err := watchDir(watcher, watchedDirs, mu, path); err != nil {
+					slog.Error("failed to watch nested directory", "path", path, "error", err)
+				} else if added {
+					dirCount++
 				}
 				return nil
 			}

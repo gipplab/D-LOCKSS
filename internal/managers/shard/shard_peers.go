@@ -39,10 +39,7 @@ func (sm *ShardManager) getShardPeerCount(useMeshFallback bool) int {
 
 // activePeersInCurrentShard returns the ACTIVE peers (excluding self) seen in the current shard.
 func (sm *ShardManager) activePeersInCurrentShard() []peer.ID {
-	sm.mu.RLock()
-	currentShard := sm.currentShard
-	sm.mu.RUnlock()
-	return sm.activePeersInShard(currentShard)
+	return sm.activePeersInShard(sm.getCurrentShard())
 }
 
 // activePeersInShard returns the ACTIVE peers (excluding self) recorded for a
@@ -52,10 +49,7 @@ func (sm *ShardManager) activePeersInShard(shardID string) []peer.ID {
 }
 
 func (sm *ShardManager) GetShardInfo() string {
-	sm.mu.RLock()
-	currentShard := sm.currentShard
-	sm.mu.RUnlock()
-	return currentShard
+	return sm.getCurrentShard()
 }
 
 // PeerID returns the local peer's ID.
@@ -140,11 +134,9 @@ func (sm *ShardManager) probeShardSilently(shardID string, probeTimeout time.Dur
 	}
 	defer psSub.Cancel()
 
-	// Publish PROBE so others know we're a prober (not counted)
-	probeMsg := []byte(msgPrefixProbe + sm.h.ID().String())
-	_ = t.Publish(sm.ctx, probeMsg)
+	// PROBE tells members this node is only probing, so they do not count it.
+	_ = t.Publish(sm.ctx, []byte(msgPrefixProbe+sm.h.ID().String()))
 
-	// Process incoming messages to collect HEARTBEAT/JOIN/PROBE role info
 	deadline := time.Now().Add(probeTimeout)
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(sm.ctx, 500*time.Millisecond)
@@ -162,43 +154,15 @@ func (sm *ShardManager) probeShardSilently(shardID string, probeTimeout time.Dur
 		sm.processTextProtocolForProbe(msg, shardID)
 	}
 
+	// Only ACTIVE peers count, never the mesh size. The mesh can include the
+	// monitor or other non-ACTIVE subscribers; trusting it would allow a
+	// phantom "join existing" for an empty child, bypassing the create threshold.
 	activeCount := sm.peers.CountActive(shardID, false, "", sm.cfg.Sharding.SeenPeersWindow)
-	if activeCount > 0 {
-		sm.mu.Lock()
-		if old := sm.probeTopicCache[shardID]; old != nil && old != t {
-			_ = old.Close()
-		}
-		const maxProbeCache = 4
-		if len(sm.probeTopicCache) >= maxProbeCache && sm.probeTopicCache[shardID] == nil {
-			for k, v := range sm.probeTopicCache {
-				_ = v.Close()
-				delete(sm.probeTopicCache, k)
-				break
-			}
-		}
-		sm.probeTopicCache[shardID] = t
-		sm.mu.Unlock()
-		return activeCount
-	}
 
-	// No ACTIVE peers: return 0 instead of mesh count. The mesh can include the monitor
-	// or other non-ACTIVE subscribers; trusting it would allow phantom "join existing"
-	// when the child is empty, bypassing the create threshold (14).
 	sm.mu.Lock()
-	if old := sm.probeTopicCache[shardID]; old != nil && old != t {
-		_ = old.Close()
-	}
-	const maxProbeCache = 4
-	if len(sm.probeTopicCache) >= maxProbeCache && sm.probeTopicCache[shardID] == nil {
-		for k, v := range sm.probeTopicCache {
-			_ = v.Close()
-			delete(sm.probeTopicCache, k)
-			break
-		}
-	}
-	sm.probeTopicCache[shardID] = t
+	sm.cacheProbeTopicLocked(shardID, t)
 	sm.mu.Unlock()
-	return 0
+	return activeCount
 }
 
 func (sm *ShardManager) getProbePeerCount(shardID string, activeWindow time.Duration) int {
@@ -206,9 +170,5 @@ func (sm *ShardManager) getProbePeerCount(shardID string, activeWindow time.Dura
 	currentShard := sm.currentShard
 	_, observerOnly := sm.observerOnlyShards[shardID]
 	sm.mu.RUnlock()
-	activeCount := sm.peers.CountActive(shardID, !observerOnly, currentShard, activeWindow)
-	if activeCount > 0 {
-		return activeCount
-	}
-	return 0
+	return sm.peers.CountActive(shardID, !observerOnly, currentShard, activeWindow)
 }

@@ -62,43 +62,40 @@ func (m *Monitor) snapshotNodes(filter func(id string, node *nodeState, shard st
 
 	activeShardCounts := make(map[string]int)
 	for id, node := range m.nodes {
-		if !m.isDisplayableNodeUnlocked(id, node) {
-			continue
-		}
-		shard := node.EffectiveShard()
-		if node.Role != "PASSIVE" {
-			activeShardCounts[shard]++
+		if m.isDisplayableNodeLocked(id, node) && node.Role != "PASSIVE" {
+			activeShardCounts[node.EffectiveShard()]++
 		}
 	}
 
 	var snapshot []nodeSnap
 	for id, node := range m.nodes {
-		if !m.isDisplayableNodeUnlocked(id, node) {
+		if !m.isDisplayableNodeLocked(id, node) {
 			continue
 		}
 		shard := node.EffectiveShard()
 		if filter != nil && !filter(id, node, shard) {
 			continue
 		}
-		peersInShard := activeShardCounts[shard]
-		if peersInShard < 1 {
-			peersInShard = 1
-		}
 		firstSeen := node.LastSeen
 		if len(node.ShardHistory) > 0 {
 			firstSeen = node.ShardHistory[0].FirstSeen
-		}
-		pinnedFiles := node.PinnedFiles
-		if pinnedFiles < 0 {
-			pinnedFiles = 0
 		}
 		role := node.Role
 		if role == "" {
 			role = "ACTIVE"
 		}
 		snapshot = append(snapshot, nodeSnap{
-			id: id, peerID: node.PeerID, nodeName: node.NodeName, currentShard: node.CurrentShard, role: role, knownFiles: node.KnownFiles,
-			lastSeen: node.LastSeen.Unix(), shard: shard, peersInShard: peersInShard, uptimeSeconds: time.Since(firstSeen).Seconds(), pinnedFiles: pinnedFiles,
+			id:            id,
+			peerID:        node.PeerID,
+			nodeName:      node.NodeName,
+			currentShard:  node.CurrentShard,
+			role:          role,
+			knownFiles:    node.KnownFiles,
+			lastSeen:      node.LastSeen.Unix(),
+			shard:         shard,
+			peersInShard:  max(activeShardCounts[shard], 1),
+			uptimeSeconds: time.Since(firstSeen).Seconds(),
+			pinnedFiles:   max(node.PinnedFiles, 0),
 		})
 	}
 	return snapshot
@@ -107,14 +104,17 @@ func (m *Monitor) snapshotNodes(filter func(id string, node *nodeState, shard st
 func (m *Monitor) buildNodeResponse(snapshot []nodeSnap) map[string]interface{} {
 	response := make(map[string]interface{})
 	for _, s := range snapshot {
-		pinnedInShard := m.getPinnedInShardForNode(s.id, s.shard)
 		status := StatusResponse{
-			PeerID:        s.peerID,
-			Version:       "1.0.0",
-			CurrentShard:  s.currentShard,
-			Role:          s.role,
-			PeersInShard:  s.peersInShard,
-			Storage:       StorageStatus{PinnedFiles: s.pinnedFiles, PinnedInShard: pinnedInShard, KnownFiles: s.knownFiles},
+			PeerID:       s.peerID,
+			Version:      "1.0.0",
+			CurrentShard: s.currentShard,
+			Role:         s.role,
+			PeersInShard: s.peersInShard,
+			Storage: StorageStatus{
+				PinnedFiles:   s.pinnedFiles,
+				PinnedInShard: m.getPinnedInShardForNode(s.id, s.shard),
+				KnownFiles:    s.knownFiles,
+			},
 			UptimeSeconds: s.uptimeSeconds,
 		}
 		response[s.id] = map[string]interface{}{
@@ -136,13 +136,11 @@ func (m *Monitor) handleNodes(w http.ResponseWriter, r *http.Request) {
 			strings.Contains(strings.ToLower(node.CurrentShard), query) ||
 			strings.Contains(strings.ToLower(node.NodeName), query)
 	})
-	response := m.buildNodeResponse(snapshot)
-	writeJSON(w, response)
+	writeJSON(w, m.buildNodeResponse(snapshot))
 }
 
-func (m *Monitor) handleShardTree(w http.ResponseWriter, r *http.Request) {
-	tree := m.GetShardTree()
-	writeJSON(w, tree)
+func (m *Monitor) handleShardTree(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, m.GetShardTree())
 }
 
 func (m *Monitor) handleShardNodes(w http.ResponseWriter, r *http.Request) {
@@ -155,17 +153,10 @@ func (m *Monitor) handleShardNodes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Monitor) handleRootTopic(w http.ResponseWriter, _ *http.Request) {
-	m.writeRootTopicResponse(w)
-}
-
-func (m *Monitor) writeRootTopicResponse(w http.ResponseWriter) {
-	prefix := m.getTopicPrefix()
-	topic := m.getTopicName()
-	rootTopic := fmt.Sprintf("%s-%s-shard-", prefix, topic)
 	writeJSON(w, map[string]string{
-		"root_topic":   rootTopic,
-		"topic_prefix": prefix,
-		"topic_name":   topic,
+		"root_topic":   m.shardTopic(""),
+		"topic_prefix": m.cfg.PubsubTopicPrefix,
+		"topic_name":   m.cfg.TopicName,
 	})
 }
 
@@ -176,37 +167,26 @@ func (m *Monitor) handleNodeFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m.mu.RLock()
-	var entries []cidEntry
-	if files, ok := m.nodeFiles[peerID]; ok {
-		entries = m.buildCIDEntriesUnlocked(files)
-	} else {
-		entries = []cidEntry{}
-	}
+	entries := m.buildCIDEntriesLocked(m.nodeFiles[peerID])
 	m.mu.RUnlock()
 	writeJSON(w, map[string]interface{}{"peer_id": peerID, "cids": entries, "count": len(entries)})
 }
 
-func (m *Monitor) handleUniqueCIDs(w http.ResponseWriter, r *http.Request) {
+func (m *Monitor) handleUniqueCIDs(w http.ResponseWriter, _ *http.Request) {
 	m.mu.RLock()
-	entries := m.buildCIDEntriesUnlocked(m.uniqueCIDs)
+	entries := m.buildCIDEntriesLocked(m.uniqueCIDs)
 	m.mu.RUnlock()
 	writeJSON(w, map[string]interface{}{"cids": entries, "count": len(entries)})
 }
 
-func (m *Monitor) handlePayloadCIDsExport(w http.ResponseWriter, r *http.Request) {
-	m.mu.RLock()
-	cids := make([]string, 0, len(m.uniqueCIDs))
-	for c := range m.uniqueCIDs {
-		cids = append(cids, c)
-	}
-	m.mu.RUnlock()
+func (m *Monitor) handlePayloadCIDsExport(w http.ResponseWriter, _ *http.Request) {
+	cids := m.UniqueCIDList()
 	sort.Strings(cids)
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="payload_cids.txt"`)
 	for _, c := range cids {
-		w.Write([]byte(c))
-		w.Write([]byte("\n"))
+		fmt.Fprintln(w, c)
 	}
 }
 
@@ -302,22 +282,23 @@ func (m *Monitor) handleIdentify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	connectCtx, connectCancel := context.WithTimeout(r.Context(), 8*time.Second)
-	defer connectCancel()
+	connectCtx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
 
-	addrs := m.host.Peerstore().Addrs(pid)
-	if len(addrs) > 0 {
+	pstore := m.host.Peerstore()
+	if addrs := pstore.Addrs(pid); len(addrs) > 0 {
 		_ = m.host.Connect(connectCtx, peer.AddrInfo{ID: pid, Addrs: addrs})
 	}
 
 	connected := m.host.Network().Connectedness(pid) == network.Connected
 
-	agentVersion, _ := m.host.Peerstore().Get(pid, "AgentVersion")
-	protocolVersion, _ := m.host.Peerstore().Get(pid, "ProtocolVersion")
-	protocols, _ := m.host.Peerstore().GetProtocols(pid)
+	agentVersion, _ := pstore.Get(pid, "AgentVersion")
+	protocolVersion, _ := pstore.Get(pid, "ProtocolVersion")
+	protocols, _ := pstore.GetProtocols(pid)
 
+	addrs := pstore.Addrs(pid)
 	addrStrs := make([]string, 0, len(addrs))
-	for _, a := range m.host.Peerstore().Addrs(pid) {
+	for _, a := range addrs {
 		addrStrs = append(addrStrs, a.String())
 	}
 
@@ -326,20 +307,19 @@ func (m *Monitor) handleIdentify(w http.ResponseWriter, r *http.Request) {
 		protoStrs = append(protoStrs, string(p))
 	}
 
-	result := map[string]interface{}{
+	writeJSON(w, map[string]interface{}{
 		"peer_id":          pid.String(),
 		"agent_version":    fmt.Sprintf("%v", agentVersion),
 		"protocol_version": fmt.Sprintf("%v", protocolVersion),
 		"protocols":        protoStrs,
 		"addresses":        addrStrs,
 		"connected":        connected,
-	}
-	writeJSON(w, result)
+	})
 }
 
-func (m *Monitor) handleDashboard(w http.ResponseWriter, r *http.Request) {
+func (m *Monitor) handleDashboard(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(dashboardHTML))
+	io.WriteString(w, dashboardHTML)
 }
 
 // RunStatusLogger periodically logs a summary of active nodes and shards.
@@ -351,36 +331,34 @@ func (m *Monitor) RunStatusLogger(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			m.mu.RLock()
-			shardCounts := make(map[string]int)
-			totalPinned := 0
-			nodeCount := 0
-			for id, node := range m.nodes {
-				if !m.isDisplayableNodeUnlocked(id, node) {
-					continue
-				}
-				nodeCount++
-				shard := node.EffectiveShard()
-				shardCounts[shard]++
-				if node.PinnedFiles > 0 {
-					totalPinned += node.PinnedFiles
-				}
-			}
-			m.mu.RUnlock()
-			shardIDs := make([]string, 0, len(shardCounts))
-			for sid := range shardCounts {
-				shardIDs = append(shardIDs, sid)
-			}
-			sort.Strings(shardIDs)
-			parts := make([]string, 0, len(shardIDs))
-			for _, sid := range shardIDs {
-				parts = append(parts, fmt.Sprintf("%s: %d", shardLabel(sid), shardCounts[sid]))
-			}
-			slog.Info("status", "nodes", nodeCount, "shards", len(shardCounts), "pinned", totalPinned, "detail", strings.Join(parts, ", "))
+			m.logStatus()
 		}
 	}
 }
 
-// Close releases resources held by the monitor.
-func (m *Monitor) Close() {
+func (m *Monitor) logStatus() {
+	m.mu.RLock()
+	shardCounts := make(map[string]int)
+	totalPinned := 0
+	nodeCount := 0
+	for id, node := range m.nodes {
+		if !m.isDisplayableNodeLocked(id, node) {
+			continue
+		}
+		nodeCount++
+		shardCounts[node.EffectiveShard()]++
+		totalPinned += max(node.PinnedFiles, 0)
+	}
+	m.mu.RUnlock()
+
+	shardIDs := make([]string, 0, len(shardCounts))
+	for sid := range shardCounts {
+		shardIDs = append(shardIDs, sid)
+	}
+	sort.Strings(shardIDs)
+	parts := make([]string, 0, len(shardIDs))
+	for _, sid := range shardIDs {
+		parts = append(parts, fmt.Sprintf("%s: %d", shardLabel(sid), shardCounts[sid]))
+	}
+	slog.Info("status", "nodes", nodeCount, "shards", len(shardCounts), "pinned", totalPinned, "detail", strings.Join(parts, ", "))
 }

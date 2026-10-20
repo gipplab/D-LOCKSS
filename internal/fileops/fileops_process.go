@@ -71,24 +71,20 @@ func (fp *FileProcessor) processNewFile(path string) {
 	}
 
 	payloadCIDStr := payloadCID.String()
-	fp.recentIngestMu.Lock()
-	if lastIngest, seen := fp.recentIngests[payloadCIDStr]; seen && time.Since(lastIngest) < recentIngestTTL {
-		fp.recentIngestMu.Unlock()
-		slog.Info("skipping duplicate payload", "payload", payloadCIDStr, "path", path, "last_ingested_ago", time.Since(lastIngest).Round(time.Second))
+	if !fp.claimRecentIngest(payloadCIDStr) {
+		slog.Info("skipping duplicate payload", "payload", payloadCIDStr, "path", path)
 		cleanupPayload()
 		return
 	}
-	fp.recentIngests[payloadCIDStr] = time.Now()
-	now := time.Now()
-	for k, t := range fp.recentIngests {
-		if now.Sub(t) > 2*recentIngestTTL {
-			delete(fp.recentIngests, k)
-		}
-	}
-	fp.recentIngestMu.Unlock()
 
 	slog.Debug("building manifest", "path", path, "payload", payloadCIDStr)
-	manifestCID, manifestCIDStr, err := fp.buildAndStoreManifest(ctx, path, payloadCID, cleanupPayload)
+	info, err := os.Stat(path)
+	if err != nil {
+		cleanupPayload()
+		slog.Error("failed to stat file", "path", path, "error", err)
+		return
+	}
+	manifestCID, manifestCIDStr, err := fp.buildAndStoreManifest(ctx, "file://"+filepath.Base(path), uint64(info.Size()), payloadCID, cleanupPayload)
 	if err != nil {
 		slog.Error("failed to build manifest", "path", path, "error", err)
 		return
@@ -101,6 +97,24 @@ func (fp *FileProcessor) processNewFile(path string) {
 
 	fp.trackAndAnnounceFile(manifestCID, manifestCIDStr, payloadCID)
 	slog.Info("file processing completed", "path", path, "manifest", manifestCIDStr, "payload", payloadCIDStr)
+}
+
+// claimRecentIngest records payload as ingested now. It reports false when the
+// payload was already ingested within recentIngestTTL.
+func (fp *FileProcessor) claimRecentIngest(payload string) bool {
+	fp.recentIngestMu.Lock()
+	defer fp.recentIngestMu.Unlock()
+	now := time.Now()
+	if last, seen := fp.recentIngests[payload]; seen && now.Sub(last) < recentIngestTTL {
+		return false
+	}
+	fp.recentIngests[payload] = now
+	for k, t := range fp.recentIngests {
+		if now.Sub(t) > 2*recentIngestTTL {
+			delete(fp.recentIngests, k)
+		}
+	}
+	return true
 }
 
 func (fp *FileProcessor) importFileToIPFS(ctx context.Context, path string) (cid.Cid, func(), error) {
@@ -116,39 +130,31 @@ func (fp *FileProcessor) importFileToIPFS(ctx context.Context, path string) (cid
 	return payloadCID, cleanupPayload, nil
 }
 
-func (fp *FileProcessor) buildAndStoreManifest(ctx context.Context, path string, payloadCID cid.Cid, cleanupPayload func()) (cid.Cid, string, error) {
-	info, err := os.Stat(path)
+// buildAndStoreManifest signs and stores the manifest for payloadCID. On
+// failure it calls cleanupPayload.
+func (fp *FileProcessor) buildAndStoreManifest(ctx context.Context, metaRef string, size uint64, payloadCID cid.Cid, cleanupPayload func()) (cid.Cid, string, error) {
+	ro := schema.NewResearchObject(metaRef, fp.shardMgr.PeerID(), payloadCID, size)
+	manifestCID, err := fp.storeManifest(ctx, ro)
 	if err != nil {
 		cleanupPayload()
 		return cid.Cid{}, "", err
 	}
+	return manifestCID, manifestCID.String(), nil
+}
 
-	metaRef := "file://" + filepath.Base(path)
-	ro := schema.NewResearchObject(
-		metaRef,
-		fp.shardMgr.PeerID(),
-		payloadCID,
-		uint64(info.Size()),
-	)
-
+func (fp *FileProcessor) storeManifest(ctx context.Context, ro *schema.ResearchObject) (cid.Cid, error) {
 	if err := fp.signResearchObject(ro); err != nil {
-		cleanupPayload()
-		return cid.Cid{}, "", err
+		return cid.Cid{}, err
 	}
-
 	roBytes, err := ro.MarshalCBOR()
 	if err != nil {
-		cleanupPayload()
-		return cid.Cid{}, "", err
+		return cid.Cid{}, fmt.Errorf("failed to marshal manifest: %w", err)
 	}
-
 	manifestCID, err := fp.ipfsClient.PutDagCBOR(ctx, roBytes)
 	if err != nil {
-		cleanupPayload()
-		return cid.Cid{}, "", err
+		return cid.Cid{}, fmt.Errorf("failed to store manifest: %w", err)
 	}
-
-	return manifestCID, manifestCID.String(), nil
+	return manifestCID, nil
 }
 
 func (fp *FileProcessor) signResearchObject(ro *schema.ResearchObject) error {
@@ -180,7 +186,7 @@ func (fp *FileProcessor) checkBadBitsAndPin(ctx context.Context, manifestCID cid
 	}
 
 	slog.Debug("pinning manifest recursively", "manifest", manifestCIDStr)
-	if err := fp.ipfsClient.PinRecursive(ctx, manifestCID); err != nil {
+	if err := fp.ipfsClient.PinManifest(ctx, manifestCID); err != nil {
 		slog.Error("failed to pin manifest", "manifest", manifestCIDStr, "error", err)
 		cleanupPayload()
 		return false
@@ -226,36 +232,42 @@ func (fp *FileProcessor) announceResponsibleFile(manifestCID cid.Cid, manifestCI
 	slog.Info("responsible for file, announcing to shard", "payload", payloadCIDStr, "manifest", manifestCIDStr)
 
 	currentShard := fp.shardMgr.GetShardInfo()
-	im := schema.IngestMessage{
-		SignedEnvelope: schema.SignedEnvelope{Type: schema.MessageTypeIngest, ManifestCID: manifestCID},
-		ShardID:        currentShard,
-	}
-
-	if err := fp.signer.SignProtocolMessage(&im); err != nil {
-		slog.Error("failed to sign IngestMessage", "manifest", manifestCIDStr, "error", err)
-		return
-	}
-
-	b, err := im.MarshalCBOR()
+	b, err := fp.encodeIngestMessage(manifestCID, currentShard)
 	if err != nil {
-		slog.Error("failed to marshal IngestMessage", "manifest", manifestCIDStr, "error", err)
+		slog.Error("failed to encode ingest message", "manifest", manifestCIDStr, "error", err)
 		return
 	}
-
 	fp.shardMgr.PublishIngestMessageToCurrentAndChildIfSplit(b, currentShard, payloadCIDStr)
 
-	// Announce both manifest and payload to the DHT so gateways can find providers.
-	// Each gets its own timeout so a slow manifest provide can't starve the payload.
+	// Both manifest and payload are provided so gateways can find this node.
+	// Separate timeouts keep a slow manifest provide from starving the payload.
+	fp.provideAsync(manifestCIDStr)
+	fp.provideAsync(payloadCIDStr)
+}
+
+func (fp *FileProcessor) provideAsync(key string) {
 	go func() {
-		ctx1, cancel1 := context.WithTimeout(fp.ctx, fp.cfg.Files.DHTProvideTimeout)
-		defer cancel1()
-		fp.storageMgr.ProvideFile(ctx1, manifestCIDStr)
+		ctx, cancel := context.WithTimeout(fp.ctx, fp.cfg.Files.DHTProvideTimeout)
+		defer cancel()
+		fp.storageMgr.ProvideFile(ctx, key)
 	}()
-	go func() {
-		ctx2, cancel2 := context.WithTimeout(fp.ctx, fp.cfg.Files.DHTProvideTimeout)
-		defer cancel2()
-		fp.storageMgr.ProvideFile(ctx2, payloadCIDStr)
-	}()
+}
+
+// encodeIngestMessage returns a signed, CBOR-encoded IngestMessage that
+// announces manifestCID to shardID.
+func (fp *FileProcessor) encodeIngestMessage(manifestCID cid.Cid, shardID string) ([]byte, error) {
+	im := schema.IngestMessage{
+		SignedEnvelope: schema.SignedEnvelope{Type: schema.MessageTypeIngest, ManifestCID: manifestCID},
+		ShardID:        shardID,
+	}
+	if err := fp.signer.SignProtocolMessage(&im); err != nil {
+		return nil, fmt.Errorf("failed to sign IngestMessage: %w", err)
+	}
+	b, err := im.MarshalCBOR()
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal IngestMessage: %w", err)
+	}
+	return b, nil
 }
 
 func (fp *FileProcessor) announceCustodialFile(manifestCID cid.Cid, manifestCIDStr, payloadCIDStr string) {
@@ -298,17 +310,11 @@ func (fp *FileProcessor) announceCustodialFile(manifestCID cid.Cid, manifestCIDS
 	}
 	slog.Info("injected file into target shard", "target_shard", targetShard, "current_shard", currentShard)
 
-	im := schema.IngestMessage{
-		SignedEnvelope: schema.SignedEnvelope{Type: schema.MessageTypeIngest, ManifestCID: manifestCID},
-		ShardID:        targetShard,
+	b, err := fp.encodeIngestMessage(manifestCID, targetShard)
+	if err != nil {
+		slog.Error("failed to encode ingest message", "manifest", manifestCIDStr, "error", err)
+		return
 	}
-
-	if err := fp.signer.SignProtocolMessage(&im); err != nil {
-		slog.Error("failed to sign IngestMessage", "manifest", manifestCIDStr, "error", err)
-	} else if b, err := im.MarshalCBOR(); err != nil {
-		slog.Error("failed to marshal IngestMessage", "manifest", manifestCIDStr, "error", err)
-	} else {
-		fp.shardMgr.PublishToShardCBOR(b, targetShard)
-		slog.Info("published ingest message to target shard", "target_shard", targetShard)
-	}
+	fp.shardMgr.PublishToShardCBOR(b, targetShard)
+	slog.Info("published ingest message to target shard", "target_shard", targetShard)
 }

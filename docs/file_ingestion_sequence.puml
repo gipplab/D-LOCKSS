@@ -26,7 +26,7 @@ alt BadBits check fails
     FileOps -> IPFS: UnpinRecursive(ManifestCID)
     FileOps -> FileOps: Log refusal and return
 else BadBits check passes
-    FileOps -> IPFS: PinRecursive(ManifestCID)
+    FileOps -> IPFS: PinManifest(ManifestCID)
 end
 
 FileOps -> FileOps: trackAndAnnounceFile(manifestCID, payloadCID)

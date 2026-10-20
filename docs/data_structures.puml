@@ -38,7 +38,7 @@ class LocalPinTracker {
     - shardID: string
     - onPinSynced: func(cid string)
     - onPinRemoved: func(cid string)
-    - pinnedByUs: map[string]struct{}
+    - tracked: map[string]struct{}
     --
     + Start(consensusClient)
     + TriggerSync()

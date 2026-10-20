@@ -2,8 +2,8 @@ package syncmap
 
 import "sync"
 
-// Map is a generic thread-safe map. It replaces the many hand-rolled
-// sync.RWMutex + map wrappers throughout the codebase.
+// Map is a map guarded by a sync.RWMutex. The zero value is not usable;
+// create one with New.
 type Map[K comparable, V any] struct {
 	mu sync.RWMutex
 	m  map[K]V
@@ -76,7 +76,7 @@ func (s *Map[K, V]) Snapshot() map[K]V {
 	return cp
 }
 
-// Keys returns all keys as a slice.
+// Keys returns all keys in unspecified order.
 func (s *Map[K, V]) Keys() []K {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -87,7 +87,7 @@ func (s *Map[K, V]) Keys() []K {
 	return keys
 }
 
-// ReplaceAll atomically replaces the entire map contents.
+// ReplaceAll atomically replaces the map contents with a copy of m.
 func (s *Map[K, V]) ReplaceAll(m map[K]V) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

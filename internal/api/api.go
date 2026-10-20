@@ -2,12 +2,13 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 )
 
-// APIServer manages the local observability API
+// APIServer serves the node's local health check and landing page.
 type APIServer struct {
 	server *http.Server
 }
@@ -35,7 +36,7 @@ func NewAPIServer(port int) *APIServer {
 func (s *APIServer) Start() {
 	go func() {
 		slog.Info("starting observability server", "addr", s.server.Addr)
-		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := s.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("api server failed", "error", err)
 		}
 	}()

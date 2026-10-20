@@ -6,32 +6,24 @@ import (
 	"log/slog"
 
 	"dlockss/internal/common"
-
-	"github.com/ipfs/go-cid"
 )
 
-// MigratePins moves all pins that are now responsible in the destination shard
-// from the source shard cluster to the destination shard cluster.
+// MigratePins moves every pin of the source shard whose payload now maps to
+// the destination shard: it is pinned in the destination cluster and then
+// unpinned from the source cluster.
 func (cm *ClusterManager) MigratePins(ctx context.Context, sourceShardID, destShardID string) error {
 	slog.Info("starting pin migration", "source", sourceShardID, "dest", destShardID)
 
 	pins, err := cm.ListPins(ctx, sourceShardID)
 	if err != nil {
-		return fmt.Errorf("source shard %s not found or error: %w", sourceShardID, err)
+		return fmt.Errorf("list pins of source shard %s: %w", sourceShardID, err)
 	}
-
-	allocations := make([]cid.Cid, 0, len(pins))
-	for _, pin := range pins {
-		allocations = append(allocations, pin.Cid.Cid)
-	}
-
-	slog.Info("found pins in source shard", "count", len(allocations), "source", sourceShardID)
+	slog.Info("found pins in source shard", "count", len(pins), "source", sourceShardID)
 
 	destDepth := len(destShardID)
-
-	migrated := 0
-	var failures int
-	for _, c := range allocations {
+	var migrated, failures int
+	for _, pin := range pins {
+		c := pin.Cid.Cid
 		key := c.String()
 		payloadCIDStr, _ := common.GetPayloadCIDForShardAssignment(ctx, cm.ipfsClient, key)
 		stableHex := common.KeyToStableHex(payloadCIDStr)

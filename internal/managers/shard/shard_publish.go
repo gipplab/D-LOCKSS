@@ -2,12 +2,15 @@ package shard
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/ipfs/go-cid"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 
 	"dlockss/internal/common"
+	"dlockss/pkg/schema"
 )
 
 func (sm *ShardManager) AnnouncePinned(manifestCID string) {
@@ -21,8 +24,7 @@ func (sm *ShardManager) AnnouncePinned(manifestCID string) {
 	if !exists || sub.topic == nil {
 		return
 	}
-	msg := []byte(msgPrefixPinned + manifestCID)
-	_ = sub.topic.Publish(sm.ctx, msg)
+	_ = sub.topic.Publish(sm.ctx, []byte(msgPrefixPinned+manifestCID))
 }
 
 func (sm *ShardManager) PublishToShardCBOR(data []byte, shardID string) {
@@ -36,12 +38,60 @@ func (sm *ShardManager) PublishToShardCBOR(data []byte, shardID string) {
 	if sub.topic != nil {
 		_ = sub.topic.Publish(sm.ctx, data)
 	} else {
-		topicName := sm.shardTopicName(shardID)
-		_ = sm.ps.Publish(topicName, data)
+		_ = sm.ps.Publish(sm.shardTopicName(shardID), data)
 	}
 }
 
-// PublishIngestMessageToCurrentAndChildIfSplit publishes to current shard and to target child if split in progress.
+// publishAsObserver subscribes to shardID as an observer for the duration of
+// one publish. It returns false, without publishing, when the observer
+// subscription cannot be made.
+func (sm *ShardManager) publishAsObserver(data []byte, shardID string) bool {
+	if !sm.JoinShardAsObserver(shardID) {
+		return false
+	}
+	sm.PublishToShardCBOR(data, shardID)
+	sm.LeaveShardAsObserver(shardID)
+	return true
+}
+
+// publishIngest signs an IngestMessage for manifestCID and publishes it to shardID.
+func (sm *ShardManager) publishIngest(manifestCID cid.Cid, shardID string) {
+	im := schema.IngestMessage{
+		SignedEnvelope: schema.SignedEnvelope{Type: schema.MessageTypeIngest, ManifestCID: manifestCID},
+		ShardID:        shardID,
+	}
+	if err := sm.signer.SignProtocolMessage(&im); err != nil {
+		return
+	}
+	b, err := im.MarshalCBOR()
+	if err != nil {
+		return
+	}
+	sm.PublishToShardCBOR(b, shardID)
+}
+
+func (sm *ShardManager) signedReplicationRequest(manifestCID cid.Cid) ([]byte, error) {
+	rr := &schema.ReplicationRequest{
+		SignedEnvelope: schema.SignedEnvelope{Type: schema.MessageTypeReplicationRequest, ManifestCID: manifestCID},
+	}
+	if err := sm.signer.SignProtocolMessage(rr); err != nil {
+		return nil, err
+	}
+	return rr.MarshalCBOR()
+}
+
+func (sm *ShardManager) heartbeatMessage(pinnedCount int, role peerRole) []byte {
+	return []byte(fmt.Sprintf("%s%s:%d:%s:%s", msgPrefixHeartbeat, sm.h.ID().String(), pinnedCount, role, sm.nodeName))
+}
+
+func (sm *ShardManager) announceMembership(topic *pubsub.Topic) {
+	role := sm.getOurRole()
+	_ = topic.Publish(sm.ctx, []byte(msgPrefixJoin+sm.h.ID().String()+":"+string(role)+":"+sm.nodeName))
+	_ = topic.Publish(sm.ctx, sm.heartbeatMessage(sm.storageMgr.GetPinnedCount(), role))
+}
+
+// PublishIngestMessageToCurrentAndChildIfSplit publishes to the current shard
+// and, while a split is in progress, to the child shard the payload belongs to.
 func (sm *ShardManager) PublishIngestMessageToCurrentAndChildIfSplit(data []byte, currentShard string, payloadCIDStr string) {
 	sm.PublishToShardCBOR(data, currentShard)
 
@@ -52,22 +102,16 @@ func (sm *ShardManager) PublishIngestMessageToCurrentAndChildIfSplit(data []byte
 	if n0 < 1 && n1 < 1 {
 		return
 	}
-	depth := len(currentShard) + 1
-	if depth < 1 {
-		depth = 1
-	}
-	childShard, err := common.TargetShardForPayload(payloadCIDStr, depth)
+	childShard, err := common.TargetShardForPayload(payloadCIDStr, len(currentShard)+1)
 	if err != nil {
 		slog.Error("failed to compute target shard for child", "payload", payloadCIDStr, "error", err)
 		return
 	}
-	if sm.JoinShardAsObserver(childShard) {
-		sm.PublishToShardCBOR(data, childShard)
-		sm.LeaveShardAsObserver(childShard)
-		slog.Info("ingest message also published to child shard", "child", childShard)
-	} else {
+	if !sm.publishAsObserver(data, childShard) {
 		slog.Warn("could not join child as observer to forward ingest message during split", "child", childShard)
+		return
 	}
+	slog.Info("ingest message also published to child shard", "child", childShard)
 }
 
 const (
@@ -132,10 +176,7 @@ func (sm *ShardManager) AmIResponsibleFor(key string) bool {
 }
 
 func (sm *ShardManager) PinToCluster(ctx context.Context, c cid.Cid) error {
-	sm.mu.RLock()
-	currentShard := sm.currentShard
-	sm.mu.RUnlock()
-	return sm.clusterMgr.Pin(ctx, currentShard, c, -1, -1)
+	return sm.clusterMgr.Pin(ctx, sm.getCurrentShard(), c, -1, -1)
 }
 
 func (sm *ShardManager) EnsureClusterForShard(ctx context.Context, shardID string) error {

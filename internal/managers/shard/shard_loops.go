@@ -3,7 +3,6 @@ package shard
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"log/slog"
 	"time"
 
@@ -21,29 +20,12 @@ const probeResponseCooldown = 5 * time.Second
 
 // runHeartbeat periodically sends heartbeat messages to the current shard topic.
 func (sm *ShardManager) runHeartbeat() {
-	var heartbeatInterval time.Duration
-	if sm.cfg.HeartbeatInterval > 0 {
-		heartbeatInterval = sm.cfg.HeartbeatInterval
-	} else {
-		heartbeatInterval = sm.cfg.Sharding.ShardPeerCheckInterval / 3
-		if heartbeatInterval < 10*time.Second {
-			heartbeatInterval = 10 * time.Second
-		}
+	interval := sm.cfg.HeartbeatInterval
+	if interval <= 0 {
+		interval = max(sm.cfg.Sharding.ShardPeerCheckInterval/3, 10*time.Second)
 	}
-
-	ticker := time.NewTicker(heartbeatInterval)
-	defer ticker.Stop()
-
 	sm.sendHeartbeat()
-
-	for {
-		select {
-		case <-sm.ctx.Done():
-			return
-		case <-ticker.C:
-			sm.sendHeartbeat()
-		}
-	}
+	sm.runEvery(interval, sm.sendHeartbeat)
 }
 
 // sendHeartbeat publishes heartbeat and a batch of PINNED to the current shard.
@@ -58,9 +40,7 @@ func (sm *ShardManager) sendHeartbeat() {
 	}
 
 	pinnedCount := sm.storageMgr.GetPinnedCount()
-	role := sm.getOurRole()
-	heartbeatMsg := []byte(fmt.Sprintf("%s%s:%d:%s:%s", msgPrefixHeartbeat, sm.h.ID().String(), pinnedCount, role, sm.nodeName))
-	if err := sub.topic.Publish(sm.ctx, heartbeatMsg); err != nil {
+	if err := sub.topic.Publish(sm.ctx, sm.heartbeatMessage(pinnedCount, sm.getOurRole())); err != nil {
 		return
 	}
 	slog.Debug("heartbeat sent", "shard", currentShard, "pinned", pinnedCount)
@@ -96,12 +76,12 @@ func (sm *ShardManager) reprovideNextPinnedFile() {
 		// (e.g. OOM/timeout on low-memory Pis). Idempotent: returns
 		// quickly when the DAG is already complete locally.
 		pinCtx, pinCancel := context.WithTimeout(sm.ctx, 2*time.Minute)
-		if err := sm.ipfsClient.PinRecursive(pinCtx, manifestCID); err != nil {
-			pinCancel()
+		err = sm.ipfsClient.PinManifest(pinCtx, manifestCID)
+		pinCancel()
+		if err != nil {
 			slog.Debug("reprovide pin failed, will retry", "manifest", manifestCIDStr, "error", err)
 			return
 		}
-		pinCancel()
 
 		pctx, pcancel := context.WithTimeout(sm.ctx, sm.cfg.Files.DHTProvideTimeout)
 		defer pcancel()
@@ -137,17 +117,16 @@ func (sm *ShardManager) announcePinnedFilesBatch(topic *pubsub.Topic, batchSize 
 		if key == "" {
 			return
 		}
-		msg := []byte(msgPrefixPinned + key)
-		_ = topic.Publish(sm.ctx, msg)
+		_ = topic.Publish(sm.ctx, []byte(msgPrefixPinned+key))
 	}
 }
 
 func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
-	if msg.GetFrom() == sm.h.ID() {
+	from := msg.GetFrom()
+	if from == sm.h.ID() {
 		return
 	}
 
-	from := msg.GetFrom()
 	now := time.Now()
 	sm.peers.RecordSeen(shardID, from)
 	sm.mu.Lock()
@@ -164,39 +143,31 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 	sm.processCBORMessage(msg, shardID)
 }
 
+// processTextProtocol handles plain-text protocol messages and reports whether
+// msg was consumed.
 func (sm *ShardManager) processTextProtocol(msg *pubsub.Message, shardID string, from peer.ID, now time.Time) bool {
-	if len(msg.Data) == 0 {
+	data := msg.Data
+	switch {
+	case len(data) == 0:
+		return false
+	case data[0] == '{':
+		// JSON messages are consumed and ignored.
+	case bytes.HasPrefix(data, []byte(msgPrefixHeartbeat)):
+		sm.peers.RecordRole(shardID, from, parseHeartbeatRole(data))
+	case bytes.HasPrefix(data, []byte(msgPrefixPinned)):
+		sm.storageMgr.AddKnownFile(string(data[len(msgPrefixPinned):]))
+	case bytes.HasPrefix(data, []byte(msgPrefixJoin)):
+		sm.peers.RecordRole(shardID, from, parseJoinRole(data))
+	case bytes.HasPrefix(data, []byte(msgPrefixLeave)):
+		sm.peers.RemoveRole(shardID, from)
+	case bytes.HasPrefix(data, []byte(msgPrefixProbe)):
+		sm.handleProbeMessage(shardID, from, now)
+	case bytes.HasPrefix(data, []byte(msgPrefixSplit)):
+		sm.lifecycle.recordSplitAnnouncement(string(data[len(msgPrefixSplit):]))
+	default:
 		return false
 	}
-	if msg.Data[0] == '{' {
-		return true
-	}
-	if bytes.HasPrefix(msg.Data, []byte(msgPrefixHeartbeat)) {
-		sm.peers.RecordRole(shardID, from, parseHeartbeatRole(msg.Data))
-		return true
-	}
-	if bytes.HasPrefix(msg.Data, []byte(msgPrefixPinned)) {
-		key := string(msg.Data[len(msgPrefixPinned):])
-		sm.storageMgr.AddKnownFile(key)
-		return true
-	}
-	if bytes.HasPrefix(msg.Data, []byte(msgPrefixJoin)) {
-		sm.peers.RecordRole(shardID, from, parseJoinRole(msg.Data))
-		return true
-	}
-	if bytes.HasPrefix(msg.Data, []byte(msgPrefixLeave)) {
-		sm.peers.RemoveRole(shardID, from)
-		return true
-	}
-	if bytes.HasPrefix(msg.Data, []byte(msgPrefixProbe)) {
-		sm.handleProbeMessage(shardID, from, now)
-		return true
-	}
-	if bytes.HasPrefix(msg.Data, []byte(msgPrefixSplit)) {
-		sm.lifecycle.recordSplitAnnouncement(string(msg.Data[len(msgPrefixSplit):]))
-		return true
-	}
-	return false
+	return true
 }
 
 func (sm *ShardManager) processCBORMessage(msg *pubsub.Message, shardID string) {
@@ -228,29 +199,21 @@ func (sm *ShardManager) handleProbeMessage(shardID string, from peer.ID, now tim
 	sm.peers.RecordRole(shardID, from, roleProbe)
 
 	sm.mu.Lock()
-	probeRateLimited := !sm.lastProbeResponseTime.IsZero() && now.Sub(sm.lastProbeResponseTime) < probeResponseCooldown
-	if !probeRateLimited {
-		sm.lastProbeResponseTime = now
-	}
-	sm.mu.Unlock()
-
-	if probeRateLimited {
+	if !sm.lastProbeResponseTime.IsZero() && now.Sub(sm.lastProbeResponseTime) < probeResponseCooldown {
+		sm.mu.Unlock()
 		return
 	}
+	sm.lastProbeResponseTime = now
+	sm.mu.Unlock()
 
 	sm.mu.RLock()
-	cs := sm.currentShard
-	probeSub, probeSubExists := sm.shardSubs[shardID]
+	currentShard := sm.currentShard
+	sub, exists := sm.shardSubs[shardID]
 	sm.mu.RUnlock()
-	if shardID == cs && probeSubExists && probeSub.topic != nil && !probeSub.observerOnly {
-		pinnedCount := 0
-		if sm.storageMgr != nil {
-			pinnedCount = sm.storageMgr.GetPinnedCount()
-		}
-		role := sm.getOurRole()
-		hb := []byte(fmt.Sprintf("HEARTBEAT:%s:%d:%s:%s", sm.h.ID().String(), pinnedCount, role, sm.nodeName))
-		_ = probeSub.topic.Publish(sm.ctx, hb)
+	if shardID != currentShard || !exists || sub.topic == nil || sub.observerOnly {
+		return
 	}
+	_ = sub.topic.Publish(sm.ctx, sm.heartbeatMessage(sm.storageMgr.GetPinnedCount(), sm.getOurRole()))
 }
 
 func decodeCBORMessageType(data []byte) (schema.MessageType, error) {
@@ -274,38 +237,29 @@ func (sm *ShardManager) runReannouncePinsLoop() {
 	if sm.cfg.Replication.PinReannounceInterval <= 0 {
 		return
 	}
-	ticker := time.NewTicker(sm.cfg.Replication.PinReannounceInterval)
-	defer ticker.Stop()
+	sm.runEvery(sm.cfg.Replication.PinReannounceInterval, sm.reannouncePins)
+}
+
+// reannouncePins announces every pinned manifest the current shard is
+// responsible for.
+func (sm *ShardManager) reannouncePins() {
 	const delayBetweenPins = 40 * time.Millisecond
-	for {
-		select {
-		case <-sm.ctx.Done():
-			return
-		case <-ticker.C:
-			manifests := sm.storageMgr.GetPinnedManifests()
-			if len(manifests) == 0 {
-				continue
-			}
-			announced := 0
-			for _, manifestCIDStr := range manifests {
-				if common.IsLegacyManifest(sm.ctx, sm.ipfsClient, manifestCIDStr) {
-					continue
-				}
-				payloadCIDStr, _ := common.GetPayloadCIDForShardAssignment(sm.ctx, sm.ipfsClient, manifestCIDStr)
-				if !sm.AmIResponsibleFor(payloadCIDStr) {
-					continue
-				}
-				sm.AnnouncePinned(manifestCIDStr)
-				announced++
-				select {
-				case <-sm.ctx.Done():
-					return
-				case <-time.After(delayBetweenPins):
-				}
-			}
-			if announced > 0 {
-				slog.Debug("re-announced pins on current shard", "announced", announced, "interval", sm.cfg.Replication.PinReannounceInterval)
-			}
+	announced := 0
+	for _, manifestCIDStr := range sm.storageMgr.GetPinnedManifests() {
+		if common.IsLegacyManifest(sm.ctx, sm.ipfsClient, manifestCIDStr) {
+			continue
 		}
+		payloadCIDStr, _ := common.GetPayloadCIDForShardAssignment(sm.ctx, sm.ipfsClient, manifestCIDStr)
+		if !sm.AmIResponsibleFor(payloadCIDStr) {
+			continue
+		}
+		sm.AnnouncePinned(manifestCIDStr)
+		announced++
+		if !sm.sleep(delayBetweenPins) {
+			return
+		}
+	}
+	if announced > 0 {
+		slog.Debug("re-announced pins on current shard", "announced", announced, "interval", sm.cfg.Replication.PinReannounceInterval)
 	}
 }
