@@ -14,6 +14,16 @@ import (
 	"github.com/ipfs/go-cid"
 )
 
+const (
+	pinCheckTimeout = 30 * time.Second
+	// fetchTimeout bounds fetching and pinning one file that is not local yet.
+	fetchTimeout = 5 * time.Minute
+	// maxFetches is how many missing files are fetched at once. Fetches run
+	// beside the sync loop, so files that are already local are tracked
+	// without waiting for downloads.
+	maxFetches = 3
+)
+
 type ipfsPinner interface {
 	PinManifest(ctx context.Context, c cid.Cid) error
 	IsPinned(ctx context.Context, c cid.Cid) (bool, error)
@@ -32,6 +42,9 @@ type localPinTracker struct {
 	// tracked holds the CIDs synced from this shard's CRDT, so tracking can
 	// be released once they leave it.
 	tracked map[string]struct{}
+	// fetching holds the CIDs being fetched by a background worker.
+	fetching  map[string]struct{}
+	fetchSlot chan struct{}
 
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -59,6 +72,8 @@ func newLocalPinTracker(ipfsClient ipfsPinner, shardID string, onPinSynced func(
 		onPinRemoved: onPinRemoved,
 		origin:       origin,
 		tracked:      make(map[string]struct{}),
+		fetching:     make(map[string]struct{}),
+		fetchSlot:    make(chan struct{}, maxFetches),
 		ctx:          ctx,
 		cancel:       cancel,
 		trigger:      make(chan struct{}, 1),
@@ -126,40 +141,17 @@ func (pt *localPinTracker) syncState(consensus consensusClient) {
 			continue
 		}
 
-		block, getErr := pt.ipfsClient.GetBlock(pt.ctx, c)
-		if isLegacyManifestBlock(block) {
-			continue
-		}
-		if pt.origin != nil && pt.origin.RestrictsOrigins() {
-			if getErr != nil {
-				slog.Warn("refusing pin: cannot read manifest for origin check", "shard", pt.shardID, "cid", c, "error", getErr)
-				continue
-			}
-			if _, err := trust.CheckManifestOrigin(block, pt.origin); err != nil {
-				slog.Warn("refusing to store content from untrusted origin", "shard", pt.shardID, "cid", c, "error", err)
-				continue
-			}
-		}
-
-		isPinned, err := pt.ipfsClient.IsPinned(pt.ctx, c)
+		pinned, err := pt.isPinned(c)
 		if err != nil {
 			slog.Error("failed to check pin status", "shard", pt.shardID, "cid", c, "error", err)
 			continue
 		}
-		if !isPinned {
-			slog.Info("syncing pin to local ipfs", "shard", pt.shardID, "cid", c)
-			if err := pt.ipfsClient.PinManifest(pt.ctx, c); err != nil {
-				slog.Error("failed to pin", "shard", pt.shardID, "cid", c, "error", err)
-				continue
-			}
+		if !pinned {
+			pt.fetchAsync(c)
+			continue
 		}
-		pt.mu.Lock()
-		_, alreadyTracked := pt.tracked[cStr]
-		pt.tracked[cStr] = struct{}{}
-		pt.mu.Unlock()
-		// Notify only on the first sync; later syncs repeat every tick.
-		if !alreadyTracked && pt.onPinSynced != nil {
-			pt.onPinSynced(cStr)
+		if pt.accepts(c) {
+			pt.markTracked(cStr)
 		}
 	}
 
@@ -184,5 +176,89 @@ func (pt *localPinTracker) syncState(consensus consensusClient) {
 		pt.mu.Lock()
 		delete(pt.tracked, cidStr)
 		pt.mu.Unlock()
+	}
+}
+
+func (pt *localPinTracker) isPinned(c cid.Cid) (bool, error) {
+	ctx, cancel := context.WithTimeout(pt.ctx, pinCheckTimeout)
+	defer cancel()
+	return pt.ipfsClient.IsPinned(ctx, c)
+}
+
+// acceptsWithin reports whether c may be stored: it is not a legacy manifest and,
+// when origins are restricted, it was ingested by a trusted peer. A manifest
+// that is not local is fetched from the network until ctx ends.
+func (pt *localPinTracker) acceptsWithin(ctx context.Context, c cid.Cid) bool {
+	block, err := pt.ipfsClient.GetBlock(ctx, c)
+	if isLegacyManifestBlock(block) {
+		return false
+	}
+	if pt.origin == nil || !pt.origin.RestrictsOrigins() {
+		return true
+	}
+	if err != nil {
+		slog.Warn("refusing pin: cannot read manifest for origin check", "shard", pt.shardID, "cid", c, "error", err)
+		return false
+	}
+	if _, err := trust.CheckManifestOrigin(block, pt.origin); err != nil {
+		slog.Warn("refusing to store content from untrusted origin", "shard", pt.shardID, "cid", c, "error", err)
+		return false
+	}
+	return true
+}
+
+func (pt *localPinTracker) accepts(c cid.Cid) bool {
+	ctx, cancel := context.WithTimeout(pt.ctx, pinCheckTimeout)
+	defer cancel()
+	return pt.acceptsWithin(ctx, c)
+}
+
+// fetchAsync pins c in the background if a fetch slot is free. A file that is
+// not fetched now is tried again on a later sync.
+func (pt *localPinTracker) fetchAsync(c cid.Cid) {
+	cStr := c.String()
+	pt.mu.Lock()
+	if _, busy := pt.fetching[cStr]; busy {
+		pt.mu.Unlock()
+		return
+	}
+	select {
+	case pt.fetchSlot <- struct{}{}:
+	default:
+		pt.mu.Unlock()
+		return
+	}
+	pt.fetching[cStr] = struct{}{}
+	pt.mu.Unlock()
+
+	go func() {
+		defer func() {
+			pt.mu.Lock()
+			delete(pt.fetching, cStr)
+			pt.mu.Unlock()
+			<-pt.fetchSlot
+		}()
+		ctx, cancel := context.WithTimeout(pt.ctx, fetchTimeout)
+		defer cancel()
+		if !pt.acceptsWithin(ctx, c) {
+			return
+		}
+		slog.Info("syncing pin to local ipfs", "shard", pt.shardID, "cid", c)
+		if err := pt.ipfsClient.PinManifest(ctx, c); err != nil {
+			slog.Error("failed to pin", "shard", pt.shardID, "cid", c, "error", err)
+			return
+		}
+		pt.markTracked(cStr)
+	}()
+}
+
+// markTracked records cStr as synced and notifies onPinSynced the first time.
+func (pt *localPinTracker) markTracked(cStr string) {
+	pt.mu.Lock()
+	_, already := pt.tracked[cStr]
+	pt.tracked[cStr] = struct{}{}
+	pt.mu.Unlock()
+	if !already && pt.onPinSynced != nil {
+		pt.onPinSynced(cStr)
 	}
 }

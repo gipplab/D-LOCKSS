@@ -99,13 +99,25 @@ type ClusterManagerConfig struct {
 	OnPinRemoved func(cid string)
 }
 
+// crdtRouting is the routing given to ipfs-cluster's CRDT. Its blocks live in
+// this node's datastore, not in Kubo, and are exchanged with shard peers over
+// bitswap, so they are not announced: Kubo would reject each one as not found
+// locally, and the CRDT's reprovider would flood it with such requests.
+type crdtRouting struct{ routing.Routing }
+
+func (crdtRouting) Provide(context.Context, cid.Cid, bool) error { return nil }
+
 func NewClusterManager(cfg ClusterManagerConfig) *ClusterManager {
+	var dht routing.Routing
+	if cfg.DHT != nil {
+		dht = crdtRouting{cfg.DHT}
+	}
 	return &ClusterManager{
 		cfg:          cfg.Cfg,
 		host:         cfg.Host,
 		badBits:      cfg.BadBits,
 		pubsub:       cfg.PubSub,
-		dht:          cfg.DHT,
+		dht:          dht,
 		datastore:    cfg.Datastore,
 		ipfsClient:   cfg.IPFSClient,
 		trustedPeers: cfg.TrustedPeers,

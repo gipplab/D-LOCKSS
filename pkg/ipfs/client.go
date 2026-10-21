@@ -3,6 +3,7 @@ package ipfs
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -85,11 +86,20 @@ func (c *Client) PutDagCBOR(ctx context.Context, block []byte) (cid.Cid, error) 
 	return parsed, nil
 }
 
-// GetBlock fetches block bytes by CID. ctx unused (BlockGet has no cancel).
+// GetBlock fetches block bytes by CID. A block that is not local is fetched
+// from the network until ctx ends.
 func (c *Client) GetBlock(ctx context.Context, blockCID cid.Cid) ([]byte, error) {
-	b, err := c.api.BlockGet(blockCID.String())
+	resp, err := c.api.Request("block/get", blockCID.String()).Send(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get block %s: %w", blockCID, err)
+	}
+	defer resp.Close()
+	if resp.Error != nil {
+		return nil, fmt.Errorf("failed to get block %s: %w", blockCID, resp.Error)
+	}
+	b, err := io.ReadAll(resp.Output)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read block %s: %w", blockCID, err)
 	}
 	return b, nil
 }
@@ -154,7 +164,9 @@ func (c *Client) UnpinRecursive(ctx context.Context, root cid.Cid) error {
 // IsPinned reports whether root is pinned.
 func (c *Client) IsPinned(ctx context.Context, root cid.Cid) (bool, error) {
 	var raw struct{ Keys map[string]ipfsapi.PinInfo }
-	if err := c.api.Request("pin/ls", root.String()).Exec(ctx, &raw); err != nil {
+	// Manifests are always pinned recursively. Without a type, Kubo also
+	// checks indirect pins by walking every pinned DAG.
+	if err := c.api.Request("pin/ls", root.String()).Option("type", "recursive").Exec(ctx, &raw); err != nil {
 		// Kubo reports an unpinned CID as an error.
 		if strings.Contains(err.Error(), "is not pinned") {
 			return false, nil
