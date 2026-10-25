@@ -19,18 +19,20 @@ header .topic { color:var(--dim); }
 button { font:inherit; background:var(--bg); color:var(--fg); border:1px solid var(--line);
          padding:3px 10px; cursor:pointer; }
 button:hover { background:var(--fg); color:var(--bg); }
-input, select { font:inherit; border:1px solid var(--line); padding:3px 6px; background:var(--bg); color:var(--fg); }
+input, select { font:inherit; border:1px solid var(--line); padding:3px 6px; background:var(--bg); color:var(--fg);
+                max-width:100%; }
 section { border:1px solid var(--line); margin-bottom:14px; padding:10px; }
 section > h2 { font-size:12px; margin:-10px -10px 10px; padding:5px 10px; background:var(--fg);
                color:var(--bg); letter-spacing:1px; }
-.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; margin-bottom:14px; }
+.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(160px,100%),1fr)); gap:10px; margin-bottom:14px; }
 .card { border:1px solid var(--line); padding:10px; cursor:pointer; }
 .card .num { font-size:24px; font-weight:bold; }
 .card .lbl { color:var(--dim); font-size:11px; letter-spacing:1px; }
-.charts { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:14px; }
+.charts { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr)); gap:14px; }
 .chartbox { border:1px solid var(--line); padding:10px; }
 .chartbox h3 { margin:0 0 8px; font-size:12px; letter-spacing:1px; }
 .subline { color:var(--dim); font-size:11px; margin-top:6px; }
+.tablewrap { overflow-x:auto; } /* wide tables scroll inside their section, never the page */
 table { width:100%; border-collapse:collapse; }
 th, td { text-align:left; padding:4px 8px; border-bottom:1px solid var(--soft); vertical-align:top; }
 th { border-bottom:1px solid var(--line); font-size:11px; letter-spacing:1px; }
@@ -38,7 +40,7 @@ tr.passive { color:var(--dim); }
 .tag { border:1px solid var(--line); padding:0 4px; font-size:11px; }
 .tag.green { background:#dfd; }
 .tag.dim { color:var(--dim); border-color:var(--dim); }
-.peerid { color:var(--dim); font-size:11px; cursor:pointer; text-decoration:underline; }
+.peerid { color:var(--dim); font-size:11px; cursor:pointer; text-decoration:underline; word-break:break-all; }
 .shardbadge { background:var(--fg); color:var(--bg); padding:0 5px; }
 /* shard tree */
 .tree { overflow-x:auto; padding:8px 0; }
@@ -56,17 +58,17 @@ tr.passive { color:var(--dim); }
 .tree .box:hover .cnt { color:var(--bg); }
 /* modal */
 .modal-back { display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:10; }
-.modal { background:var(--bg); border:2px solid var(--line); max-width:720px; margin:6vh auto;
-         max-height:84vh; overflow:auto; padding:14px; }
+.modal { background:var(--bg); border:2px solid var(--line); width:min(720px, calc(100% - 24px));
+         margin:6vh auto; max-height:84vh; overflow:auto; padding:14px; }
 .modal h3 { margin-top:0; }
 .cidrow { border-bottom:1px solid var(--soft); padding:6px 0; }
 .cid { cursor:pointer; word-break:break-all; }
 .cid:hover { background:var(--soft); }
-.meta { color:var(--dim); font-size:11px; }
+.meta { color:var(--dim); font-size:11px; overflow-wrap:anywhere; }
 #toast { display:none; position:fixed; bottom:20px; left:50%; transform:translateX(-50%);
          background:var(--fg); color:var(--bg); padding:6px 14px; z-index:30; }
 /* search */
-.searchwrap { position:relative; display:inline-block; }
+.searchwrap { position:relative; display:inline-block; max-width:100%; }
 #suggest { display:none; position:absolute; top:100%; left:0; right:0; background:var(--bg);
            border:1px solid var(--line); z-index:5; max-height:220px; overflow:auto; }
 #suggest div { padding:3px 8px; cursor:pointer; }
@@ -130,10 +132,12 @@ label { display:block; margin:8px 0 2px; font-size:11px; letter-spacing:1px; }
 <section id="nodesec">
   <h2>NETWORK NODES</h2>
   <input id="nodeq" size="30" placeholder="filter nodes...">
+  <div class="tablewrap">
   <table>
     <thead><tr><th></th><th>PEER</th><th>SHARD</th><th>PEERS</th><th>PINNED</th><th>KNOWN</th><th>UPTIME</th><th>LAST SEEN</th></tr></thead>
     <tbody id="nodetbody"></tbody>
   </table>
+  </div>
 </section>
 
 <div class="modal-back" id="modalback" onclick="if(event.target===this)closeModal()">
@@ -173,7 +177,7 @@ const nodeChart = new Chart($('nodeChart'), { type:'bar',
     scales:{ y:{beginAtZero:true,ticks:{precision:0}} } } });
 const shardChart = new Chart($('shardChart'), { type:'doughnut',
   data:{ labels:[], datasets:[{data:[],backgroundColor:[]}] },
-  options:{ plugins:{legend:{position:'right'}},
+  options:{ plugins:{legend:{position: matchMedia('(max-width:700px)').matches ? 'bottom' : 'right'}},
     onClick:(e,els)=>{ if(els.length) openShardNodes(shardChart._ids[els[0].index]); } } });
 
 /* ---- refresh loops ---- */
