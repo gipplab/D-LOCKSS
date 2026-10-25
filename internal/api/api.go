@@ -1,75 +1,42 @@
+// Package api exposes the node's small observability HTTP endpoint.
 package api
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 )
 
-// APIServer serves the node's local health check and landing page.
-type APIServer struct {
-	server *http.Server
+// Server is the observability HTTP server: a liveness check, nothing more.
+type Server struct {
+	srv *http.Server
 }
 
-func NewAPIServer(port int) *APIServer {
-	s := &APIServer{}
-
+// New builds the server on the given port (all interfaces).
+func New(port int) *Server {
 	mux := http.NewServeMux()
-
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+		fmt.Fprint(w, "OK")
 	})
-
-	mux.HandleFunc("/", s.handleDashboard)
-
-	s.server = &http.Server{
-		Addr:    fmt.Sprintf(":%d", port),
-		Handler: mux,
-	}
-
-	return s
+	return &Server{srv: &http.Server{
+		Addr:         fmt.Sprintf(":%d", port),
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}}
 }
 
-func (s *APIServer) Start() {
+// Start serves in the background.
+func (s *Server) Start() {
 	go func() {
-		slog.Info("starting observability server", "addr", s.server.Addr)
-		if err := s.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("api server failed", "error", err)
+		if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Warn("api server stopped", "err", err)
 		}
 	}()
 }
 
-func (s *APIServer) Shutdown(ctx context.Context) error {
-	return s.server.Shutdown(ctx)
-}
-
-func (s *APIServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(dashboardHTML))
-}
-
-const dashboardHTML = `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>D-LOCKSS Node</title>
-  <style>
-    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
-    h1 { color: #333; }
-    a { color: #0066cc; }
-  </style>
-</head>
-<body>
-  <h1>D-LOCKSS Node</h1>
-  <p>This node is running. Use the <strong>D-LOCKSS Monitor</strong> for network-wide observability.</p>
-  <p><a href="/health">Health check</a></p>
-</body>
-</html>
-`
+// Shutdown stops the server gracefully.
+func (s *Server) Shutdown(ctx context.Context) error { return s.srv.Shutdown(ctx) }

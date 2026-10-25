@@ -1,78 +1,78 @@
+// Package badbits implements the content denylist (e.g. DMCA takedowns):
+// a CSV of CID strings that the node refuses to ingest, pin, or replicate.
 package badbits
 
 import (
 	"encoding/csv"
-	"log/slog"
 	"os"
 	"strings"
 	"sync"
 )
 
-// Filter holds a set of blocked CIDs loaded from a CSV file.
+// Filter is a set of blocked CID strings. The zero/nil Filter blocks nothing.
 type Filter struct {
-	mu     sync.RWMutex
-	cids   map[string]bool
-	loaded bool
+	mu      sync.RWMutex
+	blocked map[string]struct{}
 }
 
-// NewFilter loads a bad-bits list from path and returns a Filter.
-// If the file does not exist, blocking is disabled (no error).
-func NewFilter(path string) (*Filter, error) {
-	f := &Filter{cids: make(map[string]bool)}
-
+// Load reads the denylist CSV. The first column of each row is a CID string;
+// a header row is skipped unless it looks like a CID. A missing file yields
+// an empty (open) filter with no error.
+func Load(path string) (*Filter, error) {
+	f := &Filter{blocked: map[string]struct{}{}}
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			slog.Info("badbits file not found, content blocking disabled", "path", path)
 			return f, nil
 		}
-		return f, err
+		return nil, err
 	}
 	defer file.Close()
 
-	records, err := csv.NewReader(file).ReadAll()
+	r := csv.NewReader(file)
+	r.FieldsPerRecord = -1
+	rows, err := r.ReadAll()
 	if err != nil {
-		return f, err
+		return nil, err
 	}
-	if len(records) == 0 {
-		slog.Info("badbits file empty", "path", path)
-		return f, nil
-	}
-
-	for i, record := range records {
-		if len(record) == 0 {
+	for i, row := range rows {
+		if len(row) == 0 {
 			continue
 		}
-		val := strings.TrimSpace(record[0])
-		if val == "" {
+		v := strings.TrimSpace(row[0])
+		if v == "" {
 			continue
 		}
-		// The first row is a header unless it holds a CID.
-		if i == 0 && !looksLikeCID(val) {
-			continue
+		if i == 0 && !looksLikeCID(v) {
+			continue // header
 		}
-		f.cids[val] = true
+		f.blocked[v] = struct{}{}
 	}
-
-	f.loaded = true
-	slog.Info("loaded blocked cids", "count", len(f.cids), "path", path)
 	return f, nil
 }
 
 func looksLikeCID(s string) bool {
-	return strings.HasPrefix(s, "bafy") || strings.HasPrefix(s, "Qm") || strings.HasPrefix(s, "bafk")
+	return strings.HasPrefix(s, "bafy") || strings.HasPrefix(s, "bafk") || strings.HasPrefix(s, "Qm")
 }
 
-// IsBlocked returns true if the given CID is in the block list.
-// Returns false when the filter is nil or was not loaded.
-func (f *Filter) IsBlocked(cid string) bool {
+// IsBlocked reports whether the CID string is denylisted. Matching is exact:
+// CIDv0 and CIDv1 forms are distinct entries.
+func (f *Filter) IsBlocked(cidStr string) bool {
 	if f == nil {
 		return false
 	}
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	if !f.loaded {
-		return false
+	_, ok := f.blocked[cidStr]
+	return ok
+}
+
+// Len returns the number of blocked CIDs.
+func (f *Filter) Len() int {
+	if f == nil {
+		return 0
 	}
-	return f.cids[strings.TrimSpace(cid)]
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return len(f.blocked)
 }

@@ -1,431 +1,160 @@
-// Command dlockss runs a D-LOCKSS node: file ingestion, sharding, replication, and observability.
+// Command dlockss runs a D-LOCKSS preservation node: it ingests local and
+// Kubo-pinned content, wraps it in signed manifests, and keeps it replicated
+// across its shard of the network.
 package main
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"log"
 	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"sync"
 	"syscall"
 	"time"
 
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
+
 	"dlockss/internal/api"
 	"dlockss/internal/badbits"
-	"dlockss/internal/common"
 	"dlockss/internal/config"
-	"dlockss/internal/discovery"
-	"dlockss/internal/fileops"
 	"dlockss/internal/identity"
-	"dlockss/internal/managers/clusters"
-	"dlockss/internal/managers/shard"
-	"dlockss/internal/managers/storage"
-	"dlockss/internal/signing"
+	"dlockss/internal/ingest"
+	"dlockss/internal/kubo"
+	"dlockss/internal/p2p"
+	"dlockss/internal/pinset"
+	"dlockss/internal/protocol"
+	"dlockss/internal/shard"
+	"dlockss/internal/store"
 	"dlockss/internal/trust"
-	"dlockss/pkg/ipfs"
-	"dlockss/pkg/schema"
-
-	"github.com/ipfs/go-cid"
-	leveldb "github.com/ipfs/go-ds-leveldb"
-	"github.com/libp2p/go-libp2p"
-	kaddht "github.com/libp2p/go-libp2p-kad-dht"
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
-	"github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/libp2p/go-libp2p/core/host"
-	libp2pmetrics "github.com/libp2p/go-libp2p/core/metrics"
-	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
-	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
-	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
-	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
-	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
-	"github.com/libp2p/go-libp2p/p2p/security/noise"
-	"github.com/pbnjay/memory"
 )
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	var logLevel slog.LevelVar
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: &logLevel})))
-
 	cfg := config.LoadFromEnv()
-	cfg.Validate()
+	level := slog.LevelInfo
 	if cfg.VerboseLogging {
-		logLevel.Set(slog.LevelDebug)
+		level = slog.LevelDebug
 	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+	cfg.Validate()
 	cfg.Log()
 
-	if msg := cfg.ValidatePathSafetyCheck(); msg != "" {
-		log.Fatalf("[Fatal] Unsafe path configuration: %s", msg)
+	if err := cfg.ValidatePathSafety(); err != nil {
+		slog.Error("unsafe path layout", "err", err)
+		os.Exit(1)
 	}
 
-	badBitsFilter, err := badbits.NewFilter(cfg.BadBitsPath)
+	bb, err := badbits.Load(cfg.BadBitsPath)
 	if err != nil {
-		slog.Warn("failed to load bad bits list", "error", err)
+		slog.Warn("could not load BadBits denylist; content blocking is off", "path", cfg.BadBitsPath, "err", err)
+		bb = nil
+	} else if bb.Len() > 0 {
+		slog.Info("BadBits denylist loaded", "entries", bb.Len())
 	}
 
 	nodeName := identity.ResolveNodeName(cfg)
-	if nodeName != "" {
-		slog.Info("node name resolved", "name", nodeName)
-	}
 
-	ipfsClient, err := ipfs.NewClient(cfg.IPFSNodeAddress)
+	client, err := kubo.New(ctx, cfg.IPFSNodeAddress)
 	if err != nil {
-		log.Fatalf("[Fatal] IPFS not available: %v (start IPFS with: ipfs daemon)", err)
+		slog.Error("IPFS is not available; start the Kubo daemon first (ipfs daemon)", "err", err)
+		os.Exit(1)
 	}
-	dht := ipfs.NewIPFSDHTAdapterFromClient(ipfsClient)
 
-	privKey, err := identity.LoadKey(cfg)
+	key, err := identity.LoadKey(cfg)
 	if err != nil {
-		log.Fatalf("[Fatal] Failed to load identity: %v", err)
+		slog.Error("could not resolve node identity", "err", err)
+		os.Exit(1)
 	}
 
-	rcm, err := newResourceManager()
+	node, err := p2p.NewNode(ctx, cfg, key)
 	if err != nil {
-		log.Fatalf("[Fatal] Failed to create resource manager: %v", err)
+		slog.Error("could not start libp2p", "err", err)
+		os.Exit(1)
 	}
-	defer rcm.Close()
+	defer node.Close()
+	self := node.Host.ID()
+	slog.Info("node started", "peer_id", self, "name", nodeName, "private_network", cfg.PrivateNetwork)
 
-	bandwidthCounter := libp2pmetrics.NewBandwidthCounter()
-	h, err := newHost(cfg, privKey, rcm, bandwidthCounter)
+	ps, err := pubsub.NewGossipSub(ctx, node.Host)
 	if err != nil {
-		log.Fatalf("[Fatal] Failed to create libp2p host: %v", err)
-	}
-	defer h.Close()
-
-	slog.Info("libp2p host created", "peer_id", h.ID().String(), "private_network", cfg.PrivateNetwork)
-	if path := os.Getenv("DLOCKSS_BANDWIDTH_PATH"); path != "" {
-		go writeBandwidthSnapshots(ctx, bandwidthCounter, path)
+		slog.Error("could not start gossipsub", "err", err)
+		os.Exit(1)
 	}
 
-	ps, err := pubsub.NewGossipSub(ctx, h)
-	if err != nil {
-		log.Fatalf("[Fatal] Failed to create pubsub: %v", err)
-	}
-
-	// This DHT is the node's own, separate from the IPFS daemon's, and is
-	// used for rendezvous.
-	var dhtOpts []kaddht.Option
-	if cfg.DHTClient {
-		dhtOpts = append(dhtOpts, kaddht.Mode(kaddht.ModeClient))
-	}
-	kademliaDHT, err := kaddht.New(ctx, h, dhtOpts...)
-	if err != nil {
-		log.Fatalf("[Fatal] Failed to create DHT: %v", err)
-	}
-	if err = kademliaDHT.Bootstrap(ctx); err != nil {
-		log.Fatalf("[Fatal] Failed to bootstrap DHT: %v", err)
-	}
-
-	if !cfg.PrivateNetwork {
-		connectBootstrapPeers(ctx, h, cfg.BootstrapTimeout)
-	} else {
+	if cfg.PrivateNetwork {
 		slog.Info("private network mode: skipping public DHT bootstrap and AutoRelay")
+	} else {
+		p2p.ConnectBootstrapPeers(ctx, node.Host)
+	}
+	p2p.StartDiscovery(ctx, node.Host, node.DHT, cfg.DiscoveryServiceTag)
+
+	trustMgr := trust.NewManager(cfg.TrustMode)
+	if err := trustMgr.LoadStore(cfg.TrustStorePath); err != nil && !os.IsNotExist(err) {
+		slog.Error("could not load trust store", "path", cfg.TrustStorePath, "err", err)
+		os.Exit(1)
+	}
+	trustMgr.AddOrigins(cfg.IngestAllowlist)
+	if trustMgr.RestrictsOrigins() {
+		slog.Info("origin restriction active", "trusted_peers", trustMgr.Len(), "mode", trustMgr.Mode())
+	} else if trustMgr.Mode() == trust.ModeAllowlist {
+		slog.Info("allowlist mode with an empty trust list: accepting all origins")
 	}
 
-	startDiscovery(ctx, h, kademliaDHT, cfg.DiscoveryServiceTag)
+	st := store.New(client, bb)
+	disk := store.NewDiskMonitor(cfg.FileWatchFolder, cfg.DiskUsageHighWaterMark)
+	signer := protocol.NewSigner(self, key, trustMgr)
 
-	trustMgr, err := loadTrustManager(cfg)
+	pins, err := pinset.NewManager(ctx, cfg.ClusterStorePath, client, bb, trustMgr)
 	if err != nil {
-		log.Fatalf("[Fatal] Failed to load trust store %s: %v", cfg.Security.TrustStorePath, err)
+		slog.Error("could not open the pinset store", "err", err)
+		os.Exit(1)
 	}
 
-	// The cluster store must live outside FileWatchFolder, or the node would
-	// ingest its own database files (see Config.ValidatePathSafetyCheck).
-	dstore, err := leveldb.NewDatastore(cfg.ClusterStorePath, nil)
-	if err != nil {
-		log.Fatalf("[Fatal] Failed to create datastore at %s: %v", cfg.ClusterStorePath, err)
-	}
-	defer dstore.Close()
-
-	rateLimiter := common.NewRateLimiter(cfg.RateLimitWindow, cfg.MaxMessagesPerWindow)
-	storageMgr := storage.NewStorageManager(cfg, dht, badBitsFilter)
-	signer := signing.NewSigner(signing.SignerConfig{
-		Cfg:      cfg,
-		Host:     h,
-		PrivKey:  privKey,
-		PeerID:   h.ID(),
-		TrustMgr: trustMgr,
-		DHT:      dht,
-	})
-
-	// announcePinned is set once the shard manager exists, which itself
-	// depends on the cluster manager.
-	var announcePinned func(string)
-	// onPinSynced runs when the PinTracker syncs a pin from the CRDT.
-	// Announcing PINNED right away lets the monitor see the replica before the
-	// next heartbeat batch, and providing manifest and payload lets retrieval
-	// checkers and gateways see every replica as a provider.
-	onPinSynced := func(manifestCIDStr string) {
-		storageMgr.PinFile(manifestCIDStr)
-		if announcePinned != nil {
-			announcePinned(manifestCIDStr)
-		}
-		go func() {
-			pctx, pcancel := context.WithTimeout(ctx, cfg.Files.DHTProvideTimeout)
-			defer pcancel()
-			storageMgr.ProvideFile(pctx, manifestCIDStr)
-		}()
-		go func() {
-			pctx, pcancel := context.WithTimeout(ctx, cfg.Files.DHTProvideTimeout)
-			defer pcancel()
-			pinAndProvidePayload(pctx, ipfsClient, storageMgr, manifestCIDStr)
-		}()
-	}
-	clusterMgr := clusters.NewClusterManager(clusters.ClusterManagerConfig{
-		Cfg:          cfg,
-		Host:         h,
-		PubSub:       ps,
-		DHT:          dht,
-		Datastore:    dstore,
-		IPFSClient:   ipfsClient,
-		TrustedPeers: trustMgr.GetTrustedPeers(),
-		Origin:       trustMgr,
-		BadBits:      badBitsFilter,
-		OnPinSynced:  onPinSynced,
-		OnPinRemoved: storageMgr.UnpinFile,
-	})
-	shardMgr, err := shard.NewShardManager(shard.ShardManagerConfig{
-		Cfg:         cfg,
-		Ctx:         ctx,
-		Host:        h,
-		PubSub:      ps,
-		IPFSClient:  ipfsClient,
-		Storage:     storageMgr,
-		Signer:      signer,
-		RateLimiter: rateLimiter,
-		Cluster:     clusterMgr,
-		Origin:      trustMgr,
-		NodeName:    nodeName,
+	shardMgr, err := shard.New(ctx, shard.Deps{
+		Config:   cfg,
+		Self:     self,
+		NodeName: nodeName,
+		PubSub:   ps,
+		Signer:   signer,
+		Trust:    trustMgr,
+		Store:    st,
+		Disk:     disk,
+		Pins:     pins,
+		Client:   client,
 	})
 	if err != nil {
-		log.Fatalf("[Fatal] Failed to initialize shard manager: %v", err)
+		slog.Error("could not build the shard manager", "err", err)
+		os.Exit(1)
 	}
-	clusterMgr.SetShardPeerProvider(shardMgr) // CRDT Peers() and allocations use real shard membership
-	announcePinned = shardMgr.AnnouncePinned
 
-	apiServer := api.NewAPIServer(cfg.APIPort)
+	pins.OnSynced = shardMgr.OnPinSynced
+	pins.OnRemoved = st.Unpin
+
+	apiServer := api.New(cfg.APIPort)
 	apiServer.Start()
 
-	fp := fileops.NewFileProcessor(fileops.FileProcessorConfig{
-		Cfg:        cfg,
-		IPFSClient: ipfsClient,
-		Shard:      shardMgr,
-		Storage:    storageMgr,
-		PrivKey:    privKey,
-		Signer:     signer,
-		BadBits:    badBitsFilter,
-	})
-	go fp.WatchFolder(ctx)
+	if err := shardMgr.Run(); err != nil {
+		slog.Error("could not start the shard manager", "err", err)
+		os.Exit(1)
+	}
 
-	// The shard manager must run before existing files are scanned, so the
-	// node joins its shard and learns of splits before re-ingesting.
-	shardMgr.Run()
-
-	// The scan waits for the node to settle into its shard (discovery, split
-	// rebroadcast). Re-ingesting replaces legacy manifests that carry
-	// timestamps with deterministic ones.
-	go func() {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(15 * time.Second):
-		}
-		fp.ScanExistingFiles()
-		if cfg.Files.PinIngestEnabled {
-			go fp.WatchPins(ctx)
-		}
-	}()
+	// The first rescan only records candidates and the second (30 s later)
+	// ingests, so the shard manager has settled before announcements start.
+	proc := ingest.NewProcessor(cfg, client, st, bb, signer, shardMgr, self)
+	go proc.WatchFolder(ctx)
+	if cfg.PinIngestEnabled {
+		go proc.WatchPins(ctx)
+	}
 
 	<-ctx.Done()
 	slog.Info("shutting down")
-	fp.Stop()
 	if err := shardMgr.Close(); err != nil {
-		slog.Error("shard manager close error", "error", err)
+		slog.Warn("shard manager shutdown", "err", err)
 	}
-	_ = apiServer.Shutdown(context.Background())
-}
-
-// newResourceManager scales libp2p's default limits to an eighth of system
-// memory, but never below 384 MiB, so shard peers can always connect. Plain
-// AutoScale on low-memory nodes can hit "resource limit exceeded" and block
-// shard coordination.
-func newResourceManager() (network.ResourceManager, error) {
-	limits := rcmgr.DefaultLimits
-	libp2p.SetDefaultServiceLimits(&limits)
-	const minMemForScale = 384 << 20
-	mem := max(memory.TotalMemory()/8, minMemForScale)
-	return rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(limits.Scale(int64(mem), 512)))
-}
-
-func newHost(cfg *config.Config, privKey crypto.PrivKey, rcm network.ResourceManager, bandwidth *libp2pmetrics.BandwidthCounter) (host.Host, error) {
-	cm, err := connmgr.NewConnManager(cfg.ConnLowWater, cfg.ConnHighWater)
-	if err != nil {
-		return nil, fmt.Errorf("connection manager: %w", err)
-	}
-	opts := []libp2p.Option{
-		libp2p.ConnectionManager(cm),
-		libp2p.ResourceManager(rcm),
-		libp2p.Identity(privKey),
-		libp2p.ListenAddrStrings(
-			"/ip4/0.0.0.0/tcp/0",
-			"/ip6/::/tcp/0",
-			"/ip4/0.0.0.0/udp/0/quic-v1",
-			"/ip6/::/udp/0/quic-v1",
-		),
-		libp2p.Security(noise.ID, noise.New),
-		libp2p.BandwidthReporter(bandwidth),
-	}
-	if !cfg.PrivateNetwork {
-		opts = append(opts,
-			libp2p.NATPortMap(),
-			libp2p.EnableHolePunching(),
-			libp2p.EnableAutoRelayWithStaticRelays(kaddht.GetDefaultBootstrapPeerAddrInfos()),
-			libp2p.EnableNATService(),
-		)
-	}
-	return libp2p.New(opts...)
-}
-
-// connectBootstrapPeers dials the public bootstrap peers in parallel and
-// returns once every dial has finished or timeout has elapsed.
-func connectBootstrapPeers(ctx context.Context, h host.Host, timeout time.Duration) {
-	var wg sync.WaitGroup
-	for _, addr := range kaddht.DefaultBootstrapPeers {
-		info, err := peer.AddrInfoFromP2pAddr(addr)
-		if err != nil {
-			continue
-		}
-		wg.Go(func() {
-			h.Connect(ctx, *info)
-		})
-	}
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(timeout):
-		slog.Warn("bootstrap timeout, proceeding with partial connectivity", "timeout", timeout)
-	}
-}
-
-// startDiscovery advertises tag on the DHT and on mDNS, so nodes and the
-// monitor (which uses the same tag) find each other, and starts the peer
-// finder.
-func startDiscovery(ctx context.Context, h host.Host, kademliaDHT *kaddht.IpfsDHT, tag string) {
-	routingDiscovery := routing.NewRoutingDiscovery(kademliaDHT)
-	dutil.Advertise(ctx, routingDiscovery, tag)
-	slog.Info("advertising service on DHT", "tag", tag)
-
-	mdnsSvc := mdns.NewMdnsService(h, tag, &discovery.DiscoveryNotifee{H: h, Ctx: ctx})
-	if err := mdnsSvc.Start(); err != nil {
-		slog.Warn("mDNS start failed, peer/monitor discovery limited", "error", err)
-	}
-
-	go discovery.RunPeerFinder(ctx, h, routingDiscovery, tag)
-}
-
-// loadTrustManager loads the trust store, which decides whose data this node
-// stores and, in allowlist mode, who may send signed protocol messages or
-// write CRDT pins. A missing trust store is not an error.
-func loadTrustManager(cfg *config.Config) (*trust.TrustManager, error) {
-	trustMgr := trust.NewTrustManager(cfg.Security.TrustMode)
-	if err := trustMgr.LoadTrustedPeers(cfg.Security.TrustStorePath); err != nil {
-		if !os.IsNotExist(err) {
-			return nil, err
-		}
-		if cfg.Security.TrustMode == "allowlist" {
-			slog.Info("trust mode is allowlist but trust store is missing; accepting all origins", "path", cfg.Security.TrustStorePath)
-		}
-	}
-	if added, invalid := trustMgr.AddOrigins(cfg.IngestAllowlist); len(invalid) > 0 {
-		slog.Warn("ignoring invalid peer IDs in DLOCKSS_INGEST_ALLOWLIST", "ids", invalid, "accepted", added)
-	}
-	slog.Info("data origin policy",
-		"restrict", trustMgr.RestrictsOrigins(),
-		"trusted_origins", len(trustMgr.GetTrustedPeers()),
-		"trust_mode", cfg.Security.TrustMode,
-		"trust_store", cfg.Security.TrustStorePath,
-	)
-	return trustMgr, nil
-}
-
-// pinAndProvidePayload pins the payload of a manifest as its own root, so
-// Kubo's "pinned" reprovider strategy re-announces it, and provides it to the
-// DHT. Replicas pin only the manifest, so this adds the missing payload pin;
-// the blocks are already local through the manifest's recursive pin.
-func pinAndProvidePayload(ctx context.Context, ipfsClient *ipfs.Client, storageMgr *storage.StorageManager, manifestCIDStr string) {
-	manifestCID, err := cid.Decode(manifestCIDStr)
-	if err != nil {
-		return
-	}
-	block, err := ipfsClient.GetBlock(ctx, manifestCID)
-	if err != nil {
-		slog.Warn("failed to resolve payload from manifest", "manifest", manifestCIDStr, "error", err)
-		return
-	}
-	var ro schema.ResearchObject
-	if err := ro.UnmarshalCBOR(block); err != nil || ro.HasLegacyTimestamp || !ro.Payload.Defined() {
-		return
-	}
-	if err := ipfsClient.PinRecursive(ctx, ro.Payload); err != nil {
-		slog.Warn("failed to pin payload", "payload", ro.Payload, "error", err)
-	}
-	storageMgr.ProvideFile(ctx, ro.Payload.String())
-}
-
-type bandwidthSnapshot struct {
-	Total     libp2pmetrics.Stats            `json:"total"`
-	Protocols map[string]libp2pmetrics.Stats `json:"protocols"`
-}
-
-func writeBandwidthSnapshots(ctx context.Context, counter *libp2pmetrics.BandwidthCounter, path string) {
-	write := func() {
-		protocols := make(map[string]libp2pmetrics.Stats)
-		for id, stats := range counter.GetBandwidthByProtocol() {
-			protocols[string(id)] = stats
-		}
-		data, err := json.Marshal(bandwidthSnapshot{
-			Total:     counter.GetBandwidthTotals(),
-			Protocols: protocols,
-		})
-		if err != nil {
-			slog.Warn("failed to marshal bandwidth snapshot", "error", err)
-			return
-		}
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			slog.Warn("failed to create bandwidth snapshot directory", "error", err)
-			return
-		}
-		tmp := path + ".tmp"
-		if err := os.WriteFile(tmp, data, 0o644); err != nil {
-			slog.Warn("failed to write bandwidth snapshot", "error", err)
-			return
-		}
-		if err := os.Rename(tmp, path); err != nil {
-			slog.Warn("failed to publish bandwidth snapshot", "error", err)
-		}
-	}
-
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			write()
-		case <-ctx.Done():
-			write()
-			return
-		}
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := apiServer.Shutdown(shutdownCtx); err != nil {
+		slog.Warn("api shutdown", "err", err)
 	}
 }

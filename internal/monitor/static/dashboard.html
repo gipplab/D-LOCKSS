@@ -1,674 +1,446 @@
-<!DOCTYPE html>
-<html>
+<!doctype html>
+<html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>D-LOCKSS Network Monitor</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js" integrity="sha384-e6nUZLBkQ86NJ6TVVKAeSaK8jWa3NhkYWZFomE39AvDbQWeie9PlQqM3pmYW5d1g" crossorigin="anonymous"></script>
-    <style>
-        body { font-family: "Courier New", Courier, monospace; margin: 20px; background: #f8f9fa; color: #333; }
-        .container { max-width: 1600px; margin: 0 auto; }
-        h1 { color: #222; text-transform: uppercase; border-bottom: 2px solid #333; padding-bottom: 10px; }
-        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0; }
-        .stat-card { background: white; padding: 15px; border: 1px solid #333; }
-        .stat-value { font-size: 2em; font-weight: 700; color: #000; }
-        .stat-label { color: #555; font-size: 0.8em; text-transform: uppercase; margin-top: 5px; }
-        .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 20px; margin: 20px 0; }
-        .chart-container { background: white; padding: 20px; border: 1px solid #333; }
-        .shard-tree-section { background: white; padding: 20px; margin: 20px 0; border: 1px solid #333; overflow-x: auto; }
-        .tree-chart { display: flex; justify-content: center; padding: 20px 0; min-width: max-content; }
-        .tree-node { display: flex; flex-direction: column; align-items: center; position: relative; padding: 20px 5px 0 5px; }
-        .tree-node::before, .tree-node::after { content: ''; position: absolute; top: 0; right: 50%; border-top: 1px solid #333; width: 50%; height: 20px; }
-        .tree-node::after { right: auto; left: 50%; border-left: 1px solid #333; }
-        .tree-node:only-child::after, .tree-node:only-child::before { display: none; }
-        .tree-node:first-child::before, .tree-node:last-child::after { border: 0 none; }
-        .tree-node:last-child::before { border-right: 1px solid #333; border-radius: 0 5px 0 0; }
-        .tree-node:first-child::after { border-radius: 5px 0 0 0; }
-        .node-content { border: 1px solid #333; padding: 5px 10px; text-align: center; background: #fff; z-index: 2; font-size: 0.85em; min-width: 80px; box-shadow: 2px 2px 0px #eee; }
-        .node-content:hover { background: #f5f5f5; }
-        .node-id { font-weight: bold; color: #000; margin-bottom: 2px; }
-        .node-count { font-size: 0.8em; color: #555; }
-        .node-children { display: flex; flex-direction: row; padding-top: 20px; position: relative; }
-        .node-children::before { content: ''; position: absolute; top: 0; left: 50%; border-left: 1px solid #333; width: 0; height: 20px; }
-        .node-table { background: white; padding: 20px; margin: 20px 0; border: 1px solid #333; }
-        table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
-        th { text-align: left; padding: 10px; border-bottom: 2px solid #333; background: #eee; text-transform: uppercase; font-size: 0.8em; }
-        td { padding: 10px; border-bottom: 1px solid #ddd; }
-        .status-text { font-weight: bold; font-size: 0.8em; }
-        .status-online { color: green; }
-        .status-full { color: #999; }
-        tr.node-passive { opacity: 0.45; }
-        tr.node-passive td { color: #999; }
-        .btn-text { background: none; border: 1px solid #999; cursor: pointer; font-family: inherit; font-size: 0.8em; padding: 2px 6px; text-transform: uppercase; color: #333; }
-        .btn-text:hover { background: #eee; color: #000; border-color: #333; }
-        .btn-save { border-color: green; color: green; }
-        .btn-cancel { border-color: red; color: red; }
-        .shard-badge { background: #eee; padding: 2px 6px; font-size: 0.9em; border: 1px solid #ccc; }
-        .alias-input { font-family: inherit; padding: 4px; border: 1px solid #333; width: 120px; }
-        .stat-card.clickable { cursor: pointer; }
-        .stat-card.clickable:hover { background: #f0f0f0; }
-        .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1000; }
-        .modal { background: white; border: 2px solid #333; max-width: 90vw; max-height: 85vh; overflow: hidden; display: flex; flex-direction: column; }
-        .modal-header { padding: 15px 20px; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center; }
-        .modal-body { padding: 20px; overflow-y: auto; flex: 1; }
-        .cid-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid #eee; font-size: 0.85em; flex-wrap: nowrap; }
-        .cid-row .cid-value { font-family: monospace; white-space: nowrap; flex: 1; min-width: 200px; cursor: pointer; }
-        .cid-row .cid-value:hover { color: #06A77D; }
-        .cid-row .cid-meta { color: #666; font-size: 0.9em; white-space: nowrap; }
-        .copy-toast { position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%); background: #333; color: #fff; padding: 8px 20px; font-size: 0.85em; z-index: 2000; opacity: 0; transition: opacity 0.3s; pointer-events: none; }
-        .cid-row .cid-actions { display: flex; gap: 6px; flex-shrink: 0; }
-
-        .load-spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #ccc; border-top-color: #06A77D; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; }
-        @keyframes spin { to { transform: rotate(360deg); } }
-        .keyword-search-section { background: white; padding: 20px; margin: 20px 0; border: 1px solid #333; }
-        .kw-search-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
-        .kw-input-wrap { position: relative; flex: 1; max-width: 500px; }
-        .kw-input-wrap input { width: 100%; padding: 10px 12px; border: 1px solid #333; font-family: inherit; font-size: 0.95em; box-sizing: border-box; }
-        .kw-input-wrap input:focus { outline: none; border-color: #06A77D; }
-        .kw-ac { position: absolute; top: 100%; left: 0; right: 0; background: white; border: 1px solid #333; border-top: none; max-height: 220px; overflow-y: auto; z-index: 100; display: none; }
-        .kw-ac-item { padding: 8px 12px; cursor: pointer; display: flex; justify-content: space-between; font-size: 0.85em; }
-        .kw-ac-item:hover, .kw-ac-item.active { background: #f0f0f0; }
-        .kw-ac-count { color: #999; font-size: 0.85em; }
-        .kw-search-btn { padding: 10px 20px !important; font-size: 0.95em !important; }
-        .kw-stats-lbl { font-size: 0.75em; color: #999; white-space: nowrap; }
-        .kw-recent { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-        .kw-recent-label { font-size: 0.75em; color: #999; text-transform: uppercase; margin-right: 4px; }
-        .kw-tag-btn { background: #eee; border: 1px solid #ccc; padding: 3px 10px; font-size: 0.8em; cursor: pointer; text-transform: lowercase; font-family: inherit; }
-        .kw-tag-btn:hover { background: #ddd; border-color: #999; }
-        .kw-results { margin-top: 15px; }
-        .kw-results-hdr { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid #ddd; }
-        .kw-result-item { display: flex; flex-direction: column; gap: 4px; padding: 10px 0; border-bottom: 1px solid #eee; font-size: 0.85em; }
-        .kw-result-top { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-        .kw-result-cid { font-family: monospace; word-break: break-all; flex: 1; min-width: 200px; }
-        .kw-result-meta { color: #666; font-size: 0.9em; }
-        .kw-result-kws { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
-        .kw-kw-tag { background: #e8f5e9; border: 1px solid #a5d6a7; padding: 1px 6px; font-size: 0.8em; border-radius: 2px; cursor: pointer; }
-        .kw-kw-tag:hover { background: #c8e6c9; }
-        .kw-class { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
-        .kw-class-tag { padding: 1px 8px; font-size: 0.8em; border-radius: 2px; cursor: pointer; border: 1px solid; }
-        .kw-class-tag:hover { filter: brightness(0.92); }
-        .kw-field { background: #e3f2fd; border-color: #90caf9; color: #1565c0; }
-        .kw-subtopic { background: #f3e5f5; border-color: #ce93d8; color: #7b1fa2; }
-        .kw-niche { background: #fff3e0; border-color: #ffcc80; color: #e65100; }
-        .kw-pagination { display: flex; justify-content: center; align-items: center; gap: 6px; margin-top: 12px; padding-top: 10px; border-top: 1px solid #eee; }
-        .kw-page-btn { background: #eee; border: 1px solid #ccc; padding: 4px 12px; font-size: 0.85em; cursor: pointer; font-family: inherit; }
-        .kw-page-btn:hover { background: #ddd; border-color: #999; }
-        .kw-page-btn.active { background: #333; color: white; border-color: #333; }
-        .kw-page-btn:disabled { opacity: 0.4; cursor: default; }
-        .kw-page-info { font-size: 0.8em; color: #666; }
-        .kw-settings-field { display: flex; flex-direction: column; gap: 4px; margin-top: 12px; font-size: 0.85em; }
-        .kw-settings-field input, .kw-settings-field select { padding: 8px 10px; border: 1px solid #333; font-family: inherit; font-size: 0.95em; }
-    </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>D-LOCKSS Monitor</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"
+        integrity="sha384-e6nUZLBkQ86NJ6TVVKAeSaK8jWa3NhkYWZFomE39AvDbQWeie9PlQqM3pmYW5d1g"
+        crossorigin="anonymous"></script>
+<style>
+:root { --fg:#111; --bg:#fff; --dim:#666; --line:#111; --soft:#eee; }
+* { box-sizing:border-box; }
+body { font-family:"SF Mono",Menlo,Consolas,monospace; background:var(--bg); color:var(--fg);
+       margin:0; padding:16px; font-size:13px; }
+h1 { font-size:16px; margin:0; letter-spacing:1px; }
+header { display:flex; align-items:baseline; gap:16px; border-bottom:2px solid var(--line);
+         padding-bottom:10px; margin-bottom:14px; flex-wrap:wrap; }
+header .topic { color:var(--dim); }
+button { font:inherit; background:var(--bg); color:var(--fg); border:1px solid var(--line);
+         padding:3px 10px; cursor:pointer; }
+button:hover { background:var(--fg); color:var(--bg); }
+input, select { font:inherit; border:1px solid var(--line); padding:3px 6px; background:var(--bg); color:var(--fg); }
+section { border:1px solid var(--line); margin-bottom:14px; padding:10px; }
+section > h2 { font-size:12px; margin:-10px -10px 10px; padding:5px 10px; background:var(--fg);
+               color:var(--bg); letter-spacing:1px; }
+.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; margin-bottom:14px; }
+.card { border:1px solid var(--line); padding:10px; cursor:pointer; }
+.card .num { font-size:24px; font-weight:bold; }
+.card .lbl { color:var(--dim); font-size:11px; letter-spacing:1px; }
+.charts { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:14px; }
+.chartbox { border:1px solid var(--line); padding:10px; }
+.chartbox h3 { margin:0 0 8px; font-size:12px; letter-spacing:1px; }
+.subline { color:var(--dim); font-size:11px; margin-top:6px; }
+table { width:100%; border-collapse:collapse; }
+th, td { text-align:left; padding:4px 8px; border-bottom:1px solid var(--soft); vertical-align:top; }
+th { border-bottom:1px solid var(--line); font-size:11px; letter-spacing:1px; }
+tr.passive { color:var(--dim); }
+.tag { border:1px solid var(--line); padding:0 4px; font-size:11px; }
+.tag.green { background:#dfd; }
+.tag.dim { color:var(--dim); border-color:var(--dim); }
+.peerid { color:var(--dim); font-size:11px; cursor:pointer; text-decoration:underline; }
+.shardbadge { background:var(--fg); color:var(--bg); padding:0 5px; }
+/* shard tree */
+.tree { overflow-x:auto; padding:8px 0; }
+.tree ul { display:flex; justify-content:center; padding-top:16px; position:relative; margin:0; list-style:none; }
+.tree li { padding:16px 6px 0; position:relative; }
+.tree li::before { content:""; position:absolute; top:0; left:50%; width:1px; height:16px; background:var(--line); }
+.tree > ul > li::before { display:none; }
+.tree li::after { content:""; position:absolute; top:0; left:0; right:0; height:1px; background:var(--line); }
+.tree li:first-child::after { left:50%; }
+.tree li:last-child::after { right:50%; }
+.tree li:only-child::after { display:none; }
+.tree .box { border:1px solid var(--line); padding:5px 10px; cursor:pointer; text-align:center; white-space:nowrap; }
+.tree .box:hover { background:var(--fg); color:var(--bg); }
+.tree .box .cnt { color:var(--dim); font-size:11px; }
+.tree .box:hover .cnt { color:var(--bg); }
+/* modal */
+.modal-back { display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:10; }
+.modal { background:var(--bg); border:2px solid var(--line); max-width:720px; margin:6vh auto;
+         max-height:84vh; overflow:auto; padding:14px; }
+.modal h3 { margin-top:0; }
+.cidrow { border-bottom:1px solid var(--soft); padding:6px 0; }
+.cid { cursor:pointer; word-break:break-all; }
+.cid:hover { background:var(--soft); }
+.meta { color:var(--dim); font-size:11px; }
+#toast { display:none; position:fixed; bottom:20px; left:50%; transform:translateX(-50%);
+         background:var(--fg); color:var(--bg); padding:6px 14px; z-index:30; }
+/* search */
+.searchwrap { position:relative; display:inline-block; }
+#suggest { display:none; position:absolute; top:100%; left:0; right:0; background:var(--bg);
+           border:1px solid var(--line); z-index:5; max-height:220px; overflow:auto; }
+#suggest div { padding:3px 8px; cursor:pointer; }
+#suggest div.sel, #suggest div:hover { background:var(--fg); color:var(--bg); }
+.chip { display:inline-block; border:1px solid var(--line); padding:1px 7px; margin:2px; cursor:pointer; font-size:11px; }
+.chip:hover { background:var(--fg); color:var(--bg); }
+.result { border-bottom:1px solid var(--soft); padding:8px 0; }
+.result .title { font-weight:bold; }
+.tags .chip.f { background:#eef; } .tags .chip.s { background:#efe; } .tags .chip.n { background:#fee; }
+.pager button { margin-right:4px; }
+.err { color:#a00; }
+.help { color:var(--dim); font-size:11px; }
+label { display:block; margin:8px 0 2px; font-size:11px; letter-spacing:1px; }
+.alias-edit input { width:110px; }
+</style>
 </head>
 <body>
-    <div class="container">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 20px;">
-            <h1>D-LOCKSS Monitor</h1>
-            <div style="font-size: 0.9em; text-align: right;">
-                <div>SYSTEM STATUS: <span class="status-text status-online">[ONLINE]</span> <button class="btn-text" id="kwSettingsBtn" style="margin-left:8px;">SETTINGS</button></div>
-                <div id="root-topic-row" style="font-size: 0.75em; color: #666; margin-top: 4px; word-break: break-all;">
-                    Topic: <span id="topic-name-value" style="font-weight:bold;">--</span>
-                    <span style="margin-left: 8px;">Prefix: <span id="root-topic-value">--</span></span>
-                </div>
-            </div>
-        </div>
-        <div class="keyword-search-section">
-            <div id="kwSetup" style="display:none;">
-                <div style="display:flex; justify-content:space-between; align-items:center;">
-                    <h3 style="margin:0; text-transform:uppercase; font-size:1em;">Keyword Search</h3>
-                    <span class="kw-stats-lbl">API key not set</span>
-                </div>
-                <p style="font-size:0.85em; color:#555; margin:10px 0 0 0;">Open SETTINGS to choose Google AI Studio or SAIA. The key you save is the password for later changes.</p>
-            </div>
-            <div id="kwSearchUI" style="display:none;">
-                <div style="display:flex; justify-content:space-between; align-items:center;">
-                    <h3 style="margin:0; text-transform:uppercase; font-size:1em;">Keyword Search</h3>
-                    <span id="kwStatsLbl" class="kw-stats-lbl"></span>
-                </div>
-                <div class="kw-search-row">
-                    <div class="kw-input-wrap">
-                        <input type="text" id="kwInput" placeholder="Search documents by keyword..." autocomplete="off">
-                        <div id="kwAC" class="kw-ac"></div>
-                    </div>
-                    <button class="btn-text kw-search-btn" id="kwSearchBtn">SEARCH</button>
-                </div>
-                <div id="kwRecent" class="kw-recent"></div>
-                <div id="kwResults" class="kw-results" style="display:none;"></div>
-            </div>
-        </div>
-        <div class="stats">
-            <div class="stat-card clickable" id="total-nodes-card" title="Click to jump to Network Nodes"><div class="stat-value" id="total-nodes">--</div><div class="stat-label">Total Nodes</div></div>
-            <div class="stat-card"><div class="stat-value" id="total-pinned">--</div><div class="stat-label">Total Pinned</div></div>
-            <div class="stat-card clickable" id="unique-cids-card" title="Click to view all CIDs"><div class="stat-value" id="unique-files">--</div><div class="stat-label">Unique CIDs</div></div>
-            <div class="stat-card clickable" id="total-shards-card" title="Click to jump to Shard Topology"><div class="stat-value" id="total-shards">--</div><div class="stat-label">Active Shards</div></div>
-        </div>
-        <div class="charts">
-            <div class="chart-container" style="cursor: pointer;"><h3 style="margin-top:0; text-transform:uppercase; font-size:1em;">Replication Status</h3><p style="font-size:0.75em; color:#666; margin:0 0 10px 0;">Network-wide (all shards). Nodes unpin files that no longer belong to their shard after a split.</p><canvas id="replicationChart"></canvas><div id="replicationByShard" style="font-size:0.8em; margin-top:10px; color:#555;"></div></div>
-            <div class="chart-container" style="cursor: pointer;"><h3 style="margin-top:0; text-transform:uppercase; font-size:1em;">Pinned Files per Node</h3><canvas id="filesChart"></canvas></div>
-            <div class="chart-container" style="cursor: pointer;"><h3 style="margin-top:0; text-transform:uppercase; font-size:1em;">Shard Distribution</h3><canvas id="shardChart"></canvas></div>
-        </div>
-        <div class="shard-tree-section" id="shard-topology-section"><h3 style="margin-top:0; text-transform:uppercase; font-size:1em;">Shard Topology Chart</h3><div id="shardTreeContainer" class="tree-chart"></div></div>
-        <div class="node-table" id="network-nodes-section">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
-                <h3 style="margin:0; text-transform:uppercase; font-size:1em;">Network Nodes</h3>
-                <input type="text" id="nodeSearch" placeholder="SEARCH ID/SHARD..." style="padding: 8px; border: 1px solid #333; width: 300px; font-family:inherit;" onkeyup="debouncedFilter()">
-            </div>
-            <table id="nodeTable"><thead><tr><th style="width: 80px;">Action</th><th>Peer ID</th><th>Shard</th><th>Peers</th><th>Pinned</th><th>Known</th><th>Uptime</th><th>Last Seen</th></tr></thead><tbody id="nodeTableBody"></tbody></table>
-        </div>
+<header>
+  <h1>D-LOCKSS SYSTEM STATUS <span id="online">[ONLINE]</span></h1>
+  <span class="topic" id="topicinfo"></span>
+  <span style="flex:1"></span>
+  <button onclick="openSettings()">SETTINGS</button>
+</header>
+
+<section id="kwsection">
+  <h2>KEYWORD SEARCH</h2>
+  <div id="kwsetup" class="help" style="display:none">No API key configured — open SETTINGS to enable keyword indexing.</div>
+  <div id="kwui">
+    <div class="help" id="kwstats"></div>
+    <div style="margin:6px 0">
+      <span class="searchwrap">
+        <input id="kwq" size="40" placeholder="search keywords, fields, titles...">
+        <div id="suggest"></div>
+      </span>
+      <button onclick="doSearch()">SEARCH</button>
     </div>
-    <div id="copy-toast" class="copy-toast">Copied to clipboard</div>
-    <div id="cids-modal" class="modal-overlay" style="display: none;">
-        <div class="modal" style="width: 1100px;">
-            <div class="modal-header"><h3 style="margin:0; text-transform: uppercase; font-size: 1em;">Unique CIDs</h3><div style="display:flex; gap:8px; align-items:center;"><input type="text" id="cids-modal-search" placeholder="Filter CIDs..." style="padding: 6px; font-family: inherit; font-size: 0.85em; width: 180px; border: 1px solid #333;"><button class="btn-text" id="cids-export-btn" title="Export payload CIDs as text file">EXPORT PAYLOAD CIDS</button><button class="btn-text" id="cids-modal-close">CLOSE</button></div></div>
-            <div class="modal-body"><div id="cids-modal-list"></div></div>
-        </div>
-    </div>
-    <div id="node-files-modal" class="modal-overlay" style="display: none;">
-        <div class="modal" style="width: 700px;">
-            <div class="modal-header"><h3 style="margin:0; text-transform: uppercase; font-size: 1em;" id="node-files-modal-title">Pinned Files</h3><input type="text" id="node-files-modal-search" placeholder="Filter CIDs..." style="padding: 6px; font-family: inherit; font-size: 0.85em; width: 180px; border: 1px solid #333;"><button class="btn-text" id="node-files-modal-close">CLOSE</button></div>
-            <div class="modal-body"><div id="node-files-modal-list"></div></div>
-        </div>
-    </div>
-    <div id="replication-modal" class="modal-overlay" style="display: none;">
-        <div class="modal" style="width: 700px;">
-            <div class="modal-header"><h3 style="margin:0; text-transform: uppercase; font-size: 1em;" id="replication-modal-title">Files at Replication Level</h3><input type="text" id="replication-modal-search" placeholder="Filter CIDs..." style="padding: 6px; font-family: inherit; font-size: 0.85em; width: 180px; border: 1px solid #333;"><button class="btn-text" id="replication-modal-close">CLOSE</button></div>
-            <div class="modal-body"><div id="replication-modal-list"></div></div>
-        </div>
-    </div>
-    <div id="shard-nodes-modal" class="modal-overlay" style="display: none;">
-        <div class="modal" style="width: 700px;">
-            <div class="modal-header"><h3 style="margin:0; text-transform: uppercase; font-size: 1em;" id="shard-nodes-modal-title">Nodes in Shard</h3><input type="text" id="shard-nodes-modal-search" placeholder="Filter nodes..." style="padding: 6px; font-family: inherit; font-size: 0.85em; width: 180px; border: 1px solid #333;"><button class="btn-text" id="shard-nodes-modal-close">CLOSE</button></div>
-            <div class="modal-body"><div id="shard-nodes-modal-list"></div></div>
-        </div>
-    </div>
-    <div id="identify-modal" class="modal-overlay" style="display: none;">
-        <div class="modal" style="width: 700px;">
-            <div class="modal-header"><h3 style="margin:0; text-transform: uppercase; font-size: 1em;" id="identify-modal-title">Peer Identify</h3><button class="btn-text" id="identify-modal-close">CLOSE</button></div>
-            <div class="modal-body"><div id="identify-modal-content"></div></div>
-        </div>
-    </div>
-    <div id="kwSettingsModal" class="modal-overlay" style="display:none;">
-        <div class="modal" style="width:480px;">
-            <div class="modal-header">
-                <strong>KEYWORD SETTINGS</strong>
-                <button class="btn-text" id="kwSettingsClose">CLOSE</button>
-            </div>
-            <div class="modal-body">
-                <p id="kwSettingsHelp" style="font-size:0.85em; color:#555; margin:0;"></p>
-                <label class="kw-settings-field" id="kwPasswordRow">Password
-                    <input type="password" id="kwPassword" placeholder="Current API key" autocomplete="off">
-                </label>
-                <label class="kw-settings-field">API
-                    <select id="kwProvider">
-                        <option value="google">Google AI Studio</option>
-                        <option value="saia">SAIA</option>
-                    </select>
-                </label>
-                <p id="kwGoogleNote" style="font-size:0.8em; color:#555; margin:8px 0 0 0;">Uses gemini-2.5-flash-lite, the stable model with the highest free-tier quota (about 15 requests per minute and 1,000 per day).</p>
-                <label class="kw-settings-field" id="kwBaseRow">API base
-                    <input type="text" id="kwAPIBase" placeholder="https://chat-ai.academiccloud.de/v1" autocomplete="off">
-                </label>
-                <label class="kw-settings-field">API key
-                    <input type="password" id="kwApiKey" placeholder="API key" autocomplete="off">
-                </label>
-                <label class="kw-settings-field">IPFS gateway
-                    <input type="text" id="kwGateway" placeholder="http://ipfs:8080" autocomplete="off">
-                </label>
-                <p style="font-size:0.8em; color:#555; margin:8px 0 0 0;">Payloads are loaded through this monitor from that gateway. The default is the Kubo gateway on the Docker network.</p>
-                <div id="kwKeyErr" style="color:#c00; font-size:0.85em; margin-top:8px;"></div>
-                <div style="margin-top:14px;"><button class="btn-text kw-search-btn" id="kwSaveKey">SAVE</button></div>
-            </div>
-        </div>
-    </div>
-    <script>
-        let filesChart, shardChart, replicationChart;
-        const ALIASES_STORAGE_KEY = 'dlockss_node_aliases';
-        let currentlyEditingPeerID = null;
-        const filesCtx = document.getElementById('filesChart').getContext('2d');
-        const shardCtx = document.getElementById('shardChart').getContext('2d');
-        const replicationCtx = document.getElementById('replicationChart').getContext('2d');
-        let searchTimeout;
-        function escapeHtml(text) { const div = document.createElement('div'); div.textContent = text; return div.innerHTML; }
-        function escapeJs(text) { if (!text) return ''; return text.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"'); }
-        function loadAliases() { try { return JSON.parse(localStorage.getItem(ALIASES_STORAGE_KEY) || '{}'); } catch { return {}; } }
-        function saveAliases(aliases) { localStorage.setItem(ALIASES_STORAGE_KEY, JSON.stringify(aliases)); }
-        function setAlias(peerID, alias) { const aliases = loadAliases(); if (alias && alias.trim()) aliases[peerID] = alias.trim(); else delete aliases[peerID]; saveAliases(aliases); currentlyEditingPeerID = null; updateDashboard(); }
-        function getAliases() { return loadAliases(); }
-        function editAlias(peerID, currentAlias, btn) {
-            const row = btn.closest('tr'); const displayDiv = row.querySelector('.alias-display-container');
-            if (!displayDiv) return; currentlyEditingPeerID = peerID;
-            displayDiv.innerHTML = '';
-            const input = document.createElement('input'); input.type = 'text'; input.className = 'alias-input'; input.value = currentAlias || ''; input.placeholder = 'LABEL...';
-            const saveBtn = document.createElement('button'); saveBtn.className = 'btn-text btn-save'; saveBtn.textContent = 'SAVE'; saveBtn.onclick = () => setAlias(peerID, input.value);
-            const cancelBtn = document.createElement('button'); cancelBtn.className = 'btn-text btn-cancel'; cancelBtn.textContent = 'CANCEL'; cancelBtn.onclick = () => { currentlyEditingPeerID = null; updateDashboard(); };
-            displayDiv.appendChild(input); displayDiv.appendChild(saveBtn); displayDiv.appendChild(cancelBtn); input.focus();
-            input.onkeypress = (e) => { if(e.key === 'Enter') setAlias(peerID, input.value); else if(e.key === 'Escape') cancelBtn.click(); };
-        }
-        function restoreEditingState() { if (currentlyEditingPeerID) { const row = document.querySelector('tr[data-peer-id="' + currentlyEditingPeerID.toLowerCase() + '"]'); if (row) { const btn = row.querySelector('.alias-edit-btn'); const aliases = getAliases(); if (btn) editAlias(currentlyEditingPeerID, aliases[currentlyEditingPeerID] || '', btn); } } }
-        function initCharts() {
-            Chart.defaults.font.family = '"Courier New", Courier, monospace'; Chart.defaults.color = '#333';
-            replicationChart = new Chart(replicationCtx, { type: 'bar', data: { labels: ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10+'], datasets: [{ label: 'Files', data: [0,0,0,0,0,0,0,0,0,0,0], backgroundColor: ['#D00000','#F18F01','#FFC300','#FFD60A','#FFE66D','#06A77D','#06A77D','#06A77D','#06A77D','#06A77D','#06A77D'], borderRadius: 0 }] }, options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true }, x: {} }, onClick: function(evt, elements, chart) { if (elements.length && elements[0].index >= 0 && elements[0].index <= 10) { showReplicationModal(elements[0].index); } } } });
-            filesChart = new Chart(filesCtx, { type: 'bar', data: { labels: [], datasets: [{ label: 'Pinned Files', data: [], backgroundColor: '#333', borderRadius: 0 }] }, options: { responsive: true, animation: false, plugins: { legend: { display: false } }, onClick: function(evt, elements, chart) { if (elements.length && window._chartNodeOrder && window._chartNodeOrder[elements[0].index]) { showNodeFilesModal(window._chartNodeOrder[elements[0].index]); } } } });
-            shardChart = new Chart(shardCtx, { type: 'doughnut', data: { labels: [], datasets: [{ data: [], backgroundColor: [] }] }, options: { responsive: true, animation: false, cutout: '60%', plugins: { legend: { position: 'right' } }, onClick: function(evt, elements, chart) { if (elements.length && chart.data && chart.data.labels && chart.data.labels[elements[0].index] !== undefined) { showShardNodesModal(chart.data.labels[elements[0].index]); } } } });
-        }
-        function renderShardTreeChart(node, container) {
-            const nodeDiv = document.createElement('div'); nodeDiv.className = 'tree-node';
-            const contentDiv = document.createElement('div'); contentDiv.className = 'node-content'; contentDiv.style.cursor = 'pointer'; contentDiv.title = 'Click to view nodes';
-            const label = node.shard_id === "" ? "ROOT" : node.shard_id;
-            contentDiv.innerHTML = '<div class="node-id">' + escapeHtml(label) + '</div><div class="node-count">' + node.node_count + ' NODES</div>';
-            contentDiv.onclick = function() { showShardNodesModal(node.shard_id); };
-            nodeDiv.appendChild(contentDiv);
-            if (node.children && node.children.length > 0) { const childrenDiv = document.createElement('div'); childrenDiv.className = 'node-children'; node.children.forEach(child => { renderShardTreeChart(child, childrenDiv); }); nodeDiv.appendChild(childrenDiv); }
-            container.appendChild(nodeDiv);
-        }
-        function updateShardTree() { fetch('/api/shard-tree').then(r=>r.json()).then(tree => { const c = document.getElementById('shardTreeContainer'); c.innerHTML = ''; renderShardTreeChart(tree, c); }); }
-        function updateDashboard() {
-            const q = document.getElementById('nodeSearch').value;
-            const url = '/api/nodes?t=' + Date.now() + (q ? '&q=' + encodeURIComponent(q) : '');
-            fetch(url).then(r=>r.json()).then(data => {
-                const aliases = getAliases();
-                const nodes = Object.values(data).map(n => n.data).sort((a, b) => a.peer_id.localeCompare(b.peer_id));
-                const meta = data;
-                const nodeNames = {}; Object.entries(data).forEach(([pid, m]) => { if (m.node_name) nodeNames[m.data.peer_id] = m.node_name; }); window._nodeNames = nodeNames;
-                const activeNodes = nodes.filter(n => n.role !== 'PASSIVE');
-                const fullNodes = nodes.filter(n => n.role === 'PASSIVE');
-                document.getElementById('total-nodes').textContent = fullNodes.length > 0 ? activeNodes.length + ' (' + fullNodes.length + ' full)' : nodes.length;
-                const pinnedVal = n => (n.storage.pinned_in_shard != null) ? n.storage.pinned_in_shard : n.storage.pinned_files;
-                document.getElementById('total-pinned').textContent = nodes.reduce((s,n) => s + (pinnedVal(n)||0), 0).toLocaleString();
-                fetch('/api/unique-cids').then(r=>r.json()).then(data => { document.getElementById('unique-files').textContent = (data.count || 0).toLocaleString(); }).catch(() => { const uCids = new Set(); nodes.forEach(n => (n.storage.known_cids||[]).forEach(c => uCids.add(c))); document.getElementById('unique-files').textContent = uCids.size.toLocaleString(); });
-                document.getElementById('total-shards').textContent = new Set(nodes.map(n => n.current_shard)).size;
-                fetch('/api/replication?t=' + Date.now()).then(r=>r.json()).then(data => { const dist = data.replication_distribution || [0,0,0,0,0,0,0,0,0,0,0]; if (replicationChart && replicationChart.data && replicationChart.data.datasets && replicationChart.data.datasets[0]) { replicationChart.data.datasets[0].data = Array.isArray(dist) ? dist : [0,0,0,0,0,0,0,0,0,0,0]; replicationChart.update(); } const byShard = data.files_at_target_per_shard || {}; const el = document.getElementById('replicationByShard'); if (el && Object.keys(byShard).length > 0) { const parts = Object.entries(byShard).sort((a,b)=>String(a[0]).localeCompare(String(b[0]))).map(([s,c]) => (s === '' ? 'ROOT' : s) + ': ' + c + ' files'); el.textContent = 'Files at target per shard: ' + parts.join(', '); } else if (el) el.textContent = ''; }).catch(() => { if (replicationChart && replicationChart.data && replicationChart.data.datasets && replicationChart.data.datasets[0]) { replicationChart.data.datasets[0].data = [0,0,0,0,0,0,0,0,0,0,0]; replicationChart.update(); } });
-                window._chartNodeOrder = nodes.map(n => n.peer_id);
-                filesChart.data.labels = nodes.map(n => aliases[n.peer_id] || nodeNames[n.peer_id] || n.peer_id.slice(-6));
-                filesChart.data.datasets[0].data = nodes.map(n => pinnedVal(n) || 0);
-                filesChart.data.datasets[0].backgroundColor = nodes.map(n => n.role === 'PASSIVE' ? '#ccc' : '#333');
-                filesChart.update();
-                const sCounts = {}; nodes.forEach(n => sCounts[n.current_shard] = (sCounts[n.current_shard]||0)+1); shardChart.data.labels = Object.keys(sCounts); shardChart.data.datasets[0].data = Object.values(sCounts);
-                const colorPalette = ['#FF6B6B','#4ECDC4','#45B7D1','#FFA07A','#98D8C8','#F7DC6F','#BB8FCE','#85C1E2','#F8B739','#52BE80','#EC7063','#5DADE2','#58D68D','#F4D03F','#AF7AC5','#85C1E9','#F1948A','#73C6B6','#F9E79F','#A569BD'];
-                shardChart.data.datasets[0].backgroundColor = Object.keys(sCounts).map((_,i) => colorPalette[i % colorPalette.length]); shardChart.update();
-                const tbody = document.getElementById('nodeTableBody');
-                tbody.innerHTML = nodes.map(n => {
-                    const m = meta[n.peer_id]; const alias = aliases[n.peer_id] || ''; const serverName = nodeNames[n.peer_id] || ''; const lastSeen = Math.floor((Date.now()/1000) - m.last_seen);
-                    const peerIdEscaped = escapeJs(n.peer_id); const aliasEscaped = escapeJs(alias); const peerIdHtml = escapeHtml(n.peer_id); const aliasHtml = escapeHtml(alias); const serverNameHtml = escapeHtml(serverName); const shardHtml = escapeHtml(n.current_shard);
-                    const displayName = aliasHtml || serverNameHtml || (peerIdHtml.slice(0,12) + '...');
-                    const pinned = (n.storage.pinned_in_shard != null) ? n.storage.pinned_in_shard : n.storage.pinned_files;
-                    const isPassive = n.role === 'PASSIVE';
-                    const isReplicator = n.role === 'REPLICATOR';
-                    const rowClass = isPassive ? 'node-passive' : '';
-                    const statusTag = isPassive ? '<span class="status-text status-full">[FULL]</span>' : isReplicator ? '<span class="status-text" style="color:#06A77D;">[REPLICATOR]</span>' : '<span class="status-text status-online">[ACTIVE]</span>';
-                    return '<tr class="' + rowClass + '" data-peer-id="' + escapeHtml(n.peer_id.toLowerCase()) + '"><td><button class="btn-text alias-edit-btn" onclick="editAlias(\'' + peerIdEscaped + '\', \'' + aliasEscaped + '\', this)">EDIT</button></td><td class="peer-id-cell"><div class="alias-display-container"><div style="font-weight:600;">' + displayName + '</div><div style="font-size:0.8em; color:#4af; cursor:pointer; text-decoration:underline;" onclick="event.stopPropagation(); showIdentifyModal(\'' + peerIdEscaped + '\')">' + peerIdHtml + '</div></div></td><td><span class="shard-badge">' + shardHtml + '</span></td><td>' + n.peers_in_shard + '</td><td>' + pinned + '</td><td>' + n.storage.known_files + '</td><td>' + Math.floor(n.uptime_seconds/60) + 'm</td><td>' + statusTag + ' ' + lastSeen + 's ago</td></tr>';
-                }).join('');
-                restoreEditingState();
-            });
-        }
-        function debouncedFilter() { clearTimeout(searchTimeout); searchTimeout = setTimeout(() => { updateDashboard(); }, 300); }
-        function loadRootTopic() {
-            fetch('/api/root-topic').then(r=>r.json()).then(d => {
-                if (d.topic_prefix) { window._currentTopicPrefix = d.topic_prefix; document.getElementById('root-topic-value').textContent = d.topic_prefix; }
-                if (d.topic_name) { window._currentTopicName = d.topic_name; document.getElementById('topic-name-value').textContent = d.topic_name; }
-            }).catch(() => {});
-        }
-        const GATEWAY = '';
-        function showCopyToast() {
-            const toast = document.getElementById('copy-toast');
-            toast.style.opacity = '1';
-            setTimeout(function() { toast.style.opacity = '0'; }, 1200);
-        }
-        function copyCID(text) {
-            navigator.clipboard.writeText(text).then(showCopyToast).catch(function() {});
-        }
-        function normalizeCidEntry(entry) {
-            var cid = entry.cid || entry.CID || entry;
-            var raw = entry.shard || entry.Shard || '';
-            return { cid: cid, shard: raw === '' ? 'root' : raw, replicas: entry.replicas ?? entry.Replicas ?? 0 };
-        }
-        function renderCidRow(entry) {
-            var e = normalizeCidEntry(entry);
-            return '<div class="cid-row" data-cid="' + escapeHtml(e.cid) + '"><div class="cid-value" onclick="copyCID(\'' + escapeJs(e.cid) + '\')" title="Click to copy">' + escapeHtml(e.cid) + '</div><div class="cid-meta">Shard: ' + escapeHtml(e.shard) + ' | Replicas: ' + e.replicas + '</div><div class="cid-actions"><button class="btn-text" onclick="loadManifest(\'' + escapeJs(e.cid) + '\', this.parentElement)">LOAD MANIFEST</button></div></div>';
-        }
-        function setupModalFilter(inputId, listId, rowSelector, attrFn) {
-            document.getElementById(inputId).oninput = function() {
-                var q = this.value.toLowerCase();
-                document.querySelectorAll('#' + listId + ' ' + rowSelector).forEach(function(row) {
-                    row.style.display = (!q || attrFn(row).toLowerCase().includes(q)) ? '' : 'none';
-                });
-            };
-        }
-        function showCidsModal() {
-            document.getElementById('cids-modal').style.display = 'flex';
-            fetch('/api/unique-cids?t=' + Date.now()).then(r=>r.json()).then(data => {
-                const list = document.getElementById('cids-modal-list');
-                const cids = data.cids || [];
-                list.innerHTML = cids.length === 0 ? '<p style="color:#666;">No CIDs yet. CIDs appear when nodes announce pinned files.</p>' : cids.map(renderCidRow).join('');
-            }).catch(() => { document.getElementById('cids-modal-list').innerHTML = '<p style="color:#999;">Failed to load CIDs.</p>'; });
-        }
-        function hideCidsModal() { document.getElementById('cids-modal').style.display = 'none'; }
-        function exportPayloadCIDs() {
-            window.open('/api/payload-cids-export', '_blank');
-        }
-        function showNodeFilesModal(peerId) {
-            const aliases = loadAliases();
-            const label = aliases[peerId] || (window._nodeNames && window._nodeNames[peerId]) || peerId.slice(-6);
-            document.getElementById('node-files-modal-title').textContent = 'Pinned files: ' + label;
-            document.getElementById('node-files-modal').style.display = 'flex';
-            document.getElementById('node-files-modal-search').value = '';
-            fetch('/api/node-files?peer=' + encodeURIComponent(peerId) + '&t=' + Date.now()).then(r=>r.json()).then(data => {
-                const list = document.getElementById('node-files-modal-list');
-                const cids = data.cids || [];
-                list.innerHTML = cids.length === 0 ? '<p style="color:#666;">No pinned files for this node.</p>' : cids.map(renderCidRow).join('');
-            }).catch(() => { document.getElementById('node-files-modal-list').innerHTML = '<p style="color:#999;">Failed to load node files.</p>'; });
-        }
-        function hideNodeFilesModal() { document.getElementById('node-files-modal').style.display = 'none'; }
-        function showReplicationModal(level) {
-            const label = level === 10 ? '10+' : String(level);
-            document.getElementById('replication-modal-title').textContent = 'Files at ' + label + ' replicas';
-            document.getElementById('replication-modal').style.display = 'flex';
-            document.getElementById('replication-modal-search').value = '';
-            fetch('/api/replication-cids?level=' + level + '&t=' + Date.now()).then(r=>r.json()).then(data => {
-                const list = document.getElementById('replication-modal-list');
-                const cids = data.cids || [];
-                list.innerHTML = cids.length === 0 ? '<p style="color:#666;">No files at this replication level.</p>' : cids.map(renderCidRow).join('');
-            }).catch(() => { document.getElementById('replication-modal-list').innerHTML = '<p style="color:#999;">Failed to load CIDs.</p>'; });
-        }
-        function hideReplicationModal() { document.getElementById('replication-modal').style.display = 'none'; }
-        function showShardNodesModal(shardId) {
-            const label = shardId === "" ? "ROOT" : shardId;
-            document.getElementById('shard-nodes-modal-title').textContent = 'Nodes in shard: ' + label;
-            document.getElementById('shard-nodes-modal').style.display = 'flex';
-            document.getElementById('shard-nodes-modal-search').value = '';
-            fetch('/api/shard-nodes?shard=' + encodeURIComponent(shardId) + '&t=' + Date.now()).then(r=>r.json()).then(data => {
-                const list = document.getElementById('shard-nodes-modal-list');
-                const nodes = data.nodes || {};
-                const aliases = loadAliases();
-                const entries = Object.entries(nodes).map(([pid, m]) => ({ peer_id: pid, meta: m }));
-                if (entries.length === 0) { list.innerHTML = '<p style="color:#666;">No nodes in this shard.</p>'; return; }
-                list.innerHTML = entries.map(({ peer_id, meta }) => {
-                    const n = meta.data;
-                    const alias = aliases[peer_id] || '';
-                    const serverName = meta.node_name || '';
-                    const displayName = alias || serverName || peer_id;
-                    const lastSeen = Math.floor((Date.now()/1000) - (meta.last_seen || 0));
-                    const peerIdHtml = escapeHtml(peer_id); const displayNameHtml = escapeHtml(displayName);
-                    const pinned = (n.storage.pinned_in_shard != null) ? n.storage.pinned_in_shard : n.storage.pinned_files;
-                    const searchText = (alias + ' ' + serverName + ' ' + peer_id).toLowerCase();
-                    const showPeerId = (displayName !== peer_id) ? peerIdHtml + ' | ' : '';
-                    return '<div class="cid-row node-row" data-peer-id="' + escapeHtml(peer_id.toLowerCase()) + '" data-search="' + escapeHtml(searchText) + '"><div class="cid-value">' + displayNameHtml + '</div><div class="cid-meta">' + showPeerId + 'Pinned: ' + pinned + ' | Known: ' + (n.storage.known_files||0) + ' | Last seen: ' + lastSeen + 's ago</div></div>';
-                }).join('');
-            }).catch(() => { document.getElementById('shard-nodes-modal-list').innerHTML = '<p style="color:#999;">Failed to load nodes.</p>'; });
-        }
-        function hideShardNodesModal() { document.getElementById('shard-nodes-modal').style.display = 'none'; }
-        function showIdentifyModal(peerId) {
-            const aliases = loadAliases();
-            const label = aliases[peerId] || (window._nodeNames && window._nodeNames[peerId]) || peerId.slice(0, 12) + '...';
-            document.getElementById('identify-modal-title').textContent = 'Identify: ' + label;
-            document.getElementById('identify-modal').style.display = 'flex';
-            document.getElementById('identify-modal-content').innerHTML = '<p style="color:#999;">Connecting...</p>';
-            fetch('/api/identify?peer=' + encodeURIComponent(peerId) + '&t=' + Date.now()).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }).then(data => {
-                const c = document.getElementById('identify-modal-content');
-                const connected = data.connected ? '<span style="color:#4ecdc4;">connected</span>' : '<span style="color:#ff6b6b;">not connected</span>';
-                const addrs = (data.addresses || []).map(a => '<div style="padding:2px 0; font-size:0.85em;">' + escapeHtml(a) + '</div>').join('') || '<span style="color:#666;">none</span>';
-                const protos = (data.protocols || []).map(p => '<span style="display:inline-block; background:#ccc; border:1px solid #444; border-radius:3px; padding:1px 6px; margin:2px; font-size:0.8em;">' + escapeHtml(p) + '</span>').join('') || '<span style="color:#666;">none</span>';
-                c.innerHTML = '<table style="width:100%; border-collapse:collapse;">' +
-                    '<tr><td style="padding:6px 8px; color:#999; width:130px; vertical-align:top;">Peer ID</td><td style="padding:6px 8px; word-break:break-all;">' + escapeHtml(data.peer_id || peerId) + '</td></tr>' +
-                    '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Status</td><td style="padding:6px 8px;">' + connected + '</td></tr>' +
-                    '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Agent</td><td style="padding:6px 8px;">' + escapeHtml(data.agent_version || '-') + '</td></tr>' +
-                    '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Protocol</td><td style="padding:6px 8px;">' + escapeHtml(data.protocol_version || '-') + '</td></tr>' +
-                    '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Addresses</td><td style="padding:6px 8px;">' + addrs + '</td></tr>' +
-                    '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Protocols</td><td style="padding:6px 8px;">' + protos + '</td></tr>' +
-                    '</table>';
-            }).catch(e => {
-                document.getElementById('identify-modal-content').innerHTML = '<p style="color:#ff6b6b;">Failed: ' + escapeHtml(e.message) + '</p>';
-            });
-        }
-        function hideIdentifyModal() { document.getElementById('identify-modal').style.display = 'none'; }
-        function viewManifestJson(manifestCid) {
-            const manifest = (window._manifests || {})[manifestCid];
-            if (!manifest) return;
-            const json = JSON.stringify(manifest, null, 2);
-            const blob = new Blob([json], { type: 'application/json' });
-            const url = URL.createObjectURL(blob);
-            window.open(url);
-        }
-        function loadManifest(manifestCid, actionsEl) {
-            if (actionsEl.dataset.loading) return;
-            actionsEl.dataset.loading = '1';
-            actionsEl.innerHTML = '<span class="load-spinner"></span>';
-            fetch('/api/manifest-payload?cid=' + encodeURIComponent(manifestCid)).then(r => r.json()).then(obj => {
-                const payloadCid = obj.payload_cid;
-                if (payloadCid) {
-                    window._manifests = window._manifests || {};
-                    window._manifests[manifestCid] = obj.manifest;
-                    const payloadUrl = GATEWAY + '/ipfs/' + payloadCid + '/';
-                    actionsEl.innerHTML = '<button class="btn-text" onclick="viewManifestJson(\'' + escapeJs(manifestCid) + '\')">VIEW MANIFEST</button><a href="' + payloadUrl + '" target="_blank" rel="noopener" class="btn-text">VIEW PAYLOAD</a>';
-                } else {
-                    actionsEl.innerHTML = '<button class="btn-text" onclick="loadManifest(\'' + escapeJs(manifestCid) + '\', this.parentElement)">LOAD MANIFEST</button>';
-                    alert(obj.error || 'Payload not found in manifest');
-                }
-                delete actionsEl.dataset.loading;
-            }).catch(() => {
-                actionsEl.innerHTML = '<button class="btn-text" onclick="loadManifest(\'' + escapeJs(manifestCid) + '\', this.parentElement)">LOAD MANIFEST</button>';
-                delete actionsEl.dataset.loading;
-                alert('Failed to load manifest');
-            });
-        }
-        document.getElementById('cids-export-btn').onclick = exportPayloadCIDs;
-        document.getElementById('unique-cids-card').onclick = showCidsModal;
-        document.getElementById('total-nodes-card').onclick = function() { document.getElementById('network-nodes-section').scrollIntoView({ behavior: 'smooth' }); };
-        document.getElementById('total-shards-card').onclick = function() { document.getElementById('shard-topology-section').scrollIntoView({ behavior: 'smooth' }); };
-        document.getElementById('cids-modal-close').onclick = hideCidsModal;
-        document.getElementById('cids-modal').onclick = function(e) { if (e.target === this) hideCidsModal(); };
-        setupModalFilter('cids-modal-search', 'cids-modal-list', '.cid-row', function(r) { return r.dataset.cid || ''; });
-        document.getElementById('node-files-modal-close').onclick = hideNodeFilesModal;
-        document.getElementById('node-files-modal').onclick = function(e) { if (e.target === this) hideNodeFilesModal(); };
-        setupModalFilter('node-files-modal-search', 'node-files-modal-list', '.cid-row', function(r) { return r.dataset.cid || ''; });
-        document.getElementById('replication-modal-close').onclick = hideReplicationModal;
-        document.getElementById('replication-modal').onclick = function(e) { if (e.target === this) hideReplicationModal(); };
-        setupModalFilter('replication-modal-search', 'replication-modal-list', '.cid-row', function(r) { return r.dataset.cid || ''; });
-        document.getElementById('shard-nodes-modal-close').onclick = hideShardNodesModal;
-        document.getElementById('shard-nodes-modal').onclick = function(e) { if (e.target === this) hideShardNodesModal(); };
-        document.getElementById('identify-modal-close').onclick = hideIdentifyModal;
-        document.getElementById('identify-modal').onclick = function(e) { if (e.target === this) hideIdentifyModal(); };
-        setupModalFilter('shard-nodes-modal-search', 'shard-nodes-modal-list', '.node-row', function(r) { return r.dataset.search || r.dataset.peerId || ''; });
-        let kwACIndex = -1;
-        let kwACTimeout;
-        const kwInput = document.getElementById('kwInput');
-        const kwAC = document.getElementById('kwAC');
-        const kwSearchBtn = document.getElementById('kwSearchBtn');
-        var kwAllResults = [];
-        var kwCurrentQuery = '';
-        var kwPage = 0;
-        var kwPerPage = 20;
-        function kwDoSearch(query) {
-            if (!query || !query.trim()) return;
-            query = query.trim();
-            kwInput.value = query;
-            kwHideAC();
-            kwCurrentQuery = query;
-            kwPage = 0;
-            document.getElementById('kwResults').style.display = 'block';
-            document.getElementById('kwResults').innerHTML = '<p style="color:#999;">Searching...</p>';
-            fetch('/api/keyword-search?q=' + encodeURIComponent(query) + '&t=' + Date.now()).then(r => r.json()).then(data => {
-                kwAllResults = data.results || [];
-                if (kwAllResults.length === 0) {
-                    document.getElementById('kwResults').innerHTML = '<p style="color:#666;">No documents found for "' + escapeHtml(query) + '".</p>';
-                    return;
-                }
-                kwRenderPage();
-                document.getElementById('kwResults').scrollIntoView({ behavior: 'smooth', block: 'start' });
-                kwLoadRecent();
-            }).catch(() => {
-                document.getElementById('kwResults').innerHTML = '<p style="color:#ff6b6b;">Search failed.</p>';
-            });
-        }
-        function kwRenderPage() {
-            var total = kwAllResults.length;
-            var totalPages = Math.ceil(total / kwPerPage);
-            var start = kwPage * kwPerPage;
-            var end = Math.min(start + kwPerPage, total);
-            var pageResults = kwAllResults.slice(start, end);
-            var html = '<div class="kw-results-hdr"><span>' + total + ' document' + (total !== 1 ? 's' : '') + ' matching "' + escapeHtml(kwCurrentQuery) + '"</span><button class="btn-text" onclick="document.getElementById(\'kwResults\').style.display=\'none\'">CLOSE</button></div>';
-            html += pageResults.map(function(r) {
-                var shard = (r.shard || '') === '' ? 'root' : escapeHtml(r.shard);
-                var kws = (r.keywords || []).map(function(k) { return '<span class="kw-kw-tag" onclick="kwDoSearch(\'' + escapeJs(k) + '\')">' + escapeHtml(k) + '</span>'; }).join('');
-                var title = r.title || '';
-                var payloadUrl = GATEWAY + '/ipfs/' + (r.payload_cid || '') + '/';
-                var titleHtml = title ? '<div style="font-weight:600; margin-bottom:2px;">' + escapeHtml(title) + '</div>' : '';
-                var classHtml = '';
-                var bf = r.broad_field || '', st = r.sub_topic || '', rn = r.research_niche || '';
-                if (bf || st || rn) {
-                    classHtml = '<div class="kw-class">';
-                    if (bf) classHtml += '<span class="kw-class-tag kw-field" onclick="kwDoSearch(\'' + escapeJs(bf) + '\')">' + escapeHtml(bf) + '</span>';
-                    if (st) classHtml += '<span class="kw-class-tag kw-subtopic" onclick="kwDoSearch(\'' + escapeJs(st) + '\')">' + escapeHtml(st) + '</span>';
-                    if (rn) classHtml += '<span class="kw-class-tag kw-niche" onclick="kwDoSearch(\'' + escapeJs(rn) + '\')">' + escapeHtml(rn) + '</span>';
-                    classHtml += '</div>';
-                }
-                return '<div class="kw-result-item">' + titleHtml + classHtml + '<div class="kw-result-top"><div class="kw-result-cid">' + escapeHtml(r.manifest_cid) + '</div><div class="kw-result-meta">Shard: ' + shard + ' | Replicas: ' + (r.replicas || 0) + '</div><a href="' + payloadUrl + '" target="_blank" rel="noopener" class="btn-text">VIEW</a></div><div class="kw-result-kws">' + kws + '</div></div>';
-            }).join('');
-            if (totalPages > 1) {
-                html += '<div class="kw-pagination">';
-                html += '<button class="kw-page-btn" onclick="kwGoPage(' + (kwPage - 1) + ')"' + (kwPage === 0 ? ' disabled' : '') + '>&laquo;</button>';
-                for (var p = 0; p < totalPages; p++) {
-                    html += '<button class="kw-page-btn' + (p === kwPage ? ' active' : '') + '" onclick="kwGoPage(' + p + ')">' + (p + 1) + '</button>';
-                }
-                html += '<button class="kw-page-btn" onclick="kwGoPage(' + (kwPage + 1) + ')"' + (kwPage >= totalPages - 1 ? ' disabled' : '') + '>&raquo;</button>';
-                html += '<span class="kw-page-info">' + (start + 1) + '–' + end + ' of ' + total + '</span>';
-                html += '</div>';
-            }
-            document.getElementById('kwResults').innerHTML = html;
-        }
-        function kwGoPage(p) {
-            var totalPages = Math.ceil(kwAllResults.length / kwPerPage);
-            if (p < 0 || p >= totalPages) return;
-            kwPage = p;
-            kwRenderPage();
-            document.getElementById('kwResults').scrollIntoView({ behavior: 'smooth', block: 'start' });
-        }
-        function kwShowAC(suggestions) {
-            if (!suggestions || suggestions.length === 0) { kwHideAC(); return; }
-            kwACIndex = -1;
-            kwAC.innerHTML = suggestions.map((s, i) => '<div class="kw-ac-item" data-idx="' + i + '" onmousedown="kwDoSearch(\'' + escapeJs(s.keyword) + '\')">' + escapeHtml(s.keyword) + '<span class="kw-ac-count">' + s.cid_count + ' doc' + (s.cid_count !== 1 ? 's' : '') + '</span></div>').join('');
-            kwAC.style.display = 'block';
-        }
-        function kwHideAC() { kwAC.style.display = 'none'; kwACIndex = -1; }
-        function kwFetchSuggestions() {
-            const q = kwInput.value.trim();
-            if (q.length < 1) { kwHideAC(); return; }
-            fetch('/api/keyword-suggest?q=' + encodeURIComponent(q) + '&t=' + Date.now()).then(r => r.json()).then(data => {
-                kwShowAC(data.suggestions || []);
-            }).catch(() => kwHideAC());
-        }
-        kwInput.addEventListener('input', function() {
-            clearTimeout(kwACTimeout);
-            kwACTimeout = setTimeout(kwFetchSuggestions, 200);
-        });
-        kwInput.addEventListener('keydown', function(e) {
-            const items = kwAC.querySelectorAll('.kw-ac-item');
-            if (e.key === 'ArrowDown') {
-                e.preventDefault();
-                kwACIndex = Math.min(kwACIndex + 1, items.length - 1);
-                items.forEach((el, i) => el.classList.toggle('active', i === kwACIndex));
-                if (kwACIndex >= 0) kwInput.value = items[kwACIndex].textContent.replace(/\d+ docs?$/, '').trim();
-            } else if (e.key === 'ArrowUp') {
-                e.preventDefault();
-                kwACIndex = Math.max(kwACIndex - 1, -1);
-                items.forEach((el, i) => el.classList.toggle('active', i === kwACIndex));
-                if (kwACIndex >= 0) kwInput.value = items[kwACIndex].textContent.replace(/\d+ docs?$/, '').trim();
-            } else if (e.key === 'Enter') {
-                kwHideAC();
-                kwDoSearch(kwInput.value);
-            } else if (e.key === 'Escape') {
-                kwHideAC();
-            }
-        });
-        kwInput.addEventListener('blur', function() { setTimeout(kwHideAC, 150); });
-        kwSearchBtn.addEventListener('click', function() { kwDoSearch(kwInput.value); });
-        function kwLoadRecent() {
-            fetch('/api/recent-searches?t=' + Date.now()).then(r => r.json()).then(data => {
-                const el = document.getElementById('kwRecent');
-                const searches = data.searches || [];
-                if (searches.length === 0) { el.innerHTML = ''; return; }
-                el.innerHTML = '<span class="kw-recent-label">Recent:</span>' + searches.slice(0, 5).map(s => '<button class="kw-tag-btn" onclick="kwDoSearch(\'' + escapeJs(s.keyword) + '\')">' + escapeHtml(s.keyword) + ' (' + s.result_count + ')</button>').join('');
-            }).catch(() => {});
-        }
-        var kwCanSetKey = true;
-        var kwCurrentProvider = 'google';
-        function kwSyncProviderFields() {
-            var google = document.getElementById('kwProvider').value === 'google';
-            document.getElementById('kwGoogleNote').style.display = google ? '' : 'none';
-            document.getElementById('kwBaseRow').style.display = google ? 'none' : '';
-        }
-        function kwOpenSettings() {
-            document.getElementById('kwKeyErr').textContent = '';
-            document.getElementById('kwPassword').value = '';
-            document.getElementById('kwApiKey').value = '';
-            document.getElementById('kwGateway').value = window._kwGateway || 'http://ipfs:8080';
-            document.getElementById('kwPasswordRow').style.display = kwCanSetKey ? 'none' : '';
-            document.getElementById('kwProvider').value = kwCurrentProvider || 'google';
-            document.getElementById('kwSettingsHelp').textContent = kwCanSetKey
-                ? 'The key you save becomes the password for this dialog.'
-                : 'The password is the API key currently in use.';
-            kwSyncProviderFields();
-            document.getElementById('kwSettingsModal').style.display = 'flex';
-        }
-        function kwShowSearchUI(data) {
-            document.getElementById('kwSetup').style.display = 'none';
-            document.getElementById('kwSearchUI').style.display = '';
-            var who = data.provider === 'google' ? 'Google' : 'SAIA';
-            document.getElementById('kwStatsLbl').textContent = who + ' | Indexed: ' + data.indexed + '/' + data.total_cids + ' | Keywords: ' + data.unique_keywords;
-        }
-        function kwLoadStats() {
-            fetch('/api/keyword-stats?t=' + Date.now()).then(r => r.json()).then(data => {
-                kwCanSetKey = !!data.can_set_key;
-                if (data.provider) kwCurrentProvider = data.provider;
-                if (data.gateway) window._kwGateway = data.gateway;
-                if (data.enabled) { kwShowSearchUI(data); return; }
-                document.getElementById('kwSetup').style.display = data.can_set_key ? '' : 'none';
-                document.getElementById('kwSearchUI').style.display = 'none';
-            }).catch(() => {});
-        }
-        document.getElementById('kwSettingsBtn').addEventListener('click', kwOpenSettings);
-        document.getElementById('kwSettingsClose').addEventListener('click', function() {
-            document.getElementById('kwSettingsModal').style.display = 'none';
-        });
-        document.getElementById('kwProvider').addEventListener('change', kwSyncProviderFields);
-        document.getElementById('kwSaveKey').addEventListener('click', function() {
-            var key = document.getElementById('kwApiKey').value.trim();
-            var errEl = document.getElementById('kwKeyErr');
-            errEl.textContent = '';
-            if (!key && kwCanSetKey) { errEl.textContent = 'Enter an API key.'; return; }
-            var body = {
-                provider: document.getElementById('kwProvider').value,
-                api_key: key,
-                api_base: document.getElementById('kwAPIBase').value.trim(),
-                gateway: document.getElementById('kwGateway').value.trim()
-            };
-            if (!kwCanSetKey) body.password = document.getElementById('kwPassword').value;
-            fetch('/api/keyword-api-key', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body)
-            }).then(function(r) { return r.json().then(function(data) { return { ok: r.ok, status: r.status, data: data }; }); }).then(function(res) {
-                if (res.ok) {
-                    document.getElementById('kwApiKey').value = '';
-                    document.getElementById('kwPassword').value = '';
-                    document.getElementById('kwSettingsModal').style.display = 'none';
-                    kwLoadStats();
-                    kwLoadRecent();
-                    return;
-                }
-                errEl.textContent = res.data.error || 'Failed to save settings.';
-            }).catch(function() { errEl.textContent = 'Failed to save settings.'; });
-        });
-        document.getElementById('kwApiKey').addEventListener('keydown', function(e) {
-            if (e.key === 'Enter') { document.getElementById('kwSaveKey').click(); }
-        });
-        document.getElementById('kwPassword').addEventListener('keydown', function(e) {
-            if (e.key === 'Enter') { document.getElementById('kwSaveKey').click(); }
-        });
-        kwLoadRecent();
-        kwLoadStats();
-        setInterval(kwLoadStats, 10000);
-        initCharts(); updateDashboard(); updateShardTree(); loadRootTopic();
-        setInterval(() => { if(!document.getElementById('nodeSearch').value && currentlyEditingPeerID === null) { updateDashboard(); updateShardTree(); } }, 5000);
-    </script>
+    <div id="recent"></div>
+    <div id="results"></div>
+    <div class="pager" id="pager"></div>
+  </div>
+</section>
+
+<div class="cards">
+  <div class="card" onclick="document.getElementById('nodesec').scrollIntoView()">
+    <div class="num" id="c-nodes">0</div><div class="lbl">TOTAL NODES</div></div>
+  <div class="card"><div class="num" id="c-pinned">0</div><div class="lbl">TOTAL PINNED</div></div>
+  <div class="card" onclick="openUniqueCIDs()"><div class="num" id="c-cids">0</div><div class="lbl">UNIQUE CIDS</div></div>
+  <div class="card" onclick="document.getElementById('treesec').scrollIntoView()">
+    <div class="num" id="c-shards">0</div><div class="lbl">ACTIVE SHARDS</div></div>
+</div>
+
+<div class="charts">
+  <div class="chartbox"><h3>REPLICATION STATUS</h3><canvas id="replChart" height="190"></canvas>
+    <div class="subline" id="perShard"></div></div>
+  <div class="chartbox"><h3>PINNED FILES PER NODE</h3><canvas id="nodeChart" height="190"></canvas></div>
+  <div class="chartbox"><h3>SHARD DISTRIBUTION</h3><canvas id="shardChart" height="190"></canvas></div>
+</div>
+
+<section id="treesec"><h2>SHARD TOPOLOGY</h2><div class="tree" id="tree"></div></section>
+
+<section id="nodesec">
+  <h2>NETWORK NODES</h2>
+  <input id="nodeq" size="30" placeholder="filter nodes...">
+  <table>
+    <thead><tr><th></th><th>PEER</th><th>SHARD</th><th>PEERS</th><th>PINNED</th><th>KNOWN</th><th>UPTIME</th><th>LAST SEEN</th></tr></thead>
+    <tbody id="nodetbody"></tbody>
+  </table>
+</section>
+
+<div class="modal-back" id="modalback" onclick="if(event.target===this)closeModal()">
+  <div class="modal" id="modalbox"></div>
+</div>
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const GATEWAY = ''; // files load through the monitor's /ipfs proxy
+let aliases = {};
+try { aliases = JSON.parse(localStorage.getItem('dlockss_node_aliases') || '{}'); } catch (e) {}
+function saveAliases(){ try { localStorage.setItem('dlockss_node_aliases', JSON.stringify(aliases)); } catch(e){} }
+let editingAlias = null;
+let nodesCache = {};
+
+function displayName(id, name){ return aliases[id] || name || id.slice(0,12); }
+function toast(msg){ const t=$('toast'); t.textContent=msg; t.style.display='block';
+  clearTimeout(t._h); t._h=setTimeout(()=>t.style.display='none',1500); }
+async function j(url, opts){ const r = await fetch(url, opts); if(!r.ok){ let m='HTTP '+r.status;
+  try{ m=(await r.json()).error||m }catch(e){} throw new Error(m);} return r.json(); }
+
+/* ---- charts ---- */
+const black='#111', grey='#999', green='#2a2', red='#c33', orange='#e80';
+const palette=['#111','#555','#888','#aaa','#345','#567','#789','#234','#456','#678',
+               '#433','#655','#877','#344','#566','#788','#223','#445','#667','#889'];
+const replChart = new Chart($('replChart'), { type:'bar',
+  data:{ labels:['0','1','2','3','4','5','6','7','8','9','10+'], datasets:[{data:[],backgroundColor:[]}] },
+  options:{ plugins:{legend:{display:false}},
+    onClick:(e,els)=>{ if(els.length) openReplicationLevel(els[0].index); },
+    scales:{ y:{beginAtZero:true,ticks:{precision:0}} } } });
+const nodeChart = new Chart($('nodeChart'), { type:'bar',
+  data:{ labels:[], datasets:[{data:[],backgroundColor:[]}] },
+  options:{ plugins:{legend:{display:false}},
+    onClick:(e,els)=>{ if(els.length) openNodeFiles(nodeChart._peers[els[0].index]); },
+    scales:{ y:{beginAtZero:true,ticks:{precision:0}} } } });
+const shardChart = new Chart($('shardChart'), { type:'doughnut',
+  data:{ labels:[], datasets:[{data:[],backgroundColor:[]}] },
+  options:{ plugins:{legend:{position:'right'}},
+    onClick:(e,els)=>{ if(els.length) openShardNodes(shardChart._ids[els[0].index]); } } });
+
+/* ---- refresh loops ---- */
+function paused(){ return $('nodeq').value.trim()!=='' || editingAlias!==null; }
+async function refresh(){
+  if (paused()) return;
+  try {
+    const [nodes, repl, tree] = await Promise.all([
+      j('/api/nodes'), j('/api/replication'), j('/api/shard-tree')]);
+    nodesCache = nodes;
+    renderNodes(nodes); renderCards(nodes, repl); renderRepl(repl);
+    renderNodeChart(nodes); renderShardChart(nodes); renderTree(tree);
+    $('online').textContent='[ONLINE]';
+  } catch(e){ $('online').textContent='[OFFLINE]'; }
+}
+async function refreshKw(){
+  try {
+    const st = await j('/api/keyword-stats');
+    $('kwsetup').style.display = st.enabled ? 'none':'block';
+    $('kwui').style.display = st.enabled ? 'block':'none';
+    $('kwstats').textContent = `${st.provider} | Indexed: ${st.indexed}/${st.total_cids} | Keywords: ${st.unique_keywords} | Daily: ${st.daily_remaining}/${st.daily_limit}`;
+    kwEnabled = st.enabled; canSetKey = st.can_set_key;
+    const rec = await j('/api/recent-searches');
+    $('recent').innerHTML = (rec.searches||[]).slice(0,5).map(s=>
+      `<span class="chip" onclick="searchFor('${esc(s.keyword)}')">${esc(s.keyword)} (${s.result_count})</span>`).join('') || '';
+    if (rec.searches && rec.searches.length) $('recent').insertAdjacentHTML('afterbegin','Recent: ');
+  } catch(e){}
+}
+setInterval(refresh, 5000); setInterval(refreshKw, 10000);
+refresh(); refreshKw();
+j('/api/root-topic').then(t=>{ $('topicinfo').textContent = `topic: ${t.topic_name} | prefix: ${t.topic_prefix}`; });
+
+/* ---- rendering ---- */
+function esc(s){ return String(s??'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function shardLabel(s){ return s===''||s==null ? 'ROOT' : s; }
+
+function renderCards(nodes, repl){
+  const rows = Object.values(nodes);
+  const passive = rows.filter(r=>r.data.role==='PASSIVE').length;
+  $('c-nodes').textContent = passive ? `${rows.length-passive} (${passive} full)` : rows.length;
+  let pinned=0; rows.forEach(r=>{ pinned += r.data.storage.pinned_in_shard || r.data.storage.pinned_files; });
+  $('c-pinned').textContent = pinned;
+  const shards = new Set(rows.map(r=>r.data.current_shard)); $('c-shards').textContent = shards.size;
+  j('/api/unique-cids').then(u=>{ $('c-cids').textContent = u.count; }).catch(()=>{});
+}
+function renderRepl(repl){
+  const d = repl.replication_distribution||[];
+  replChart.data.datasets[0].data = d;
+  replChart.data.datasets[0].backgroundColor = d.map((_,i)=> i<3?red : i<5?orange : green);
+  replChart.update('none');
+  const per = repl.files_at_target_per_shard||{};
+  $('perShard').textContent = 'Files at target per shard: ' +
+    (Object.keys(per).length ? Object.entries(per).map(([s,n])=>`${s}:${n}`).join('  ') : '(none)') +
+    ` | avg ${Number(repl.avg_replication_level||0).toFixed(1)} | at target ${repl.files_at_target}`;
+}
+function renderNodeChart(nodes){
+  const rows = Object.entries(nodes);
+  nodeChart.data.labels = rows.map(([id,r])=> displayName(id, r.node_name).slice(0,14) || id.slice(-6));
+  nodeChart.data.datasets[0].data = rows.map(([,r])=> r.data.storage.pinned_files);
+  nodeChart.data.datasets[0].backgroundColor = rows.map(([,r])=> r.data.role==='PASSIVE'?grey:black);
+  nodeChart._peers = rows.map(([id])=>id);
+  nodeChart.update('none');
+}
+function renderShardChart(nodes){
+  const by = {};
+  Object.values(nodes).forEach(r=>{ const s = shardLabel(r.data.current_shard); by[s]=(by[s]||0)+1; });
+  const labels = Object.keys(by).sort();
+  shardChart.data.labels = labels;
+  shardChart.data.datasets[0].data = labels.map(l=>by[l]);
+  shardChart.data.datasets[0].backgroundColor = labels.map((_,i)=>palette[i%palette.length]);
+  shardChart._ids = labels.map(l=> l==='ROOT'?'':l);
+  shardChart.update('none');
+}
+function renderTree(root){
+  function node(t){
+    const kids = (t.children||[]).map(node).join('');
+    return `<li><div class="box" onclick="openShardNodes('${t.shard_id}')">`+
+      `${shardLabel(t.shard_id)}<div class="cnt">${t.node_count} NODES</div></div>`+
+      (kids?`<ul>${kids}</ul>`:'')+`</li>`;
+  }
+  $('tree').innerHTML = root ? `<ul>${node(root)}</ul>` : '';
+}
+function renderNodes(nodes){
+  const rows = Object.entries(nodes).sort((a,b)=> a[0].localeCompare(b[0]));
+  $('nodetbody').innerHTML = rows.map(([id,r])=>{
+    const d=r.data, passive=d.role==='PASSIVE';
+    const ago = Math.max(0, Math.floor(Date.now()/1000 - r.last_seen));
+    const tag = passive? '<span class="tag dim">[FULL]</span>' :
+      d.role==='REPLICATOR' ? '<span class="tag green">[REPLICATOR]</span>' : '<span class="tag">[ACTIVE]</span>';
+    const nameCell = editingAlias===id
+      ? `<span class="alias-edit"><input id="aliasin" value="${esc(aliases[id]||'')}"
+           onkeydown="if(event.key==='Enter')saveAlias('${id}');if(event.key==='Escape')cancelAlias()">
+           <button onclick="saveAlias('${id}')">SAVE</button><button onclick="cancelAlias()">CANCEL</button></span>`
+      : `<strong>${esc(displayName(id, r.node_name))}</strong>`;
+    return `<tr class="${passive?'passive':''}">
+      <td><button onclick="startAlias('${id}')">EDIT</button></td>
+      <td>${nameCell}<br><span class="peerid" onclick="openIdentify('${id}')">${id}</span></td>
+      <td><span class="shardbadge">${shardLabel(d.current_shard)}</span></td>
+      <td>${d.peers_in_shard}</td><td>${d.storage.pinned_files}</td><td>${d.storage.known_files}</td>
+      <td>${Math.floor(d.uptime_seconds/60)}m</td>
+      <td>${tag} ${ago}s ago</td></tr>`;
+  }).join('');
+}
+function startAlias(id){ editingAlias=id; renderNodes(nodesCache); $('aliasin')?.focus(); }
+function saveAlias(id){ const v=$('aliasin').value.trim(); if(v) aliases[id]=v; else delete aliases[id];
+  saveAliases(); editingAlias=null; renderNodes(nodesCache); }
+function cancelAlias(){ editingAlias=null; renderNodes(nodesCache); }
+let nodeqT; $('nodeq').addEventListener('input', ()=>{ clearTimeout(nodeqT);
+  nodeqT=setTimeout(async ()=>{ const q=$('nodeq').value.trim();
+    renderNodes(await j('/api/nodes'+(q?`?q=${encodeURIComponent(q)}`:''))); },300); });
+
+/* ---- modals ---- */
+function openModal(html){ $('modalbox').innerHTML=html; $('modalback').style.display='block'; }
+function closeModal(){ $('modalback').style.display='none'; }
+function cidListHTML(rows, idPrefix){
+  return `<input placeholder="filter..." oninput="filterCids(this)" style="margin-bottom:8px">`+
+    `<div>${rows.map((r,i)=>`
+    <div class="cidrow" data-cid="${esc(r.cid)}">
+      <div class="cid" onclick="copyCid('${esc(r.cid)}')">${esc(r.cid)}</div>
+      <div class="meta">Shard ${esc(r.shard)} | Replicas ${r.replicas}
+        <button onclick="loadManifest(this,'${esc(r.cid)}')">LOAD MANIFEST</button></div>
+    </div>`).join('') || '(empty)'}</div>`;
+}
+function filterCids(inp){ const q=inp.value.toLowerCase();
+  inp.parentElement.querySelectorAll('.cidrow').forEach(d=>{
+    d.style.display = d.dataset.cid.toLowerCase().includes(q)?'':'none'; }); }
+function copyCid(c){ navigator.clipboard?.writeText(c).then(()=>toast('copied')); }
+async function loadManifest(btn, cid){
+  btn.disabled=true;
+  try {
+    const m = await j('/api/manifest-payload?cid='+encodeURIComponent(cid));
+    const blob = new Blob([JSON.stringify(m.manifest,null,2)],{type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    btn.outerHTML = `<a href="${url}" target="_blank"><button>VIEW MANIFEST</button></a>
+      <a href="/ipfs/${esc(m.payload_cid)}/" target="_blank"><button>VIEW PAYLOAD</button></a>`;
+  } catch(e){ btn.disabled=false; toast(e.message); }
+}
+async function openUniqueCIDs(){
+  const u = await j('/api/unique-cids');
+  openModal(`<h3>UNIQUE CIDS (${u.count})
+    <a href="/api/payload-cids-export"><button>EXPORT PAYLOAD CIDS</button></a></h3>`+cidListHTML(u.cids||[]));
+}
+async function openReplicationLevel(level){
+  const r = await j('/api/replication-cids?level='+level);
+  openModal(`<h3>FILES AT REPLICATION LEVEL ${level===10?'10+':level} (${r.count})</h3>`+cidListHTML(r.cids||[]));
+}
+async function openNodeFiles(peer){
+  const r = await j('/api/node-files?peer='+encodeURIComponent(peer));
+  openModal(`<h3>FILES OF ${esc(displayName(peer, (nodesCache[peer]||{}).node_name))} (${r.count})</h3>`+cidListHTML(r.cids||[]));
+}
+async function openShardNodes(shard){
+  const r = await j('/api/shard-nodes?shard='+encodeURIComponent(shard));
+  const rows = Object.entries(r.nodes||{}).map(([id,row])=>`
+    <div class="cidrow" data-cid="${id}">
+      <strong>${esc(displayName(id,row.node_name))}</strong> <span class="tag">${esc(row.data.role)}</span><br>
+      <span class="peerid" onclick="openIdentify('${id}')">${id}</span>
+      <div class="meta">pinned ${row.data.storage.pinned_files} | known ${row.data.storage.known_files}</div>
+    </div>`).join('');
+  openModal(`<h3>NODES IN SHARD ${esc(r.shard_label)} (${r.count})</h3>
+    <input placeholder="filter..." oninput="filterCids(this)" style="margin-bottom:8px"><div>${rows||'(empty)'}</div>`);
+}
+async function openIdentify(peer){
+  openModal(`<h3>PEER IDENTIFY</h3><div class="meta">querying...</div>`);
+  try {
+    const r = await j('/api/identify?peer='+encodeURIComponent(peer));
+    openModal(`<h3>PEER IDENTIFY</h3>
+      <div class="cid" onclick="copyCid('${esc(r.peer_id)}')">${esc(r.peer_id)}</div>
+      <p>connected: ${r.connected} | agent: ${esc(r.agent_version)||'?'} | protocol: ${esc(r.protocol_version)||'?'}</p>
+      <p>${(r.addresses||[]).map(a=>`<div class="meta">${esc(a)}</div>`).join('')}</p>
+      <p class="tags">${(r.protocols||[]).map(p=>`<span class="chip">${esc(p)}</span>`).join('')}</p>`);
+  } catch(e){ openModal(`<h3>PEER IDENTIFY</h3><p class="err">${esc(e.message)}</p>`); }
+}
+document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeModal(); });
+
+/* ---- keyword search ---- */
+let kwEnabled=false, canSetKey=true, kwResults=[], kwPage=0;
+const PAGE=20;
+function searchFor(q){ $('kwq').value=q; doSearch(); }
+async function doSearch(){
+  const q=$('kwq').value.trim(); if(!q) return;
+  hideSuggest();
+  try {
+    const r = await j('/api/keyword-search?q='+encodeURIComponent(q));
+    kwResults=r.results||[]; kwPage=0; renderResults(); refreshKw();
+  } catch(e){ $('results').innerHTML=`<p class="err">${esc(e.message)}</p>`; }
+}
+function renderResults(){
+  const start=kwPage*PAGE, page=kwResults.slice(start,start+PAGE);
+  $('results').innerHTML = page.map(r=>`
+    <div class="result">
+      <div class="title">${esc(r.title||'(untitled)')}</div>
+      <div class="tags">
+        <span class="chip f" onclick="searchFor('${esc(r.broad_field)}')">${esc(r.broad_field)}</span>
+        <span class="chip s" onclick="searchFor('${esc(r.sub_topic)}')">${esc(r.sub_topic)}</span>
+        <span class="chip n" onclick="searchFor('${esc(r.research_niche)}')">${esc(r.research_niche)}</span>
+      </div>
+      <div class="cid" onclick="copyCid('${esc(r.manifest_cid)}')">${esc(r.manifest_cid)}</div>
+      <div class="meta">Shard ${esc(r.shard)} | Replicas ${r.replicas}
+        <a href="/ipfs/${esc(r.payload_cid)}/" target="_blank"><button>VIEW</button></a></div>
+      <div class="tags">${(r.keywords||[]).map(k=>`<span class="chip" onclick="searchFor('${esc(k)}')">${esc(k)}</span>`).join('')}</div>
+    </div>`).join('') || '<p>(no results)</p>';
+  const pages=Math.ceil(kwResults.length/PAGE);
+  $('pager').innerHTML = pages>1 ? Array.from({length:pages},(_,i)=>
+    `<button ${i===kwPage?'disabled':''} onclick="kwPage=${i};renderResults()">${i+1}</button>`).join('') : '';
+}
+/* autocomplete */
+let sugT, sugSel=-1, sugItems=[];
+$('kwq').addEventListener('input', ()=>{ clearTimeout(sugT); sugT=setTimeout(suggest,200); });
+$('kwq').addEventListener('keydown', e=>{
+  const box=$('suggest');
+  if(e.key==='Enter'){ if(sugSel>=0&&sugItems[sugSel]){ $('kwq').value=sugItems[sugSel]; } doSearch(); }
+  else if(e.key==='Escape'){ hideSuggest(); }
+  else if(e.key==='ArrowDown'||e.key==='ArrowUp'){
+    e.preventDefault();
+    sugSel = e.key==='ArrowDown' ? Math.min(sugSel+1,sugItems.length-1) : Math.max(sugSel-1,0);
+    [...box.children].forEach((d,i)=>d.classList.toggle('sel',i===sugSel));
+  }
+});
+async function suggest(){
+  const q=$('kwq').value.trim(); if(!q){ hideSuggest(); return; }
+  try {
+    const r = await j('/api/keyword-suggest?q='+encodeURIComponent(q));
+    sugItems=(r.suggestions||[]).map(s=>s.keyword); sugSel=-1;
+    $('suggest').innerHTML = (r.suggestions||[]).map(s=>
+      `<div onclick="searchFor('${esc(s.keyword)}')">${esc(s.keyword)} <span class="meta">(${s.cid_count})</span></div>`).join('');
+    $('suggest').style.display = sugItems.length?'block':'none';
+  } catch(e){ hideSuggest(); }
+}
+function hideSuggest(){ $('suggest').style.display='none'; sugSel=-1; sugItems=[]; }
+
+/* ---- settings ---- */
+function openSettings(){
+  openModal(`<h3>KEYWORD SETTINGS</h3>
+    ${canSetKey?'':`<label>PASSWORD</label><input id="st-pass" type="password" size="40">
+      <div class="help">The password is the API key currently in use.</div>`}
+    <label>API PROVIDER</label>
+    <select id="st-prov" onchange="provChanged()">
+      <option value="google">Google AI Studio</option>
+      <option value="saia">SAIA</option>
+    </select>
+    <div class="help" id="st-provhelp">Google AI Studio uses gemini-2.5-flash-lite (highest free daily quota, ~1,000 requests/day).</div>
+    <div id="st-basewrap" style="display:none"><label>API BASE</label>
+      <input id="st-base" size="40" placeholder="https://chat-ai.academiccloud.de/v1"></div>
+    <label>API KEY</label><input id="st-key" type="password" size="40">
+    <div class="help">The key you save becomes the password for this dialog.</div>
+    <label>IPFS GATEWAY</label><input id="st-gw" size="40" placeholder="http://ipfs:8080">
+    <p class="err" id="st-err"></p>
+    <button onclick="saveSettings()">SAVE</button> <button onclick="closeModal()">CANCEL</button>`);
+}
+function provChanged(){
+  const g = $('st-prov').value==='google';
+  $('st-basewrap').style.display = g?'none':'block';
+  $('st-provhelp').style.display = g?'block':'none';
+}
+async function saveSettings(){
+  try {
+    const body = {
+      password: $('st-pass')?$('st-pass').value:'',
+      provider: $('st-prov').value,
+      api_key: $('st-key').value,
+      api_base: $('st-base')?$('st-base').value:'',
+      gateway: $('st-gw').value };
+    await j('/api/keyword-api-key', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body) });
+    closeModal(); toast('settings saved'); refreshKw();
+  } catch(e){ $('st-err').textContent = e.message; }
+}
+</script>
 </body>
 </html>

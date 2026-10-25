@@ -1,481 +1,301 @@
 package keywords
 
 import (
-	"context"
 	"encoding/json"
-	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/time/rate"
 )
 
 const (
 	indexFileName    = "keyword_index.json"
 	failuresFileName = "keyword_failures.json"
-
-	numWorkers      = 2
-	requestSpacing  = time.Second
-	saiaDailyCap    = 20_000
-	googleDailyCap  = 1_000
-	maxRetries      = 3
-	retryCooldown   = 10 * time.Minute
-	batchRetryDelay = time.Minute // shortest indexer pause after a rate limit
-	maxRecentItems  = 30
+	maxRecentSearches = 30
+	maxFailures       = 3                // then permanent
+	failureCooldown   = 10 * time.Minute // between tries of one CID
 )
 
-// CIDSource is the set of known manifest CIDs (implemented by the monitor).
-type CIDSource interface {
-	UniqueCIDList() []string
+// Entry is one indexed research object.
+type Entry struct {
+	ManifestCID   string   `json:"manifest_cid"`
+	PayloadCID    string   `json:"payload_cid"`
+	MetaRef       string   `json:"meta_ref"`
+	Title         string   `json:"title"`
+	BroadField    string   `json:"broad_field"`
+	SubTopic      string   `json:"sub_topic"`
+	ResearchNiche string   `json:"research_niche"`
+	Keywords      []string `json:"keywords"`
+	IndexedAt     int64    `json:"indexed_at"`
 }
 
-// Store indexes documents and datasets announced on the network and answers
-// keyword searches.
-type Store struct {
-	mu sync.RWMutex
-
-	cidKeywords map[string]*CIDKeywordEntry
-	keywordCIDs map[string]map[string]struct{}
-	processed   map[string]bool
-	inflight    map[string]bool
-	failures    map[string]*failureRecord
-	recent      []RecentSearch
-
-	dailyCount   int
-	dayStart     time.Time
-	totalOK      int
-	totalFail    int
-	totalSkipped int
-
-	cfg        Config
-	keyReady   chan struct{}
-	keyOnce    sync.Once
-	llmLimiter *rate.Limiter
-	pauseUntil time.Time
-	// pdfToText is set once by Run before the workers start.
-	pdfToText bool
-}
-
-type CIDKeywordEntry struct {
-	ManifestCID   string    `json:"manifest_cid"`
-	PayloadCID    string    `json:"payload_cid"`
-	MetaRef       string    `json:"meta_ref"`
-	Title         string    `json:"title"`
-	BroadField    string    `json:"broad_field"`
-	SubTopic      string    `json:"sub_topic"`
-	ResearchNiche string    `json:"research_niche"`
-	Keywords      []string  `json:"keywords"`
-	IndexedAt     time.Time `json:"indexed_at"`
-}
-
-type failureRecord struct {
+type failRec struct {
 	Count   int       `json:"count"`
 	LastTry time.Time `json:"last_try"`
 }
 
+// RecentSearch is a remembered successful query.
 type RecentSearch struct {
 	Keyword     string `json:"keyword"`
 	ResultCount int    `json:"result_count"`
 	Timestamp   int64  `json:"timestamp"`
 }
 
-type KeywordSuggestion struct {
-	Keyword  string `json:"keyword"`
-	CIDCount int    `json:"cid_count"`
+// Store holds the keyword index: entries, an inverted label map, failures,
+// and recent searches. Entries and permanent failures persist to disk.
+type Store struct {
+	dataDir string
+
+	mu       sync.RWMutex
+	entries  map[string]*Entry
+	inverted map[string]map[string]struct{} // label -> manifest CIDs
+	skipped  map[string]struct{}
+	failures map[string]*failRec
+	recent   []RecentSearch
 }
 
-type Stats struct {
-	TotalCIDs      int    `json:"total_cids"`
-	Indexed        int    `json:"indexed"`
-	Failed         int    `json:"failed"`
-	Skipped        int    `json:"skipped"`
-	Pending        int    `json:"pending"`
-	UniqueKeywords int    `json:"unique_keywords"`
-	DailyRemaining int    `json:"daily_remaining"`
-	DailyLimit     int    `json:"daily_limit"`
-	Enabled        bool   `json:"enabled"`
-	CanSetKey      bool   `json:"can_set_key"`
-	Provider       string `json:"provider"`
-	Model          string `json:"model"`
-	Gateway        string `json:"gateway"`
-}
-
-func NewStore(cfg Config) *Store {
-	if cfg.DataDir != "" {
-		if saved, ok := loadSettings(cfg.DataDir); ok {
-			if cfg.APIKey == "" {
-				cfg.APIKey = saved.APIKey
-			}
-			if cfg.Provider == "" {
-				cfg.Provider = saved.Provider
-			}
-			if cfg.APIBase == "" {
-				cfg.APIBase = saved.APIBase
-			}
-			if cfg.Model == "" {
-				cfg.Model = saved.Model
-			}
-			if cfg.Gateway == "" {
-				cfg.Gateway = saved.Gateway
-			}
-		} else if cfg.APIKey == "" {
-			cfg.APIKey = LoadAPIKey(cfg.DataDir)
-		}
-	}
-	cfg = normalizeConfig(cfg)
+// NewStore loads (or creates) the index under dataDir.
+func NewStore(dataDir string) *Store {
 	s := &Store{
-		cidKeywords: make(map[string]*CIDKeywordEntry),
-		keywordCIDs: make(map[string]map[string]struct{}),
-		processed:   make(map[string]bool),
-		inflight:    make(map[string]bool),
-		failures:    make(map[string]*failureRecord),
-		recent:      make([]RecentSearch, 0, maxRecentItems),
-		dayStart:    startOfDay(time.Now()),
-		cfg:         cfg,
-		keyReady:    make(chan struct{}),
-		llmLimiter:  newLLMLimiter(cfg.Provider),
+		dataDir:  dataDir,
+		entries:  map[string]*Entry{},
+		inverted: map[string]map[string]struct{}{},
+		skipped:  map[string]struct{}{},
+		failures: map[string]*failRec{},
 	}
-	if cfg.APIKey != "" {
-		s.signalKeyReady()
-	}
-	s.loadIndex()
-	s.loadFailures()
+	s.load()
 	return s
 }
 
-func (s *Store) Enabled() bool {
-	if s == nil {
-		return false
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.cfg.APIKey != ""
-}
-
-func (s *Store) signalKeyReady() {
-	s.keyOnce.Do(func() { close(s.keyReady) })
-}
-
-// requestCap returns the provider's daily request limit. The caller holds s.mu.
-func (s *Store) requestCap() int {
-	if s.cfg.Provider == ProviderGoogle {
-		return googleDailyCap
-	}
-	return saiaDailyCap
-}
-
-func (s *Store) snapshotConfig() Config {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.cfg
-}
-
-func (s *Store) waitLLM() {
-	s.mu.RLock()
-	lim := s.llmLimiter
-	s.mu.RUnlock()
-	if lim != nil {
-		_ = lim.Wait(context.Background())
-	}
-}
-
-// SetAPIKeyOnce persists the SAIA key to {DataDir}/.api_key and enables indexing.
-// It fails if a key is already set (file, env, or a previous UI save).
-func (s *Store) SetAPIKeyOnce(key string) error {
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return ErrAPIKeyEmpty
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.cfg.APIKey != "" {
-		return ErrAPIKeySet
-	}
-	s.cfg.DataDir = dataDirOrDefault(s.cfg.DataDir)
-	if err := saveAPIKey(s.cfg.DataDir, key); err != nil {
-		return err
-	}
-	s.cfg.APIKey = key
-	s.signalKeyReady()
-	slog.Info("api key saved once", "path", apiKeyPath(s.cfg.DataDir))
-	return nil
-}
-
-func (s *Store) indexPath() string {
-	return filepath.Join(s.cfg.DataDir, indexFileName)
-}
-
-func (s *Store) failuresPath() string {
-	return filepath.Join(s.cfg.DataDir, failuresFileName)
-}
-
-func (s *Store) loadIndex() {
-	if s.cfg.DataDir == "" {
-		return
-	}
-	data, err := os.ReadFile(s.indexPath())
-	if err != nil {
-		if !os.IsNotExist(err) {
-			slog.Warn("failed to read keyword index", "path", s.indexPath(), "error", err)
-		}
-		return
-	}
-	var entries map[string]*CIDKeywordEntry
-	if err := json.Unmarshal(data, &entries); err != nil {
-		slog.Warn("failed to parse keyword index", "path", s.indexPath(), "error", err)
-		return
-	}
-	for cid, entry := range entries {
-		s.cidKeywords[cid] = entry
-		s.processed[cid] = true
-		s.indexLabels(cid, entry)
-	}
-	s.totalOK = len(entries)
-	slog.Info("loaded keyword index", "entries", len(entries), "keywords", len(s.keywordCIDs))
-}
-
-func (s *Store) saveIndex() {
-	if s.cfg.DataDir == "" {
-		return
-	}
-	if err := os.MkdirAll(s.cfg.DataDir, 0o700); err != nil {
-		slog.Error("keyword index dir", "error", err)
-		return
-	}
-	s.mu.RLock()
-	data, err := json.Marshal(s.cidKeywords)
-	s.mu.RUnlock()
-	if err != nil {
-		slog.Error("marshal keyword index", "error", err)
-		return
-	}
-	atomicWrite(s.indexPath(), data)
-}
-
-func (s *Store) loadFailures() {
-	if s.cfg.DataDir == "" {
-		return
-	}
-	data, err := os.ReadFile(s.failuresPath())
-	if err != nil {
-		if !os.IsNotExist(err) {
-			slog.Warn("failed to read keyword failures", "path", s.failuresPath(), "error", err)
-		}
-		return
-	}
-	var entries map[string]*failureRecord
-	if err := json.Unmarshal(data, &entries); err != nil {
-		slog.Warn("failed to parse keyword failures", "error", err)
-		return
-	}
-	for cid, f := range entries {
-		s.failures[cid] = f
-	}
-}
-
-func (s *Store) saveFailures() {
-	if s.cfg.DataDir == "" {
-		return
-	}
-	permanent := make(map[string]*failureRecord)
-	for cid, f := range s.failures {
-		if f.Count >= maxRetries {
-			permanent[cid] = f
+func (s *Store) load() {
+	if raw, err := os.ReadFile(filepath.Join(s.dataDir, indexFileName)); err == nil {
+		var m map[string]*Entry
+		if json.Unmarshal(raw, &m) == nil {
+			s.entries = m
+			for _, e := range m {
+				s.indexLabelsLocked(e)
+			}
 		}
 	}
-	if len(permanent) == 0 {
-		return
+	if raw, err := os.ReadFile(filepath.Join(s.dataDir, failuresFileName)); err == nil {
+		var m map[string]*failRec
+		if json.Unmarshal(raw, &m) == nil {
+			s.failures = m
+		}
 	}
-	if err := os.MkdirAll(s.cfg.DataDir, 0o700); err != nil {
-		return
-	}
-	data, err := json.Marshal(permanent)
+}
+
+func (s *Store) saveIndexLocked() {
+	raw, err := json.Marshal(s.entries)
 	if err != nil {
 		return
 	}
-	atomicWrite(s.failuresPath(), data)
+	os.MkdirAll(s.dataDir, 0o700)
+	_ = writeAtomic(filepath.Join(s.dataDir, indexFileName), raw, 0o600)
 }
 
-// resetFailuresLocked forgets all failures, including those saved as
-// permanent, so files that failed under the previous provider or key are
-// tried again. The caller holds s.mu.
-func (s *Store) resetFailuresLocked() {
-	s.failures = make(map[string]*failureRecord)
-	s.totalFail = 0
-	if s.cfg.DataDir == "" {
-		return
-	}
-	if err := os.Remove(s.failuresPath()); err != nil && !os.IsNotExist(err) {
-		slog.Warn("failed to remove keyword failures", "path", s.failuresPath(), "error", err)
-	}
-}
-
-func atomicWrite(path string, data []byte) {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		slog.Error("write temp file", "path", tmp, "error", err)
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		slog.Error("rename file", "path", path, "error", err)
-	}
-}
-
-func (s *Store) indexLabels(manifestCID string, entry *CIDKeywordEntry) {
-	for _, kw := range entryLabels(entry) {
-		if s.keywordCIDs[kw] == nil {
-			s.keywordCIDs[kw] = make(map[string]struct{})
-		}
-		s.keywordCIDs[kw][manifestCID] = struct{}{}
-	}
-}
-
-func entryLabels(entry *CIDKeywordEntry) []string {
-	labels := make([]string, 0, len(entry.Keywords)+3)
-	for _, kw := range entry.Keywords {
-		if kw = normalizeKeyword(kw); kw != "" {
-			labels = append(labels, kw)
+// saveFailuresLocked persists only permanent failures.
+func (s *Store) saveFailuresLocked() {
+	perm := map[string]*failRec{}
+	for k, f := range s.failures {
+		if f.Count >= maxFailures {
+			perm[k] = f
 		}
 	}
-	for _, field := range []string{entry.BroadField, entry.SubTopic, entry.ResearchNiche} {
-		if kw := normalizeKeyword(field); kw != "" {
-			labels = append(labels, kw)
+	raw, err := json.Marshal(perm)
+	if err != nil {
+		return
+	}
+	os.MkdirAll(s.dataDir, 0o700)
+	_ = writeAtomic(filepath.Join(s.dataDir, failuresFileName), raw, 0o600)
+}
+
+func (s *Store) labelsOf(e *Entry) []string {
+	labels := append([]string{}, e.Keywords...)
+	for _, extra := range []string{e.BroadField, e.SubTopic, e.ResearchNiche} {
+		if v := strings.ToLower(strings.TrimSpace(extra)); v != "" {
+			labels = append(labels, v)
 		}
 	}
 	return labels
 }
 
-func normalizeKeyword(s string) string {
-	return strings.ToLower(strings.TrimSpace(s))
-}
-
-// Run waits for an API key if none is set, then indexes newly announced content.
-func (s *Store) Run(ctx context.Context, source CIDSource) {
-	if !s.Enabled() {
-		slog.Info("no API key yet; set it in the monitor settings or via SAIA_API_KEY / .api_key")
-		select {
-		case <-ctx.Done():
-			return
-		case <-s.keyReady:
+func (s *Store) indexLabelsLocked(e *Entry) {
+	for _, label := range s.labelsOf(e) {
+		set := s.inverted[label]
+		if set == nil {
+			set = map[string]struct{}{}
+			s.inverted[label] = set
 		}
-		if !s.Enabled() {
-			return
-		}
-	}
-	if _, err := exec.LookPath("pdftotext"); err == nil {
-		s.pdfToText = true
-	} else {
-		slog.Warn("pdftotext not found; PDFs are not indexed (install poppler-utils)")
-	}
-	cfg := s.snapshotConfig()
-	slog.Info("keyword indexing enabled", "provider", cfg.Provider, "model", cfg.Model, "api_base", cfg.APIBase, "workers", numWorkers)
-
-	work := make(chan string, numWorkers)
-	var wg sync.WaitGroup
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for cid := range work {
-				s.processCID(cid)
-			}
-		}()
-	}
-
-	ticker := time.NewTicker(requestSpacing)
-	defer ticker.Stop()
-	defer func() { close(work); wg.Wait() }()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			cid := s.pickNextCID(source)
-			if cid == "" {
-				continue
-			}
-			select {
-			case work <- cid:
-			case <-ctx.Done():
-				return
-			}
-		}
+		set[e.ManifestCID] = struct{}{}
 	}
 }
 
-func (s *Store) pickNextCID(source CIDSource) string {
-	candidates := source.UniqueCIDList()
-	sort.Strings(candidates)
-
+// Put stores a successful extraction and persists the index.
+func (s *Store) Put(e *Entry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.resetDayIfNeeded()
-	now := time.Now()
-	if s.dailyCount >= s.requestCap() || now.Before(s.pauseUntil) {
-		return ""
-	}
-	for _, c := range candidates {
-		if s.processed[c] || s.inflight[c] {
-			continue
-		}
-		if f, ok := s.failures[c]; ok {
-			if f.Count >= maxRetries {
-				continue
-			}
-			if now.Sub(f.LastTry) < retryCooldown {
-				continue
-			}
-		}
-		s.inflight[c] = true
-		return c
-	}
-	return ""
+	s.entries[e.ManifestCID] = e
+	s.indexLabelsLocked(e)
+	delete(s.failures, e.ManifestCID)
+	s.saveIndexLocked()
 }
 
-func (s *Store) clearInflight(manifestCID string) {
-	s.mu.Lock()
-	delete(s.inflight, manifestCID)
-	s.mu.Unlock()
+// Get returns an indexed entry.
+func (s *Store) Get(manifestCID string) (*Entry, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, ok := s.entries[manifestCID]
+	return e, ok
 }
 
-func (s *Store) recordFailure(manifestCID string) {
+// MarkSkipped records unsupported content: processed, never retried.
+func (s *Store) MarkSkipped(cid string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	f, ok := s.failures[manifestCID]
-	if !ok {
-		f = &failureRecord{}
-		s.failures[manifestCID] = f
+	s.skipped[cid] = struct{}{}
+}
+
+// RecordFailure counts a failed attempt; at maxFailures it becomes permanent
+// and is persisted.
+func (s *Store) RecordFailure(cid string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f := s.failures[cid]
+	if f == nil {
+		f = &failRec{}
+		s.failures[cid] = f
 	}
 	f.Count++
 	f.LastTry = time.Now()
-	s.totalFail++
-	if f.Count >= maxRetries {
-		s.saveFailures()
+	if f.Count >= maxFailures {
+		s.saveFailuresLocked()
 	}
 }
 
-func (s *Store) markSkipped(manifestCID string) {
+// ResetFailures clears every failure (settings changed: try again).
+func (s *Store) ResetFailures() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.processed[manifestCID] = true
-	s.totalSkipped++
+	s.failures = map[string]*failRec{}
+	os.Remove(filepath.Join(s.dataDir, failuresFileName))
 }
 
-func (s *Store) resetDayIfNeeded() {
-	dayStart := startOfDay(time.Now())
-	if dayStart.After(s.dayStart) {
-		s.dayStart = dayStart
-		s.dailyCount = 0
+// eligible reports whether a CID should be picked for indexing now.
+func (s *Store) eligible(cid string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, done := s.entries[cid]; done {
+		return false
+	}
+	if _, skip := s.skipped[cid]; skip {
+		return false
+	}
+	if f := s.failures[cid]; f != nil {
+		if f.Count >= maxFailures {
+			return false
+		}
+		if time.Since(f.LastTry) < failureCooldown {
+			return false
+		}
+	}
+	return true
+}
+
+// Search runs an AND substring query over labels and descriptive fields,
+// newest first.
+func (s *Store) Search(query string) []*Entry {
+	terms := strings.Fields(strings.ToLower(query))
+	if len(terms) == 0 {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []*Entry
+	for _, e := range s.entries {
+		haystack := strings.ToLower(e.Title + " " + e.BroadField + " " + e.SubTopic + " " + e.ResearchNiche)
+		match := true
+		for _, term := range terms {
+			found := strings.Contains(haystack, term)
+			if !found {
+				for _, label := range s.labelsOf(e) {
+					if strings.Contains(label, term) {
+						found = true
+						break
+					}
+				}
+			}
+			if !found {
+				match = false
+				break
+			}
+		}
+		if match {
+			out = append(out, e)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].IndexedAt > out[j].IndexedAt })
+	return out
+}
+
+// Suggestion is one autocomplete candidate.
+type Suggestion struct {
+	Keyword  string `json:"keyword"`
+	CIDCount int    `json:"cid_count"`
+}
+
+// Suggest returns up to 20 labels containing the query, by count then name.
+func (s *Store) Suggest(query string) []Suggestion {
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []Suggestion
+	for label, set := range s.inverted {
+		if strings.Contains(label, q) {
+			out = append(out, Suggestion{Keyword: label, CIDCount: len(set)})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CIDCount != out[j].CIDCount {
+			return out[i].CIDCount > out[j].CIDCount
+		}
+		return out[i].Keyword < out[j].Keyword
+	})
+	if len(out) > 20 {
+		out = out[:20]
+	}
+	return out
+}
+
+// RecordSearch remembers a query that returned results.
+func (s *Store) RecordSearch(keyword string, results int) {
+	if results == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recent = append([]RecentSearch{{Keyword: keyword, ResultCount: results, Timestamp: time.Now().Unix()}}, s.recent...)
+	if len(s.recent) > maxRecentSearches {
+		s.recent = s.recent[:maxRecentSearches]
 	}
 }
 
-func startOfDay(t time.Time) time.Time {
-	t = t.UTC()
-	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+// RecentSearches returns remembered queries, newest first.
+func (s *Store) RecentSearches() []RecentSearch {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]RecentSearch{}, s.recent...)
+}
+
+// Counts returns (indexed, skipped, failed, uniqueLabels). failed counts
+// distinct failing CIDs once, permanent or not.
+func (s *Store) Counts() (indexed, skipped, failed, labels int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.entries), len(s.skipped), len(s.failures), len(s.inverted)
 }

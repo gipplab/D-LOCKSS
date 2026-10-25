@@ -42,7 +42,13 @@
     metadata reference, otherwise `ipfs://<cid>`. Files that are only in the WebUI's *Files* view (MFS) are not
     pinned and are not ingested. D-LOCKSS labels its own manifest pins `dlockss:manifest` and never ingests them
     or the payloads they reference. Unpinning in Kubo does not remove ingested content from D-LOCKSS.
-    Disable with `DLOCKSS_PIN_INGEST=false`; the poll interval is `DLOCKSS_PIN_INGEST_INTERVAL` (default `1m`).
+    Disable with `DLOCKSS_PIN_INGEST=false` (the poll interval is fixed at 1m).
+
+    Folder ingest is a periodic rescan: a file is picked up once its size is stable across two scans (up to ~1 minute).
+
+### Troubleshooting
+*   **"IPFS is not available"** — start the daemon (`ipfs daemon`) and check its API address (`ipfs config Addresses.API`) against `DLOCKSS_IPFS_NODE`.
+*   **No peers** — open Kubo's swarm ports 4001/tcp and 4001/udp (the D-LOCKSS node itself uses random ports and NAT traversal).
 
 ### Configuration
 Configure via environment variables:
@@ -64,9 +70,6 @@ export DLOCKSS_MAX_PEERS_PER_SHARD=12
 # Network
 export DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/5001"
 
-# DHT tuning
-export DLOCKSS_MAX_CONCURRENT_DHT_PROVIDES=8 # Limit concurrent DHT provide operations
-
 # Isolated eval / private testnets (skip public DHT bootstrap + AutoRelay)
 export DLOCKSS_PRIVATE_NETWORK=true
 
@@ -78,18 +81,21 @@ export DLOCKSS_VERBOSE_LOGGING=true # Enable detailed metrics and status logs
 # Include this node's own peer ID if it should ingest local files.
 export DLOCKSS_INGEST_ALLOWLIST="12D3KooWPublisherA,12D3KooWPublisherB"
 # export DLOCKSS_TRUST_STORE="/data/trusted_peers.json"
-# export DLOCKSS_TRUST_MODE=allowlist   # also restrict protocol/CRDT writers
+# export DLOCKSS_TRUST_MODE=allowlist   # also restrict protocol message senders
 ```
+
+Protocol timings, concurrency bounds, and security parameters are frozen
+constants; setting an unknown `DLOCKSS_*` variable logs a warning. The full
+knob list is in [docs/DLOCKSS_PROTOCOL.md](docs/DLOCKSS_PROTOCOL.md) §9.
 
 #### Node Naming
 
 Nodes can have a human-readable name displayed in the monitor dashboard. The name is resolved in order:
 
-1. `DLOCKSS_NODE_NAME` environment variable (highest priority)
+1. `DLOCKSS_NODE_NAME` environment variable (highest priority, persisted)
 2. Persisted name file (`node_name` alongside the data directory)
-3. Interactive prompt on first startup (when running outside Docker/testnet)
 
-Testnet nodes are automatically named `testnet_1`, `testnet_2`, etc.
+Unnamed nodes show their peer ID in the monitor. Testnet nodes are automatically named `testnet_1`, `testnet_2`, etc.
 
 #### Identity Persistence
 
@@ -101,7 +107,7 @@ The node's libp2p identity (private key) determines its **Peer ID**. The identit
 
 For Docker deployments: either mount the Kubo config file and set `DLOCKSS_IPFS_CONFIG`, or mount a persistent volume and set `DLOCKSS_DATA_DIR` to a subdirectory on it. The identity key, node name, and cluster state are stored alongside the data directory and will survive container rebuilds.
 
-> **Path safety:** The node refuses to start if the identity key, node name, or cluster store would be placed *inside* the ingest directory (`DLOCKSS_DATA_DIR`), since the file watcher would try to ingest them. Always set `DLOCKSS_DATA_DIR` to a dedicated subdirectory (e.g. `./data`, not `.`).
+> **Path safety:** The node refuses to start if the identity key, node name, or cluster store would be placed *inside* the ingest directory (`DLOCKSS_DATA_DIR`), since the ingest scanner would pick them up. Always set `DLOCKSS_DATA_DIR` to a dedicated subdirectory (e.g. `./data`, not `.`).
 
 #### Docker Compose Example
 
@@ -170,31 +176,29 @@ See [docs/DLOCKSS_PROTOCOL.md](docs/DLOCKSS_PROTOCOL.md) for protocol details.
 
 ## 3. Architecture
 
-D-LOCKSS acts as a self-healing, sharded storage cluster using the IPFS/Libp2p stack.
+D-LOCKSS acts as a self-healing, sharded storage network on the IPFS/libp2p stack.
 
 ### Key Components
-1.  **Shard Manager:** Dynamically splits responsibilities based on peer count to maintain scalability. Delegates lifecycle decisions (split/merge/discovery) to a `lifecycleManager` and replication to a `replicationManager`.
-2.  **Cluster Manager:** Manages embedded **IPFS Cluster** instances (one per shard) using **CRDTs** for state consensus; nodes in a shard sync and pin content assigned to that shard.
-3.  **File Watcher:** Monitors the data directory to automatically ingest content (via `handleWatcherEvent` / `handleNewDirectory`), and polls Kubo's recursive pins to ingest those created by users (`WatchPins`).
-4.  **Storage Monitor:** Protects nodes from disk exhaustion by rejecting custodial requests when full.
-5.  **BadBits Manager:** Enforces content blocking (e.g., DMCA) based on configured country codes.
+1.  **Shard Engine** (`internal/shard`): membership tracking, dynamic split/merge/discovery, the replication checker, and one placement pass that re-homes every file (custodial handoff, orphan handoff, and post-move resharding in a single loop).
+2.  **Pin Sets** (`internal/pinset`): each shard has a persistent replicated pin set — the manifests every member must hold. A per-shard tracker reconciles the set against Kubo with bounded background fetches. Convergence rides entirely on the signed message protocol (IngestMessage + ReplicationRequest + PINNED announcements); there is no embedded consensus layer.
+3.  **Ingest** (`internal/ingest`): a recursive folder watcher and a Kubo pin watcher feed one shared pipeline that imports, wraps, signs, pins, and announces content.
+4.  **Kubo client** (`internal/kubo`): a minimal, fully context-aware HTTP RPC client (~12 endpoints) plus a serialized DHT provide worker with retries.
+5.  **Security** (`internal/trust`, `internal/protocol`, `internal/badbits`): signed messages with replay protection, origin allowlisting, per-peer rate limiting, and a CID denylist.
+6.  **Disk monitor** (`internal/store`): above the high-water mark the node advertises PASSIVE, steering custodial and replication load away.
 
 ### "Networked RAID" Logic
-*   **Striping -> Sharding:** Responsibility for files is determined by a stable hash of the **PayloadCID** (TargetShardForPayload); each file lives in exactly one cluster (shard).
-*   **Redundancy -> Cluster Consensus:** Each shard runs an embedded IPFS Cluster CRDT. When a file is ingested, it is "pinned" to the shard's cluster state. All peers in that shard sync this state and automatically pin the content locally.
-*   **Write Cache -> Custodial Mode:** Nodes temporarily hold files they don't own until they can hand them off to the responsible shard.
+*   **Striping -> Sharding:** Responsibility for a file is a stable hash of its **PayloadCID**; each file lives in exactly one shard.
+*   **Redundancy -> Shard pin sets:** Every member of a shard pins every file in the shard's pin set, so the shard size (bounded by min/max peers) is the copy count. Periodic ReplicationRequests act as anti-entropy, so late joiners and restarted nodes converge.
+*   **Write Cache -> Custodial Mode:** Nodes temporarily hold files they don't own until the responsible shard demonstrably has them (DHT provider checks), then release.
 
-Documentation:
-*   [Protocol specification](docs/DLOCKSS_PROTOCOL.md)
-*   [Replication performance](docs/REPLICATION_PERFORMANCE.md)
-*   Architecture diagrams (PlantUML) in `docs/`
+Documentation: [docs/DLOCKSS_PROTOCOL.md](docs/DLOCKSS_PROTOCOL.md) is the canonical specification — wire protocol, node behavior, configuration, monitor, and the differences from the original implementation.
 
 ---
 
 ## 4. Development
 
 ### Building from Source
-Requires Go 1.21+.
+Requires Go 1.25+.
 
 ```bash
 git clone https://github.com/gipplab/D-LOCKSS
@@ -239,7 +243,7 @@ Images, audio, video, archives, other binaries, and files over 20 MB that need a
 
 The monitor displays each node's **name** (if configured via `DLOCKSS_NODE_NAME`), falling back to the Peer ID. Names propagate via HEARTBEAT/JOIN messages and appear in the node table, charts, and shard modals. Client-side aliases (EDIT button) override server-side names. Each node has **one peer ID**: when `DLOCKSS_IPFS_CONFIG` is set (e.g. in testnet), D-LOCKSS uses the IPFS repo identity so the same ID appears in the monitor and in `node_x.ipfs.log`.
 
-The monitor bootstrap-subscribes to all shards up to depth 6 (127 shards) so it can see nodes even when started late. Set `DLOCKSS_MONITOR_BOOTSTRAP_SHARD_DEPTH` (0–12) to tune.
+The monitor subscribes to the root shard and follows SPLIT announcements (rebroadcast to ancestor topics every 60 s) down the tree, so it sees nodes even when started late.
 
 Alternatively use: https://dlockss-monitor.wmcloud.org.
 
@@ -252,7 +256,7 @@ go test ./... -v
 ```
 
 ### Code Layout
-Configuration is grouped into nested structs (`Sharding`, `Replication`, `Files`, `Security`, `Orphan`). `ShardManager` delegates replication to `replicationManager` and split/merge/discovery to `lifecycleManager`.
+Configuration is grouped into nested structs (`Sharding`, `Replication`, `Files`, `Security`, `Orphan`) in `internal/config`. The node is composed of small packages: `schema` (wire formats), `protocol` (signing, nonces, rate limits, text messages), `kubo` (IPFS RPC), `pinset` (per-shard replicated pin sets), `shard` (the engine), `ingest` (watchers + pipeline), `store` (registries, provides, disk), `trust`, `badbits`, `identity`, `p2p`, and `api`. The monitor lives in `internal/monitor` with keyword indexing in `internal/keywords`.
 
 ---
 

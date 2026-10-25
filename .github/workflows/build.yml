@@ -40,6 +40,12 @@ jobs:
             exit 1
           fi
 
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
       - name: Build
         run: |
           set -e

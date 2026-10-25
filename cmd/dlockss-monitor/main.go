@@ -1,109 +1,89 @@
-// Command dlockss-monitor runs the D-LOCKSS network monitor.
+// Command dlockss-monitor observes a D-LOCKSS network as a silent PROBE and
+// serves a dashboard on port 8080: nodes, shards, replication health, and an
+// optional LLM-backed keyword search over the preserved content.
 package main
 
 import (
 	"context"
-	"errors"
 	"flag"
-	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/peer"
+
+	"dlockss/internal/config"
 	"dlockss/internal/keywords"
 	"dlockss/internal/monitor"
 )
 
 func main() {
-	topicFlag := flag.String("topic", "", "archive topic name (overrides DLOCKSS_TOPIC_NAME env var)")
-	prefixFlag := flag.String("prefix", "", "pubsub topic prefix / protocol version (overrides DLOCKSS_PUBSUB_TOPIC_PREFIX env var)")
+	topicFlag := flag.String("topic", "", "topic name (overrides DLOCKSS_TOPIC_NAME)")
+	prefixFlag := flag.String("prefix", "", "pubsub topic prefix (overrides DLOCKSS_PUBSUB_TOPIC_PREFIX)")
 	flag.Parse()
 
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
-
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	m := monitor.NewMonitor(monitorConfig(*topicFlag, *prefixFlag))
+	topicName := firstNonEmpty(*topicFlag, os.Getenv("DLOCKSS_TOPIC_NAME"), config.DefaultTopicName)
+	topicPrefix := firstNonEmpty(*prefixFlag, os.Getenv("DLOCKSS_PUBSUB_TOPIC_PREFIX"), config.DefaultPubsubVersion)
 
-	kwCfg := keywords.ConfigFromEnv()
-	if kwCfg.APIKey != "" {
-		slog.Info("keyword indexing configured", "model", kwCfg.Model, "data_dir", kwCfg.DataDir)
+	nodeTimeout := 350 * time.Second
+	if v := os.Getenv("DLOCKSS_MONITOR_NODE_CLEANUP_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			nodeTimeout = d
+		} else {
+			slog.Warn("invalid DLOCKSS_MONITOR_NODE_CLEANUP_TIMEOUT, using default", "value", v)
+		}
 	}
-	m.SetKeywords(keywords.NewStore(kwCfg))
-	m.StartKeywordIndexer(ctx)
-
-	h, err := monitor.StartLibP2P(ctx, m)
+	dataDir := keywords.DataDir()
+	net, err := monitor.NewNet(ctx, dataDir)
 	if err != nil {
-		slog.Error("p2p error", "error", err)
+		slog.Error("could not start the monitor host", "err", err)
 		os.Exit(1)
 	}
-	defer h.Close()
+	defer net.Host.Close()
+	slog.Info("monitor started", "peer_id", net.Host.ID(), "topic", topicName, "prefix", topicPrefix)
 
-	mux := http.NewServeMux()
-	m.RegisterRoutes(mux)
+	state := monitor.NewState(net.Host.ID(), nodeTimeout)
+	topicOf := func(shardID string) string { return topicPrefix + "-" + topicName + "-shard-" + shardID }
+	subs := monitor.NewSubscriber(net, state, topicOf)
+	subs.Bootstrap(ctx)
+	go subs.RunDynamic(ctx)
+	go state.RunCleanup(ctx)
+	go net.RunPeerstoreGC(ctx,
+		func(p peer.ID) bool {
+			for _, n := range state.Nodes() {
+				if n.PeerID == p {
+					return true
+				}
+			}
+			return false
+		},
+		subs.TopicPeers,
+	)
 
-	srv := &http.Server{
-		Addr:         fmt.Sprintf(":%d", monitor.WebUIPort),
-		Handler:      mux,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 20 * time.Second,
-		IdleTimeout:  120 * time.Second,
-	}
+	settings := keywords.LoadSettings(dataDir)
+	store := keywords.NewStore(dataDir)
+	indexer := keywords.NewIndexer(store, settings, state.UniqueCIDs)
+	go indexer.Run(ctx)
 
-	go m.RunStatusLogger(ctx)
-
-	go func() {
-		slog.Info("monitor started", "url", fmt.Sprintf("http://localhost:%d", monitor.WebUIPort), "peer_id", h.ID().String())
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("http server error", "error", err)
-		}
-	}()
-
-	<-ctx.Done()
-	slog.Info("shutting down gracefully")
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		slog.Error("http shutdown error", "error", err)
+	server := monitor.NewServer(state, net, indexer, topicPrefix, topicName)
+	slog.Info("dashboard listening", "addr", "http://localhost:8080")
+	if err := server.Run(ctx); err != nil && ctx.Err() == nil {
+		slog.Error("http server failed", "err", err)
+		os.Exit(1)
 	}
 }
 
-// monitorConfig applies environment overrides to the defaults, then the
-// command-line flags, which take precedence.
-func monitorConfig(topicFlag, prefixFlag string) monitor.Config {
-	cfg := monitor.DefaultConfig()
-	if v := os.Getenv("DLOCKSS_MONITOR_NODE_CLEANUP_TIMEOUT"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			cfg.NodeCleanupTimeout = d
-			slog.Info("node cleanup timeout from env", "timeout", cfg.NodeCleanupTimeout)
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
 		}
 	}
-	if v := os.Getenv("DLOCKSS_MONITOR_BOOTSTRAP_SHARD_DEPTH"); v != "" {
-		if d, err := strconv.Atoi(v); err == nil && d >= 0 && d <= 12 {
-			cfg.BootstrapShardDepth = d
-			slog.Info("bootstrap shard depth from env", "depth", cfg.BootstrapShardDepth)
-		}
-	}
-	if v := os.Getenv("DLOCKSS_PUBSUB_TOPIC_PREFIX"); v != "" {
-		cfg.PubsubTopicPrefix = v
-		slog.Info("pubsub topic prefix from env", "prefix", cfg.PubsubTopicPrefix)
-	}
-	if v := os.Getenv("DLOCKSS_TOPIC_NAME"); v != "" {
-		cfg.TopicName = v
-		slog.Info("topic name from env", "topic", cfg.TopicName)
-	}
-	if topicFlag != "" {
-		cfg.TopicName = topicFlag
-		slog.Info("topic name from flag", "topic", cfg.TopicName)
-	}
-	if prefixFlag != "" {
-		cfg.PubsubTopicPrefix = prefixFlag
-		slog.Info("pubsub topic prefix from flag", "prefix", cfg.PubsubTopicPrefix)
-	}
-	return cfg
+	return ""
 }

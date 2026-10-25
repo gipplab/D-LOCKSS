@@ -1,3 +1,8 @@
+// Package config loads the node's operator-facing configuration from the
+// environment. Only knobs an operator genuinely sets are configurable;
+// protocol timings, concurrency bounds, and security parameters are frozen
+// constants in their packages. Invalid values are logged and replaced by the
+// default, never fatal.
 package config
 
 import (
@@ -7,505 +12,238 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 )
 
-// DefaultPubsubVersion is the protocol version used for pubsub topic names.
-// Bump when releasing to avoid cross-talk with older nodes. Keep in sync with releases.
+// DefaultPubsubVersion is the pubsub topic prefix. It is bumped on breaking
+// protocol changes so incompatible versions never share topics.
 const DefaultPubsubVersion = "dlockss-v0.0.3"
 
-func getEnvString(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
-}
-
-// getEnvParsed returns the parsed value of key, or defaultValue when key is
-// unset or does not parse as kind.
-func getEnvParsed[T any](key string, defaultValue T, kind string, parse func(string) (T, error)) T {
-	value := os.Getenv(key)
-	if value == "" {
-		return defaultValue
-	}
-	if parsed, err := parse(value); err == nil {
-		return parsed
-	}
-	slog.Warn("invalid env "+kind+", using default", "key", key, "default", defaultValue)
-	return defaultValue
-}
-
-func getEnvInt(key string, defaultValue int) int {
-	return getEnvParsed(key, defaultValue, "integer", strconv.Atoi)
-}
-
-func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
-	return getEnvParsed(key, defaultValue, "duration", time.ParseDuration)
-}
-
-func getEnvFloat(key string, defaultValue float64) float64 {
-	return getEnvParsed(key, defaultValue, "float", func(s string) (float64, error) {
-		return strconv.ParseFloat(s, 64)
-	})
-}
-
-func getEnvBool(key string, defaultValue bool) bool {
-	return getEnvParsed(key, defaultValue, "boolean", strconv.ParseBool)
-}
-
-func getEnvStringSlice(key string) []string {
-	var result []string
-	for _, p := range strings.Split(os.Getenv(key), ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			result = append(result, p)
-		}
-	}
-	return result
-}
-
-func clusterStorePath(dataDir string) string {
-	if p := os.Getenv("DLOCKSS_CLUSTER_STORE"); p != "" {
-		return p
-	}
-	return filepath.Join(filepath.Dir(dataDir), "cluster_store")
-}
-
-func identityPath(dataDir string) string {
-	if p := os.Getenv("DLOCKSS_IDENTITY_PATH"); p != "" {
-		return p
-	}
-	return filepath.Join(filepath.Dir(dataDir), "dlockss.key")
-}
-
-func nodeNamePath(dataDir string) string {
-	return filepath.Join(filepath.Dir(dataDir), "node_name")
-}
-
-// DefaultTopicName is the archive topic when none is configured.
+// DefaultTopicName is the archive (network) name within the topic namespace.
 const DefaultTopicName = "creative-commons"
 
-// ShardingConfig holds parameters that govern shard splitting, merging, and peer tracking.
-type ShardingConfig struct {
-	MaxPeersPerShard              int
-	MinPeersPerShard              int
-	MinPeersAcrossSiblings        int
-	ShardPeerCheckInterval        time.Duration
-	ShardDiscoveryInterval        time.Duration
-	ShardSplitRebroadcastInterval time.Duration
-	SeenPeersWindow               time.Duration
-	PruneStalePeersInterval       time.Duration
-	ShardOverlapDuration          time.Duration
-	ShardMoveCooldown             time.Duration
-	MergeUpCooldown               time.Duration
-	ProbeTimeoutMerge             time.Duration
-	SiblingEmptyMergeAfter        time.Duration
-}
-
-// ReplicationConfig holds parameters for content replication across peers.
-type ReplicationConfig struct {
-	CheckInterval                  time.Duration
-	MaxConcurrentReplicationChecks int
-	AutoReplicationEnabled         bool
-	AutoReplicationTimeout         time.Duration
-	PinReannounceInterval          time.Duration
-}
-
-// FileConfig holds parameters for file ingestion and DHT operations.
-type FileConfig struct {
-	FileImportTimeout           time.Duration
-	DHTProvideTimeout           time.Duration
-	MaxConcurrentDHTProvides    int
-	FileProcessingDelay         time.Duration
-	FileStabilityDelay          time.Duration
-	MaxConcurrentFileProcessing int
-	ReshardDelay                time.Duration
-	ReshardHandoffDelay         time.Duration
-	// PinIngestEnabled ingests recursive pins that users create in Kubo.
-	PinIngestEnabled  bool
-	PinIngestInterval time.Duration
-}
-
-// SecurityConfig holds trust, signing, and nonce parameters.
-type SecurityConfig struct {
-	TrustMode           string
-	TrustStorePath      string
-	SignatureMode       string
-	SignatureMaxAge     time.Duration
-	NonceSize           int
-	MinNonceSize        int
-	FutureSkewTolerance time.Duration
-}
-
-// OrphanConfig holds parameters for orphan file detection and cleanup.
-type OrphanConfig struct {
-	UnpinGracePeriod   time.Duration
-	HandoffGrace       time.Duration
-	UnpinMinHandoffCnt int
-}
-
-// Config holds all runtime configuration for a D-LOCKSS node.
+// Config is the node configuration.
 type Config struct {
-	DiscoveryServiceTag    string
-	PubsubTopicPrefix      string
-	TopicName              string
-	IngestAllowlist        []string
-	FileWatchFolder        string
-	ClusterStorePath       string
-	BadBitsPath            string
-	IPFSNodeAddress        string
-	APIPort                int
-	BootstrapTimeout       time.Duration
-	HeartbeatInterval      time.Duration
-	VerboseLogging         bool
-	RateLimitWindow        time.Duration
-	MaxMessagesPerWindow   int
-	DiskUsageHighWaterMark float64
-	NodeName               string
-	IdentityPath           string
-	NodeNamePath           string
-	IPFSConfigPath         string
-	// PrivateNetwork skips public DHT bootstrap peers and AutoRelay.
-	// Use for isolated eval testnets (mDNS + unique DiscoveryServiceTag).
-	PrivateNetwork bool
-	// ConnLowWater and ConnHighWater bound the libp2p host's connections:
-	// above high water the connection manager trims down to low water.
-	ConnLowWater  int
-	ConnHighWater int
-	// DHTClient keeps the node's DHT in client mode, so it never answers
-	// DHT queries from the public network. Saves bandwidth on slow links.
-	DHTClient bool
+	// Network identity and namespace.
+	DiscoveryServiceTag string // DLOCKSS_DISCOVERY_TAG
+	PubsubTopicPrefix   string // DLOCKSS_PUBSUB_TOPIC_PREFIX
+	TopicName           string // DLOCKSS_TOPIC_NAME
+	PrivateNetwork      bool   // DLOCKSS_PRIVATE_NETWORK: skip public bootstrap/NAT/relay
+	DHTClient           bool   // DLOCKSS_DHT_CLIENT: rendezvous DHT in client mode
 
-	Sharding    ShardingConfig
-	Replication ReplicationConfig
-	Files       FileConfig
-	Security    SecurityConfig
-	Orphan      OrphanConfig
+	// Paths. State files live in the PARENT of the ingest directory so the
+	// scanner never ingests them.
+	FileWatchFolder  string // DLOCKSS_DATA_DIR (ingest directory)
+	ClusterStorePath string // DLOCKSS_CLUSTER_STORE (pin sets)
+	BadBitsPath      string // DLOCKSS_BADBITS_PATH
+	IdentityPath     string // DLOCKSS_IDENTITY_PATH
+	NodeNamePath     string // derived: <parent>/node_name
+	IPFSConfigPath   string // DLOCKSS_IPFS_CONFIG (share Kubo's identity)
+	TrustStorePath   string // DLOCKSS_TRUST_STORE
+
+	// Node.
+	NodeName        string // DLOCKSS_NODE_NAME
+	IPFSNodeAddress string // DLOCKSS_IPFS_NODE
+	APIPort         int    // DLOCKSS_API_PORT
+	VerboseLogging  bool   // DLOCKSS_VERBOSE_LOGGING
+
+	// Behavior.
+	MinPeersPerShard       int      // DLOCKSS_MIN_PEERS_PER_SHARD: copies floor
+	MaxPeersPerShard       int      // DLOCKSS_MAX_PEERS_PER_SHARD: split above
+	TrustMode              string   // DLOCKSS_TRUST_MODE: open | allowlist
+	IngestAllowlist        []string // DLOCKSS_INGEST_ALLOWLIST
+	DiskUsageHighWaterMark float64  // DLOCKSS_DISK_USAGE_HIGH_WATER_MARK (%)
+	PinIngestEnabled       bool     // DLOCKSS_PIN_INGEST
 }
 
-// DefaultConfig returns a Config with all hardcoded defaults (no env reads).
-// Useful for tests that need a deterministic baseline.
-func DefaultConfig() *Config {
-	dataDir := "./data"
-	return &Config{
-		DiscoveryServiceTag:    "dlockss-prod",
-		PubsubTopicPrefix:      DefaultPubsubVersion,
-		TopicName:              DefaultTopicName,
-		FileWatchFolder:        dataDir,
-		ClusterStorePath:       filepath.Join(filepath.Dir(dataDir), "cluster_store"),
-		BadBitsPath:            "badBits.csv",
-		IPFSNodeAddress:        "/ip4/127.0.0.1/tcp/5001",
-		APIPort:                5050,
-		BootstrapTimeout:       15 * time.Second,
-		ConnLowWater:           160,
-		ConnHighWater:          192,
-		HeartbeatInterval:      10 * time.Second,
-		RateLimitWindow:        1 * time.Minute,
-		MaxMessagesPerWindow:   100,
-		DiskUsageHighWaterMark: 90.0,
-		IdentityPath:           filepath.Join(filepath.Dir(dataDir), "dlockss.key"),
-		NodeNamePath:           filepath.Join(filepath.Dir(dataDir), "node_name"),
+// knownVars lists every environment variable this version reads; anything
+// else with the DLOCKSS_ prefix gets a warning so operators notice frozen or
+// removed knobs.
+var knownVars = map[string]struct{}{
+	"DLOCKSS_DISCOVERY_TAG": {}, "DLOCKSS_PUBSUB_TOPIC_PREFIX": {}, "DLOCKSS_TOPIC_NAME": {},
+	"DLOCKSS_PRIVATE_NETWORK": {}, "DLOCKSS_DHT_CLIENT": {},
+	"DLOCKSS_DATA_DIR": {}, "DLOCKSS_CLUSTER_STORE": {}, "DLOCKSS_BADBITS_PATH": {},
+	"DLOCKSS_IDENTITY_PATH": {}, "DLOCKSS_IPFS_CONFIG": {}, "DLOCKSS_TRUST_STORE": {},
+	"DLOCKSS_NODE_NAME": {}, "DLOCKSS_IPFS_NODE": {}, "DLOCKSS_API_PORT": {},
+	"DLOCKSS_VERBOSE_LOGGING": {},
+	"DLOCKSS_MIN_PEERS_PER_SHARD": {}, "DLOCKSS_MAX_PEERS_PER_SHARD": {},
+	"DLOCKSS_TRUST_MODE": {}, "DLOCKSS_INGEST_ALLOWLIST": {},
+	"DLOCKSS_DISK_USAGE_HIGH_WATER_MARK": {}, "DLOCKSS_PIN_INGEST": {},
+}
 
-		Sharding: ShardingConfig{
-			MaxPeersPerShard:              12,
-			MinPeersPerShard:              6,
-			MinPeersAcrossSiblings:        10,
-			ShardPeerCheckInterval:        2 * time.Minute,
-			ShardDiscoveryInterval:        2 * time.Minute,
-			ShardSplitRebroadcastInterval: 60 * time.Second,
-			SeenPeersWindow:               350 * time.Second,
-			PruneStalePeersInterval:       10 * time.Minute,
-			ShardOverlapDuration:          2 * time.Minute,
-			ShardMoveCooldown:             30 * time.Second,
-			MergeUpCooldown:               2 * time.Minute,
-			ProbeTimeoutMerge:             6 * time.Second,
-			SiblingEmptyMergeAfter:        5 * time.Minute,
-		},
-		Replication: ReplicationConfig{
-			CheckInterval:                  1 * time.Minute,
-			MaxConcurrentReplicationChecks: 5,
-			AutoReplicationEnabled:         true,
-			AutoReplicationTimeout:         5 * time.Minute,
-			PinReannounceInterval:          2 * time.Minute,
-		},
-		Files: FileConfig{
-			FileImportTimeout:           2 * time.Minute,
-			DHTProvideTimeout:           60 * time.Second,
-			MaxConcurrentDHTProvides:    8,
-			FileProcessingDelay:         100 * time.Millisecond,
-			FileStabilityDelay:          3 * time.Second,
-			MaxConcurrentFileProcessing: 5,
-			ReshardDelay:                5 * time.Second,
-			ReshardHandoffDelay:         3 * time.Second,
-			PinIngestEnabled:            true,
-			PinIngestInterval:           time.Minute,
-		},
-		Security: SecurityConfig{
-			TrustMode:           "open",
-			TrustStorePath:      filepath.Join(filepath.Dir(dataDir), "trusted_peers.json"),
-			SignatureMode:       "strict",
-			SignatureMaxAge:     10 * time.Minute,
-			NonceSize:           16,
-			MinNonceSize:        8,
-			FutureSkewTolerance: 30 * time.Second,
-		},
-		Orphan: OrphanConfig{
-			UnpinGracePeriod:   6 * time.Minute,
-			HandoffGrace:       6 * time.Minute,
-			UnpinMinHandoffCnt: 2,
-		},
+func envString(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
+	return def
 }
 
-// LoadFromEnv creates a Config by reading environment variables, falling back
-// to hardcoded defaults for any variable that is not set.
-func LoadFromEnv() *Config {
-	dataDir := getEnvString("DLOCKSS_DATA_DIR", "./data")
+func envParsed[T any](key string, def T, kind string, parse func(string) (T, error)) T {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	p, err := parse(v)
+	if err != nil {
+		slog.Warn("invalid env "+kind+", using default", "var", key, "value", v)
+		return def
+	}
+	return p
+}
 
-	cfg := DefaultConfig()
+func envInt(key string, def int) int {
+	return envParsed(key, def, "int", strconv.Atoi)
+}
 
-	cfg.DiscoveryServiceTag = getEnvString("DLOCKSS_DISCOVERY_TAG", cfg.DiscoveryServiceTag)
-	cfg.PubsubTopicPrefix = getEnvString("DLOCKSS_PUBSUB_TOPIC_PREFIX", cfg.PubsubTopicPrefix)
-	cfg.TopicName = getEnvString("DLOCKSS_TOPIC_NAME", cfg.TopicName)
-	cfg.IngestAllowlist = getEnvStringSlice("DLOCKSS_INGEST_ALLOWLIST")
-	cfg.FileWatchFolder = dataDir
-	cfg.ClusterStorePath = clusterStorePath(dataDir)
-	cfg.BadBitsPath = getEnvString("DLOCKSS_BADBITS_PATH", cfg.BadBitsPath)
-	cfg.IPFSNodeAddress = getEnvString("DLOCKSS_IPFS_NODE", cfg.IPFSNodeAddress)
-	cfg.APIPort = getEnvInt("DLOCKSS_API_PORT", cfg.APIPort)
-	cfg.BootstrapTimeout = getEnvDuration("DLOCKSS_BOOTSTRAP_TIMEOUT", cfg.BootstrapTimeout)
-	cfg.HeartbeatInterval = getEnvDuration("DLOCKSS_HEARTBEAT_INTERVAL", cfg.HeartbeatInterval)
-	cfg.VerboseLogging = getEnvBool("DLOCKSS_VERBOSE_LOGGING", cfg.VerboseLogging)
-	cfg.RateLimitWindow = getEnvDuration("DLOCKSS_RATE_LIMIT_WINDOW", cfg.RateLimitWindow)
-	cfg.MaxMessagesPerWindow = getEnvInt("DLOCKSS_MAX_MESSAGES_PER_WINDOW", cfg.MaxMessagesPerWindow)
-	cfg.DiskUsageHighWaterMark = getEnvFloat("DLOCKSS_DISK_USAGE_HIGH_WATER_MARK", cfg.DiskUsageHighWaterMark)
-	cfg.NodeName = getEnvString("DLOCKSS_NODE_NAME", cfg.NodeName)
-	cfg.IdentityPath = identityPath(dataDir)
-	cfg.NodeNamePath = nodeNamePath(dataDir)
-	cfg.IPFSConfigPath = getEnvString("DLOCKSS_IPFS_CONFIG", cfg.IPFSConfigPath)
-	cfg.PrivateNetwork = getEnvBool("DLOCKSS_PRIVATE_NETWORK", cfg.PrivateNetwork)
-	cfg.ConnLowWater = getEnvInt("DLOCKSS_CONN_LOW_WATER", cfg.ConnLowWater)
-	cfg.ConnHighWater = getEnvInt("DLOCKSS_CONN_HIGH_WATER", cfg.ConnHighWater)
-	cfg.DHTClient = getEnvBool("DLOCKSS_DHT_CLIENT", cfg.DHTClient)
+func envFloat(key string, def float64) float64 {
+	return envParsed(key, def, "float", func(s string) (float64, error) { return strconv.ParseFloat(s, 64) })
+}
 
-	cfg.Sharding.MaxPeersPerShard = getEnvInt("DLOCKSS_MAX_PEERS_PER_SHARD", cfg.Sharding.MaxPeersPerShard)
-	cfg.Sharding.MinPeersPerShard = getEnvInt("DLOCKSS_MIN_PEERS_PER_SHARD", cfg.Sharding.MinPeersPerShard)
-	cfg.Sharding.MinPeersAcrossSiblings = getEnvInt("DLOCKSS_MIN_PEERS_ACROSS_SIBLINGS", cfg.Sharding.MinPeersAcrossSiblings)
-	cfg.Sharding.ShardPeerCheckInterval = getEnvDuration("DLOCKSS_SHARD_PEER_CHECK_INTERVAL", cfg.Sharding.ShardPeerCheckInterval)
-	cfg.Sharding.ShardDiscoveryInterval = getEnvDuration("DLOCKSS_SHARD_DISCOVERY_INTERVAL", cfg.Sharding.ShardDiscoveryInterval)
-	cfg.Sharding.ShardSplitRebroadcastInterval = getEnvDuration("DLOCKSS_SHARD_SPLIT_REBROADCAST_INTERVAL", cfg.Sharding.ShardSplitRebroadcastInterval)
-	cfg.Sharding.SeenPeersWindow = getEnvDuration("DLOCKSS_SEEN_PEERS_WINDOW", cfg.Sharding.SeenPeersWindow)
-	cfg.Sharding.PruneStalePeersInterval = getEnvDuration("DLOCKSS_PRUNE_STALE_PEERS_INTERVAL", cfg.Sharding.PruneStalePeersInterval)
-	cfg.Sharding.ShardOverlapDuration = getEnvDuration("DLOCKSS_SHARD_OVERLAP_DURATION", cfg.Sharding.ShardOverlapDuration)
-	cfg.Sharding.ShardMoveCooldown = getEnvDuration("DLOCKSS_SHARD_MOVE_COOLDOWN", cfg.Sharding.ShardMoveCooldown)
-	cfg.Sharding.MergeUpCooldown = getEnvDuration("DLOCKSS_MERGE_UP_COOLDOWN", cfg.Sharding.MergeUpCooldown)
-	cfg.Sharding.ProbeTimeoutMerge = getEnvDuration("DLOCKSS_PROBE_TIMEOUT_MERGE", cfg.Sharding.ProbeTimeoutMerge)
-	cfg.Sharding.SiblingEmptyMergeAfter = getEnvDuration("DLOCKSS_SIBLING_EMPTY_MERGE_AFTER", cfg.Sharding.SiblingEmptyMergeAfter)
+func envBool(key string, def bool) bool {
+	return envParsed(key, def, "bool", strconv.ParseBool)
+}
 
-	for _, key := range []string{"DLOCKSS_MIN_REPLICATION", "DLOCKSS_MAX_REPLICATION"} {
-		if os.Getenv(key) != "" {
-			slog.Warn("ignoring removed setting: every shard member holds every file of its shard, so the shard limits DLOCKSS_MIN_PEERS_PER_SHARD and DLOCKSS_MAX_PEERS_PER_SHARD bound the copies", "env", key)
+func envStringSlice(key string) []string {
+	v := os.Getenv(key)
+	if v == "" {
+		return nil
+	}
+	var out []string
+	for _, item := range strings.Split(v, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
 		}
 	}
-	cfg.Replication.CheckInterval = getEnvDuration("DLOCKSS_CHECK_INTERVAL", cfg.Replication.CheckInterval)
-	cfg.Replication.MaxConcurrentReplicationChecks = getEnvInt("DLOCKSS_MAX_CONCURRENT_CHECKS", cfg.Replication.MaxConcurrentReplicationChecks)
-	cfg.Replication.AutoReplicationEnabled = getEnvBool("DLOCKSS_AUTO_REPLICATION_ENABLED", cfg.Replication.AutoReplicationEnabled)
-	cfg.Replication.AutoReplicationTimeout = getEnvDuration("DLOCKSS_AUTO_REPLICATION_TIMEOUT", cfg.Replication.AutoReplicationTimeout)
-	cfg.Replication.PinReannounceInterval = getEnvDuration("DLOCKSS_PIN_REANNOUNCE_INTERVAL", cfg.Replication.PinReannounceInterval)
+	return out
+}
 
-	cfg.Files.FileImportTimeout = getEnvDuration("DLOCKSS_FILE_IMPORT_TIMEOUT", cfg.Files.FileImportTimeout)
-	cfg.Files.DHTProvideTimeout = getEnvDuration("DLOCKSS_DHT_PROVIDE_TIMEOUT", cfg.Files.DHTProvideTimeout)
-	cfg.Files.MaxConcurrentDHTProvides = getEnvInt("DLOCKSS_MAX_CONCURRENT_DHT_PROVIDES", cfg.Files.MaxConcurrentDHTProvides)
-	cfg.Files.FileProcessingDelay = getEnvDuration("DLOCKSS_FILE_PROCESSING_DELAY", cfg.Files.FileProcessingDelay)
-	cfg.Files.FileStabilityDelay = getEnvDuration("DLOCKSS_FILE_STABILITY_DELAY", cfg.Files.FileStabilityDelay)
-	cfg.Files.MaxConcurrentFileProcessing = getEnvInt("DLOCKSS_MAX_CONCURRENT_FILE_PROCESSING", cfg.Files.MaxConcurrentFileProcessing)
-	cfg.Files.ReshardDelay = getEnvDuration("DLOCKSS_RESHARD_DELAY", cfg.Files.ReshardDelay)
-	cfg.Files.ReshardHandoffDelay = getEnvDuration("DLOCKSS_RESHARD_HANDOFF_DELAY", cfg.Files.ReshardHandoffDelay)
-	cfg.Files.PinIngestEnabled = getEnvBool("DLOCKSS_PIN_INGEST", cfg.Files.PinIngestEnabled)
-	cfg.Files.PinIngestInterval = getEnvDuration("DLOCKSS_PIN_INGEST_INTERVAL", cfg.Files.PinIngestInterval)
+// LoadFromEnv builds the configuration from defaults overlaid with the
+// environment.
+func LoadFromEnv() *Config {
+	dataDir := envString("DLOCKSS_DATA_DIR", "./data")
+	parent := filepath.Dir(dataDir)
 
-	cfg.Security.TrustMode = getEnvString("DLOCKSS_TRUST_MODE", cfg.Security.TrustMode)
-	cfg.Security.TrustStorePath = getEnvString("DLOCKSS_TRUST_STORE", filepath.Join(filepath.Dir(dataDir), "trusted_peers.json"))
-	cfg.Security.SignatureMode = getEnvString("DLOCKSS_SIGNATURE_MODE", cfg.Security.SignatureMode)
-	cfg.Security.SignatureMaxAge = getEnvDuration("DLOCKSS_SIGNATURE_MAX_AGE", cfg.Security.SignatureMaxAge)
-	cfg.Security.NonceSize = getEnvInt("DLOCKSS_NONCE_SIZE", cfg.Security.NonceSize)
-	cfg.Security.MinNonceSize = getEnvInt("DLOCKSS_MIN_NONCE_SIZE", cfg.Security.MinNonceSize)
-	cfg.Security.FutureSkewTolerance = getEnvDuration("DLOCKSS_FUTURE_SKEW_TOLERANCE", cfg.Security.FutureSkewTolerance)
+	cfg := &Config{
+		DiscoveryServiceTag: envString("DLOCKSS_DISCOVERY_TAG", "dlockss-prod"),
+		PubsubTopicPrefix:   envString("DLOCKSS_PUBSUB_TOPIC_PREFIX", DefaultPubsubVersion),
+		TopicName:           envString("DLOCKSS_TOPIC_NAME", DefaultTopicName),
+		PrivateNetwork:      envBool("DLOCKSS_PRIVATE_NETWORK", false),
+		DHTClient:           envBool("DLOCKSS_DHT_CLIENT", false),
 
-	cfg.Orphan.UnpinGracePeriod = getEnvDuration("DLOCKSS_ORPHAN_UNPIN_GRACE", cfg.Orphan.UnpinGracePeriod)
-	cfg.Orphan.HandoffGrace = getEnvDuration("DLOCKSS_ORPHAN_HANDOFF_GRACE", cfg.Orphan.HandoffGrace)
-	cfg.Orphan.UnpinMinHandoffCnt = getEnvInt("DLOCKSS_ORPHAN_MIN_HANDOFF_COUNT", cfg.Orphan.UnpinMinHandoffCnt)
+		FileWatchFolder:  dataDir,
+		ClusterStorePath: envString("DLOCKSS_CLUSTER_STORE", filepath.Join(parent, "cluster_store")),
+		BadBitsPath:      envString("DLOCKSS_BADBITS_PATH", "badBits.csv"),
+		IdentityPath:     envString("DLOCKSS_IDENTITY_PATH", filepath.Join(parent, "dlockss.key")),
+		NodeNamePath:     filepath.Join(parent, "node_name"),
+		IPFSConfigPath:   os.Getenv("DLOCKSS_IPFS_CONFIG"),
+		TrustStorePath:   envString("DLOCKSS_TRUST_STORE", filepath.Join(parent, "trusted_peers.json")),
 
+		NodeName:        os.Getenv("DLOCKSS_NODE_NAME"),
+		IPFSNodeAddress: envString("DLOCKSS_IPFS_NODE", "/ip4/127.0.0.1/tcp/5001"),
+		APIPort:         envInt("DLOCKSS_API_PORT", 5050),
+		VerboseLogging:  envBool("DLOCKSS_VERBOSE_LOGGING", false),
+
+		MinPeersPerShard:       envInt("DLOCKSS_MIN_PEERS_PER_SHARD", 6),
+		MaxPeersPerShard:       envInt("DLOCKSS_MAX_PEERS_PER_SHARD", 12),
+		TrustMode:              envString("DLOCKSS_TRUST_MODE", "open"),
+		IngestAllowlist:        envStringSlice("DLOCKSS_INGEST_ALLOWLIST"),
+		DiskUsageHighWaterMark: envFloat("DLOCKSS_DISK_USAGE_HIGH_WATER_MARK", 90.0),
+		PinIngestEnabled:       envBool("DLOCKSS_PIN_INGEST", true),
+	}
+
+	warnUnknownVars()
 	return cfg
 }
 
-// Validate checks and corrects invalid configuration values.
-func (c *Config) Validate() {
-	switch c.Security.SignatureMode {
-	case "off", "warn", "strict":
-	default:
-		slog.Warn("unknown signature mode, defaulting to strict", "mode", c.Security.SignatureMode)
-		c.Security.SignatureMode = "strict"
-	}
-	switch c.Security.TrustMode {
-	case "open", "allowlist":
-	default:
-		slog.Warn("unknown trust mode, defaulting to open", "mode", c.Security.TrustMode)
-		c.Security.TrustMode = "open"
-	}
-	if c.Files.MaxConcurrentFileProcessing < 1 {
-		slog.Warn("invalid config value, using default", "key", "MaxConcurrentFileProcessing", "value", c.Files.MaxConcurrentFileProcessing, "default", 5)
-		c.Files.MaxConcurrentFileProcessing = 5
-	}
-	if c.Security.NonceSize < 1 {
-		slog.Warn("invalid config value, using default", "key", "NonceSize", "value", c.Security.NonceSize, "default", 16)
-		c.Security.NonceSize = 16
-	}
-	if c.Security.MinNonceSize < 1 {
-		slog.Warn("invalid config value, using default", "key", "MinNonceSize", "value", c.Security.MinNonceSize, "default", 8)
-		c.Security.MinNonceSize = 8
-	}
-	if c.Replication.MaxConcurrentReplicationChecks < 1 {
-		slog.Warn("invalid config value, using default", "key", "MaxConcurrentReplicationChecks", "value", c.Replication.MaxConcurrentReplicationChecks, "default", 5)
-		c.Replication.MaxConcurrentReplicationChecks = 5
-	}
-	if c.ConnLowWater < 1 || c.ConnHighWater <= c.ConnLowWater {
-		slog.Warn("connection water marks need 0 < low < high, using defaults", "low", c.ConnLowWater, "high", c.ConnHighWater, "default_low", 160, "default_high", 192)
-		c.ConnLowWater, c.ConnHighWater = 160, 192
-	}
-	if c.DiskUsageHighWaterMark <= 0 || c.DiskUsageHighWaterMark > 100 {
-		slog.Warn("disk usage high water mark out of range, using default", "value", c.DiskUsageHighWaterMark, "default", 90.0)
-		c.DiskUsageHighWaterMark = 90.0
-	}
-}
-
-// ValidatePathSafetyCheck checks that state files do not reside inside the
-// ingest directory. Returns a non-empty error message listing offenders.
-func (c *Config) ValidatePathSafetyCheck() string {
-	checks := []struct {
-		label string
-		path  string
-	}{
-		{"IdentityPath (DLOCKSS_IDENTITY_PATH)", c.IdentityPath},
-		{"NodeNamePath", c.NodeNamePath},
-		{"IPFSConfigPath (DLOCKSS_IPFS_CONFIG)", c.IPFSConfigPath},
-		{"ClusterStorePath (DLOCKSS_CLUSTER_STORE)", c.ClusterStorePath},
-		{"TrustStorePath (DLOCKSS_TRUST_STORE)", c.Security.TrustStorePath},
-	}
-	var problems []string
-	for _, ck := range checks {
-		if isInsideDir(ck.path, c.FileWatchFolder) {
-			problems = append(problems, fmt.Sprintf("  %s = %s", ck.label, ck.path))
+func warnUnknownVars() {
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if !strings.HasPrefix(name, "DLOCKSS_") {
+			continue
+		}
+		if _, ok := knownVars[name]; !ok {
+			slog.Warn("environment variable is not used by this version (frozen or removed knob)", "var", name)
 		}
 	}
-	if len(problems) == 0 {
-		return ""
-	}
-	return fmt.Sprintf(
-		"the following state paths resolve inside the ingest directory (%s) and would be ingested as data:\n%s\n"+
-			"Set DLOCKSS_DATA_DIR to a dedicated subdirectory (e.g. ./data) or override the conflicting paths.",
-		c.FileWatchFolder, strings.Join(problems, "\n"))
 }
 
-// Log prints all configuration values after calling Validate.
-func (c *Config) Log() {
-	c.Validate()
-
-	slog.Info("config: network",
-		"discovery_tag", c.DiscoveryServiceTag,
-		"pubsub_prefix", c.PubsubTopicPrefix,
-		"topic_name", c.TopicName,
-		"ingest_allowlist_env", len(c.IngestAllowlist),
-		"ipfs_node", c.IPFSNodeAddress,
-		"api_port", c.APIPort,
-		"bootstrap_timeout", c.BootstrapTimeout,
-		"conn_low_water", c.ConnLowWater,
-		"conn_high_water", c.ConnHighWater,
-		"dht_client", c.DHTClient,
-	)
-	slog.Info("config: paths",
-		"data_dir", c.FileWatchFolder,
-		"cluster_store", c.ClusterStorePath,
-		"identity", c.IdentityPath,
-		"badbits", c.BadBitsPath,
-		"trust_store", c.Security.TrustStorePath,
-	)
-	slog.Info("config: sharding",
-		"max_peers", c.Sharding.MaxPeersPerShard,
-		"min_peers", c.Sharding.MinPeersPerShard,
-		"min_across_siblings", c.Sharding.MinPeersAcrossSiblings,
-		"peer_check_interval", c.Sharding.ShardPeerCheckInterval,
-		"discovery_interval", c.Sharding.ShardDiscoveryInterval,
-		"split_rebroadcast", c.Sharding.ShardSplitRebroadcastInterval,
-		"seen_peers_window", c.Sharding.SeenPeersWindow,
-		"prune_stale_interval", c.Sharding.PruneStalePeersInterval,
-		"overlap_duration", c.Sharding.ShardOverlapDuration,
-		"move_cooldown", c.Sharding.ShardMoveCooldown,
-		"merge_up_cooldown", c.Sharding.MergeUpCooldown,
-		"probe_timeout_merge", c.Sharding.ProbeTimeoutMerge,
-		"sibling_empty_merge_after", c.Sharding.SiblingEmptyMergeAfter,
-	)
-	slog.Info("config: replication",
-		"check_interval", c.Replication.CheckInterval,
-		"max_concurrent_checks", c.Replication.MaxConcurrentReplicationChecks,
-		"auto_enabled", c.Replication.AutoReplicationEnabled,
-		"auto_timeout", c.Replication.AutoReplicationTimeout,
-		"pin_reannounce", c.Replication.PinReannounceInterval,
-	)
-	slog.Info("config: files",
-		"import_timeout", c.Files.FileImportTimeout,
-		"dht_provide_timeout", c.Files.DHTProvideTimeout,
-		"max_concurrent_dht_provides", c.Files.MaxConcurrentDHTProvides,
-		"processing_delay", c.Files.FileProcessingDelay,
-		"stability_delay", c.Files.FileStabilityDelay,
-		"max_concurrent", c.Files.MaxConcurrentFileProcessing,
-		"reshard_delay", c.Files.ReshardDelay,
-		"reshard_handoff_delay", c.Files.ReshardHandoffDelay,
-		"pin_ingest", c.Files.PinIngestEnabled,
-		"pin_ingest_interval", c.Files.PinIngestInterval,
-	)
-	slog.Info("config: orphan",
-		"unpin_grace", c.Orphan.UnpinGracePeriod,
-		"handoff_grace", c.Orphan.HandoffGrace,
-		"min_handoff_count", c.Orphan.UnpinMinHandoffCnt,
-	)
-	slog.Info("config: security",
-		"trust_mode", c.Security.TrustMode,
-		"signature_mode", c.Security.SignatureMode,
-		"signature_max_age", c.Security.SignatureMaxAge,
-		"nonce_size", c.Security.NonceSize,
-		"min_nonce_size", c.Security.MinNonceSize,
-		"future_skew_tolerance", c.Security.FutureSkewTolerance,
-	)
-	heartbeat := "auto"
-	if c.HeartbeatInterval > 0 {
-		heartbeat = c.HeartbeatInterval.String()
+// Validate corrects out-of-range values with a warning. It never fails.
+func (c *Config) Validate() {
+	fix := func(field string, bad bool, apply func()) {
+		if bad {
+			slog.Warn("invalid config value, using default", "field", field)
+			apply()
+		}
 	}
-	slog.Info("config: heartbeat",
-		"heartbeat_interval", heartbeat,
-		"verbose", c.VerboseLogging,
-	)
-	slog.Info("config: rate limiting",
-		"window", c.RateLimitWindow,
-		"max_messages", c.MaxMessagesPerWindow,
-	)
-	slog.Info("config: storage",
-		"disk_high_water_mark", c.DiskUsageHighWaterMark,
-	)
+	fix("TrustMode", c.TrustMode != "open" && c.TrustMode != "allowlist",
+		func() { c.TrustMode = "open" })
+	fix("MinPeersPerShard", c.MinPeersPerShard < 1, func() { c.MinPeersPerShard = 6 })
+	fix("MaxPeersPerShard", c.MaxPeersPerShard < 2, func() { c.MaxPeersPerShard = 12 })
+	fix("MinPeersPerShard>MaxPeersPerShard", c.MinPeersPerShard > c.MaxPeersPerShard,
+		func() { c.MinPeersPerShard, c.MaxPeersPerShard = c.MaxPeersPerShard, c.MinPeersPerShard })
+	fix("DiskUsageHighWaterMark", c.DiskUsageHighWaterMark <= 0 || c.DiskUsageHighWaterMark > 100,
+		func() { c.DiskUsageHighWaterMark = 90.0 })
+	fix("APIPort", c.APIPort < 1 || c.APIPort > 65535, func() { c.APIPort = 5050 })
 }
 
-// isInsideDir reports whether path resolves to a location inside dir.
-func isInsideDir(path, dir string) bool {
+// ValidatePathSafety fails when a state file would live inside the ingest
+// directory, where the scanner would ingest it as data.
+func (c *Config) ValidatePathSafety() error {
+	checks := map[string]string{
+		"identity key (DLOCKSS_IDENTITY_PATH)":  c.IdentityPath,
+		"node name file":                        c.NodeNamePath,
+		"cluster store (DLOCKSS_CLUSTER_STORE)": c.ClusterStorePath,
+		"trust store (DLOCKSS_TRUST_STORE)":     c.TrustStorePath,
+	}
+	if c.IPFSConfigPath != "" {
+		checks["IPFS config (DLOCKSS_IPFS_CONFIG)"] = c.IPFSConfigPath
+	}
+	for name, path := range checks {
+		inside, err := isInsideDir(path, c.FileWatchFolder)
+		if err != nil {
+			return fmt.Errorf("checking %s: %w", name, err)
+		}
+		if inside {
+			return fmt.Errorf("%s (%s) resolves inside the ingest directory %s; "+
+				"set DLOCKSS_DATA_DIR to a dedicated subdirectory (e.g. ./data, not .)",
+				name, path, c.FileWatchFolder)
+		}
+	}
+	return nil
+}
+
+func isInsideDir(path, dir string) (bool, error) {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		return false
+		return false, err
 	}
 	absDir, err := filepath.Abs(dir)
 	if err != nil {
-		return false
+		return false, err
 	}
 	rel, err := filepath.Rel(absDir, absPath)
 	if err != nil {
-		return false
+		return false, nil
 	}
-	return !strings.HasPrefix(rel, "..")
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))), nil
+}
+
+// ShardTopic returns the shard topic name for the given shard ID.
+func (c *Config) ShardTopic(shardID string) string {
+	return c.PubsubTopicPrefix + "-" + c.TopicName + "-shard-" + shardID
+}
+
+// Log prints the effective configuration at Info level.
+func (c *Config) Log() {
+	slog.Info("config: network",
+		"topic_prefix", c.PubsubTopicPrefix, "topic", c.TopicName,
+		"discovery_tag", c.DiscoveryServiceTag, "private_network", c.PrivateNetwork,
+		"dht_client", c.DHTClient)
+	slog.Info("config: paths",
+		"data_dir", c.FileWatchFolder, "cluster_store", c.ClusterStorePath,
+		"identity", c.IdentityPath, "trust_store", c.TrustStorePath,
+		"badbits", c.BadBitsPath, "ipfs", c.IPFSNodeAddress)
+	slog.Info("config: behavior",
+		"min_peers", c.MinPeersPerShard, "max_peers", c.MaxPeersPerShard,
+		"trust_mode", c.TrustMode, "disk_hwm_pct", c.DiskUsageHighWaterMark,
+		"pin_ingest", c.PinIngestEnabled, "api_port", c.APIPort)
 }

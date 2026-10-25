@@ -4,51 +4,298 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path"
+	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
-	"github.com/ipfs/boxo/ipld/merkledag"
-	"github.com/ipfs/boxo/ipld/unixfs"
 	"github.com/ipfs/go-cid"
-	"github.com/multiformats/go-multicodec"
 	"golang.org/x/net/html"
+
+	"dlockss/internal/schema"
 )
 
 const (
-	maxFetchSize        = 20 * 1024 * 1024
-	maxTextFetch        = 512 * 1024
-	maxRootBlockSize    = 2 * 1024 * 1024
-	maxZipPartSize      = 8 * 1024 * 1024
-	maxDirEntries       = 50
-	maxDirSamples       = 5
-	maxDirAttempts      = 2 * maxDirSamples
-	minSampleLen        = 500
-	sniffLen            = 512
-	payloadFetchTimeout = 90 * time.Second
+	manifestFetchLimit  = 1 << 20  // 1 MiB
+	manifestFetchTime   = 30 * time.Second
+	payloadFetchTime    = 90 * time.Second
+	textReadLimit       = 512 << 10 // 512 KiB of plain text
+	rootBlockLimit      = 2 << 20   // directory root block
+	binaryFetchLimit    = 20 << 20  // PDF / zip containers
+	zipPartLimit        = 8 << 20   // each document part inside a zip
+	pdftotextTimeout    = 2 * time.Minute
+	dirListingMaxEntries = 50
+	dirSampleMaxFiles   = 5
+	dirSampleMaxTries   = 10
+	dirSampleMinBudget  = 500
 )
 
-// errUnsupported marks content that cannot be indexed, such as media,
-// archives, image-only PDFs, or files over maxFetchSize. Retrying it would
-// give the same result, so it is skipped rather than counted as a failure.
+// errUnsupported marks content that is deliberately skipped (media,
+// archives, oversized, empty): recorded as skipped, never retried.
 var errUnsupported = errors.New("unsupported content")
 
-func unsupported(format string, args ...any) error {
-	return fmt.Errorf("%w: %s", errUnsupported, fmt.Sprintf(format, args...))
+// IsUnsupported reports whether err marks skippable content.
+func IsUnsupported(err error) bool { return errors.Is(err, errUnsupported) }
+
+// gatewayStatusError surfaces upstream HTTP status (429 pauses the indexer).
+type gatewayStatusError struct {
+	status     int
+	retryAfter time.Duration
 }
+
+func (e *gatewayStatusError) Error() string { return fmt.Sprintf("gateway HTTP %d", e.status) }
+
+var httpClient = &http.Client{}
+
+func gatewayGet(ctx context.Context, url string, limit int64, timeout time.Duration) ([]byte, http.Header, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return nil, resp.Header, &gatewayStatusError{status: resp.StatusCode, retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, limit))
+	return data, resp.Header, err
+}
+
+// FetchManifest reads and decodes a ResearchObject block through the gateway.
+func FetchManifest(ctx context.Context, gateway string, manifest string) (*schema.ResearchObject, error) {
+	data, _, err := gatewayGet(ctx, gateway+"/ipfs/"+manifest+"?format=raw", manifestFetchLimit, manifestFetchTime)
+	if err != nil {
+		return nil, err
+	}
+	var ro schema.ResearchObject
+	if err := ro.UnmarshalCBOR(data); err != nil {
+		return nil, fmt.Errorf("manifest decode: %w", err)
+	}
+	return &ro, nil
+}
+
+// document is extracted text ready for the LLM.
+type document struct {
+	Name   string
+	Format string
+	Text   string
+}
+
+// nameFromMetaRef derives a display name: file:// gives the basename,
+// ipfs:// gives none, anything else is used as-is.
+func nameFromMetaRef(metaRef string) string {
+	switch {
+	case strings.HasPrefix(metaRef, "file://"):
+		return path.Base(strings.TrimPrefix(metaRef, "file://"))
+	case strings.HasPrefix(metaRef, "ipfs://"):
+		return ""
+	default:
+		return metaRef
+	}
+}
+
+// LoadContent fetches a payload through the gateway and extracts text,
+// handling single files and UnixFS directories.
+func LoadContent(ctx context.Context, gateway string, payload cid.Cid, metaRef string) (*document, error) {
+	switch payload.Prefix().Codec {
+	case cid.Raw, cid.DagProtobuf:
+	default:
+		return nil, fmt.Errorf("%w: payload codec %d", errUnsupported, payload.Prefix().Codec)
+	}
+	name := nameFromMetaRef(metaRef)
+
+	data, hdr, err := gatewayGet(ctx, gateway+"/ipfs/"+payload.String(), textReadLimit, payloadFetchTime)
+	if err != nil {
+		var gw *gatewayStatusError
+		if errors.As(err, &gw) {
+			return nil, err
+		}
+		return nil, err
+	}
+	if strings.HasPrefix(hdr.Get("Etag"), `"DirIndex-`) {
+		return loadDirectory(ctx, gateway, payload, name)
+	}
+	return extract(ctx, gateway, payload.String(), name, data, hdr.Get("Content-Type"), textReadLimit)
+}
+
+// extract classifies content and pulls text out of it. bigFetchPath is the
+// gateway path used to re-fetch large binary formats in full.
+func extract(ctx context.Context, gateway, gwPath, name string, head []byte, contentType string, budget int) (*document, error) {
+	kind := classify(name, head, contentType)
+	switch kind {
+	case kindPDF:
+		return extractBinary(ctx, gateway, gwPath, name, "PDF", extractPDF)
+	case kindZip:
+		return extractBinary(ctx, gateway, gwPath, name, zipFormatName(name), extractZip)
+	case kindHTML:
+		text := htmlText(head)
+		return finishDoc(name, "HTML", text, budget)
+	case kindXML:
+		return finishDoc(name, "XML", xmlText(head), budget)
+	case kindText:
+		return finishDoc(name, "text", string(head), budget)
+	default:
+		return nil, fmt.Errorf("%w: %s", errUnsupported, name)
+	}
+}
+
+func finishDoc(name, format, text string, budget int) (*document, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil, fmt.Errorf("%w: no text", errUnsupported)
+	}
+	if len(text) > budget {
+		text = text[:budget]
+	}
+	return &document{Name: name, Format: format, Text: text}, nil
+}
+
+// extractBinary spools PDF/zip content to a temp file (bounded) and runs the
+// given extractor.
+func extractBinary(ctx context.Context, gateway, gwPath, name, format string, fn func(ctx context.Context, path string, size int64) (string, error)) (*document, error) {
+	ctx, cancel := context.WithTimeout(ctx, payloadFetchTime)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, gateway+"/ipfs/"+gwPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, &gatewayStatusError{status: resp.StatusCode, retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
+	}
+	tmp, err := os.CreateTemp("", "dlockss-kw-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+	n, err := io.Copy(tmp, io.LimitReader(resp.Body, binaryFetchLimit+1))
+	if err != nil {
+		return nil, err
+	}
+	if n > binaryFetchLimit {
+		return nil, fmt.Errorf("%w: over %d MiB", errUnsupported, binaryFetchLimit>>20)
+	}
+	text, err := fn(ctx, tmp.Name(), n)
+	if err != nil {
+		return nil, err
+	}
+	return finishDoc(name, format, text, saiaTextLimit)
+}
+
+// PDFSupported reports whether pdftotext is on PATH; without it PDFs are
+// skipped rather than failed.
+func PDFSupported() bool {
+	_, err := exec.LookPath("pdftotext")
+	return err == nil
+}
+
+func extractPDF(ctx context.Context, path string, _ int64) (string, error) {
+	if !PDFSupported() {
+		return "", fmt.Errorf("%w: pdftotext not installed", errUnsupported)
+	}
+	ctx, cancel := context.WithTimeout(ctx, pdftotextTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "pdftotext", "-layout", "-enc", "UTF-8", path, "-").Output()
+	if err != nil {
+		return "", fmt.Errorf("pdftotext: %w", err)
+	}
+	return string(out), nil
+}
+
+var slideRe = regexp.MustCompile(`^ppt/slides/slide(\d+)\.xml$`)
+
+// extractZip handles OOXML, OpenDocument, and EPUB containers.
+func extractZip(ctx context.Context, path string, size int64) (string, error) {
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		return "", fmt.Errorf("%w: unreadable zip", errUnsupported)
+	}
+	defer zr.Close()
+
+	readPart := func(f *zip.File) string {
+		rc, err := f.Open()
+		if err != nil {
+			return ""
+		}
+		defer rc.Close()
+		raw, _ := io.ReadAll(io.LimitReader(rc, zipPartLimit))
+		return string(raw)
+	}
+
+	files := map[string]*zip.File{}
+	var slides []*zip.File
+	isEpub := false
+	for _, f := range zr.File {
+		files[f.Name] = f
+		if slideRe.MatchString(f.Name) {
+			slides = append(slides, f)
+		}
+		if f.Name == "META-INF/container.xml" {
+			isEpub = true
+		}
+	}
+
+	switch {
+	case files["word/document.xml"] != nil:
+		return xmlText([]byte(readPart(files["word/document.xml"]))), nil
+	case files["xl/sharedStrings.xml"] != nil:
+		return xmlText([]byte(readPart(files["xl/sharedStrings.xml"]))), nil
+	case len(slides) > 0:
+		sort.Slice(slides, func(i, j int) bool {
+			a := slideRe.FindStringSubmatch(slides[i].Name)[1]
+			b := slideRe.FindStringSubmatch(slides[j].Name)[1]
+			return len(a) < len(b) || (len(a) == len(b) && a < b)
+		})
+		var sb strings.Builder
+		for _, s := range slides {
+			sb.WriteString(xmlText([]byte(readPart(s))))
+			sb.WriteByte('\n')
+		}
+		return sb.String(), nil
+	case files["content.xml"] != nil: // OpenDocument
+		return xmlText([]byte(readPart(files["content.xml"]))), nil
+	case isEpub:
+		var sb strings.Builder
+		for _, f := range zr.File {
+			ext := strings.ToLower(path2ext(f.Name))
+			if ext == ".xhtml" || ext == ".html" || ext == ".htm" {
+				sb.WriteString(htmlText([]byte(readPart(f))))
+				sb.WriteByte('\n')
+				if sb.Len() > saiaTextLimit {
+					break
+				}
+			}
+		}
+		return sb.String(), nil
+	default:
+		return "", fmt.Errorf("%w: unrecognized zip container", errUnsupported)
+	}
+}
+
+func path2ext(p string) string { return path.Ext(p) }
+
+// ---- classification ----
 
 type contentKind int
 
@@ -58,527 +305,357 @@ const (
 	kindHTML
 	kindXML
 	kindPDF
-	// kindZip is a zip container that may be an OOXML, OpenDocument, or EPUB
-	// file; the parts inside decide.
 	kindZip
 )
 
-// content is the text handed to the LLM for one payload.
-type content struct {
-	name   string
-	format string
-	text   string
+var textExts = map[string]bool{
+	".txt": true, ".md": true, ".rst": true, ".org": true, ".csv": true, ".tsv": true,
+	".json": true, ".jsonl": true, ".ndjson": true, ".geojson": true, ".yaml": true, ".yml": true,
+	".toml": true, ".ini": true, ".cfg": true, ".tex": true, ".bib": true, ".ris": true,
+	".r": true, ".py": true, ".ipynb": true, ".jl": true, ".m": true, ".go": true, ".java": true,
+	".c": true, ".h": true, ".cpp": true, ".rs": true, ".js": true, ".ts": true, ".sh": true,
+	".sql": true, ".log": true, ".srt": true, ".vtt": true, ".nt": true, ".ttl": true,
 }
 
-var textFormats = map[string]string{
-	".txt": "plain text", ".md": "Markdown", ".rst": "reStructuredText", ".org": "Org",
-	".csv": "CSV table", ".tsv": "TSV table", ".json": "JSON", ".jsonl": "JSON lines",
-	".ndjson": "JSON lines", ".geojson": "GeoJSON", ".yaml": "YAML", ".yml": "YAML",
-	".toml": "TOML", ".ini": "INI", ".cfg": "configuration", ".tex": "LaTeX",
-	".bib": "BibTeX", ".ris": "RIS citation", ".r": "R source", ".py": "Python source",
-	".ipynb": "Jupyter notebook", ".jl": "Julia source", ".m": "MATLAB source",
-	".go": "Go source", ".java": "Java source", ".c": "C source", ".h": "C header",
-	".cpp": "C++ source", ".rs": "Rust source", ".js": "JavaScript source",
-	".ts": "TypeScript source", ".sh": "shell script", ".sql": "SQL", ".log": "log",
-	".srt": "subtitles", ".vtt": "subtitles", ".nt": "N-Triples", ".ttl": "Turtle",
-}
-
-var markupFormats = map[string]contentKind{
+var markupExts = map[string]contentKind{
 	".html": kindHTML, ".htm": kindHTML, ".xhtml": kindHTML,
-	".xml": kindXML, ".rdf": kindXML, ".kml": kindXML,
-	".gpx": kindXML, ".tei": kindXML, ".jats": kindXML,
+	".xml": kindXML, ".rdf": kindXML, ".kml": kindXML, ".gpx": kindXML, ".tei": kindXML, ".jats": kindXML,
 }
 
-// skipExts are media, archive, and binary extensions that directory sampling
-// does not fetch.
+// skipExts marks media/archives never worth sampling or extracting.
 var skipExts = map[string]bool{
-	".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".bmp": true, ".tif": true,
-	".tiff": true, ".webp": true, ".svg": true, ".heic": true, ".ico": true, ".raw": true,
-	".mp3": true, ".wav": true, ".flac": true, ".ogg": true, ".m4a": true, ".aac": true,
-	".mp4": true, ".mkv": true, ".mov": true, ".avi": true, ".webm": true, ".m4v": true,
-	".zip": true, ".gz": true, ".tgz": true, ".tar": true, ".bz2": true, ".xz": true,
-	".zst": true, ".7z": true, ".rar": true, ".iso": true, ".img": true, ".bin": true,
-	".exe": true, ".dll": true, ".so": true, ".dylib": true, ".class": true, ".jar": true,
-	".pyc": true, ".o": true, ".a": true, ".wasm": true, ".ttf": true, ".otf": true,
-	".woff": true, ".woff2": true, ".parquet": true, ".h5": true, ".hdf5": true,
-	".nc": true, ".npy": true, ".npz": true, ".sqlite": true, ".db": true,
+	".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".webp": true, ".svg": true,
+	".mp3": true, ".wav": true, ".flac": true, ".ogg": true, ".mp4": true, ".mkv": true,
+	".avi": true, ".mov": true, ".webm": true, ".zip": true, ".tar": true, ".gz": true,
+	".bz2": true, ".xz": true, ".7z": true, ".rar": true, ".iso": true, ".bin": true,
+	".exe": true, ".dll": true, ".so": true, ".woff": true, ".woff2": true, ".ttf": true,
 }
 
-var zipFormats = map[string]string{
-	".docx": "Word document", ".pptx": "PowerPoint presentation", ".xlsx": "Excel workbook",
-	".odt": "OpenDocument text", ".odp": "OpenDocument presentation",
-	".ods": "OpenDocument spreadsheet", ".epub": "EPUB book",
+var zipDocExts = map[string]bool{
+	".docx": true, ".pptx": true, ".xlsx": true, ".odt": true, ".odp": true, ".ods": true, ".epub": true,
 }
 
-// classify decides how to read a payload from its name, the gateway's
-// Content-Type, and its first bytes. Media types are never indexed.
-func classify(name, contentType string, head []byte) (contentKind, string) {
+func zipFormatName(name string) string {
+	ext := strings.TrimPrefix(strings.ToLower(path.Ext(name)), ".")
+	if ext == "" {
+		return "document"
+	}
+	return strings.ToUpper(ext)
+}
+
+func classify(name string, head []byte, contentType string) contentKind {
+	if bytes.HasPrefix(head, []byte("%PDF")) {
+		return kindPDF
+	}
+	if bytes.HasPrefix(head, []byte("PK\x03\x04")) {
+		if ext := strings.ToLower(path.Ext(name)); ext != "" && !zipDocExts[ext] {
+			return kindUnsupported
+		}
+		return kindZip
+	}
+	ct := contentType
+	if ct == "" || strings.HasPrefix(ct, "application/octet-stream") {
+		ct = http.DetectContentType(head)
+	}
+	switch {
+	case strings.HasPrefix(ct, "image/"), strings.HasPrefix(ct, "audio/"),
+		strings.HasPrefix(ct, "video/"), strings.HasPrefix(ct, "font/"):
+		return kindUnsupported
+	}
 	ext := strings.ToLower(path.Ext(name))
-	switch {
-	case bytes.HasPrefix(head, []byte("%PDF")):
-		return kindPDF, "PDF"
-	case bytes.HasPrefix(head, []byte("PK\x03\x04")):
-		if f, ok := zipFormats[ext]; ok {
-			return kindZip, f
-		}
-		return kindZip, "zip container"
+	if skipExts[ext] {
+		return kindUnsupported
 	}
-
-	mediaType, _, _ := mime.ParseMediaType(contentType)
-	if mediaType == "" || mediaType == "application/octet-stream" {
-		mediaType, _, _ = mime.ParseMediaType(http.DetectContentType(head))
+	if k, ok := markupExts[ext]; ok {
+		return k
 	}
-	if isMedia(mediaType) {
-		return kindUnsupported, mediaType
-	}
-	if kind, ok := markupFormats[ext]; ok {
-		return kind, strings.ToUpper(ext[1:])
-	}
-	if f, ok := textFormats[ext]; ok && looksLikeText(head) {
-		return kindText, f
+	if textExts[ext] && looksLikeText(head) {
+		return kindText
 	}
 	switch {
-	case mediaType == "text/html" || mediaType == "application/xhtml+xml":
-		return kindHTML, "HTML"
-	case mediaType == "text/xml" || mediaType == "application/xml" || strings.HasSuffix(mediaType, "+xml"):
-		return kindXML, "XML"
+	case strings.Contains(ct, "html"):
+		return kindHTML
+	case strings.Contains(ct, "xml"):
+		return kindXML
+	case strings.HasPrefix(ct, "text/") && looksLikeText(head):
+		return kindText
 	}
-	if looksLikeText(head) {
-		return kindText, "plain text"
+	if looksLikeText(head) && ext == "" {
+		return kindText
 	}
-	return kindUnsupported, mediaType
+	return kindUnsupported
 }
 
-func isMedia(mediaType string) bool {
-	for _, p := range []string{"image/", "audio/", "video/", "font/"} {
-		if strings.HasPrefix(mediaType, p) {
-			return true
-		}
-	}
-	return false
-}
-
-// looksLikeText reports whether b is UTF-8 with almost no control characters.
-// A rune cut off at the end of the sniffed prefix is ignored.
+// looksLikeText: valid UTF-8, no NUL bytes, ≤1% control characters.
 func looksLikeText(b []byte) bool {
-	if len(b) == 0 {
-		return false
-	}
-	for i := 0; i < utf8.UTFMax && !utf8.Valid(b); i++ {
-		b = b[:len(b)-1]
-	}
-	if !utf8.Valid(b) {
+	if len(b) == 0 || !utf8.Valid(b) {
 		return false
 	}
 	control := 0
-	for _, r := range string(b) {
-		if r == 0 {
+	for _, c := range b {
+		if c == 0 {
 			return false
 		}
-		if unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t' && r != '\f' {
+		if c < 0x20 && c != '\n' && c != '\r' && c != '\t' {
 			control++
 		}
 	}
 	return control*100 <= len(b)
 }
 
-// itemName is the file name recorded in a manifest's metadata reference:
-// "file://<name>" for watch-folder ingests, the pin name for pin ingests, and
-// nothing for "ipfs://<cid>".
-func itemName(metaRef string) string {
-	switch {
-	case strings.HasPrefix(metaRef, "file://"):
-		return strings.TrimPrefix(metaRef, "file://")
-	case strings.HasPrefix(metaRef, "ipfs://"):
-		return ""
-	default:
-		return metaRef
-	}
-}
+// ---- markup extraction ----
 
-func gatewayPath(root string, segments ...string) string {
-	p := url.PathEscape(root)
-	for _, s := range segments {
-		p += "/" + url.PathEscape(s)
-	}
-	return p
-}
-
-// errDirectory reports that the gateway answered with a directory listing.
-var errDirectory = errors.New("directory")
-
-// loadContent fetches a payload and extracts text from it. A UnixFS
-// directory is read as its listing plus excerpts of a few readable files.
-func (s *Store) loadContent(payloadCID, name string) (*content, error) {
-	c, err := cid.Decode(payloadCID)
-	if err != nil {
-		return nil, fmt.Errorf("payload cid: %w", err)
-	}
-	if t := c.Type(); t != cid.Raw && t != cid.DagProtobuf {
-		return nil, unsupported("codec %s", multicodec.Code(t))
-	}
-	limit := s.textLimit()
-	text, format, err := s.fileText(gatewayPath(payloadCID), name, limit)
-	if errors.Is(err, errDirectory) {
-		return s.directoryContent(payloadCID, name, limit)
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &content{name: name, format: format, text: text}, nil
-}
-
-// textLimit is the number of bytes of content the current provider accepts.
-func (s *Store) textLimit() int {
-	if s.snapshotConfig().Provider == ProviderGoogle {
-		return googleMaxTextLen
-	}
-	return maxTextLen
-}
-
-func (s *Store) rootNode(payloadCID string) (*merkledag.ProtoNode, *unixfs.FSNode, error) {
-	resp, err := s.gatewayGet(gatewayPath(payloadCID)+"?format=raw", manifestFetchTimeout)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxRootBlockSize))
-	if err != nil {
-		return nil, nil, fmt.Errorf("read root block: %w", err)
-	}
-	node, err := merkledag.DecodeProtobuf(raw)
-	if err != nil {
-		return nil, nil, fmt.Errorf("decode root block: %w", err)
-	}
-	fsn, err := unixfs.FSNodeFromBytes(node.Data())
-	if err != nil {
-		return nil, nil, unsupported("dag-pb node without UnixFS data")
-	}
-	return node, fsn, nil
-}
-
-type dirEntry struct {
-	name string
-	size uint64
-}
-
-func (s *Store) directoryContent(dirCID, name string, limit int) (*content, error) {
-	node, fsn, err := s.rootNode(dirCID)
-	if err != nil {
-		return nil, err
-	}
-	entries := directoryEntries(node, fsn)
-	var listing strings.Builder
-	fmt.Fprintf(&listing, "Directory with %d entries:\n", len(entries))
-	for i, e := range entries {
-		if i == maxDirEntries {
-			fmt.Fprintf(&listing, "... and %d more\n", len(entries)-maxDirEntries)
-			break
-		}
-		fmt.Fprintf(&listing, "%s (%d bytes)\n", e.name, e.size)
-	}
-
-	budget := max((limit-listing.Len())/maxDirSamples, minSampleLen)
-	var samples strings.Builder
-	sampled, attempts := 0, 0
-	for _, e := range sampleOrder(entries) {
-		if sampled == maxDirSamples || attempts == maxDirAttempts {
-			break
-		}
-		attempts++
-		text, format, err := s.fileText(gatewayPath(dirCID, e.name), e.name, budget)
-		var rl rateLimitedError
-		if errors.As(err, &rl) {
-			return nil, err
-		}
-		if err != nil {
-			continue
-		}
-		fmt.Fprintf(&samples, "\n=== %s (%s) ===\n%s\n", e.name, format, text)
-		sampled++
-	}
-	if sampled == 0 {
-		return nil, unsupported("directory without readable files")
-	}
-	return &content{name: name, format: "directory", text: listing.String() + samples.String()}, nil
-}
-
-// directoryEntries lists a directory node's links. Links of a HAMT shard
-// carry a hex bucket prefix; links that are only a prefix point to nested
-// shards and are left out.
-func directoryEntries(node *merkledag.ProtoNode, fsn *unixfs.FSNode) []dirEntry {
-	prefix := 0
-	if fsn.Type() == unixfs.THAMTShard && fsn.Fanout() > 1 {
-		prefix = len(strconv.FormatUint(fsn.Fanout()-1, 16))
-	}
-	entries := make([]dirEntry, 0, len(node.Links()))
-	for _, l := range node.Links() {
-		if len(l.Name) <= prefix {
-			continue
-		}
-		entries = append(entries, dirEntry{name: l.Name[prefix:], size: l.Size})
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
-	return entries
-}
-
-// sampleOrder puts documents first, then other text files, then names without
-// a known extension; known media and archives are dropped.
-func sampleOrder(entries []dirEntry) []dirEntry {
-	rank := func(name string) int {
-		ext := strings.ToLower(path.Ext(name))
-		switch {
-		case ext == ".pdf" || zipFormats[ext] != "":
-			return 0
-		case textFormats[ext] != "" || markupFormats[ext] != kindUnsupported:
-			return 1
-		case skipExts[ext]:
-			return -1
-		default:
-			return 2
-		}
-	}
-	out := make([]dirEntry, 0, len(entries))
-	for _, e := range entries {
-		if rank(e.name) >= 0 {
-			out = append(out, e)
-		}
-	}
-	sort.SliceStable(out, func(i, j int) bool { return rank(out[i].name) < rank(out[j].name) })
-	return out
-}
-
-// fileText fetches one file and returns at most limit bytes of its text and a
-// short description of its format.
-func (s *Store) fileText(ipfsPath, name string, limit int) (string, string, error) {
-	resp, err := s.gatewayGet(ipfsPath, payloadFetchTimeout)
-	if err != nil {
-		return "", "", err
-	}
-	defer resp.Body.Close()
-	if strings.HasPrefix(resp.Header.Get("Etag"), `"DirIndex-`) {
-		return "", "", errDirectory
-	}
-
-	head := make([]byte, sniffLen)
-	n, err := io.ReadFull(resp.Body, head)
-	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-		return "", "", fmt.Errorf("read: %w", err)
-	}
-	head = head[:n]
-	kind, format := classify(name, resp.Header.Get("Content-Type"), head)
-	body := io.MultiReader(bytes.NewReader(head), resp.Body)
-
-	var text string
-	switch kind {
-	case kindText, kindHTML, kindXML:
-		data, err := io.ReadAll(io.LimitReader(body, maxTextFetch))
-		if err != nil {
-			return "", "", fmt.Errorf("read: %w", err)
-		}
-		switch kind {
-		case kindHTML:
-			text = htmlText(data)
-		case kindXML:
-			text = xmlText(bytes.NewReader(data))
-		default:
-			text = string(data)
-		}
-	case kindPDF, kindZip:
-		if resp.ContentLength > maxFetchSize {
-			return "", "", unsupported("%s of %d bytes exceeds %d MB", format, resp.ContentLength, maxFetchSize>>20)
-		}
-		tmp, err := spoolToTemp(body)
-		if err != nil {
-			return "", "", err
-		}
-		defer func() { _ = os.Remove(tmp) }()
-		if kind == kindPDF {
-			if !s.pdfToText {
-				return "", "", unsupported("PDF (pdftotext not installed)")
-			}
-			text, err = convertPDFFromFile(tmp)
-		} else {
-			text, format, err = zipText(tmp, format)
-		}
-		if err != nil {
-			return "", "", err
-		}
-	default:
-		return "", "", unsupported("%s", format)
-	}
-
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return "", "", unsupported("%s without text", format)
-	}
-	return trimUTF8(text, limit), format, nil
-}
-
-func spoolToTemp(r io.Reader) (string, error) {
-	f, err := os.CreateTemp("", "dlockss-index-*")
-	if err != nil {
-		return "", fmt.Errorf("create temp file: %w", err)
-	}
-	n, copyErr := io.Copy(f, io.LimitReader(r, maxFetchSize+1))
-	closeErr := f.Close()
-	switch {
-	case copyErr != nil || closeErr != nil:
-		_ = os.Remove(f.Name())
-		return "", fmt.Errorf("download: %w", errors.Join(copyErr, closeErr))
-	case n > maxFetchSize:
-		_ = os.Remove(f.Name())
-		return "", unsupported("file exceeds %d MB", maxFetchSize>>20)
-	}
-	return f.Name(), nil
-}
-
-func convertPDFFromFile(pdfPath string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "pdftotext", "-layout", "-enc", "UTF-8", pdfPath, "-")
-	out := bytes.NewBuffer(make([]byte, 0, maxTextLen+1024))
-	var stderr bytes.Buffer
-	cmd.Stdout = out
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return "", fmt.Errorf("pdftotext timeout: %w", ctx.Err())
-		}
-		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return "", fmt.Errorf("pdftotext: %w: %s", err, truncate(msg, 500))
-		}
-		return "", fmt.Errorf("pdftotext: %w", err)
-	}
-	return out.String(), nil
-}
-
-// zipText reads the text parts of OOXML, OpenDocument, and EPUB files. Other
-// zip files are not indexed.
-func zipText(zipPath, format string) (string, string, error) {
-	zr, err := zip.OpenReader(zipPath)
-	if err != nil {
-		return "", "", unsupported("unreadable zip: %v", err)
-	}
-	defer zr.Close()
-
-	parts, detected := textParts(zr.File)
-	if len(parts) == 0 {
-		return "", "", unsupported("%s", format)
-	}
-	if format == "zip container" {
-		format = detected
-	}
-	var b strings.Builder
-	for _, f := range parts {
-		if b.Len() >= maxTextLen {
-			break
-		}
-		rc, err := f.Open()
-		if err != nil {
-			continue
-		}
-		b.WriteString(xmlText(io.LimitReader(rc, maxZipPartSize)))
-		b.WriteByte('\n')
-		_ = rc.Close()
-	}
-	return b.String(), format, nil
-}
-
-func textParts(files []*zip.File) ([]*zip.File, string) {
-	byName := make(map[string]*zip.File, len(files))
-	for _, f := range files {
-		byName[f.Name] = f
-	}
-	if f, ok := byName["word/document.xml"]; ok {
-		return []*zip.File{f}, "Word document"
-	}
-	if f, ok := byName["xl/sharedStrings.xml"]; ok {
-		return []*zip.File{f}, "Excel workbook"
-	}
-	if f, ok := byName["content.xml"]; ok {
-		return []*zip.File{f}, "OpenDocument file"
-	}
-	var slides, chapters []*zip.File
-	for _, f := range files {
-		switch {
-		case strings.HasPrefix(f.Name, "ppt/slides/slide") && strings.HasSuffix(f.Name, ".xml"):
-			slides = append(slides, f)
-		case byName["META-INF/container.xml"] != nil && (strings.HasSuffix(f.Name, ".xhtml") || strings.HasSuffix(f.Name, ".html") || strings.HasSuffix(f.Name, ".htm")):
-			chapters = append(chapters, f)
-		}
-	}
-	if len(slides) > 0 {
-		sort.Slice(slides, func(i, j int) bool { return slideNumber(slides[i].Name) < slideNumber(slides[j].Name) })
-		return slides, "PowerPoint presentation"
-	}
-	if len(chapters) > 0 {
-		sort.Slice(chapters, func(i, j int) bool { return chapters[i].Name < chapters[j].Name })
-		return chapters, "EPUB book"
-	}
-	return nil, ""
-}
-
-func slideNumber(name string) int {
-	n, _ := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(name, "ppt/slides/slide"), ".xml"))
-	return n
-}
-
-// xmlText returns the character data of an XML document, one space between
-// text nodes. Malformed input yields the text read up to the error.
-func xmlText(r io.Reader) string {
-	dec := xml.NewDecoder(r)
-	dec.Strict = false
-	dec.AutoClose = xml.HTMLAutoClose
-	dec.Entity = xml.HTMLEntity
-	var b strings.Builder
-	for b.Len() < maxTextFetch {
-		tok, err := dec.Token()
-		if err != nil {
-			break
-		}
-		if cd, ok := tok.(xml.CharData); ok {
-			if t := strings.TrimSpace(string(cd)); t != "" {
-				b.WriteString(t)
-				b.WriteByte(' ')
-			}
-		}
-	}
-	return b.String()
-}
-
-// htmlText returns the visible text of an HTML document.
-func htmlText(data []byte) string {
-	z := html.NewTokenizer(bytes.NewReader(data))
-	var b strings.Builder
-	skip := 0
+func htmlText(raw []byte) string {
+	tok := html.NewTokenizer(bytes.NewReader(raw))
+	var sb strings.Builder
+	skipDepth := 0
 	for {
-		switch z.Next() {
+		switch tok.Next() {
 		case html.ErrorToken:
-			return b.String()
+			return sb.String()
 		case html.StartTagToken:
-			if name, _ := z.TagName(); isHiddenTag(name) {
-				skip++
+			name, _ := tok.TagName()
+			switch string(name) {
+			case "script", "style", "noscript", "template":
+				skipDepth++
 			}
 		case html.EndTagToken:
-			if name, _ := z.TagName(); isHiddenTag(name) && skip > 0 {
-				skip--
+			name, _ := tok.TagName()
+			switch string(name) {
+			case "script", "style", "noscript", "template":
+				if skipDepth > 0 {
+					skipDepth--
+				}
 			}
 		case html.TextToken:
-			if skip == 0 {
-				if t := strings.TrimSpace(string(z.Text())); t != "" {
-					b.WriteString(t)
-					b.WriteByte(' ')
+			if skipDepth == 0 {
+				if t := strings.TrimSpace(string(tok.Text())); t != "" {
+					sb.WriteString(t)
+					sb.WriteByte(' ')
 				}
 			}
 		}
 	}
 }
 
-func isHiddenTag(name []byte) bool {
-	switch string(name) {
-	case "script", "style", "noscript", "template":
-		return true
+func xmlText(raw []byte) string {
+	dec := xml.NewDecoder(bytes.NewReader(raw))
+	dec.Strict = false
+	var sb strings.Builder
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return sb.String()
+		}
+		if cd, ok := tok.(xml.CharData); ok {
+			if t := strings.TrimSpace(string(cd)); t != "" {
+				sb.WriteString(t)
+				sb.WriteByte(' ')
+			}
+		}
 	}
-	return false
+}
+
+// ---- UnixFS directories ----
+
+// loadDirectory indexes a pinned directory: its file listing plus excerpts
+// of a few readable files.
+func loadDirectory(ctx context.Context, gateway string, root cid.Cid, name string) (*document, error) {
+	block, _, err := gatewayGet(ctx, gateway+"/ipfs/"+root.String()+"?format=raw", rootBlockLimit, manifestFetchTime)
+	if err != nil {
+		return nil, err
+	}
+	links, err := parseDagPBLinks(block)
+	if err != nil {
+		return nil, fmt.Errorf("%w: unreadable directory", errUnsupported)
+	}
+
+	var listing strings.Builder
+	listing.WriteString("Directory listing:\n")
+	for i, l := range links {
+		if i >= dirListingMaxEntries {
+			listing.WriteString(fmt.Sprintf("... and %d more entries\n", len(links)-i))
+			break
+		}
+		listing.WriteString(fmt.Sprintf("%s (%d bytes)\n", l.Name, l.Size))
+	}
+
+	// Sample a few extractable files, best formats first.
+	ordered := make([]dagLink, len(links))
+	copy(ordered, links)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return samplePriority(ordered[i].Name) < samplePriority(ordered[j].Name)
+	})
+
+	limit := saiaTextLimit
+	budget := (limit - listing.Len()) / dirSampleMaxFiles
+	if budget < dirSampleMinBudget {
+		budget = dirSampleMinBudget
+	}
+	var sb strings.Builder
+	sb.WriteString(listing.String())
+	sampled, tries := 0, 0
+	for _, l := range ordered {
+		if sampled >= dirSampleMaxFiles || tries >= dirSampleMaxTries {
+			break
+		}
+		prio := samplePriority(l.Name)
+		if prio >= prioSkip {
+			continue
+		}
+		tries++
+		head, hdr, err := gatewayGet(ctx, gateway+"/ipfs/"+root.String()+"/"+l.Name, textReadLimit, payloadFetchTime)
+		if err != nil {
+			continue
+		}
+		doc, err := extract(ctx, gateway, root.String()+"/"+l.Name, l.Name, head, hdr.Get("Content-Type"), budget)
+		if err != nil {
+			continue
+		}
+		text := doc.Text
+		if len(text) > budget {
+			text = text[:budget]
+		}
+		sb.WriteString("\n--- " + l.Name + " ---\n" + text + "\n")
+		sampled++
+	}
+	if name == "" {
+		name = "directory " + root.String()
+	}
+	return finishDoc(name, "directory", sb.String(), limit)
+}
+
+const (
+	prioDocument = 0 // pdf/office/epub
+	prioText     = 1 // text and markup
+	prioUnknown  = 2
+	prioSkip     = 3 // media/archives
+)
+
+func samplePriority(name string) int {
+	ext := strings.ToLower(path.Ext(name))
+	switch {
+	case ext == ".pdf" || zipDocExts[ext]:
+		return prioDocument
+	case textExts[ext]:
+		return prioText
+	case markupExts[ext] != kindUnsupported && ext != "":
+		if _, ok := markupExts[ext]; ok {
+			return prioText
+		}
+		return prioUnknown
+	case skipExts[ext]:
+		return prioSkip
+	default:
+		return prioUnknown
+	}
+}
+
+// ---- minimal dag-pb decoding (directory links only) ----
+
+type dagLink struct {
+	Name string
+	Size uint64
+}
+
+// unixfs Data types (from the UnixFS protobuf enum).
+const unixfsHAMTShard = 5
+
+// parseDagPBLinks reads a dag-pb node's links and strips HAMT shard name
+// prefixes (2 hex chars) when the node is a HAMT directory.
+func parseDagPBLinks(block []byte) ([]dagLink, error) {
+	var links []dagLink
+	var nodeData []byte
+	if err := walkProto(block, func(field int, wire int, val []byte, num uint64) error {
+		switch field {
+		case 1: // Data
+			nodeData = val
+		case 2: // Links
+			var l dagLink
+			if err := walkProto(val, func(f, w int, v []byte, n uint64) error {
+				switch f {
+				case 2:
+					l.Name = string(v)
+				case 3:
+					l.Size = n
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+			links = append(links, l)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	// HAMT shards prefix names with 2 hex characters.
+	if unixfsType(nodeData) == unixfsHAMTShard {
+		for i := range links {
+			if len(links[i].Name) > 2 {
+				links[i].Name = links[i].Name[2:]
+			}
+		}
+	}
+	return links, nil
+}
+
+func unixfsType(data []byte) int {
+	t := -1
+	_ = walkProto(data, func(field, wire int, val []byte, num uint64) error {
+		if field == 1 && wire == 0 {
+			t = int(num)
+		}
+		return nil
+	})
+	return t
+}
+
+// walkProto iterates protobuf wire fields: varint (wire 0) passes num,
+// length-delimited (wire 2) passes val. Other wire types are skipped.
+func walkProto(b []byte, fn func(field, wire int, val []byte, num uint64) error) error {
+	for len(b) > 0 {
+		tag, n := binary.Uvarint(b)
+		if n <= 0 {
+			return errors.New("bad protobuf tag")
+		}
+		b = b[n:]
+		field := int(tag >> 3)
+		wire := int(tag & 7)
+		switch wire {
+		case 0:
+			v, n := binary.Uvarint(b)
+			if n <= 0 {
+				return errors.New("bad varint")
+			}
+			b = b[n:]
+			if err := fn(field, wire, nil, v); err != nil {
+				return err
+			}
+		case 2:
+			l, n := binary.Uvarint(b)
+			if n <= 0 || uint64(len(b)-n) < l {
+				return errors.New("bad length")
+			}
+			val := b[n : n+int(l)]
+			b = b[n+int(l):]
+			if err := fn(field, wire, val, 0); err != nil {
+				return err
+			}
+		case 5:
+			if len(b) < 4 {
+				return errors.New("truncated fixed32")
+			}
+			b = b[4:]
+		case 1:
+			if len(b) < 8 {
+				return errors.New("truncated fixed64")
+			}
+			b = b[8:]
+		default:
+			return fmt.Errorf("unsupported wire type %d", wire)
+		}
+	}
+	return nil
 }

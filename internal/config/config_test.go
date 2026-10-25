@@ -3,372 +3,94 @@ package config
 import (
 	"path/filepath"
 	"testing"
-	"time"
 )
 
-func TestDefaultConfig(t *testing.T) {
-	cfg := DefaultConfig()
-	if cfg == nil {
-		t.Fatal("DefaultConfig returned nil")
-	}
-
-	if cfg.DiscoveryServiceTag != "dlockss-prod" {
-		t.Errorf("DiscoveryServiceTag = %q, want dlockss-prod", cfg.DiscoveryServiceTag)
-	}
-	if cfg.PubsubTopicPrefix != DefaultPubsubVersion {
-		t.Errorf("PubsubTopicPrefix = %q, want %q", cfg.PubsubTopicPrefix, DefaultPubsubVersion)
+func TestDefaults(t *testing.T) {
+	cfg := LoadFromEnv()
+	if cfg.PubsubTopicPrefix != "dlockss-v0.0.3" || cfg.TopicName != "creative-commons" {
+		t.Fatalf("topic defaults wrong: %q %q", cfg.PubsubTopicPrefix, cfg.TopicName)
 	}
 	if cfg.FileWatchFolder != "./data" {
-		t.Errorf("FileWatchFolder = %q, want ./data", cfg.FileWatchFolder)
+		t.Fatalf("data dir default: %q", cfg.FileWatchFolder)
 	}
-	if cfg.BadBitsPath != "badBits.csv" {
-		t.Errorf("BadBitsPath = %q, want badBits.csv", cfg.BadBitsPath)
+	if cfg.ClusterStorePath != filepath.Join(".", "cluster_store") {
+		t.Fatalf("cluster store default: %q", cfg.ClusterStorePath)
 	}
-	if cfg.Security.TrustMode != "open" {
-		t.Errorf("TrustMode = %q, want open", cfg.Security.TrustMode)
+	if cfg.MaxPeersPerShard != 12 || cfg.MinPeersPerShard != 6 {
+		t.Fatal("shard size defaults wrong")
 	}
-	if cfg.Security.SignatureMode != "strict" {
-		t.Errorf("SignatureMode = %q, want strict", cfg.Security.SignatureMode)
+	if cfg.TrustMode != "open" {
+		t.Fatal("trust default wrong")
 	}
-	if cfg.IPFSNodeAddress != "/ip4/127.0.0.1/tcp/5001" {
-		t.Errorf("IPFSNodeAddress = %q, want /ip4/127.0.0.1/tcp/5001", cfg.IPFSNodeAddress)
+	if !cfg.PinIngestEnabled || cfg.APIPort != 5050 {
+		t.Fatal("node defaults wrong")
+	}
+}
+
+func TestEnvOverridesAndInvalidValues(t *testing.T) {
+	t.Setenv("DLOCKSS_MAX_PEERS_PER_SHARD", "20")
+	t.Setenv("DLOCKSS_API_PORT", "notanumber")
+	t.Setenv("DLOCKSS_PRIVATE_NETWORK", "true")
+	cfg := LoadFromEnv()
+	if cfg.MaxPeersPerShard != 20 {
+		t.Fatal("int override ignored")
 	}
 	if cfg.APIPort != 5050 {
-		t.Errorf("APIPort = %d, want 5050", cfg.APIPort)
+		t.Fatal("invalid int must keep the default")
 	}
-	if cfg.Sharding.MaxPeersPerShard != 12 {
-		t.Errorf("MaxPeersPerShard = %d, want 12", cfg.Sharding.MaxPeersPerShard)
+	if !cfg.PrivateNetwork {
+		t.Fatal("bool override ignored")
 	}
-	if cfg.Sharding.MinPeersPerShard != 6 {
-		t.Errorf("MinPeersPerShard = %d, want 6", cfg.Sharding.MinPeersPerShard)
+}
+
+func TestValidateCorrections(t *testing.T) {
+	cfg := LoadFromEnv()
+	cfg.TrustMode = "bogus"
+	cfg.DiskUsageHighWaterMark = 150
+	cfg.MinPeersPerShard, cfg.MaxPeersPerShard = 9, 3
+	cfg.APIPort = -1
+	cfg.Validate()
+	if cfg.TrustMode != "open" {
+		t.Fatal("trust mode correction failed")
 	}
 	if cfg.DiskUsageHighWaterMark != 90.0 {
-		t.Errorf("DiskUsageHighWaterMark = %f, want 90.0", cfg.DiskUsageHighWaterMark)
+		t.Fatal("hwm correction failed")
 	}
-	if cfg.Replication.CheckInterval != 1*time.Minute {
-		t.Errorf("CheckInterval = %v, want 1m", cfg.Replication.CheckInterval)
+	if cfg.MinPeersPerShard != 3 || cfg.MaxPeersPerShard != 9 {
+		t.Fatal("min/max swap failed")
 	}
-	if cfg.BootstrapTimeout != 15*time.Second {
-		t.Errorf("BootstrapTimeout = %v, want 15s", cfg.BootstrapTimeout)
-	}
-	if cfg.Security.SignatureMaxAge != 10*time.Minute {
-		t.Errorf("SignatureMaxAge = %v, want 10m", cfg.Security.SignatureMaxAge)
-	}
-	if !cfg.Replication.AutoReplicationEnabled {
-		t.Error("AutoReplicationEnabled = false, want true")
-	}
-	if cfg.VerboseLogging {
-		t.Error("VerboseLogging = true, want false")
-	}
-	wantClusterStore := filepath.Join(filepath.Dir("./data"), "cluster_store")
-	if cfg.ClusterStorePath != wantClusterStore {
-		t.Errorf("ClusterStorePath = %q, want %q", cfg.ClusterStorePath, wantClusterStore)
-	}
-	wantIdentity := filepath.Join(filepath.Dir("./data"), "dlockss.key")
-	if cfg.IdentityPath != wantIdentity {
-		t.Errorf("IdentityPath = %q, want %q", cfg.IdentityPath, wantIdentity)
+	if cfg.APIPort != 5050 {
+		t.Fatal("port correction failed")
 	}
 }
 
-func TestLoadFromEnv(t *testing.T) {
-	t.Setenv("DLOCKSS_DATA_DIR", "/custom/data")
-	t.Setenv("DLOCKSS_DISCOVERY_TAG", "dlockss-test")
-	t.Setenv("DLOCKSS_API_PORT", "9090")
-	t.Setenv("DLOCKSS_SIGNATURE_MODE", "warn")
-	t.Setenv("DLOCKSS_VERBOSE_LOGGING", "true")
-	t.Setenv("DLOCKSS_CHECK_INTERVAL", "2m")
-	t.Setenv("DLOCKSS_DISK_USAGE_HIGH_WATER_MARK", "85.5")
-	t.Setenv("DLOCKSS_NODE_NAME", "test-node-1")
-
+func TestPathSafety(t *testing.T) {
 	cfg := LoadFromEnv()
-
-	if cfg.FileWatchFolder != "/custom/data" {
-		t.Errorf("FileWatchFolder = %q, want /custom/data", cfg.FileWatchFolder)
+	dir := t.TempDir()
+	cfg.FileWatchFolder = filepath.Join(dir, "data")
+	cfg.IdentityPath = filepath.Join(dir, "dlockss.key")
+	cfg.NodeNamePath = filepath.Join(dir, "node_name")
+	cfg.ClusterStorePath = filepath.Join(dir, "cluster_store")
+	cfg.TrustStorePath = filepath.Join(dir, "trusted_peers.json")
+	if err := cfg.ValidatePathSafety(); err != nil {
+		t.Fatalf("safe layout rejected: %v", err)
 	}
-	if cfg.DiscoveryServiceTag != "dlockss-test" {
-		t.Errorf("DiscoveryServiceTag = %q, want dlockss-test", cfg.DiscoveryServiceTag)
+	cfg.IdentityPath = filepath.Join(cfg.FileWatchFolder, "dlockss.key")
+	if err := cfg.ValidatePathSafety(); err == nil {
+		t.Fatal("identity inside the ingest dir must be rejected")
 	}
-	if cfg.APIPort != 9090 {
-		t.Errorf("APIPort = %d, want 9090", cfg.APIPort)
-	}
-	if cfg.Security.SignatureMode != "warn" {
-		t.Errorf("SignatureMode = %q, want warn", cfg.Security.SignatureMode)
-	}
-	if !cfg.VerboseLogging {
-		t.Errorf("VerboseLogging = false, want true")
-	}
-	if cfg.Replication.CheckInterval != 2*time.Minute {
-		t.Errorf("CheckInterval = %v, want 2m", cfg.Replication.CheckInterval)
-	}
-	if cfg.DiskUsageHighWaterMark != 85.5 {
-		t.Errorf("DiskUsageHighWaterMark = %f, want 85.5", cfg.DiskUsageHighWaterMark)
-	}
-	if cfg.NodeName != "test-node-1" {
-		t.Errorf("NodeName = %q, want test-node-1", cfg.NodeName)
+	cfg.IdentityPath = cfg.FileWatchFolder // equal counts as inside
+	if err := cfg.ValidatePathSafety(); err == nil {
+		t.Fatal("identity equal to the ingest dir must be rejected")
 	}
 }
 
-func TestLoadFromEnv_ClusterStoreOverride(t *testing.T) {
-	t.Setenv("DLOCKSS_DATA_DIR", "/data")
-	t.Setenv("DLOCKSS_CLUSTER_STORE", "/custom/cluster_store")
+func TestShardTopic(t *testing.T) {
 	cfg := LoadFromEnv()
-	if cfg.ClusterStorePath != "/custom/cluster_store" {
-		t.Errorf("ClusterStorePath = %q, want /custom/cluster_store", cfg.ClusterStorePath)
+	if got := cfg.ShardTopic(""); got != "dlockss-v0.0.3-creative-commons-shard-" {
+		t.Fatalf("root topic: %q", got)
 	}
-}
-
-func TestLoadFromEnv_TrustStoreDerivedFromDataDir(t *testing.T) {
-	t.Setenv("DLOCKSS_DATA_DIR", "/custom/data")
-	t.Setenv("DLOCKSS_TRUST_STORE", "")
-	cfg := LoadFromEnv()
-	want := filepath.Join("/custom", "trusted_peers.json")
-	if cfg.Security.TrustStorePath != want {
-		t.Errorf("TrustStorePath = %q, want %q", cfg.Security.TrustStorePath, want)
-	}
-}
-
-func TestLoadFromEnv_TrustStoreOverride(t *testing.T) {
-	t.Setenv("DLOCKSS_DATA_DIR", "/custom/data")
-	t.Setenv("DLOCKSS_TRUST_STORE", "/etc/dlockss/trusted_peers.json")
-	cfg := LoadFromEnv()
-	if cfg.Security.TrustStorePath != "/etc/dlockss/trusted_peers.json" {
-		t.Errorf("TrustStorePath = %q, want override", cfg.Security.TrustStorePath)
-	}
-}
-
-func TestLoadFromEnv_IngestAllowlist(t *testing.T) {
-	t.Setenv("DLOCKSS_INGEST_ALLOWLIST", "12D3KooWAAA, 12D3KooWBBB")
-	cfg := LoadFromEnv()
-	if len(cfg.IngestAllowlist) != 2 {
-		t.Fatalf("IngestAllowlist len = %d, want 2", len(cfg.IngestAllowlist))
-	}
-}
-
-func TestValidate_InvalidTrustMode(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.Security.TrustMode = "maybe"
-	cfg.Validate()
-	if cfg.Security.TrustMode != "open" {
-		t.Errorf("TrustMode after Validate = %q, want open", cfg.Security.TrustMode)
-	}
-}
-
-func TestLoadFromEnv_IdentityPathOverride(t *testing.T) {
-	t.Setenv("DLOCKSS_DATA_DIR", "/data")
-	t.Setenv("DLOCKSS_IDENTITY_PATH", "/custom/dlockss.key")
-	cfg := LoadFromEnv()
-	if cfg.IdentityPath != "/custom/dlockss.key" {
-		t.Errorf("IdentityPath = %q, want /custom/dlockss.key", cfg.IdentityPath)
-	}
-}
-
-func TestValidate_InvalidSignatureMode(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.Security.SignatureMode = "invalid-mode"
-	cfg.Validate()
-	if cfg.Security.SignatureMode != "strict" {
-		t.Errorf("SignatureMode after Validate = %q, want strict", cfg.Security.SignatureMode)
-	}
-}
-
-func TestValidate_ValidSignatureModes(t *testing.T) {
-	for _, mode := range []string{"off", "warn", "strict"} {
-		cfg := DefaultConfig()
-		cfg.Security.SignatureMode = mode
-		cfg.Validate()
-		if cfg.Security.SignatureMode != mode {
-			t.Errorf("SignatureMode %q was changed to %q", mode, cfg.Security.SignatureMode)
-		}
-	}
-}
-
-func TestValidate_MaxConcurrentFileProcessing(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.Files.MaxConcurrentFileProcessing = 0
-	cfg.Validate()
-	if cfg.Files.MaxConcurrentFileProcessing != 5 {
-		t.Errorf("MaxConcurrentFileProcessing = %d, want 5", cfg.Files.MaxConcurrentFileProcessing)
-	}
-
-	cfg.Files.MaxConcurrentFileProcessing = -1
-	cfg.Validate()
-	if cfg.Files.MaxConcurrentFileProcessing != 5 {
-		t.Errorf("MaxConcurrentFileProcessing (negative) = %d, want 5", cfg.Files.MaxConcurrentFileProcessing)
-	}
-}
-
-func TestValidate_NonceSize(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.Security.NonceSize = 0
-	cfg.Validate()
-	if cfg.Security.NonceSize != 16 {
-		t.Errorf("NonceSize = %d, want 16", cfg.Security.NonceSize)
-	}
-
-	cfg.Security.NonceSize = -5
-	cfg.Validate()
-	if cfg.Security.NonceSize != 16 {
-		t.Errorf("NonceSize (negative) = %d, want 16", cfg.Security.NonceSize)
-	}
-}
-
-func TestValidate_MinNonceSize(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.Security.MinNonceSize = 0
-	cfg.Validate()
-	if cfg.Security.MinNonceSize != 8 {
-		t.Errorf("MinNonceSize = %d, want 8", cfg.Security.MinNonceSize)
-	}
-}
-
-func TestValidate_MaxConcurrentReplicationChecks(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.Replication.MaxConcurrentReplicationChecks = 0
-	cfg.Validate()
-	if cfg.Replication.MaxConcurrentReplicationChecks != 5 {
-		t.Errorf("MaxConcurrentReplicationChecks = %d, want 5", cfg.Replication.MaxConcurrentReplicationChecks)
-	}
-}
-
-func TestValidate_DiskUsageHighWaterMark(t *testing.T) {
-	tests := []struct {
-		value float64
-		want  float64
-	}{
-		{0, 90.0},
-		{-10, 90.0},
-		{101, 90.0},
-		{150, 90.0},
-		{50.0, 50.0},
-		{90.0, 90.0},
-		{100.0, 100.0},
-	}
-	for _, tt := range tests {
-		cfg := DefaultConfig()
-		cfg.DiskUsageHighWaterMark = tt.value
-		cfg.Validate()
-		if cfg.DiskUsageHighWaterMark != tt.want {
-			t.Errorf("DiskUsageHighWaterMark %f -> %f, want %f", tt.value, cfg.DiskUsageHighWaterMark, tt.want)
-		}
-	}
-}
-
-func TestGetEnvInt_Valid(t *testing.T) {
-	t.Setenv("TEST_INT_KEY", "42")
-	got := getEnvInt("TEST_INT_KEY", 10)
-	if got != 42 {
-		t.Errorf("getEnvInt = %d, want 42", got)
-	}
-}
-
-func TestGetEnvInt_Invalid(t *testing.T) {
-	t.Setenv("TEST_INT_INVALID", "not-a-number")
-	got := getEnvInt("TEST_INT_INVALID", 99)
-	if got != 99 {
-		t.Errorf("getEnvInt(invalid) = %d, want 99", got)
-	}
-}
-
-func TestGetEnvInt_Unset(t *testing.T) {
-	t.Setenv("TEST_INT_UNSET", "")
-	got := getEnvInt("TEST_INT_UNSET", 7)
-	if got != 7 {
-		t.Errorf("getEnvInt(unset) = %d, want 7", got)
-	}
-}
-
-func TestGetEnvDuration_Valid(t *testing.T) {
-	t.Setenv("TEST_DUR_KEY", "30s")
-	got := getEnvDuration("TEST_DUR_KEY", 5*time.Minute)
-	if got != 30*time.Second {
-		t.Errorf("getEnvDuration = %v, want 30s", got)
-	}
-}
-
-func TestGetEnvDuration_Invalid(t *testing.T) {
-	t.Setenv("TEST_DUR_INVALID", "not-a-duration")
-	got := getEnvDuration("TEST_DUR_INVALID", 2*time.Hour)
-	if got != 2*time.Hour {
-		t.Errorf("getEnvDuration(invalid) = %v, want 2h", got)
-	}
-}
-
-func TestGetEnvDuration_Unset(t *testing.T) {
-	t.Setenv("TEST_DUR_UNSET", "")
-	got := getEnvDuration("TEST_DUR_UNSET", 1*time.Second)
-	if got != 1*time.Second {
-		t.Errorf("getEnvDuration(unset) = %v, want 1s", got)
-	}
-}
-
-func TestGetEnvFloat_Valid(t *testing.T) {
-	t.Setenv("TEST_FLOAT_KEY", "3.14")
-	got := getEnvFloat("TEST_FLOAT_KEY", 1.0)
-	if got != 3.14 {
-		t.Errorf("getEnvFloat = %f, want 3.14", got)
-	}
-}
-
-func TestGetEnvFloat_Invalid(t *testing.T) {
-	t.Setenv("TEST_FLOAT_INVALID", "xyz")
-	got := getEnvFloat("TEST_FLOAT_INVALID", 2.5)
-	if got != 2.5 {
-		t.Errorf("getEnvFloat(invalid) = %f, want 2.5", got)
-	}
-}
-
-func TestGetEnvFloat_Unset(t *testing.T) {
-	t.Setenv("TEST_FLOAT_UNSET", "")
-	got := getEnvFloat("TEST_FLOAT_UNSET", 0.5)
-	if got != 0.5 {
-		t.Errorf("getEnvFloat(unset) = %f, want 0.5", got)
-	}
-}
-
-func TestGetEnvBool_Valid(t *testing.T) {
-	for _, tc := range []struct {
-		env  string
-		def  bool
-		want bool
-	}{
-		{"true", false, true},
-		{"1", false, true},
-		{"TRUE", false, true},
-		{"false", true, false},
-		{"0", true, false},
-		{"FALSE", true, false},
-	} {
-		t.Setenv("TEST_BOOL_KEY", tc.env)
-		got := getEnvBool("TEST_BOOL_KEY", tc.def)
-		if got != tc.want {
-			t.Errorf("getEnvBool(%q, %v) = %v, want %v", tc.env, tc.def, got, tc.want)
-		}
-	}
-}
-
-func TestGetEnvBool_Invalid(t *testing.T) {
-	t.Setenv("TEST_BOOL_INVALID", "maybe")
-	got := getEnvBool("TEST_BOOL_INVALID", true)
-	if !got {
-		t.Errorf("getEnvBool(invalid) = %v, want true (default)", got)
-	}
-
-	t.Setenv("TEST_BOOL_INVALID2", "nope")
-	got = getEnvBool("TEST_BOOL_INVALID2", false)
-	if got {
-		t.Errorf("getEnvBool(invalid) = %v, want false (default)", got)
-	}
-}
-
-func TestGetEnvBool_Unset(t *testing.T) {
-	t.Setenv("TEST_BOOL_UNSET", "")
-	got := getEnvBool("TEST_BOOL_UNSET", true)
-	if !got {
-		t.Errorf("getEnvBool(unset) = %v, want true", got)
-	}
-
-	got = getEnvBool("TEST_BOOL_UNSET", false)
-	if got {
-		t.Errorf("getEnvBool(unset) = %v, want false", got)
+	if got := cfg.ShardTopic("01"); got != "dlockss-v0.0.3-creative-commons-shard-01" {
+		t.Fatalf("shard topic: %q", got)
 	}
 }
