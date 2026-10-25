@@ -17,7 +17,7 @@ FROM alpine:3.21 AS final
 COPY --from=builder /build/dlockss /usr/local/bin/dlockss
 
 WORKDIR /data
-ENV DLOCKSS_DATA_DIR=/data/ingest
+ENV DLOCKSS_STATE_DIR=/data
 
 EXPOSE 5050
 

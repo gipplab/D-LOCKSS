@@ -147,7 +147,7 @@ echo "Logs: $BASE_DIR/node_X.log"
 echo "PIDs: $PID_FILE"
 
 echo -e "\n${YELLOW}--- Usage ---${NC}"
-echo "Ingest a file:   cp your-file.pdf $BASE_DIR/node_1/data/"
+echo "Ingest a file:   IPFS_PATH=$BASE_DIR/node_1/ipfs_repo ipfs add your-file.pdf"
 echo "Or pin it:       IPFS_PATH=$BASE_DIR/node_1/ipfs_repo ipfs add your-file.pdf"
 echo "Watch logs:      tail -f $BASE_DIR/node_*.log"
 echo "Press [ENTER] to stop the network."

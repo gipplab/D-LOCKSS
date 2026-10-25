@@ -13,8 +13,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -115,74 +113,6 @@ func (c *Client) Version(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return v.Version, nil
-}
-
-// unixfsV1Args returns the IPIP-0499 unixfs-v1-2025 import profile: CIDv1,
-// sha2-256, raw leaves, 1 MiB chunks, balanced DAG, 1024 links per node.
-func unixfsV1Args() url.Values {
-	return url.Values{
-		"pin":            {"true"},
-		"cid-version":    {"1"},
-		"hash":           {"sha2-256"},
-		"raw-leaves":     {"true"},
-		"chunker":        {"size-1048576"},
-		"trickle":        {"false"},
-		"max-file-links": {"1024"},
-	}
-}
-
-// ImportFile adds a local file to Kubo with the unixfs-v1-2025 profile and
-// pins it. It returns the root CID.
-func (c *Client) ImportFile(ctx context.Context, path string) (cid.Cid, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return cid.Undef, err
-	}
-	defer f.Close()
-
-	pr, pw := io.Pipe()
-	mw := multipart.NewWriter(pw)
-	go func() {
-		part, err := mw.CreateFormFile("file", filepath.Base(path))
-		if err == nil {
-			_, err = io.Copy(part, f)
-		}
-		if cerr := mw.Close(); err == nil {
-			err = cerr
-		}
-		pw.CloseWithError(err)
-	}()
-
-	resp, err := c.request(ctx, "add", unixfsV1Args(), pr, mw.FormDataContentType())
-	if err != nil {
-		return cid.Undef, err
-	}
-	defer resp.Body.Close()
-
-	// The response is NDJSON; the root entry is the last line.
-	var last struct {
-		Hash string `json:"Hash"`
-	}
-	dec := json.NewDecoder(resp.Body)
-	seen := false
-	for {
-		var line struct {
-			Hash string `json:"Hash"`
-		}
-		if err := dec.Decode(&line); err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return cid.Undef, err
-		}
-		if line.Hash != "" {
-			last, seen = line, true
-		}
-	}
-	if !seen {
-		return cid.Undef, errors.New("add: no root CID in response")
-	}
-	return cid.Decode(last.Hash)
 }
 
 // PutDagCBOR stores a dag-cbor block (sha2-256) and returns its CID.

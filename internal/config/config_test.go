@@ -10,11 +10,15 @@ func TestDefaults(t *testing.T) {
 	if cfg.PubsubTopicPrefix != "dlockss-v0.0.3" || cfg.TopicName != "creative-commons" {
 		t.Fatalf("topic defaults wrong: %q %q", cfg.PubsubTopicPrefix, cfg.TopicName)
 	}
-	if cfg.FileWatchFolder != "./data" {
-		t.Fatalf("data dir default: %q", cfg.FileWatchFolder)
+	if cfg.StateDir != "./dlockss-state" {
+		t.Fatalf("state dir default: %q", cfg.StateDir)
 	}
-	if cfg.ClusterStorePath != filepath.Join(".", "cluster_store") {
+	if cfg.ClusterStorePath != filepath.Join(cfg.StateDir, "cluster_store") {
 		t.Fatalf("cluster store default: %q", cfg.ClusterStorePath)
+	}
+	if cfg.IdentityPath != filepath.Join(cfg.StateDir, "dlockss.key") ||
+		cfg.TrustStorePath != filepath.Join(cfg.StateDir, "trusted_peers.json") {
+		t.Fatal("derived state paths wrong")
 	}
 	if cfg.MaxPeersPerShard != 12 || cfg.MinPeersPerShard != 6 {
 		t.Fatal("shard size defaults wrong")
@@ -64,24 +68,12 @@ func TestValidateCorrections(t *testing.T) {
 	}
 }
 
-func TestPathSafety(t *testing.T) {
+func TestStateDirOverride(t *testing.T) {
+	t.Setenv("DLOCKSS_STATE_DIR", "/var/lib/dlockss")
 	cfg := LoadFromEnv()
-	dir := t.TempDir()
-	cfg.FileWatchFolder = filepath.Join(dir, "data")
-	cfg.IdentityPath = filepath.Join(dir, "dlockss.key")
-	cfg.NodeNamePath = filepath.Join(dir, "node_name")
-	cfg.ClusterStorePath = filepath.Join(dir, "cluster_store")
-	cfg.TrustStorePath = filepath.Join(dir, "trusted_peers.json")
-	if err := cfg.ValidatePathSafety(); err != nil {
-		t.Fatalf("safe layout rejected: %v", err)
-	}
-	cfg.IdentityPath = filepath.Join(cfg.FileWatchFolder, "dlockss.key")
-	if err := cfg.ValidatePathSafety(); err == nil {
-		t.Fatal("identity inside the ingest dir must be rejected")
-	}
-	cfg.IdentityPath = cfg.FileWatchFolder // equal counts as inside
-	if err := cfg.ValidatePathSafety(); err == nil {
-		t.Fatal("identity equal to the ingest dir must be rejected")
+	if cfg.StateDir != "/var/lib/dlockss" ||
+		cfg.IdentityPath != filepath.Join("/var/lib/dlockss", "dlockss.key") {
+		t.Fatalf("state dir override not derived: %+v", cfg.StateDir)
 	}
 }
 

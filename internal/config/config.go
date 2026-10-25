@@ -6,7 +6,6 @@
 package config
 
 import (
-	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -30,9 +29,8 @@ type Config struct {
 	PrivateNetwork      bool   // DLOCKSS_PRIVATE_NETWORK: skip public bootstrap/NAT/relay
 	DHTClient           bool   // DLOCKSS_DHT_CLIENT: rendezvous DHT in client mode
 
-	// Paths. State files live in the PARENT of the ingest directory so the
-	// scanner never ingests them.
-	FileWatchFolder  string // DLOCKSS_DATA_DIR (ingest directory)
+	// Paths.
+	StateDir         string // DLOCKSS_STATE_DIR: identity, node name, pin sets, trust store
 	ClusterStorePath string // DLOCKSS_CLUSTER_STORE (pin sets)
 	BadBitsPath      string // DLOCKSS_BADBITS_PATH
 	IdentityPath     string // DLOCKSS_IDENTITY_PATH
@@ -61,7 +59,7 @@ type Config struct {
 var knownVars = map[string]struct{}{
 	"DLOCKSS_DISCOVERY_TAG": {}, "DLOCKSS_PUBSUB_TOPIC_PREFIX": {}, "DLOCKSS_TOPIC_NAME": {},
 	"DLOCKSS_PRIVATE_NETWORK": {}, "DLOCKSS_DHT_CLIENT": {},
-	"DLOCKSS_DATA_DIR": {}, "DLOCKSS_CLUSTER_STORE": {}, "DLOCKSS_BADBITS_PATH": {},
+	"DLOCKSS_STATE_DIR": {}, "DLOCKSS_CLUSTER_STORE": {}, "DLOCKSS_BADBITS_PATH": {},
 	"DLOCKSS_IDENTITY_PATH": {}, "DLOCKSS_IPFS_CONFIG": {}, "DLOCKSS_TRUST_STORE": {},
 	"DLOCKSS_NODE_NAME": {}, "DLOCKSS_IPFS_NODE": {}, "DLOCKSS_API_PORT": {},
 	"DLOCKSS_VERBOSE_LOGGING": {},
@@ -119,8 +117,7 @@ func envStringSlice(key string) []string {
 // LoadFromEnv builds the configuration from defaults overlaid with the
 // environment.
 func LoadFromEnv() *Config {
-	dataDir := envString("DLOCKSS_DATA_DIR", "./data")
-	parent := filepath.Dir(dataDir)
+	stateDir := envString("DLOCKSS_STATE_DIR", "./dlockss-state")
 
 	cfg := &Config{
 		DiscoveryServiceTag: envString("DLOCKSS_DISCOVERY_TAG", "dlockss-prod"),
@@ -129,13 +126,13 @@ func LoadFromEnv() *Config {
 		PrivateNetwork:      envBool("DLOCKSS_PRIVATE_NETWORK", false),
 		DHTClient:           envBool("DLOCKSS_DHT_CLIENT", false),
 
-		FileWatchFolder:  dataDir,
-		ClusterStorePath: envString("DLOCKSS_CLUSTER_STORE", filepath.Join(parent, "cluster_store")),
+		StateDir:         stateDir,
+		ClusterStorePath: envString("DLOCKSS_CLUSTER_STORE", filepath.Join(stateDir, "cluster_store")),
 		BadBitsPath:      envString("DLOCKSS_BADBITS_PATH", "badBits.csv"),
-		IdentityPath:     envString("DLOCKSS_IDENTITY_PATH", filepath.Join(parent, "dlockss.key")),
-		NodeNamePath:     filepath.Join(parent, "node_name"),
+		IdentityPath:     envString("DLOCKSS_IDENTITY_PATH", filepath.Join(stateDir, "dlockss.key")),
+		NodeNamePath:     filepath.Join(stateDir, "node_name"),
 		IPFSConfigPath:   os.Getenv("DLOCKSS_IPFS_CONFIG"),
-		TrustStorePath:   envString("DLOCKSS_TRUST_STORE", filepath.Join(parent, "trusted_peers.json")),
+		TrustStorePath:   envString("DLOCKSS_TRUST_STORE", filepath.Join(stateDir, "trusted_peers.json")),
 
 		NodeName:        os.Getenv("DLOCKSS_NODE_NAME"),
 		IPFSNodeAddress: envString("DLOCKSS_IPFS_NODE", "/ip4/127.0.0.1/tcp/5001"),
@@ -185,48 +182,6 @@ func (c *Config) Validate() {
 	fix("APIPort", c.APIPort < 1 || c.APIPort > 65535, func() { c.APIPort = 5050 })
 }
 
-// ValidatePathSafety fails when a state file would live inside the ingest
-// directory, where the scanner would ingest it as data.
-func (c *Config) ValidatePathSafety() error {
-	checks := map[string]string{
-		"identity key (DLOCKSS_IDENTITY_PATH)":  c.IdentityPath,
-		"node name file":                        c.NodeNamePath,
-		"cluster store (DLOCKSS_CLUSTER_STORE)": c.ClusterStorePath,
-		"trust store (DLOCKSS_TRUST_STORE)":     c.TrustStorePath,
-	}
-	if c.IPFSConfigPath != "" {
-		checks["IPFS config (DLOCKSS_IPFS_CONFIG)"] = c.IPFSConfigPath
-	}
-	for name, path := range checks {
-		inside, err := isInsideDir(path, c.FileWatchFolder)
-		if err != nil {
-			return fmt.Errorf("checking %s: %w", name, err)
-		}
-		if inside {
-			return fmt.Errorf("%s (%s) resolves inside the ingest directory %s; "+
-				"set DLOCKSS_DATA_DIR to a dedicated subdirectory (e.g. ./data, not .)",
-				name, path, c.FileWatchFolder)
-		}
-	}
-	return nil
-}
-
-func isInsideDir(path, dir string) (bool, error) {
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return false, err
-	}
-	absDir, err := filepath.Abs(dir)
-	if err != nil {
-		return false, err
-	}
-	rel, err := filepath.Rel(absDir, absPath)
-	if err != nil {
-		return false, nil
-	}
-	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))), nil
-}
-
 // ShardTopic returns the shard topic name for the given shard ID.
 func (c *Config) ShardTopic(shardID string) string {
 	return c.PubsubTopicPrefix + "-" + c.TopicName + "-shard-" + shardID
@@ -239,7 +194,7 @@ func (c *Config) Log() {
 		"discovery_tag", c.DiscoveryServiceTag, "private_network", c.PrivateNetwork,
 		"dht_client", c.DHTClient)
 	slog.Info("config: paths",
-		"data_dir", c.FileWatchFolder, "cluster_store", c.ClusterStorePath,
+		"state_dir", c.StateDir, "cluster_store", c.ClusterStorePath,
 		"identity", c.IdentityPath, "trust_store", c.TrustStorePath,
 		"badbits", c.BadBitsPath, "ipfs", c.IPFSNodeAddress)
 	slog.Info("config: behavior",

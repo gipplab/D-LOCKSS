@@ -1,15 +1,12 @@
-// Package ingest brings new content into the network: a recursive folder
-// watcher and a Kubo pin watcher feed one shared pipeline that imports,
-// wraps, signs, pins, and announces files.
+// Package ingest brings new content into the network. Kubo's pin set is the
+// single source of truth: a pin watcher wraps every user-pinned CID in a
+// signed manifest and announces it; D-LOCKSS then keeps it replicated.
 package ingest
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -25,9 +22,9 @@ import (
 )
 
 const (
-	recentIngestTTL   = 30 * time.Second // payload-level dedup window
-	recentIngestSweep = time.Minute
-	fileImportTimeout = 2 * time.Minute
+	recentIngestTTL    = 30 * time.Second // payload-level dedup window
+	recentIngestSweep  = time.Minute
+	manifestPinTimeout = 2 * time.Minute
 )
 
 // Network is the shard engine surface the ingest pipeline needs.
@@ -68,65 +65,13 @@ func NewProcessor(cfg *config.Config, client *kubo.Client, st *store.Store, bb *
 	}
 }
 
-// validPath rejects paths outside the watch folder and temp-file suffixes.
-func (p *Processor) validPath(path string) error {
-	absRoot, err := filepath.Abs(p.cfg.FileWatchFolder)
-	if err != nil {
-		return err
-	}
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return err
-	}
-	rel, err := filepath.Rel(absRoot, absPath)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("path %s is outside the watch folder", path)
-	}
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".tmp", ".part", ".crdownload":
-		return fmt.Errorf("temporary file")
-	}
-	return nil
-}
-
-// processFile imports one local file and runs the shared pipeline.
-func (p *Processor) processFile(ctx context.Context, path string) error {
-	if !p.network.IsLocalIngestor() {
-		slog.Debug("local ingest refused: node is not an authorized ingestor", "path", path)
-		return nil
-	}
-	if err := p.validPath(path); err != nil {
-		return nil
-	}
-	info, err := os.Stat(path)
-	if err != nil || info.IsDir() {
-		return nil // vanished or replaced by a directory: the next scan decides
-	}
-
-	ictx, cancel := context.WithTimeout(ctx, fileImportTimeout)
-	payload, err := p.client.ImportFile(ictx, path)
-	cancel()
-	if err != nil {
-		return fmt.Errorf("import: %w", err)
-	}
-
-	cleanup := func() {
-		uctx, cancel := context.WithTimeout(ctx, time.Minute)
-		defer cancel()
-		_ = p.client.Unpin(uctx, payload)
-	}
-	return p.finishIngest(ctx, "file://"+filepath.Base(path), payload, uint64(info.Size()), cleanup)
-}
-
-// finishIngest is the shared tail of both ingest paths: dedup, manifest,
-// denylist, manifest pin, then track and announce. cleanup undoes the
-// payload pin of THIS path when the ingest aborts (the pin watcher passes a
-// no-op: user pins are never removed). The returned error distinguishes a
-// failed ingest (retryable) from a completed or deliberately skipped one.
-func (p *Processor) finishIngest(ctx context.Context, metaRef string, payload cid.Cid, size uint64, cleanup func()) error {
+// finishIngest wraps a payload in a signed manifest and announces it: dedup,
+// manifest build + store, denylist, manifest pin, then track and announce.
+// The user's payload pin is never touched. The returned error distinguishes
+// a failed ingest (retryable) from a completed or deliberately skipped one.
+func (p *Processor) finishIngest(ctx context.Context, metaRef string, payload cid.Cid, size uint64) error {
 	if !p.claimRecentIngest(payload) {
 		slog.Debug("skipping duplicate ingest", "payload", payload)
-		cleanup()
 		return nil
 	}
 
@@ -141,31 +86,24 @@ func (p *Processor) finishIngest(ctx context.Context, metaRef string, payload ci
 	}
 	raw, err := ro.MarshalCBOR()
 	if err != nil {
-		cleanup()
 		return fmt.Errorf("manifest encode: %w", err)
 	}
 	bctx, cancel := context.WithTimeout(ctx, time.Minute)
 	manifest, err := p.client.PutDagCBOR(bctx, raw)
 	cancel()
 	if err != nil {
-		cleanup()
 		return fmt.Errorf("manifest store: %w", err)
 	}
 
 	if p.badbits.IsBlocked(manifest.String()) {
 		slog.Warn("ingest refused: manifest is denylisted", "cid", manifest)
-		uctx, ucancel := context.WithTimeout(ctx, time.Minute)
-		_ = p.client.Unpin(uctx, manifest)
-		ucancel()
-		cleanup()
 		return nil // deliberate refusal, not a retryable failure
 	}
 
-	pctx, cancel := context.WithTimeout(ctx, fileImportTimeout)
+	pctx, cancel := context.WithTimeout(ctx, manifestPinTimeout)
 	err = p.client.PinManifest(pctx, manifest)
 	cancel()
 	if err != nil {
-		cleanup()
 		return fmt.Errorf("manifest pin: %w", err)
 	}
 

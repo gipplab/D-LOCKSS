@@ -40,8 +40,8 @@ func main() {
 	cfg.Validate()
 	cfg.Log()
 
-	if err := cfg.ValidatePathSafety(); err != nil {
-		slog.Error("unsafe path layout", "err", err)
+	if err := os.MkdirAll(cfg.StateDir, 0o755); err != nil {
+		slog.Error("cannot create the state directory", "dir", cfg.StateDir, "err", err)
 		os.Exit(1)
 	}
 
@@ -102,7 +102,7 @@ func main() {
 	}
 
 	st := store.New(client, bb)
-	disk := store.NewDiskMonitor(cfg.FileWatchFolder, cfg.DiskUsageHighWaterMark)
+	disk := store.NewDiskMonitor(cfg.StateDir, cfg.DiskUsageHighWaterMark)
 	signer := protocol.NewSigner(self, key, trustMgr)
 
 	pins, err := pinset.NewManager(ctx, cfg.ClusterStorePath, client, bb, trustMgr)
@@ -139,11 +139,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The first rescan only records candidates and the second (30 s later)
-	// ingests, so the shard manager has settled before announcements start.
-	proc := ingest.NewProcessor(cfg, client, st, bb, signer, shardMgr, self)
-	go proc.WatchFolder(ctx)
+	// Kubo's pin set is the only ingest source: everything users pin there
+	// gets wrapped, announced, and replicated.
 	if cfg.PinIngestEnabled {
+		proc := ingest.NewProcessor(cfg, client, st, bb, signer, shardMgr, self)
 		go proc.WatchPins(ctx)
 	}
 

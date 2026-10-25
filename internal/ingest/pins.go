@@ -28,10 +28,11 @@ const (
 )
 
 // pinWatcher ingests recursive pins users create in Kubo (CLI, WebUI, IPFS
-// Desktop). A pinned directory becomes one research object. D-LOCKSS's own
-// manifest pins and the payloads they cover are never ingested, and a pin is
-// only ingested on its second consecutive sighting so a concurrent folder
-// ingest (payload pinned before its manifest exists) is not raced.
+// Desktop) — the network's only ingest path. A pinned directory becomes one
+// research object. D-LOCKSS's own manifest pins and the payloads they cover
+// are never ingested, and a pin is only ingested on its second consecutive
+// sighting so a pin whose covering manifest is still landing (ingest and
+// replication pin payloads moments after their manifests) is not raced.
 type pinWatcher struct {
 	p *Processor
 
@@ -182,5 +183,5 @@ func (w *pinWatcher) ingest(ctx context.Context, payload cid.Cid, pinName string
 	}
 	cancel()
 
-	return w.p.finishIngest(ctx, metaRef, payload, size, func() {})
+	return w.p.finishIngest(ctx, metaRef, payload, size)
 }

@@ -34,9 +34,11 @@
     *(Windows: `dlockss.exe`)*
 
 2.  **Add Files:**
-    Either pin content in the node's Kubo (`ipfs pin add <cid>`, or "Set pinning" in the Kubo WebUI / IPFS Desktop),
-    or copy any file (e.g., PDF) into the data directory (default `./data` or `DLOCKSS_DATA_DIR`).
-    The node will automatically detect, ingest, pin, and replicate it.
+    Kubo's pin set is the single source of truth: add and pin content there and
+    D-LOCKSS handles the preservation. Use `ipfs add my-paper.pdf` (which pins),
+    `ipfs pin add --name paper.pdf <cid>`, or "Set pinning" in the Kubo WebUI /
+    IPFS Desktop. The node detects the pin (within a minute or two), wraps it in
+    a signed manifest, and replicates it.
 
     A pinned directory is ingested as one object. A pin name (`ipfs pin add --name paper.pdf <cid>`) becomes the
     metadata reference, otherwise `ipfs://<cid>`. Files that are only in the WebUI's *Files* view (MFS) are not
@@ -44,7 +46,8 @@
     or the payloads they reference. Unpinning in Kubo does not remove ingested content from D-LOCKSS.
     Disable with `DLOCKSS_PIN_INGEST=false` (the poll interval is fixed at 1m).
 
-    Folder ingest is a periodic rescan: a file is picked up once its size is stable across two scans (up to ~1 minute).
+    > **Chunking:** apply the `unixfs-v1-2025` profile to your Kubo repo (see Prerequisites)
+    > so identical files added on different nodes yield identical CIDs and dedupe network-wide.
 
 ### Troubleshooting
 *   **"IPFS is not available"** — start the daemon (`ipfs daemon`) and check its API address (`ipfs config Addresses.API`) against `DLOCKSS_IPFS_NODE`.
@@ -54,8 +57,8 @@
 Configure via environment variables:
 
 ```bash
-# Data Directory
-export DLOCKSS_DATA_DIR="$HOME/my-data"
+# State directory (identity key, node name, pin sets, trust store)
+export DLOCKSS_STATE_DIR="./dlockss-state"
 
 # Node Identity
 export DLOCKSS_NODE_NAME="my-node"            # Human-readable name (shown in monitor)
@@ -77,8 +80,8 @@ export DLOCKSS_PRIVATE_NETWORK=true
 export DLOCKSS_VERBOSE_LOGGING=true # Enable detailed metrics and status logs
 
 # Who this node will store data from (libp2p peer IDs).
-# A non-empty trusted_peers.json next to the data directory enables the same gate.
-# Include this node's own peer ID if it should ingest local files.
+# A non-empty trusted_peers.json in the state directory enables the same gate.
+# Include this node's own peer ID if it should ingest its own pins.
 export DLOCKSS_INGEST_ALLOWLIST="12D3KooWPublisherA,12D3KooWPublisherB"
 # export DLOCKSS_TRUST_STORE="/data/trusted_peers.json"
 # export DLOCKSS_TRUST_MODE=allowlist   # also restrict protocol message senders
@@ -93,7 +96,7 @@ knob list is in [docs/DLOCKSS_PROTOCOL.md](docs/DLOCKSS_PROTOCOL.md) §9.
 Nodes can have a human-readable name displayed in the monitor dashboard. The name is resolved in order:
 
 1. `DLOCKSS_NODE_NAME` environment variable (highest priority, persisted)
-2. Persisted name file (`node_name` alongside the data directory)
+2. Persisted name file (`node_name` in the state directory)
 
 Unnamed nodes show their peer ID in the monitor. Testnet nodes are automatically named `testnet_1`, `testnet_2`, etc.
 
@@ -102,12 +105,10 @@ Unnamed nodes show their peer ID in the monitor. Testnet nodes are automatically
 The node's libp2p identity (private key) determines its **Peer ID**. The identity is resolved in order:
 
 1. **IPFS config** (`DLOCKSS_IPFS_CONFIG` set): Reads `Identity.PrivKey` from the Kubo config JSON so D-LOCKSS and IPFS share one Peer ID. For Docker, mount the single config file read-only.
-2. **Persistent key file** (`DLOCKSS_IDENTITY_PATH` or default `{data_dir_parent}/dlockss.key`): Used when connecting to a remote/Docker Kubo node where the repo is not accessible.
+2. **Persistent key file** (`DLOCKSS_IDENTITY_PATH` or default `{state_dir}/dlockss.key`): Used when connecting to a remote/Docker Kubo node where the repo is not accessible.
 3. **Auto-generated**: If no key exists, a new Ed25519 key is generated and saved to the identity path.
 
-For Docker deployments: either mount the Kubo config file and set `DLOCKSS_IPFS_CONFIG`, or mount a persistent volume and set `DLOCKSS_DATA_DIR` to a subdirectory on it. The identity key, node name, and cluster state are stored alongside the data directory and will survive container rebuilds.
-
-> **Path safety:** The node refuses to start if the identity key, node name, or cluster store would be placed *inside* the ingest directory (`DLOCKSS_DATA_DIR`), since the ingest scanner would pick them up. Always set `DLOCKSS_DATA_DIR` to a dedicated subdirectory (e.g. `./data`, not `.`).
+For Docker deployments: either mount the Kubo config file and set `DLOCKSS_IPFS_CONFIG`, or mount a persistent volume and point `DLOCKSS_STATE_DIR` at it. The identity key, node name, pin sets, and trust store live there and survive container rebuilds.
 
 #### Docker Compose Example
 
@@ -118,12 +119,12 @@ services:
     restart: unless-stopped
     environment:
       DLOCKSS_IPFS_NODE: "/dns4/ipfs/tcp/5001"   # "ipfs" resolves to the Kubo service below
-      DLOCKSS_DATA_DIR: "/data/ingest"           # location that D-LOCKSS monitors for ingesting files
+      DLOCKSS_STATE_DIR: "/data"                 # identity, node name, pin sets, trust store
       DLOCKSS_IPFS_CONFIG: "/ipfs-repo/config"   # derive identity from IPFS node (shared peer ID)
       # DLOCKSS_NODE_NAME: my-node               # human-readable name shown in the monitor;
       #                                          # if empty the peer ID is displayed instead
     volumes:
-      - ./dlockss-files:/data                    # persistent D-LOCKSS data (identity, cluster state, ingested files)
+      - ./dlockss-files:/data                    # persistent D-LOCKSS state (identity, pin sets, trust store)
       - ipfs-data:/ipfs-repo:ro                  # read-only access to Kubo config for identity
       # Place trusted_peers.json at ./dlockss-files/trusted_peers.json
       # (inside the container: /data/trusted_peers.json). Restart to apply.
@@ -181,7 +182,7 @@ D-LOCKSS acts as a self-healing, sharded storage network on the IPFS/libp2p stac
 ### Key Components
 1.  **Shard Engine** (`internal/shard`): membership tracking, dynamic split/merge/discovery, the replication checker, and one placement pass that re-homes every file (custodial handoff, orphan handoff, and post-move resharding in a single loop).
 2.  **Pin Sets** (`internal/pinset`): each shard has a persistent replicated pin set — the manifests every member must hold. A per-shard tracker reconciles the set against Kubo with bounded background fetches. Convergence rides entirely on the signed message protocol (IngestMessage + ReplicationRequest + PINNED announcements); there is no embedded consensus layer.
-3.  **Ingest** (`internal/ingest`): a recursive folder watcher and a Kubo pin watcher feed one shared pipeline that imports, wraps, signs, pins, and announces content.
+3.  **Ingest** (`internal/ingest`): Kubo's pin set is the single ingest source — a pin watcher wraps every user-pinned CID in a signed manifest and announces it.
 4.  **Kubo client** (`internal/kubo`): a minimal, fully context-aware HTTP RPC client (~12 endpoints) plus a serialized DHT provide worker with retries.
 5.  **Security** (`internal/trust`, `internal/protocol`, `internal/badbits`): signed messages with replay protection, origin allowlisting, per-peer rate limiting, and a CID denylist.
 6.  **Disk monitor** (`internal/store`): above the high-water mark the node advertises PASSIVE, steering custodial and replication load away.
@@ -256,7 +257,7 @@ go test ./... -v
 ```
 
 ### Code Layout
-Configuration is grouped into nested structs (`Sharding`, `Replication`, `Files`, `Security`, `Orphan`) in `internal/config`. The node is composed of small packages: `schema` (wire formats), `protocol` (signing, nonces, rate limits, text messages), `kubo` (IPFS RPC), `pinset` (per-shard replicated pin sets), `shard` (the engine), `ingest` (watchers + pipeline), `store` (registries, provides, disk), `trust`, `badbits`, `identity`, `p2p`, and `api`. The monitor lives in `internal/monitor` with keyword indexing in `internal/keywords`.
+Configuration is a single flat struct in `internal/config` (~20 operator knobs; all protocol timings are frozen constants). The node is composed of small packages: `schema` (wire formats), `protocol` (signing, nonces, rate limits, text messages), `kubo` (IPFS RPC), `pinset` (per-shard replicated pin sets), `shard` (the engine), `ingest` (pin watcher + pipeline), `store` (registries, provides, disk), `trust`, `badbits`, `identity`, `p2p`, and `api`. The monitor lives in `internal/monitor` with keyword indexing in `internal/keywords`.
 
 ---
 
@@ -264,7 +265,7 @@ Configuration is grouped into nested structs (`Sharding`, `Replication`, `Files`
 
 *   **Signed Messages:** All protocol messages are signed by the sender's Libp2p key.
 *   **Manifest Verification:** ResearchObjects include signatures from the ingester.
-*   **Data origin allowlist:** If `trusted_peers.json` (default: next to the data directory, or `DLOCKSS_TRUST_STORE`) or `DLOCKSS_INGEST_ALLOWLIST` lists at least one valid peer ID, this node stores only files whose manifest `ingester_id` is on that list. Enforced on ingest announcements, CRDT pin sync, and replication fetches. Include this node's own peer ID to ingest locally. An empty or missing list is default/open mode (accept everyone).
+*   **Data origin allowlist:** If `trusted_peers.json` (default: in the state directory, or `DLOCKSS_TRUST_STORE`) or `DLOCKSS_INGEST_ALLOWLIST` lists at least one valid peer ID, this node stores only files whose manifest `ingester_id` is on that list. Enforced on ingest announcements, pin-set acceptance, and replication fetches. Include this node's own peer ID so it may ingest its own pins. An empty or missing list is default/open mode (accept everyone).
 *   **Trust Modes:** `open` (default) or `allowlist`. `allowlist` also restricts signed protocol messages and CRDT writers to the same peer list when that list is non-empty.
 
 ---

@@ -170,18 +170,11 @@ are still processed), then left. ~5 s after the move an early placement pass
 
 ## 5. Ingest
 
-### 5.1 Folder rescan
+### 5.1 Kubo pin ingest — the only ingest path
 
-The ingest directory (`DLOCKSS_DATA_DIR`) is rescanned every 30 s; a file is
-ingested once its size and mtime are unchanged across two consecutive scans
-(which doubles as the write-stability check). Paths outside the folder and
-`.tmp`/`.part`/`.crdownload` files are skipped; hidden files are processed.
-Ready files go through a bounded worker pool (5); failures retry after 5 m;
-files that disappear are forgotten.
-
-### 5.2 Kubo pin ingest
-
-Enabled by `DLOCKSS_PIN_INGEST` (default true); polls the daemon's recursive
+Kubo's pin set is the single source of truth: whatever users pin there (CLI,
+WebUI, IPFS Desktop) gets preserved. Enabled by `DLOCKSS_PIN_INGEST`
+(default true); polls the daemon's recursive
 pins every 1 m. Every dag-cbor pin is read to learn whether it is a manifest
 and which payload it covers (pins named `dlockss:manifest` are manifests
 regardless). Skipped: D-LOCKSS pins, Kubo's canonical empty directory,
@@ -192,18 +185,15 @@ sighting (so a concurrent folder ingest is never raced). A pinned directory
 is one object; metaRef = the pin name, else `ipfs://<payloadCID>`; size from
 `files/stat` (0 when the lookup fails). The user's pin is never removed.
 
-### 5.3 Shared pipeline
+### 5.2 Ingest pipeline
 
 1.  Refuse unless this node is an authorized ingestor (origin gate, §7.3).
-2.  Folder files are imported with the IPIP-0499 `unixfs-v1-2025` profile:
-    CIDv1, sha2-256, raw leaves, 1 MiB chunks, balanced DAG, 1024 links,
-    pinned.
-3.  Payloads ingested within the last 30 s are deduplicated.
-4.  Build + sign the manifest (`file://<basename>` for folder ingest); store
-    as a dag-cbor block; check BadBits on the ManifestCID (blocked ⇒ unpin
-    and abort); pin the manifest recursively under the name
-    `dlockss:manifest`.
-5.  Register + announce `PINNED`. If responsible: add to the own shard's pin
+2.  Payloads ingested within the last 30 s are deduplicated.
+3.  Build + sign the manifest; store it as a dag-cbor block; check BadBits
+    on the ManifestCID (blocked ⇒ refuse); pin the manifest recursively
+    under the name `dlockss:manifest`. The user's payload pin is never
+    touched.
+4.  Register + announce `PINNED`. If responsible: add to the own shard's pin
     set, publish a signed IngestMessage on the current shard (and to the
     payload's child at depth+1, as an observer, when that child is already
     populated — probe 2 s), and provide manifest + payload to the DHT (60 s
@@ -294,8 +284,7 @@ Ed25519, resolved in order: (1) `DLOCKSS_IPFS_CONFIG` ⇒ the Kubo config's
 key file at `DLOCKSS_IDENTITY_PATH`; (3) generated and saved (0600).
 Ed25519 peer IDs embed the public key, so signature verification never needs
 a network fetch. State files (key, node name, pin sets, trust store) live in
-the **parent** of the ingest directory; the node refuses to start when one
-would resolve inside it.
+the state directory (`DLOCKSS_STATE_DIR`).
 
 ### 7.2 Signatures
 
@@ -343,15 +332,16 @@ later.
     non-self providers).
 *   In-memory registries: pinned manifests (CID → pin time; round-robin
     iterator over sorted keys) and known files; rebuilt on restart from the
-    rescan and pin-set sync.
-*   Disk monitor on the ingest folder (usage cached 10 s): at or above the
+    pin watcher and pin-set sync.
+*   Disk monitor on the state directory's filesystem (usage cached 10 s;
+    in documented deployments the same disk as the Kubo repo): at or above the
     high-water mark the node advertises PASSIVE, steering custodial and
     replication load away. Non-Linux/macOS platforms report 0 %.
 *   Observability: `GET /health` on `DLOCKSS_API_PORT`.
 *   Startup order: config → path safety → badbits → node name → Kubo client
     → identity → host/DHT/discovery → trust → stores → pin sets → shard
-    manager → API → shard run → rescanner + pin watcher. Graceful shutdown
-    on SIGINT/SIGTERM.
+    manager → API → shard run → pin watcher. Graceful shutdown on
+    SIGINT/SIGTERM.
 
 ## 9. Configuration
 
@@ -362,10 +352,10 @@ warning so operators notice frozen or removed knobs.
 
 | Var | Default |
 |---|---|
-| DLOCKSS_DATA_DIR | ./data (ingest dir; state goes to its parent) |
-| DLOCKSS_CLUSTER_STORE | `<parent>/cluster_store` (pin sets) |
-| DLOCKSS_IDENTITY_PATH | `<parent>/dlockss.key` |
-| DLOCKSS_TRUST_STORE | `<parent>/trusted_peers.json` |
+| DLOCKSS_STATE_DIR | ./dlockss-state (identity, node name, pin sets, trust store) |
+| DLOCKSS_CLUSTER_STORE | `<state>/cluster_store` (pin sets) |
+| DLOCKSS_IDENTITY_PATH | `<state>/dlockss.key` |
+| DLOCKSS_TRUST_STORE | `<state>/trusted_peers.json` |
 | DLOCKSS_BADBITS_PATH | badBits.csv |
 | DLOCKSS_IPFS_NODE | /ip4/127.0.0.1/tcp/5001 |
 | DLOCKSS_IPFS_CONFIG | (unset: share Kubo's identity) |
@@ -388,8 +378,7 @@ Frozen constants (previously knobs): heartbeat 10 s; shard peer check 2 m
 350 s; peer-entry max age 10 m; overlap 2 m; move cooldown 30 s; merge-up
 cooldown 2 m; merge probes 6 s; min-across-siblings = 2·Min−2; replication
 check 1 m (20 s on root); 5 auto-replication slots, 5 m timeout; provide
-timeout 60 s, 8 concurrent; import timeout 2 m; rescan 30 s; pin-ingest poll
-1 m; rate limit 100/min per peer; signature max age 10 m, skew 30 s, nonces
+timeout 60 s, 8 concurrent; manifest pin timeout 2 m; pin-ingest poll 1 m; rate limit 100/min per peer; signature max age 10 m, skew 30 s, nonces
 16/[8,64]; placement pass 2 m, 10 lookups, 100 nudges, 6 m nudge spacing;
 bootstrap dial budget 15 s; connmgr 160/192.
 
@@ -458,7 +447,7 @@ bootstrap dial budget 15 s; connmgr 160/192.
 ## 11. Packaging & ops
 
 *   Binaries: `dlockss`, `dlockss-monitor`; pure Go (CGO_ENABLED=0), ≥ 1.25.
-*   Docker: node image (alpine, `DLOCKSS_DATA_DIR=/data/ingest`, EXPOSE
+*   Docker: node image (alpine, `DLOCKSS_STATE_DIR=/data`, EXPOSE
     5050) and monitor image (alpine + poppler-utils, GOMEMLIMIT=512MiB
     GOGC=50, EXPOSE 8080).
 *   Testnet: `testnet/run_testnet.sh` starts N local Kubo daemons (lowpower
@@ -495,8 +484,12 @@ provides) is preserved throughout. The notable differences:
     All repair traffic is ReplicationRequests — the original's re-inject
     path used IngestMessages, which peers refuse from non-ingesters on
     restricted networks.
-*   Folder ingest is a 30 s rescan instead of an fsnotify watcher; the
-    custodial target is the nominal shard (no 8-level populated-descent
+*   The folder-ingest path is gone entirely: Kubo's pin set is the single
+    ingest source, so the watched data directory, its path-safety rules, and
+    the client-side import (with its enforced chunking profile — canonical
+    CIDs for locally added content now rest on the documented
+    `unixfs-v1-2025` Kubo profile) all disappear. The custodial target is
+    the nominal shard (no 8-level populated-descent
     probing); the merge ladder is four rules; the PINNED reannounce loop,
     legacy (timestamped) manifest support, bandwidth snapshots, the
     interactive name prompt, and the legacy key migration are gone.

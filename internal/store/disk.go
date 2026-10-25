@@ -8,9 +8,10 @@ import (
 // diskUsageCacheTTL bounds how often the filesystem is stat'ed.
 const diskUsageCacheTTL = 10 * time.Second
 
-// DiskMonitor watches disk usage of the ingest directory. Above the high
-// water mark the node advertises PASSIVE, steering custodial and replication
-// load away before the disk fills.
+// DiskMonitor watches disk usage of the filesystem holding the node's state
+// directory (in documented deployments, the same disk as the Kubo repo).
+// Above the high water mark the node advertises PASSIVE, steering custodial
+// and replication load away before the disk fills.
 type DiskMonitor struct {
 	path string
 	hwm  float64
