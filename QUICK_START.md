@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- **Go 1.21+:** [Install Go](https://go.dev/doc/install)
+- **Go 1.26+:** [Install Go](https://go.dev/doc/install)
 - **IPFS (Kubo):** [Install IPFS](https://docs.ipfs.tech/install/command-line/)
 
 ```bash

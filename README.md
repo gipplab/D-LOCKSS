@@ -194,7 +194,7 @@ Documentation:
 ## 4. Development
 
 ### Building from Source
-Requires Go 1.21+.
+Requires Go 1.26+.
 
 ```bash
 git clone https://github.com/gipplab/D-LOCKSS

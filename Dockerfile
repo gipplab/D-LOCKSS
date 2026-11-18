@@ -1,4 +1,4 @@
-FROM golang:1.25-alpine AS builder
+FROM golang:1.27-alpine AS builder
 
 ENV CGO_ENABLED=0 \
     GOOS=linux \
@@ -12,7 +12,7 @@ RUN go mod download
 COPY . .
 RUN go build -ldflags="-s -w" -o dlockss ./cmd/dlockss
 
-FROM alpine:3.21 AS final
+FROM alpine:3.24 AS final
 
 COPY --from=builder /build/dlockss /usr/local/bin/dlockss
 
