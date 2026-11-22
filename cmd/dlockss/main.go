@@ -76,7 +76,7 @@ func main() {
 		slog.Info("node name resolved", "name", nodeName)
 	}
 
-	ipfsClient, err := ipfs.NewClient(cfg.IPFSNodeAddress)
+	ipfsClient, err := ipfs.NewClient(cfg.IPFSNodeAddress, cfg.IPFSToken)
 	if err != nil {
 		log.Fatalf("[Fatal] IPFS not available: %v (start IPFS with: ipfs daemon)", err)
 	}

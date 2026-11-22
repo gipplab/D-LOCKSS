@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 
@@ -36,18 +37,30 @@ type Client struct {
 var _ IPFSClient = (*Client)(nil)
 
 // NewClient creates a new IPFS client. An empty ipfsNodeAddr selects the
-// local node at /ip4/127.0.0.1/tcp/5001.
-func NewClient(ipfsNodeAddr string) (*Client, error) {
+// local node at /ip4/127.0.0.1/tcp/5001. A non-empty token is sent as a
+// bearer token with every request (Kubo API.Authorizations).
+func NewClient(ipfsNodeAddr, token string) (*Client, error) {
 	if ipfsNodeAddr == "" {
 		ipfsNodeAddr = "/ip4/127.0.0.1/tcp/5001"
 	}
 
 	api := ipfsapi.NewShell(ipfsNodeAddr)
+	if token != "" {
+		api = ipfsapi.NewShellWithClient(ipfsNodeAddr, &http.Client{Transport: bearer(token)})
+	}
 	if !api.IsUp() {
 		return nil, fmt.Errorf("IPFS node is not available at %s", ipfsNodeAddr)
 	}
 
 	return &Client{api: api}, nil
+}
+
+// bearer adds "Authorization: Bearer <token>" to every request.
+type bearer string
+
+func (t bearer) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.Header.Set("Authorization", "Bearer "+string(t))
+	return http.DefaultTransport.RoundTrip(req)
 }
 
 // ImportFile imports a file into IPFS using IPIP-0499 unixfs-v1-2025

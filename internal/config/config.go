@@ -153,6 +153,7 @@ type Config struct {
 	ClusterStorePath       string
 	BadBitsPath            string
 	IPFSNodeAddress        string
+	IPFSToken              string
 	APIPort                int
 	BootstrapTimeout       time.Duration
 	HeartbeatInterval      time.Duration
@@ -271,6 +272,7 @@ func LoadFromEnv() *Config {
 	cfg.ClusterStorePath = clusterStorePath(dataDir)
 	cfg.BadBitsPath = getEnvString("DLOCKSS_BADBITS_PATH", cfg.BadBitsPath)
 	cfg.IPFSNodeAddress = getEnvString("DLOCKSS_IPFS_NODE", cfg.IPFSNodeAddress)
+	cfg.IPFSToken = getEnvString("DLOCKSS_IPFS_TOKEN", "")
 	cfg.APIPort = getEnvInt("DLOCKSS_API_PORT", cfg.APIPort)
 	cfg.BootstrapTimeout = getEnvDuration("DLOCKSS_BOOTSTRAP_TIMEOUT", cfg.BootstrapTimeout)
 	cfg.HeartbeatInterval = getEnvDuration("DLOCKSS_HEARTBEAT_INTERVAL", cfg.HeartbeatInterval)
