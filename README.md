@@ -63,6 +63,7 @@ export DLOCKSS_MAX_PEERS_PER_SHARD=12
 
 # Network
 export DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/5001"
+export DLOCKSS_IPFS_TOKEN="" # Kubo API.Authorizations bearer token (empty: none)
 
 # DHT tuning
 export DLOCKSS_MAX_CONCURRENT_DHT_PROVIDES=8 # Limit concurrent DHT provide operations
