@@ -152,6 +152,7 @@ func (m *Monitor) pruneStaleAnnouncements(cutoff time.Time) {
 	for c, lastSeen := range m.uniqueCIDs {
 		if lastSeen.Before(cutoff) {
 			delete(m.uniqueCIDs, c)
+			delete(m.manifestUploader, c)
 		}
 	}
 	for nodeID, files := range m.nodeFiles {

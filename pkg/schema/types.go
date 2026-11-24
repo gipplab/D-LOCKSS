@@ -1,6 +1,7 @@
 package schema
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/ipfs/go-cid"
@@ -18,6 +19,12 @@ type ResearchObject struct {
 	Payload cid.Cid `cbor:"payload"` // Link to raw UnixFS DAG (file data)
 
 	TotalSize uint64 `cbor:"size"` // Total size in bytes
+
+	// Uploader and UploaderSig are set for uploads through the node's HTTP
+	// API: the uploader's key and its signature, see VerifyUpload. They are
+	// only serialized when set, so other manifests keep their CIDs.
+	Uploader    peer.ID `cbor:"uploader"`
+	UploaderSig []byte  `cbor:"uploader_sig"`
 
 	// HasLegacyTimestamp reports that the manifest carries a "ts" field.
 	// Such manifests have non-deterministic CIDs (the same content yields a
@@ -48,6 +55,12 @@ func (ro *ResearchObject) marshalCBOR(includeSig bool) ([]byte, error) {
 		cborKV{"payload", ro.Payload.String()},
 		cborKV{"size", int64(ro.TotalSize)},
 	)
+	if ro.Uploader != "" {
+		fields = append(fields,
+			cborKV{"uploader", ro.Uploader.String()},
+			cborKV{"uploader_sig", ro.UploaderSig},
+		)
+	}
 	b, err := marshalCBORMap(fields)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode research object: %w", err)
@@ -81,8 +94,34 @@ func (ro *ResearchObject) UnmarshalCBOR(data []byte) error {
 		return fmt.Errorf("failed to read size: %w", err)
 	}
 	ro.TotalSize = uint64(size)
+	if _, err := node.LookupByString("uploader"); err == nil {
+		if ro.Uploader, err = readPeerID(node, "uploader"); err != nil {
+			return fmt.Errorf("failed to read uploader: %w", err)
+		}
+		if ro.UploaderSig, err = readBytes(node, "uploader_sig"); err != nil {
+			return fmt.Errorf("failed to read uploader_sig: %w", err)
+		}
+	}
 	return nil
 }
+
+// VerifyUpload checks that sig is uploader's signature of payload, made with
+// 'ipfs key sign' over the message "dlockss-upload <payload CID>".
+func VerifyUpload(uploader peer.ID, payload cid.Cid, sig []byte) error {
+	pub, err := uploader.ExtractPublicKey()
+	if err != nil {
+		return fmt.Errorf("uploader key: %w", err)
+	}
+	// Kubo KeyAPI.Sign prefixes the message.
+	ok, err := pub.Verify([]byte("libp2p-key signed message:dlockss-upload "+payload.String()), sig)
+	if err != nil || !ok {
+		return ErrUploadSignature
+	}
+	return nil
+}
+
+// ErrUploadSignature reports a signature that does not match the upload.
+var ErrUploadSignature = errors.New("signature does not match \"dlockss-upload <payload CID>\"")
 
 // NewResearchObject creates a new ResearchObject with the given parameters.
 // The manifest is deterministic: the same (metadataRef, ingesterID,

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -217,9 +218,6 @@ func main() {
 	clusterMgr.SetShardPeerProvider(shardMgr) // CRDT Peers() and allocations use real shard membership
 	announcePinned = shardMgr.AnnouncePinned
 
-	apiServer := api.NewAPIServer(cfg.APIPort)
-	apiServer.Start()
-
 	fp := fileops.NewFileProcessor(fileops.FileProcessorConfig{
 		Cfg:        cfg,
 		IPFSClient: ipfsClient,
@@ -229,6 +227,13 @@ func main() {
 		Signer:     signer,
 		BadBits:    badBitsFilter,
 	})
+
+	var upload http.Handler
+	if cfg.WikiAPI != "" {
+		upload = api.UploadHandler(trust.NewWikiKeys(cfg.WikiAPI), fp)
+	}
+	apiServer := api.NewAPIServer(cfg.APIPort, upload)
+	apiServer.Start()
 	go fp.WatchFolder(ctx)
 
 	// The shard manager must run before existing files are scanned, so the

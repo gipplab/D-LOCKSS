@@ -44,6 +44,18 @@
     or the payloads they reference. Unpinning in Kubo does not remove ingested content from D-LOCKSS.
     Disable with `DLOCKSS_PIN_INGEST=false`; the poll interval is `DLOCKSS_PIN_INGEST_INTERVAL` (default `1m`).
 
+3.  **Upload to Another Node:**
+    A node with `DLOCKSS_WIKI_API` set (e.g. `https://portal.mardi4nfdi.de/w/rest.php`) accepts uploads signed with
+    a key that the wiki trusts. Create a key with `ipfs key gen mykey`, register it in the wiki, then:
+    ```bash
+    cid=$(ipfs add -Q -n --cid-version=1 --raw-leaves --chunker=size-1048576 --hash=sha2-256 --max-file-links=1024 paper.pdf)
+    sig=$(printf 'dlockss-upload %s' "$cid" | ipfs key sign -k mykey | jq -r .Signature)
+    key=$(ipfs key list -l --ipns-base=b58mh | awk '$2=="mykey"{print $1}')
+    curl --data-binary @paper.pdf "http://<node>:5050/upload?cid=$cid&key=$key&sig=$sig&name=paper.pdf"
+    ```
+    The manifest records the key and the signature. While the wiki is unreachable, the node uses its last answer
+    for a key.
+
 ### Configuration
 Configure via environment variables:
 
@@ -64,6 +76,9 @@ export DLOCKSS_MAX_PEERS_PER_SHARD=12
 # Network
 export DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/5001"
 export DLOCKSS_IPFS_TOKEN="" # Kubo RPC token or AuthSecret (bearer:<token>, basic:<user>:<pass>)
+
+# Uploads (empty: disabled); keys are checked with GET {DLOCKSS_WIKI_API}/math/v0/key/{peer ID}
+export DLOCKSS_WIKI_API="https://portal.mardi4nfdi.de/w/rest.php"
 
 # DHT tuning
 export DLOCKSS_MAX_CONCURRENT_DHT_PROVIDES=8 # Limit concurrent DHT provide operations

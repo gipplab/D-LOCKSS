@@ -7,7 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,8 +14,6 @@ import (
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
-
-	"dlockss/pkg/schema"
 )
 
 // RegisterRoutes wires all API endpoints and the dashboard onto mux.
@@ -31,6 +28,8 @@ func (m *Monitor) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/replication", m.handleReplication)
 	mux.HandleFunc("/api/replication-cids", m.handleReplicationCIDs)
 	mux.HandleFunc("/api/manifest-payload", m.handleManifestPayload)
+	mux.HandleFunc("/api/uploaders", m.handleUploaders)
+	mux.HandleFunc("/api/uploader-files", m.handleUploaderFiles)
 	mux.HandleFunc("/api/identify", m.handleIdentify)
 	mux.HandleFunc("/api/keyword-search", m.handleKeywordSearch)
 	mux.HandleFunc("/api/keyword-suggest", m.handleKeywordSuggest)
@@ -238,26 +237,9 @@ func (m *Monitor) handleManifestPayload(w http.ResponseWriter, r *http.Request) 
 		})
 		return
 	}
-	reqURL := m.keywords.Gateway() + "/ipfs/" + url.PathEscape(manifestCID)
-	client := &http.Client{Timeout: 20 * time.Second}
-	resp, err := client.Get(reqURL)
+	ro, err := m.fetchManifest(r.Context(), manifestCID)
 	if err != nil {
 		writeJSONError(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		writeJSONError(w, "gateway: "+resp.Status, http.StatusBadGateway)
-		return
-	}
-	block, err := io.ReadAll(resp.Body)
-	if err != nil {
-		writeJSONError(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	var ro schema.ResearchObject
-	if err := ro.UnmarshalCBOR(block); err != nil {
-		writeJSONError(w, "invalid manifest: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	manifest := map[string]interface{}{
@@ -266,6 +248,10 @@ func (m *Monitor) handleManifestPayload(w http.ResponseWriter, r *http.Request) 
 		"payload":     ro.Payload.String(),
 		"size":        ro.TotalSize,
 		"sig":         base64.StdEncoding.EncodeToString(ro.Signature),
+	}
+	if ro.Uploader != "" {
+		manifest["uploader"] = ro.Uploader.String()
+		manifest["uploader_sig"] = base64.StdEncoding.EncodeToString(ro.UploaderSig)
 	}
 	writeJSON(w, map[string]interface{}{"payload_cid": ro.Payload.String(), "manifest": manifest})
 }

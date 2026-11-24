@@ -8,12 +8,13 @@ import (
 	"net/http"
 )
 
-// APIServer serves the node's local health check and landing page.
+// APIServer serves the node's local health check, landing page, and, if
+// upload is not nil, uploads.
 type APIServer struct {
 	server *http.Server
 }
 
-func NewAPIServer(port int) *APIServer {
+func NewAPIServer(port int, upload http.Handler) *APIServer {
 	s := &APIServer{}
 
 	mux := http.NewServeMux()
@@ -23,6 +24,9 @@ func NewAPIServer(port int) *APIServer {
 		w.Write([]byte("OK"))
 	})
 
+	if upload != nil {
+		mux.Handle("/upload", upload)
+	}
 	mux.HandleFunc("/", s.handleDashboard)
 
 	s.server = &http.Server{

@@ -140,6 +140,7 @@
             <div class="stat-card"><div class="stat-value" id="total-pinned">--</div><div class="stat-label">Total Pinned</div></div>
             <div class="stat-card clickable" id="unique-cids-card" title="Click to view all CIDs"><div class="stat-value" id="unique-files">--</div><div class="stat-label">Unique CIDs</div></div>
             <div class="stat-card clickable" id="total-shards-card" title="Click to jump to Shard Topology"><div class="stat-value" id="total-shards">--</div><div class="stat-label">Active Shards</div></div>
+            <div class="stat-card clickable" id="uploaders-card" title="Click to view uploaders and their files"><div class="stat-value" id="total-uploaders">--</div><div class="stat-label">Uploaders</div></div>
         </div>
         <div class="charts">
             <div class="chart-container" style="cursor: pointer;"><h3 style="margin-top:0; text-transform:uppercase; font-size:1em;">Replication Status</h3><p style="font-size:0.75em; color:#666; margin:0 0 10px 0;">Network-wide (all shards). Nodes unpin files that no longer belong to their shard after a split.</p><canvas id="replicationChart"></canvas><div id="replicationByShard" style="font-size:0.8em; margin-top:10px; color:#555;"></div></div>
@@ -166,6 +167,12 @@
         <div class="modal" style="width: 700px;">
             <div class="modal-header"><h3 style="margin:0; text-transform: uppercase; font-size: 1em;" id="node-files-modal-title">Pinned Files</h3><input type="text" id="node-files-modal-search" placeholder="Filter CIDs..." style="padding: 6px; font-family: inherit; font-size: 0.85em; width: 180px; border: 1px solid #333;"><button class="btn-text" id="node-files-modal-close">CLOSE</button></div>
             <div class="modal-body"><div id="node-files-modal-list"></div></div>
+        </div>
+    </div>
+    <div id="uploaders-modal" class="modal-overlay" style="display: none;">
+        <div class="modal" style="width: 700px;">
+            <div class="modal-header"><h3 style="margin:0; text-transform: uppercase; font-size: 1em;">Uploaders</h3><input type="text" id="uploaders-modal-search" placeholder="Filter keys..." style="padding: 6px; font-family: inherit; font-size: 0.85em; width: 180px; border: 1px solid #333;"><button class="btn-text" id="uploaders-modal-close">CLOSE</button></div>
+            <div class="modal-body"><div id="uploaders-modal-list"></div></div>
         </div>
     </div>
     <div id="replication-modal" class="modal-overlay" style="display: none;">
@@ -274,6 +281,7 @@
                 document.getElementById('total-nodes').textContent = fullNodes.length > 0 ? activeNodes.length + ' (' + fullNodes.length + ' full)' : nodes.length;
                 const pinnedVal = n => (n.storage.pinned_in_shard != null) ? n.storage.pinned_in_shard : n.storage.pinned_files;
                 document.getElementById('total-pinned').textContent = nodes.reduce((s,n) => s + (pinnedVal(n)||0), 0).toLocaleString();
+                fetch('/api/uploaders').then(r=>r.json()).then(data => { document.getElementById('total-uploaders').textContent = (data.count || 0).toLocaleString(); }).catch(() => {});
                 fetch('/api/unique-cids').then(r=>r.json()).then(data => { document.getElementById('unique-files').textContent = (data.count || 0).toLocaleString(); }).catch(() => { const uCids = new Set(); nodes.forEach(n => (n.storage.known_cids||[]).forEach(c => uCids.add(c))); document.getElementById('unique-files').textContent = uCids.size.toLocaleString(); });
                 document.getElementById('total-shards').textContent = new Set(nodes.map(n => n.current_shard)).size;
                 fetch('/api/replication?t=' + Date.now()).then(r=>r.json()).then(data => { const dist = data.replication_distribution || [0,0,0,0,0,0,0,0,0,0,0]; if (replicationChart && replicationChart.data && replicationChart.data.datasets && replicationChart.data.datasets[0]) { replicationChart.data.datasets[0].data = Array.isArray(dist) ? dist : [0,0,0,0,0,0,0,0,0,0,0]; replicationChart.update(); } const byShard = data.files_at_target_per_shard || {}; const el = document.getElementById('replicationByShard'); if (el && Object.keys(byShard).length > 0) { const parts = Object.entries(byShard).sort((a,b)=>String(a[0]).localeCompare(String(b[0]))).map(([s,c]) => (s === '' ? 'ROOT' : s) + ': ' + c + ' files'); el.textContent = 'Files at target per shard: ' + parts.join(', '); } else if (el) el.textContent = ''; }).catch(() => { if (replicationChart && replicationChart.data && replicationChart.data.datasets && replicationChart.data.datasets[0]) { replicationChart.data.datasets[0].data = [0,0,0,0,0,0,0,0,0,0,0]; replicationChart.update(); } });
@@ -358,6 +366,25 @@
             }).catch(() => { document.getElementById('node-files-modal-list').innerHTML = '<p style="color:#999;">Failed to load node files.</p>'; });
         }
         function hideNodeFilesModal() { document.getElementById('node-files-modal').style.display = 'none'; }
+        function showUploadersModal() {
+            document.getElementById('uploaders-modal').style.display = 'flex';
+            document.getElementById('uploaders-modal-search').value = '';
+            fetch('/api/uploaders?t=' + Date.now()).then(r=>r.json()).then(data => {
+                const list = document.getElementById('uploaders-modal-list');
+                const ups = data.uploaders || [];
+                list.innerHTML = ups.length === 0 ? '<p style="color:#666;">No uploads with a key yet.</p>' : ups.map(u => '<div class="cid-row" data-key="' + escapeHtml(u.key) + '"><div class="cid-value" onclick="copyCID(\'' + escapeJs(u.key) + '\')" title="Click to copy">' + escapeHtml(u.key) + '</div><div class="cid-meta">Files: ' + u.files + '</div><div class="cid-actions"><button class="btn-text" onclick="showUploaderFilesModal(\'' + escapeJs(u.key) + '\')">VIEW FILES</button></div></div>').join('');
+            }).catch(() => { document.getElementById('uploaders-modal-list').innerHTML = '<p style="color:#999;">Failed to load uploaders.</p>'; });
+        }
+        function hideUploadersModal() { document.getElementById('uploaders-modal').style.display = 'none'; }
+        function showUploaderFilesModal(key) {
+            document.getElementById('node-files-modal-title').textContent = 'Uploads: ' + key;
+            document.getElementById('node-files-modal').style.display = 'flex';
+            document.getElementById('node-files-modal-search').value = '';
+            fetch('/api/uploader-files?key=' + encodeURIComponent(key) + '&t=' + Date.now()).then(r=>r.json()).then(data => {
+                const cids = data.cids || [];
+                document.getElementById('node-files-modal-list').innerHTML = cids.length === 0 ? '<p style="color:#666;">No files for this key.</p>' : cids.map(renderCidRow).join('');
+            }).catch(() => { document.getElementById('node-files-modal-list').innerHTML = '<p style="color:#999;">Failed to load files.</p>'; });
+        }
         function showReplicationModal(level) {
             const label = level === 10 ? '10+' : String(level);
             document.getElementById('replication-modal-title').textContent = 'Files at ' + label + ' replicas';
@@ -460,6 +487,10 @@
         document.getElementById('node-files-modal-close').onclick = hideNodeFilesModal;
         document.getElementById('node-files-modal').onclick = function(e) { if (e.target === this) hideNodeFilesModal(); };
         setupModalFilter('node-files-modal-search', 'node-files-modal-list', '.cid-row', function(r) { return r.dataset.cid || ''; });
+        document.getElementById('uploaders-card').onclick = showUploadersModal;
+        document.getElementById('uploaders-modal-close').onclick = hideUploadersModal;
+        document.getElementById('uploaders-modal').onclick = function(e) { if (e.target === this) hideUploadersModal(); };
+        setupModalFilter('uploaders-modal-search', 'uploaders-modal-list', '.cid-row', function(r) { return r.dataset.key || ''; });
         document.getElementById('replication-modal-close').onclick = hideReplicationModal;
         document.getElementById('replication-modal').onclick = function(e) { if (e.target === this) hideReplicationModal(); };
         setupModalFilter('replication-modal-search', 'replication-modal-list', '.cid-row', function(r) { return r.dataset.cid || ''; });

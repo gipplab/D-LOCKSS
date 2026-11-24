@@ -155,6 +155,7 @@ type Config struct {
 	IPFSNodeAddress        string
 	IPFSToken              string
 	APIPort                int
+	WikiAPI                string
 	BootstrapTimeout       time.Duration
 	HeartbeatInterval      time.Duration
 	VerboseLogging         bool
@@ -274,6 +275,7 @@ func LoadFromEnv() *Config {
 	cfg.IPFSNodeAddress = getEnvString("DLOCKSS_IPFS_NODE", cfg.IPFSNodeAddress)
 	cfg.IPFSToken = getEnvString("DLOCKSS_IPFS_TOKEN", "")
 	cfg.APIPort = getEnvInt("DLOCKSS_API_PORT", cfg.APIPort)
+	cfg.WikiAPI = getEnvString("DLOCKSS_WIKI_API", "")
 	cfg.BootstrapTimeout = getEnvDuration("DLOCKSS_BOOTSTRAP_TIMEOUT", cfg.BootstrapTimeout)
 	cfg.HeartbeatInterval = getEnvDuration("DLOCKSS_HEARTBEAT_INTERVAL", cfg.HeartbeatInterval)
 	cfg.VerboseLogging = getEnvBool("DLOCKSS_VERBOSE_LOGGING", cfg.VerboseLogging)
@@ -419,6 +421,7 @@ func (c *Config) Log() {
 		"ingest_allowlist_env", len(c.IngestAllowlist),
 		"ipfs_node", c.IPFSNodeAddress,
 		"api_port", c.APIPort,
+		"wiki_api", c.WikiAPI,
 		"bootstrap_timeout", c.BootstrapTimeout,
 		"conn_low_water", c.ConnLowWater,
 		"conn_high_water", c.ConnHighWater,

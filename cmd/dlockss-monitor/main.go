@@ -56,6 +56,7 @@ func main() {
 	}
 
 	go m.RunStatusLogger(ctx)
+	go m.RunUploaderIndex(ctx)
 
 	go func() {
 		slog.Info("monitor started", "url", fmt.Sprintf("http://localhost:%d", monitor.WebUIPort), "peer_id", h.ID().String())
