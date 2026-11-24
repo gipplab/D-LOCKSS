@@ -72,6 +72,7 @@ Edit `.env` file or set environment variables:
 # Main settings
 export DLOCKSS_DATA_DIR="./data"
 export DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/5001"
+export DLOCKSS_IPFS_TOKEN=""  # Only if Kubo's API.Authorizations is set and DLOCKSS_IPFS_CONFIG is not
 export DLOCKSS_NODE_NAME="my-node"  # Shown in monitor dashboard
 ```
 

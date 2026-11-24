@@ -1,7 +1,6 @@
 package ipfs
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -283,40 +282,20 @@ func (a *IPFSDHTAdapter) FindPeer(ctx context.Context, id peer.ID) (peer.AddrInf
 	return found, nil
 }
 
-// PutValue implements routing.ValueStore. opts are ignored.
-func (a *IPFSDHTAdapter) PutValue(ctx context.Context, key string, val []byte, opts ...routing.Option) error {
-	return a.api.Request("dht/put", key).Body(bytes.NewReader(val)).Exec(ctx, nil)
+// PutValue implements routing.ValueStore. D-LOCKSS only provides CIDs and
+// stores no values in the DHT.
+func (a *IPFSDHTAdapter) PutValue(context.Context, string, []byte, ...routing.Option) error {
+	return routing.ErrNotSupported
 }
 
-// GetValue implements routing.ValueStore. It returns the first value found.
-func (a *IPFSDHTAdapter) GetValue(ctx context.Context, key string, opts ...routing.Option) ([]byte, error) {
-	var result struct {
-		Values [][]byte `json:"Values"`
-	}
-	if err := a.api.Request("dht/get", key).Exec(ctx, &result); err != nil {
-		return nil, err
-	}
-	if len(result.Values) == 0 {
-		return nil, routing.ErrNotFound
-	}
-	return result.Values[0], nil
+// GetValue implements routing.ValueStore; see PutValue.
+func (a *IPFSDHTAdapter) GetValue(context.Context, string, ...routing.Option) ([]byte, error) {
+	return nil, routing.ErrNotSupported
 }
 
-// SearchValue implements routing.ValueStore by delivering the GetValue result
-// on a channel.
-func (a *IPFSDHTAdapter) SearchValue(ctx context.Context, key string, opts ...routing.Option) (<-chan []byte, error) {
-	out := make(chan []byte, 1)
-	go func() {
-		defer close(out)
-		val, err := a.GetValue(ctx, key, opts...)
-		if err == nil {
-			select {
-			case out <- val:
-			case <-ctx.Done():
-			}
-		}
-	}()
-	return out, nil
+// SearchValue implements routing.ValueStore; see PutValue.
+func (a *IPFSDHTAdapter) SearchValue(context.Context, string, ...routing.Option) (<-chan []byte, error) {
+	return nil, routing.ErrNotSupported
 }
 
 // Bootstrap implements routing.Routing. IPFS daemon bootstraps itself.

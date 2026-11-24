@@ -76,9 +76,15 @@ func main() {
 		slog.Info("node name resolved", "name", nodeName)
 	}
 
-	ipfsClient, err := ipfs.NewClient(cfg.IPFSNodeAddress, cfg.IPFSToken)
+	ipfsAuth := cfg.IPFSToken
+	if ipfsAuth == "" && cfg.IPFSConfigPath != "" {
+		if ipfsAuth, err = ipfs.AuthSecretFromKuboConfig(cfg.IPFSConfigPath); err != nil {
+			log.Fatalf("[Fatal] %v", err)
+		}
+	}
+	ipfsClient, err := ipfs.NewClient(cfg.IPFSNodeAddress, ipfsAuth)
 	if err != nil {
-		log.Fatalf("[Fatal] IPFS not available: %v (start IPFS with: ipfs daemon)", err)
+		log.Fatalf("[Fatal] %v", err)
 	}
 	dht := ipfs.NewIPFSDHTAdapterFromClient(ipfsClient)
 

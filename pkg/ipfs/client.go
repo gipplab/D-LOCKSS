@@ -2,6 +2,7 @@ package ipfs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -37,30 +38,45 @@ type Client struct {
 var _ IPFSClient = (*Client)(nil)
 
 // NewClient creates a new IPFS client. An empty ipfsNodeAddr selects the
-// local node at /ip4/127.0.0.1/tcp/5001. A non-empty token is sent as a
-// bearer token with every request (Kubo API.Authorizations).
-func NewClient(ipfsNodeAddr, token string) (*Client, error) {
+// local node at /ip4/127.0.0.1/tcp/5001. A non-empty authSecret (a bare
+// token, or a Kubo API.Authorizations AuthSecret such as "bearer:<token>")
+// authorizes every request.
+func NewClient(ipfsNodeAddr, authSecret string) (*Client, error) {
 	if ipfsNodeAddr == "" {
 		ipfsNodeAddr = "/ip4/127.0.0.1/tcp/5001"
 	}
 
 	api := ipfsapi.NewShell(ipfsNodeAddr)
-	if token != "" {
-		api = ipfsapi.NewShellWithClient(ipfsNodeAddr, &http.Client{Transport: bearer(token)})
+	if authSecret != "" {
+		header, err := authHeader(authSecret)
+		if err != nil {
+			return nil, err
+		}
+		// Same transport settings as ipfsapi.NewShell.
+		base := &http.Transport{Proxy: http.ProxyFromEnvironment, DisableKeepAlives: true}
+		api = ipfsapi.NewShellWithClient(ipfsNodeAddr, &http.Client{Transport: authorize{header, base}})
 	}
-	if !api.IsUp() {
-		return nil, fmt.Errorf("IPFS node is not available at %s", ipfsNodeAddr)
+	if _, _, err := api.Version(); err != nil {
+		var refused *ipfsapi.Error
+		if errors.As(err, &refused) {
+			return nil, fmt.Errorf("IPFS node at %s refused the request: %w", ipfsNodeAddr, err)
+		}
+		return nil, fmt.Errorf("IPFS node is not available at %s (start IPFS with: ipfs daemon): %w", ipfsNodeAddr, err)
 	}
 
 	return &Client{api: api}, nil
 }
 
-// bearer adds "Authorization: Bearer <token>" to every request.
-type bearer string
+// authorize adds an Authorization header to every request.
+type authorize struct {
+	header string
+	base   http.RoundTripper
+}
 
-func (t bearer) RoundTrip(req *http.Request) (*http.Response, error) {
-	req.Header.Set("Authorization", "Bearer "+string(t))
-	return http.DefaultTransport.RoundTrip(req)
+func (a authorize) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	req.Header.Set("Authorization", a.header)
+	return a.base.RoundTrip(req)
 }
 
 // ImportFile imports a file into IPFS using IPIP-0499 unixfs-v1-2025

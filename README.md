@@ -63,7 +63,7 @@ export DLOCKSS_MAX_PEERS_PER_SHARD=12
 
 # Network
 export DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/5001"
-export DLOCKSS_IPFS_TOKEN="" # Kubo API.Authorizations bearer token (empty: none)
+export DLOCKSS_IPFS_TOKEN="" # Kubo RPC token or AuthSecret (bearer:<token>, basic:<user>:<pass>)
 
 # DHT tuning
 export DLOCKSS_MAX_CONCURRENT_DHT_PROVIDES=8 # Limit concurrent DHT provide operations
@@ -80,6 +80,14 @@ export DLOCKSS_VERBOSE_LOGGING=true # Enable detailed metrics and status logs
 export DLOCKSS_INGEST_ALLOWLIST="12D3KooWPublisherA,12D3KooWPublisherB"
 # export DLOCKSS_TRUST_STORE="/data/trusted_peers.json"
 # export DLOCKSS_TRUST_MODE=allowlist   # also restrict protocol/CRDT writers
+```
+
+Without `DLOCKSS_IPFS_TOKEN`, the secret is read from `API.Authorizations` in the Kubo config at `DLOCKSS_IPFS_CONFIG`
+(the entry named `dlockss`, or the only entry). Restricted `AllowedPaths` must include:
+
+```
+/api/v0/version  /api/v0/add  /api/v0/block  /api/v0/pin  /api/v0/files/stat
+/api/v0/provide  /api/v0/routing
 ```
 
 #### Node Naming
@@ -114,7 +122,7 @@ services:
     environment:
       DLOCKSS_IPFS_NODE: "/dns4/ipfs/tcp/5001"   # "ipfs" resolves to the Kubo service below
       DLOCKSS_DATA_DIR: "/data/ingest"           # location that D-LOCKSS monitors for ingesting files
-      DLOCKSS_IPFS_CONFIG: "/ipfs-repo/config"   # derive identity from IPFS node (shared peer ID)
+      DLOCKSS_IPFS_CONFIG: "/ipfs-repo/config"   # derive identity (shared peer ID) and RPC auth from IPFS node
       # DLOCKSS_NODE_NAME: my-node               # human-readable name shown in the monitor;
       #                                          # if empty the peer ID is displayed instead
     volumes:
