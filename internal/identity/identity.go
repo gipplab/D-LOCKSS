@@ -1,12 +1,10 @@
 // Package identity handles loading, generating, migrating, and persisting
-// the node's libp2p identity key and human-readable node name.
+// the D-LOCKSS helper's libp2p key and the node's human-readable name.
 package identity
 
 import (
 	"bufio"
 	"crypto/rand"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -18,55 +16,12 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 )
 
-type ipfsConfigIdentity struct {
-	PrivKey string `json:"PrivKey"`
-}
-
-type ipfsConfig struct {
-	Identity ipfsConfigIdentity `json:"Identity"`
-}
-
-// LoadKey returns the node's private key. It tries, in order:
-//  1. Identity.PrivKey from the Kubo config JSON named by DLOCKSS_IPFS_CONFIG.
-//  2. A persisted key at config.IdentityPath.
-//  3. A legacy key at ./dlockss.key (migrated to config.IdentityPath).
-//  4. A freshly generated Ed25519 key (persisted to config.IdentityPath).
+// LoadKey returns the key of this node's D-LOCKSS helper; Kubo's key is never
+// used. It tries, in order:
+//  1. A persisted key at config.IdentityPath.
+//  2. A legacy key at ./dlockss.key (migrated to config.IdentityPath).
+//  3. A freshly generated Ed25519 key (persisted to config.IdentityPath).
 func LoadKey(cfg *config.Config) (crypto.PrivKey, error) {
-	if cfg.IPFSConfigPath != "" {
-		priv, err := loadFromIPFSConfig(cfg.IPFSConfigPath)
-		if err != nil {
-			return nil, fmt.Errorf("DLOCKSS_IPFS_CONFIG set but failed: %w", err)
-		}
-		slog.Info("using IPFS config identity", "path", cfg.IPFSConfigPath)
-		return priv, nil
-	}
-	return loadOrCreate(cfg)
-}
-
-func loadFromIPFSConfig(configPath string) (crypto.PrivKey, error) {
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("read IPFS config: %w", err)
-	}
-	var cfg ipfsConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parse IPFS config: %w", err)
-	}
-	if cfg.Identity.PrivKey == "" {
-		return nil, fmt.Errorf("IPFS config has no Identity.PrivKey")
-	}
-	raw, err := base64.StdEncoding.DecodeString(cfg.Identity.PrivKey)
-	if err != nil {
-		return nil, fmt.Errorf("decode Identity.PrivKey: %w", err)
-	}
-	priv, err := crypto.UnmarshalPrivateKey(raw)
-	if err != nil {
-		return nil, fmt.Errorf("unmarshal IPFS private key: %w", err)
-	}
-	return priv, nil
-}
-
-func loadOrCreate(cfg *config.Config) (crypto.PrivKey, error) {
 	identityPath := cfg.IdentityPath
 
 	if _, err := os.Stat(identityPath); err == nil {

@@ -90,6 +90,10 @@ func (k *pinKubo) RecursivePins(context.Context) (map[cid.Cid]string, error) {
 	return out, nil
 }
 func (k *pinKubo) DAGSize(context.Context, cid.Cid) (uint64, error) { return 42, nil }
+func (k *pinKubo) NodeID(context.Context) (peer.ID, error)          { return "", nil }
+func (k *pinKubo) SignWithNodeKey(context.Context, []byte) ([]byte, error) {
+	return []byte("node-sig"), nil
+}
 
 func (k *pinKubo) userPin(c cid.Cid, name string) {
 	k.mu.Lock()
@@ -121,7 +125,7 @@ type pinShard struct {
 	published int
 }
 
-func (s *pinShard) PeerID() peer.ID {
+func (s *pinShard) NodeID() peer.ID {
 	id, _ := peer.Decode("12D3KooW9syRZpRZKiJbLrrxbcuymbhT5BTF9hjG6bykH42q29Mb")
 	return id
 }

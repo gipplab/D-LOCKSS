@@ -12,7 +12,7 @@ import (
 
 // DefaultPubsubVersion is the protocol version used for pubsub topic names.
 // Bump when releasing to avoid cross-talk with older nodes. Keep in sync with releases.
-const DefaultPubsubVersion = "dlockss-v0.0.3"
+const DefaultPubsubVersion = "dlockss-v0.0.4"
 
 func getEnvString(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {

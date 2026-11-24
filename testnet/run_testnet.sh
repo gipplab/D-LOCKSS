@@ -122,8 +122,9 @@ for i in $(seq 1 $NODE_COUNT); do
     fi
 
     pushd "$NODE_DIR" >/dev/null
-    # Shard limits 12/6 avoid over-splitting a small testnet. The identity is
-    # taken from the Kubo config, so each node has a single peer ID.
+    # Shard limits 12/6 avoid over-splitting a small testnet. The node ID is
+    # the Kubo peer ID; D-LOCKSS creates its own helper key (dlockss.key) and
+    # reads only the RPC auth from the Kubo config.
     DLOCKSS_IPFS_CONFIG="$IPFS_REPO/config" \
     DLOCKSS_NODE_NAME="testnet_$i" \
     DLOCKSS_TOPIC_NAME="cc" \

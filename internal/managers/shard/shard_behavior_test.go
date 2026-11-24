@@ -16,6 +16,8 @@ import (
 	"dlockss/internal/config"
 	"dlockss/internal/managers/storage"
 	"dlockss/internal/testutil"
+	"dlockss/internal/trust"
+	"dlockss/pkg/schema"
 )
 
 // newTestShardManager creates a ShardManager on a real libp2p host and
@@ -33,6 +35,8 @@ func newTestShardManagerOn(t *testing.T, ctx context.Context, h host.Host, ps *p
 		Cfg:        cfg,
 		Ctx:        ctx,
 		Host:       h,
+		NodeID:     testNodeID(t, h),
+		Nodes:      trust.NewNodes(trust.NewTrustManager("open")),
 		PubSub:     ps,
 		IPFSClient: &testutil.MockIPFSClient{},
 		Storage:    storage.NewStorageManager(cfg, &testutil.MockDHTProvider{}, nil),
@@ -43,6 +47,20 @@ func newTestShardManagerOn(t *testing.T, ctx context.Context, h host.Host, ps *p
 		t.Fatal(err)
 	}
 	return sm
+}
+
+// testNodeID returns a node ID for a manager whose helper is h. It hashes into
+// the other half of the shard tree than h.ID(), so a test fails if placement
+// uses the helper ID instead of the node ID.
+func testNodeID(t *testing.T, h host.Host) peer.ID {
+	t.Helper()
+	helperHalf := common.GetBinaryPrefix(h.ID().String(), 1)
+	for i := 0; ; i++ {
+		id := testutil.MustPeerID(t, fmt.Sprintf("test-node-%d", i))
+		if common.GetBinaryPrefix(id.String(), 1) != helperHalf {
+			return id
+		}
+	}
 }
 
 func newTestHost(t *testing.T) host.Host {
@@ -126,7 +144,7 @@ func TestCountActivePeers_ExcludesSelf(t *testing.T) {
 	sm := newTestShardManager(t, ctx, "0")
 
 	shard := "0"
-	selfID := sm.h.ID()
+	selfID := sm.nodeID
 	sm.peers.RecordRole(shard, selfID, roleActive)
 	sm.peers.RecordRole(shard, "other-peer", roleActive)
 
@@ -393,7 +411,7 @@ func discoveryAtRoot(t *testing.T, siblingPeers, rootPeers []peer.ID) *ShardMana
 	t.Cleanup(cancel)
 	sm := newTestShardManager(t, ctx, "")
 	sm.cfg.Sharding.MinPeersPerShard = 3
-	own := common.GetBinaryPrefix(sm.h.ID().String(), 1)
+	own := common.GetBinaryPrefix(sm.nodeID.String(), 1)
 	other := getSiblingShard(own)
 	recordActive(sm, own, peersHashingTo(own, 5))
 	recordActive(sm, other, siblingPeers)
@@ -412,7 +430,7 @@ func TestDiscoveryRefusal_MergedPeersCountedOnce(t *testing.T) {
 	// Two peers just merged up from the sibling: they are root members and
 	// still look active in the sibling until SeenPeersWindow passes.
 	sm := discoveryAtRoot(t, nil, nil)
-	sib := getSiblingShard(common.GetBinaryPrefix(sm.h.ID().String(), 1))
+	sib := getSiblingShard(common.GetBinaryPrefix(sm.nodeID.String(), 1))
 	merged := peersHashingTo(sib, 2)
 	recordActive(sm, sib, merged)
 	recordActive(sm, "", merged)
@@ -428,7 +446,7 @@ func TestDiscoveryAllowed_SiblingAtMinPeers(t *testing.T) {
 		t.Skip("probes two shards with the discovery timeout")
 	}
 	sm := discoveryAtRoot(t, nil, nil)
-	own := common.GetBinaryPrefix(sm.h.ID().String(), 1)
+	own := common.GetBinaryPrefix(sm.nodeID.String(), 1)
 	sib := getSiblingShard(own)
 	recordActive(sm, sib, peersHashingTo(sib, 3))
 	sm.cfg.Sharding.MinPeersAcrossSiblings = 2
@@ -457,7 +475,7 @@ func TestDiscovery_CompletesHalfFinishedSplit(t *testing.T) {
 	defer cancel()
 	sm := newTestShardManager(t, ctx, "")
 	sm.cfg.Sharding.MinPeersPerShard = 3
-	own := common.GetBinaryPrefix(sm.h.ID().String(), 1)
+	own := common.GetBinaryPrefix(sm.nodeID.String(), 1)
 	other := getSiblingShard(own)
 	// The other half already split off; two more root members hash into the
 	// node's half, so with the node itself its child would hold 3.
@@ -481,7 +499,7 @@ func TestDiscovery_HalfFinishedSplitTooSmall(t *testing.T) {
 	defer cancel()
 	sm := newTestShardManager(t, ctx, "")
 	sm.cfg.Sharding.MinPeersPerShard = 3
-	own := common.GetBinaryPrefix(sm.h.ID().String(), 1)
+	own := common.GetBinaryPrefix(sm.nodeID.String(), 1)
 	other := getSiblingShard(own)
 	recordActive(sm, other, peersHashingTo(other, 4))
 	recordActive(sm, "", peersHashingTo(own, 1))
@@ -627,7 +645,8 @@ func TestProcessMessage_ProbeTriggersHeartbeat(t *testing.T) {
 	}
 	drainCancel()
 
-	if err := observer.topic.Publish(ctx, []byte("PROBE:"+observer.id.String())); err != nil {
+	probe := schema.Probe{Helper: observer.id, Binding: testutil.NewKey(t).Bind(t, observer.id)}
+	if err := observer.topic.Publish(ctx, probe.Marshal()); err != nil {
 		t.Fatal(err)
 	}
 

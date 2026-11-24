@@ -15,14 +15,25 @@ const (
 )
 
 // SignedEnvelope holds the fields common to every signed protocol message:
-// type, manifest CID, sender, timestamp, nonce, and signature.
+// type, manifest CID, sender, timestamp, nonce, and signature. SenderID is the
+// D-LOCKSS helper; NodeID and NodeSig are its Binding.
 type SignedEnvelope struct {
 	Type        MessageType
 	ManifestCID cid.Cid
 	SenderID    peer.ID
+	NodeID      peer.ID
+	NodeSig     []byte
 	Timestamp   int64
 	Nonce       []byte
 	Sig         []byte
+}
+
+// Binding returns the sender's binding, or nil if the message has none.
+func (e *SignedEnvelope) Binding() *Binding {
+	if e.NodeID == "" {
+		return nil
+	}
+	return &Binding{Node: e.NodeID, Sig: e.NodeSig}
 }
 
 // prefixFields returns the CBOR key-value pairs that appear before per-message fields.
@@ -35,11 +46,14 @@ func (e *SignedEnvelope) prefixFields() []cborKV {
 
 // suffixFields returns the CBOR key-value pairs that appear after per-message fields.
 func (e *SignedEnvelope) suffixFields(includeSig bool) []cborKV {
-	fields := []cborKV{
-		{"sender_id", e.SenderID.String()},
-		{"ts", e.Timestamp},
-		{"nonce", e.Nonce},
+	fields := []cborKV{{"sender_id", e.SenderID.String()}}
+	if e.NodeID != "" {
+		fields = append(fields, cborKV{"node_id", e.NodeID.String()}, cborKV{"node_sig", e.NodeSig})
 	}
+	fields = append(fields,
+		cborKV{"ts", e.Timestamp},
+		cborKV{"nonce", e.Nonce},
+	)
 	if includeSig {
 		fields = append(fields, cborKV{"sig", e.Sig})
 	}
@@ -61,6 +75,14 @@ func (e *SignedEnvelope) unmarshalEnvelope(node datamodel.Node) error {
 	e.SenderID, err = readPeerID(node, "sender_id")
 	if err != nil {
 		return err
+	}
+	if _, err := node.LookupByString("node_id"); err == nil {
+		if e.NodeID, err = readPeerID(node, "node_id"); err != nil {
+			return err
+		}
+		if e.NodeSig, err = readBytes(node, "node_sig"); err != nil {
+			return err
+		}
 	}
 	e.Timestamp, err = readInt(node, "ts")
 	if err != nil {

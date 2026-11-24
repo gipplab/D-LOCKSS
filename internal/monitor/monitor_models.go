@@ -10,6 +10,7 @@ import (
 
 	"dlockss/internal/config"
 	"dlockss/internal/keywords"
+	"dlockss/internal/trust"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -81,6 +82,7 @@ type StorageStatus struct {
 
 type nodeState struct {
 	PeerID         string              `json:"peer_id"`
+	HelperID       string              `json:"helper_id,omitempty"`
 	NodeName       string              `json:"node_name,omitempty"`
 	CurrentShard   string              `json:"current_shard"`
 	Role           string              `json:"role,omitempty"`
@@ -115,6 +117,7 @@ type Monitor struct {
 	cfg                 Config
 	appCtx              context.Context // set by StartLibP2P
 	nodes               map[string]*nodeState
+	helpers             *trust.Nodes // D-LOCKSS helper to Kubo node
 	splitEvents         []ShardSplitEvent
 	treeCache           *ShardTreeNode
 	treeCacheTime       time.Time
@@ -195,6 +198,7 @@ func NewMonitor(cfg Config) *Monitor {
 	m := &Monitor{
 		cfg:                 cfg,
 		nodes:               make(map[string]*nodeState),
+		helpers:             trust.NewNodes(trust.NewTrustManager("open")),
 		splitEvents:         make([]ShardSplitEvent, 0, 100),
 		uniqueCIDs:          make(map[string]time.Time),
 		shardTopics:         make(map[string]*shardSub),

@@ -25,7 +25,8 @@ import (
 // MessageAuthenticator abstracts protocol message signing and verification.
 type MessageAuthenticator interface {
 	SignProtocolMessage(msg schema.Signable) error
-	ShouldDropMessage(receivedFrom peer.ID, senderID peer.ID, timestamp int64, nonce []byte, sig []byte, marshalForSigning func() ([]byte, error), logContext string) bool
+	// Authenticate verifies msg and returns the node its sender acts for.
+	Authenticate(receivedFrom peer.ID, msg schema.Signable, logContext string) (node peer.ID, ok bool)
 }
 
 // StorageReader provides read-only queries over the local pin/file state.
@@ -66,11 +67,11 @@ const (
 )
 
 const (
-	msgPrefixHeartbeat = "HEARTBEAT:"
+	msgPrefixHeartbeat = schema.HeartbeatPrefix
 	msgPrefixPinned    = "PINNED:"
-	msgPrefixJoin      = "JOIN:"
+	msgPrefixJoin      = schema.JoinPrefix
 	msgPrefixLeave     = "LEAVE:"
-	msgPrefixProbe     = "PROBE:"
+	msgPrefixProbe     = schema.ProbePrefix
 	msgPrefixSplit     = "SPLIT:"
 )
 
@@ -105,7 +106,10 @@ func (s *shardSubscription) close() {
 type ShardManager struct {
 	ctx         context.Context
 	cfg         *config.Config
-	h           host.Host
+	h           host.Host       // the D-LOCKSS helper
+	nodeID      peer.ID         // the Kubo node, which names this node to others
+	binding     *schema.Binding // nodeID's signature naming h
+	nodes       *trust.Nodes
 	ps          *pubsub.PubSub
 	ipfsClient  ipfs.IPFSClient
 	storageMgr  StorageProvider
@@ -152,6 +156,9 @@ type ShardManagerConfig struct {
 	Cfg         *config.Config
 	Ctx         context.Context
 	Host        host.Host
+	NodeID      peer.ID
+	Binding     *schema.Binding
+	Nodes       *trust.Nodes
 	PubSub      *pubsub.PubSub
 	IPFSClient  ipfs.IPFSClient
 	Storage     StorageProvider
@@ -168,6 +175,9 @@ func NewShardManager(cfg ShardManagerConfig) (*ShardManager, error) {
 		ctx:                cfg.Ctx,
 		cfg:                cfg.Cfg,
 		h:                  cfg.Host,
+		nodeID:             cfg.NodeID,
+		binding:            cfg.Binding,
+		nodes:              cfg.Nodes,
 		ps:                 cfg.PubSub,
 		ipfsClient:         cfg.IPFSClient,
 		storageMgr:         cfg.Storage,
@@ -176,7 +186,7 @@ func NewShardManager(cfg ShardManagerConfig) (*ShardManager, error) {
 		rateLimiter:        cfg.RateLimiter,
 		nodeName:           cfg.NodeName,
 		origin:             cfg.Origin,
-		peers:              newPeerTracker(cfg.Host.ID()),
+		peers:              newPeerTracker(cfg.NodeID),
 		reshardedFiles:     common.NewKnownFiles(),
 		currentShard:       cfg.StartShard,
 		shardSubs:          make(map[string]*shardSubscription),
@@ -294,8 +304,8 @@ func (sm *ShardManager) getLastMessageTime() time.Time {
 	return sm.lastMessageTime
 }
 
-func (sm *ShardManager) localPeerID() peer.ID {
-	return sm.h.ID()
+func (sm *ShardManager) localNodeID() peer.ID {
+	return sm.nodeID
 }
 
 func (sm *ShardManager) pruneStaleSeenPeers() {
@@ -310,6 +320,7 @@ func (sm *ShardManager) publishCBOR(data []byte, shardID string) {
 	sm.PublishToShardCBOR(data, shardID)
 }
 func (sm *ShardManager) replicationSigner() MessageAuthenticator { return sm.signer }
+func (sm *ShardManager) recordSeen(shardID string, node peer.ID) { sm.peers.RecordSeen(shardID, node) }
 func (sm *ShardManager) clusterTriggerSync(shardID string)       { sm.clusterMgr.TriggerSync(shardID) }
 func (sm *ShardManager) ipfsPinManifest(ctx context.Context, c cid.Cid) error {
 	return sm.ipfsClient.PinManifest(ctx, c)
@@ -380,7 +391,7 @@ func (sm *ShardManager) publishLeaveFromShard(fromShard string) {
 	fromSub, exists := sm.shardSubs[fromShard]
 	sm.mu.RUnlock()
 	if exists && fromSub.topic != nil && !fromSub.observerOnly {
-		_ = fromSub.topic.Publish(sm.ctx, []byte(msgPrefixLeave+sm.h.ID().String()))
+		_ = fromSub.topic.Publish(sm.ctx, sm.leaveMessage())
 	}
 }
 

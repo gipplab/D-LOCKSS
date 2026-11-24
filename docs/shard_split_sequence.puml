@@ -14,7 +14,7 @@ ShardMgr -> ShardMgr: getShardPeerCount(useMeshFallback=false)\n(ACTIVE peers on
 
 alt peerCount >= MaxPeersPerShard (2 consecutive checks)\nAND estimatedPerChild >= MinPeersPerShard\nAND (child has >=1 peer OR parent >= 14 to create)\nAND time.Since(lastShardMove) >= ShardMoveCooldown (30s)
     ShardMgr -> ShardMgr: announceSplit(parentShard, targetChild)\nPublish SPLIT:child0:child1 on parent topic
-    ShardMgr -> ShardMgr: moveToShard(currentShard, targetChild)\ncurrentShard = GetBinaryPrefix(peerID, depth+1)
+    ShardMgr -> ShardMgr: moveToShard(currentShard, targetChild)\ncurrentShard = GetBinaryPrefix(nodeID, depth+1)
     ShardMgr -> ShardMgr: lastShardMove = now\nPublish LEAVE on old shard (immediate)
     
     ShardMgr -> PubSub: JoinShard(newShard)\n(topic: dlockss-creative-commons-shard-<newShard>)

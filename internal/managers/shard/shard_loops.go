@@ -102,6 +102,8 @@ func (sm *ShardManager) announcePinnedFilesBatch(topic *pubsub.Topic, batchSize 
 	}
 }
 
+// processMessage handles a message from a shard topic. Plain-text messages
+// count only for an accepted node and are recorded under its ID.
 func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 	from := msg.GetFrom()
 	if from == sm.h.ID() {
@@ -109,12 +111,15 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 	}
 
 	now := time.Now()
-	sm.peers.RecordSeen(shardID, from)
 	sm.mu.Lock()
 	sm.lastMessageTime = now
 	sm.mu.Unlock()
 
-	if sm.processTextProtocol(msg, shardID, from, now) {
+	if isTextProtocol(msg.Data) {
+		if node, ok := sm.nodes.Resolve(from, schema.AnnouncementBinding(msg.Data)); ok {
+			sm.peers.RecordSeen(shardID, node)
+			sm.processTextProtocol(msg.Data, shardID, node, now)
+		}
 		return
 	}
 
@@ -124,31 +129,39 @@ func (sm *ShardManager) processMessage(msg *pubsub.Message, shardID string) {
 	sm.processCBORMessage(msg, shardID)
 }
 
-// processTextProtocol handles plain-text protocol messages and reports whether
-// msg was consumed.
-func (sm *ShardManager) processTextProtocol(msg *pubsub.Message, shardID string, from peer.ID, now time.Time) bool {
-	data := msg.Data
-	switch {
-	case len(data) == 0:
+// isTextProtocol reports whether data is a plain-text protocol message.
+// JSON messages count as such and are ignored.
+func isTextProtocol(data []byte) bool {
+	if len(data) == 0 {
 		return false
-	case data[0] == '{':
-		// JSON messages are consumed and ignored.
+	}
+	if data[0] == '{' {
+		return true
+	}
+	for _, prefix := range []string{msgPrefixHeartbeat, msgPrefixPinned, msgPrefixJoin, msgPrefixLeave, msgPrefixProbe, msgPrefixSplit} {
+		if bytes.HasPrefix(data, []byte(prefix)) {
+			return true
+		}
+	}
+	return false
+}
+
+// processTextProtocol handles a plain-text protocol message from node.
+func (sm *ShardManager) processTextProtocol(data []byte, shardID string, node peer.ID, now time.Time) {
+	switch {
 	case bytes.HasPrefix(data, []byte(msgPrefixHeartbeat)):
-		sm.peers.RecordRole(shardID, from, parseHeartbeatRole(data))
+		sm.peers.RecordRole(shardID, node, parseRole(schema.ParseHeartbeat(data).Role))
 	case bytes.HasPrefix(data, []byte(msgPrefixPinned)):
 		sm.storageMgr.AddKnownFile(string(data[len(msgPrefixPinned):]))
 	case bytes.HasPrefix(data, []byte(msgPrefixJoin)):
-		sm.peers.RecordRole(shardID, from, parseJoinRole(data))
+		sm.peers.RecordRole(shardID, node, joinRole(schema.ParseJoin(data).Role))
 	case bytes.HasPrefix(data, []byte(msgPrefixLeave)):
-		sm.peers.RemoveRole(shardID, from)
+		sm.peers.RemoveRole(shardID, node)
 	case bytes.HasPrefix(data, []byte(msgPrefixProbe)):
-		sm.handleProbeMessage(shardID, from, now)
+		sm.handleProbeMessage(shardID, node, now)
 	case bytes.HasPrefix(data, []byte(msgPrefixSplit)):
 		sm.lifecycle.recordSplitAnnouncement(string(data[len(msgPrefixSplit):]))
-	default:
-		return false
 	}
-	return true
 }
 
 func (sm *ShardManager) processCBORMessage(msg *pubsub.Message, shardID string) {
@@ -176,8 +189,8 @@ func (sm *ShardManager) processCBORMessage(msg *pubsub.Message, shardID string) 
 	}
 }
 
-func (sm *ShardManager) handleProbeMessage(shardID string, from peer.ID, now time.Time) {
-	sm.peers.RecordRole(shardID, from, roleProbe)
+func (sm *ShardManager) handleProbeMessage(shardID string, node peer.ID, now time.Time) {
+	sm.peers.RecordRole(shardID, node, roleProbe)
 
 	sm.mu.Lock()
 	if !sm.lastProbeResponseTime.IsZero() && now.Sub(sm.lastProbeResponseTime) < probeResponseCooldown {

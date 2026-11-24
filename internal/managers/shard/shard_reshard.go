@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/ipfs/go-cid"
-	"github.com/libp2p/go-libp2p/core/peer"
 
 	"dlockss/internal/common"
 )
@@ -21,14 +20,12 @@ func (sm *ShardManager) handoffConfirmed(key string) bool {
 	return sm.otherProvidersAtLeast(key, sm.cfg.Sharding.MinPeersPerShard)
 }
 
+// otherProvidersAtLeast counts DHT providers other than this node. Providers
+// are Kubo nodes, so this node is excluded by its node ID.
 func (sm *ShardManager) otherProvidersAtLeast(key string, need int) bool {
-	var self peer.ID
-	if sm.h != nil {
-		self = sm.h.ID()
-	}
 	ctx, cancel := context.WithTimeout(sm.ctx, handoffConfirmTimeout)
 	defer cancel()
-	return sm.storageMgr.ProviderCount(ctx, key, self, need) >= need
+	return sm.storageMgr.ProviderCount(ctx, key, sm.nodeID, need) >= need
 }
 
 // RunReshardPass migrates or unpins files when moving between shards.

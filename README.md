@@ -65,8 +65,8 @@ export DLOCKSS_DATA_DIR="$HOME/my-data"
 
 # Node Identity
 export DLOCKSS_NODE_NAME="my-node"            # Human-readable name (shown in monitor)
-export DLOCKSS_IDENTITY_PATH="/data/dlockss.key"  # Persistent identity key location (fallback if IPFS node config cannot be read)
-export DLOCKSS_IPFS_CONFIG="/path/to/ipfs/config" # Kubo config JSON (derives identity from IPFS repo)
+export DLOCKSS_IDENTITY_PATH="/data/dlockss.key"  # D-LOCKSS helper key (the node ID is the Kubo peer ID)
+export DLOCKSS_IPFS_CONFIG="/path/to/ipfs/config" # Kubo config JSON (RPC auth; not used for the helper key)
 
 # Copies per file: every shard member holds every file of its shard, so the
 # shard size bounds the copies (shards split above max and merge below min).
@@ -102,8 +102,10 @@ Without `DLOCKSS_IPFS_TOKEN`, the secret is read from `API.Authorizations` in th
 
 ```
 /api/v0/version  /api/v0/add  /api/v0/block  /api/v0/pin  /api/v0/files/stat
-/api/v0/provide  /api/v0/routing
+/api/v0/provide  /api/v0/routing  /api/v0/id  /api/v0/key/sign
 ```
+
+`/api/v0/id` and `/api/v0/key/sign` are needed at startup: D-LOCKSS reads the node ID and has Kubo sign the helper binding and the manifests with the node key. A node without them does not start.
 
 #### Node Naming
 
@@ -117,15 +119,30 @@ Testnet nodes are automatically named `testnet_1`, `testnet_2`, etc.
 
 #### Identity Persistence
 
-The node's libp2p identity (private key) determines its **Peer ID**. The identity is resolved in order:
+The **node ID** is the Kubo peer ID. D-LOCKSS runs its own libp2p host with a separate **helper** key and proves the link with a binding signed by Kubo (`docs/DLOCKSS_PROTOCOL.md`, Section 7.1). The helper key is resolved in order:
 
-1. **IPFS config** (`DLOCKSS_IPFS_CONFIG` set): Reads `Identity.PrivKey` from the Kubo config JSON so D-LOCKSS and IPFS share one Peer ID. For Docker, mount the single config file read-only.
-2. **Persistent key file** (`DLOCKSS_IDENTITY_PATH` or default `{data_dir_parent}/dlockss.key`): Used when connecting to a remote/Docker Kubo node where the repo is not accessible.
-3. **Auto-generated**: If no key exists, a new Ed25519 key is generated and saved to the identity path.
+1. **Persistent key file** (`DLOCKSS_IDENTITY_PATH` or default `{data_dir_parent}/dlockss.key`).
+2. **Legacy** `./dlockss.key` in the working directory (copied to the configured path).
+3. **Auto-generated** Ed25519 key, saved to the identity path.
 
-For Docker deployments: either mount the Kubo config file and set `DLOCKSS_IPFS_CONFIG`, or mount a persistent volume and set `DLOCKSS_DATA_DIR` to a subdirectory on it. The identity key, node name, and cluster state are stored alongside the data directory and will survive container rebuilds.
+`DLOCKSS_IPFS_CONFIG` is only used for the Kubo RPC token when `DLOCKSS_IPFS_TOKEN` is unset.
+
+For Docker deployments: mount a persistent volume and set `DLOCKSS_DATA_DIR` to a subdirectory on it. The helper key, node name, and cluster state live alongside the data directory.
 
 > **Path safety:** The node refuses to start if the identity key, node name, or cluster store would be placed *inside* the ingest directory (`DLOCKSS_DATA_DIR`), since the file watcher would try to ingest them. Always set `DLOCKSS_DATA_DIR` to a dedicated subdirectory (e.g. `./data`, not `.`).
+
+#### Upgrading from a shared peer ID
+
+Earlier versions read `Identity.PrivKey` from `DLOCKSS_IPFS_CONFIG` and ran D-LOCKSS with Kubo's peer ID. The helper binding changes the protocol, so the pubsub prefix moved from `dlockss-v0.0.3` to `dlockss-v0.0.4`: updated and old nodes do not see each other. Update the monitor together with the first node; it then lists only updated nodes. For each node:
+
+1. Update D-LOCKSS and delete a key at `DLOCKSS_IDENTITY_PATH` that was copied from Kubo, so a fresh helper key is created. If the deployment sets `DLOCKSS_PUBSUB_TOPIC_PREFIX` (or the monitor's `-prefix` flag), change it to `dlockss-v0.0.4`.
+2. Restart. The node keeps its node ID (the Kubo ID), its shard and its local pin list; the monitor lists it with its first heartbeat.
+
+Until all nodes are updated, files ingested on an old node do not reach updated nodes and vice versa. Stored data is not at risk: each node keeps its CRDT state, and updated nodes reconcile their pin lists once they see each other.
+
+The startup scan re-ingests the files in `DLOCKSS_DATA_DIR`. Kubo signs manifests with a prefix, so a newly signed manifest would get a new CID; the node reuses its pinned manifest with the same content instead. Old manifests keep their old signature, which still verifies.
+
+A node that ran without `DLOCKSS_IPFS_CONFIG` had a peer ID of its own. Its node ID is now the Kubo ID (`ipfs id`): put that on allowlists. The node may move shard, and its files get new manifests because `ingester_id` changes.
 
 #### Docker Compose Example
 
@@ -137,12 +154,12 @@ services:
     environment:
       DLOCKSS_IPFS_NODE: "/dns4/ipfs/tcp/5001"   # "ipfs" resolves to the Kubo service below
       DLOCKSS_DATA_DIR: "/data/ingest"           # location that D-LOCKSS monitors for ingesting files
-      DLOCKSS_IPFS_CONFIG: "/ipfs-repo/config"   # derive identity (shared peer ID) and RPC auth from IPFS node
+      DLOCKSS_IPFS_CONFIG: "/ipfs-repo/config"   # Kubo RPC auth (when DLOCKSS_IPFS_TOKEN is unset)
       # DLOCKSS_NODE_NAME: my-node               # human-readable name shown in the monitor;
-      #                                          # if empty the peer ID is displayed instead
+      #                                          # if empty the node ID is displayed instead
     volumes:
-      - ./dlockss-files:/data                    # persistent D-LOCKSS data (identity, cluster state, ingested files)
-      - ipfs-data:/ipfs-repo:ro                  # read-only access to Kubo config for identity
+      - ./dlockss-files:/data                    # persistent D-LOCKSS data (helper key, cluster state, ingested files)
+      - ipfs-data:/ipfs-repo:ro                  # read-only access to Kubo config for RPC auth
       # Place trusted_peers.json at ./dlockss-files/trusted_peers.json
       # (inside the container: /data/trusted_peers.json). Restart to apply.
     depends_on:
@@ -261,14 +278,14 @@ Keywords are generated once per item at index time and searched locally. The ind
 
 Images, audio, video, archives, other binaries, and files over 20 MB that need a full download (PDF and office formats) are skipped.
 
-The monitor displays each node's **name** (if configured via `DLOCKSS_NODE_NAME`), falling back to the Peer ID. Names propagate via HEARTBEAT/JOIN messages and appear in the node table, charts, and shard modals. Client-side aliases (EDIT button) override server-side names. Each node has **one peer ID**: when `DLOCKSS_IPFS_CONFIG` is set (e.g. in testnet), D-LOCKSS uses the IPFS repo identity so the same ID appears in the monitor and in `node_x.ipfs.log`.
+The monitor displays each node's **name** (if configured via `DLOCKSS_NODE_NAME`), falling back to the Kubo node ID. Names propagate via HEARTBEAT/JOIN messages and appear in the node table, charts, and shard modals. Client-side aliases (EDIT button) override server-side names. The helper ID is shown as detail; Identify dials the helper.
 
 The monitor bootstrap-subscribes to all shards up to depth 6 (127 shards) so it can see nodes even when started late. Set `DLOCKSS_MONITOR_BOOTSTRAP_SHARD_DEPTH` (0–12) to tune.
 
 Alternatively use: https://dlockss-monitor.wmcloud.org.
 
 ### Testnet
-From `testnet/`: `./run_testnet.sh` starts multiple D-LOCKSS nodes and IPFS daemons. Each node is automatically named `testnet_1`, `testnet_2`, etc. (visible in the monitor) and has **one peer ID** (D-LOCKSS loads the identity from the node's IPFS repo via `DLOCKSS_IPFS_CONFIG`). Press Enter in the script to shut down.
+From `testnet/`: `./run_testnet.sh` starts multiple D-LOCKSS nodes and IPFS daemons. Each node is automatically named `testnet_1`, `testnet_2`, etc. (visible in the monitor). The monitor lists Kubo node IDs; each D-LOCKSS process has its own helper key. Press Enter in the script to shut down.
 
 ### Testing
 ```bash
@@ -284,8 +301,8 @@ Configuration is grouped into nested structs (`Sharding`, `Replication`, `Files`
 
 *   **Signed Messages:** All protocol messages are signed by the sender's Libp2p key.
 *   **Manifest Verification:** ResearchObjects include signatures from the ingester.
-*   **Data origin allowlist:** If `trusted_peers.json` (default: next to the data directory, or `DLOCKSS_TRUST_STORE`) or `DLOCKSS_INGEST_ALLOWLIST` lists at least one valid peer ID, this node stores only files whose manifest `ingester_id` is on that list. Enforced on ingest announcements, CRDT pin sync, and replication fetches. Include this node's own peer ID to ingest locally. An empty or missing list is default/open mode (accept everyone).
-*   **Trust Modes:** `open` (default) or `allowlist`. `allowlist` also restricts signed protocol messages and CRDT writers to the same peer list when that list is non-empty.
+*   **Data origin allowlist:** If `trusted_peers.json` (default: next to the data directory, or `DLOCKSS_TRUST_STORE`) or `DLOCKSS_INGEST_ALLOWLIST` lists at least one valid peer ID, this node stores only files whose manifest `ingester_id` is on that list. List **Kubo node IDs** (`ipfs id`), not D-LOCKSS helper IDs. Enforced on ingest announcements, CRDT pin sync, and replication fetches. Include this node's own Kubo ID to ingest locally. An empty or missing list is default/open mode (accept everyone).
+*   **Trust Modes:** `open` (default) or `allowlist`. `allowlist` also restricts shard membership, signed protocol messages and CRDT writers to the helpers of listed nodes (proven by their binding) when that list is non-empty.
 
 ---
 

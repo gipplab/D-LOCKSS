@@ -2,7 +2,6 @@ package shard
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"time"
 
@@ -81,12 +80,23 @@ func (sm *ShardManager) signedReplicationRequest(manifestCID cid.Cid) ([]byte, e
 }
 
 func (sm *ShardManager) heartbeatMessage(pinnedCount int, role peerRole) []byte {
-	return []byte(fmt.Sprintf("%s%s:%d:%s:%s", msgPrefixHeartbeat, sm.h.ID().String(), pinnedCount, role, sm.nodeName))
+	hb := schema.Heartbeat{Helper: sm.h.ID(), Pinned: pinnedCount, Role: string(role), Binding: sm.binding, Name: sm.nodeName}
+	return hb.Marshal()
+}
+
+func (sm *ShardManager) probeMessage() []byte {
+	p := schema.Probe{Helper: sm.h.ID(), Binding: sm.binding}
+	return p.Marshal()
+}
+
+func (sm *ShardManager) leaveMessage() []byte {
+	return []byte(msgPrefixLeave + sm.h.ID().String())
 }
 
 func (sm *ShardManager) announceMembership(topic *pubsub.Topic) {
 	role := sm.getOurRole()
-	_ = topic.Publish(sm.ctx, []byte(msgPrefixJoin+sm.h.ID().String()+":"+string(role)+":"+sm.nodeName))
+	join := schema.Join{Helper: sm.h.ID(), Role: string(role), Binding: sm.binding, Name: sm.nodeName}
+	_ = topic.Publish(sm.ctx, join.Marshal())
 	_ = topic.Publish(sm.ctx, sm.heartbeatMessage(sm.storageMgr.GetPinnedCount(), role))
 }
 

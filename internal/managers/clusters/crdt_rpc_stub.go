@@ -2,7 +2,6 @@ package clusters
 
 import (
 	"context"
-	"slices"
 	"time"
 
 	"github.com/ipfs-cluster/ipfs-cluster/api"
@@ -37,8 +36,8 @@ func (s embeddedPinTrackerStub) Untrack(ctx context.Context, in api.Pin, out *st
 }
 
 // embeddedPeerMonitorStub serves the PeerMonitor RPCs behind CRDT Peers().
-// It reports one metric per shard peer from getPeers, always including this
-// host; without getPeers it reports only this host.
+// It reports this host and one metric per shard peer from getPeers, which
+// lists the other members' node IDs.
 type embeddedPeerMonitorStub struct {
 	host     host.Host
 	shardID  string
@@ -46,15 +45,9 @@ type embeddedPeerMonitorStub struct {
 }
 
 func (s embeddedPeerMonitorStub) LatestMetrics(ctx context.Context, name string, out *[]api.Metric) error {
-	self := s.host.ID()
-	peers := []peer.ID{self}
+	peers := []peer.ID{s.host.ID()}
 	if s.getPeers != nil {
-		mesh := s.getPeers(s.shardID)
-		if slices.Contains(mesh, self) {
-			peers = mesh
-		} else {
-			peers = append(peers, mesh...)
-		}
+		peers = append(peers, s.getPeers(s.shardID)...)
 	}
 	metrics := make([]api.Metric, 0, len(peers))
 	for _, p := range peers {

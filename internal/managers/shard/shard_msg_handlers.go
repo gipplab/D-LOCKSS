@@ -25,7 +25,7 @@ func (sm *ShardManager) isAuthorizedIngestor(senderID peer.ID) bool {
 // IsLocalNodeIngestor reports whether the local node is authorized to ingest
 // files into this topic: it is on the allowlist, or no allowlist is set.
 func (sm *ShardManager) IsLocalNodeIngestor() bool {
-	return sm.isAuthorizedIngestor(sm.h.ID())
+	return sm.isAuthorizedIngestor(sm.nodeID)
 }
 
 // handleIngestMessage verifies an IngestMessage and pins the file if it was
@@ -35,16 +35,18 @@ func (sm *ShardManager) handleIngestMessage(msg *pubsub.Message, im *schema.Inge
 		return
 	}
 	logPrefix := fmt.Sprintf("IngestMessage (Shard %s)", shardID)
-	if sm.signer.ShouldDropMessage(msg.GetFrom(), im.SenderID, im.Timestamp, im.Nonce, im.Sig, im.MarshalCBORForSigning, logPrefix) {
+	node, ok := sm.signer.Authenticate(msg.GetFrom(), im, logPrefix)
+	if !ok {
 		slog.Warn("IngestMessage rejected", "from", msg.GetFrom().String(), "shard", shardID)
 		return
 	}
-	if !sm.isAuthorizedIngestor(im.SenderID) {
-		slog.Warn("IngestMessage from unauthorized peer", "sender", im.SenderID, "shard", shardID)
+	sm.peers.RecordSeen(shardID, node)
+	if !sm.isAuthorizedIngestor(node) {
+		slog.Warn("IngestMessage from unauthorized node", "node", node, "shard", shardID)
 		return
 	}
 	if !sm.allowsManifestCID(sm.ctx, im.ManifestCID) {
-		slog.Warn("IngestMessage refused: untrusted data origin", "sender", im.SenderID, "manifest", im.ManifestCID.String(), "shard", shardID)
+		slog.Warn("IngestMessage refused: untrusted data origin", "node", node, "manifest", im.ManifestCID.String(), "shard", shardID)
 		return
 	}
 	key := im.ManifestCID.String()

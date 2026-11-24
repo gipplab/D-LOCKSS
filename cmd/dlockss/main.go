@@ -89,9 +89,20 @@ func main() {
 	}
 	dht := ipfs.NewIPFSDHTAdapterFromClient(ipfsClient)
 
+	nodeID, err := ipfsClient.NodeID(ctx)
+	if err != nil {
+		log.Fatalf("[Fatal] Failed to read Kubo node ID: %v", err)
+	}
+	if _, err := nodeID.ExtractPublicKey(); err != nil {
+		log.Fatalf("[Fatal] Kubo node ID %s does not contain its public key; D-LOCKSS needs an Ed25519 Kubo identity", nodeID)
+	}
+
 	privKey, err := identity.LoadKey(cfg)
 	if err != nil {
-		log.Fatalf("[Fatal] Failed to load identity: %v", err)
+		log.Fatalf("[Fatal] Failed to load helper identity: %v", err)
+	}
+	if helperID, err := peer.IDFromPrivateKey(privKey); err == nil && helperID == nodeID {
+		log.Fatalf("[Fatal] The helper key at %s is the Kubo node key; delete it so that a new helper key is created", cfg.IdentityPath)
 	}
 
 	rcm, err := newResourceManager()
@@ -107,7 +118,19 @@ func main() {
 	}
 	defer h.Close()
 
-	slog.Info("libp2p host created", "peer_id", h.ID().String(), "private_network", cfg.PrivateNetwork)
+	bindingSig, err := ipfsClient.SignWithNodeKey(ctx, schema.BindingMessage(h.ID()))
+	if err != nil {
+		log.Fatalf("[Fatal] Failed to bind helper to Kubo node: %v", err)
+	}
+	binding := &schema.Binding{Node: nodeID, Sig: bindingSig}
+	if err := binding.Verify(h.ID()); err != nil {
+		log.Fatalf("[Fatal] Helper binding invalid: %v", err)
+	}
+
+	slog.Info("libp2p host created",
+		"node_id", nodeID.String(),
+		"helper_id", h.ID().String(),
+		"private_network", cfg.PrivateNetwork)
 	if path := os.Getenv("DLOCKSS_BANDWIDTH_PATH"); path != "" {
 		go writeBandwidthSnapshots(ctx, bandwidthCounter, path)
 	}
@@ -154,13 +177,15 @@ func main() {
 
 	rateLimiter := common.NewRateLimiter(cfg.RateLimitWindow, cfg.MaxMessagesPerWindow)
 	storageMgr := storage.NewStorageManager(cfg, dht, badBitsFilter)
+	nodes := trust.NewNodes(trustMgr)
 	signer := signing.NewSigner(signing.SignerConfig{
-		Cfg:      cfg,
-		Host:     h,
-		PrivKey:  privKey,
-		PeerID:   h.ID(),
-		TrustMgr: trustMgr,
-		DHT:      dht,
+		Cfg:     cfg,
+		Host:    h,
+		PrivKey: privKey,
+		PeerID:  h.ID(),
+		Binding: binding,
+		Nodes:   nodes,
+		DHT:     dht,
 	})
 
 	// announcePinned is set once the shard manager exists, which itself
@@ -186,6 +211,8 @@ func main() {
 			pinAndProvidePayload(pctx, ipfsClient, storageMgr, manifestCIDStr)
 		}()
 	}
+	// A non-empty allowlist puts the shard CRDTs in allowlist mode; helpers
+	// of listed nodes are added with TrustHelper.
 	clusterMgr := clusters.NewClusterManager(clusters.ClusterManagerConfig{
 		Cfg:          cfg,
 		Host:         h,
@@ -199,10 +226,16 @@ func main() {
 		OnPinSynced:  onPinSynced,
 		OnPinRemoved: storageMgr.UnpinFile,
 	})
+	nodes.OnBind(func(helper, _ peer.ID) {
+		clusterMgr.TrustHelper(context.Background(), helper)
+	})
 	shardMgr, err := shard.NewShardManager(shard.ShardManagerConfig{
 		Cfg:         cfg,
 		Ctx:         ctx,
 		Host:        h,
+		NodeID:      nodeID,
+		Binding:     binding,
+		Nodes:       nodes,
 		PubSub:      ps,
 		IPFSClient:  ipfsClient,
 		Storage:     storageMgr,
@@ -223,7 +256,7 @@ func main() {
 		IPFSClient: ipfsClient,
 		Shard:      shardMgr,
 		Storage:    storageMgr,
-		PrivKey:    privKey,
+		NodeSigner: ipfsClient,
 		Signer:     signer,
 		BadBits:    badBitsFilter,
 	})

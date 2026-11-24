@@ -10,6 +10,7 @@ import (
 
 	"github.com/ipfs/go-cid"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/peer"
 
 	"dlockss/internal/config"
 	"dlockss/pkg/schema"
@@ -31,6 +32,7 @@ type replicationOps interface {
 	clusterTriggerSync(shardID string)
 	ipfsPinManifest(ctx context.Context, c cid.Cid) error
 	replicationSigner() MessageAuthenticator
+	recordSeen(shardID string, node peer.ID)
 }
 
 type replicationManager struct {
@@ -168,10 +170,12 @@ func (rm *replicationManager) handleRequest(msg *pubsub.Message, rr *schema.Repl
 	cfg := rm.ops.replicationConfig()
 
 	logPrefix := fmt.Sprintf("ReplicationRequest (Shard %s)", shardID)
-	if signer.ShouldDropMessage(msg.GetFrom(), rr.SenderID, rr.Timestamp, rr.Nonce, rr.Sig, rr.MarshalCBORForSigning, logPrefix) {
+	node, ok := signer.Authenticate(msg.GetFrom(), rr, logPrefix)
+	if !ok {
 		slog.Warn("ReplicationRequest rejected", "manifest", rr.ManifestCID.String(), "from", msg.GetFrom().String(), "shard", shardID)
 		return
 	}
+	rm.ops.recordSeen(shardID, node)
 	c := rr.ManifestCID
 	manifestCIDStr := c.String()
 

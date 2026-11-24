@@ -56,10 +56,12 @@ type ClusterManager struct {
 	dht          routing.Routing
 	datastore    datastore.Datastore
 	trustedPeers []peer.ID
-	origin       trust.OriginGate
-	onPinSynced  func(cid string)
-	onPinRemoved func(cid string)
-	peerProvider ShardPeerProvider
+	// trustedHelpers are helpers of allowlisted nodes, trusted as CRDT writers.
+	trustedHelpers map[peer.ID]struct{}
+	origin         trust.OriginGate
+	onPinSynced    func(cid string)
+	onPinRemoved   func(cid string)
+	peerProvider   ShardPeerProvider
 
 	mu       sync.RWMutex
 	clusters map[string]*embeddedCluster
@@ -75,6 +77,7 @@ type consensusClient interface {
 	LogUnpin(ctx context.Context, pin api.Pin) error
 	State(ctx context.Context) (state.ReadOnly, error)
 	Peers(ctx context.Context) ([]peer.ID, error)
+	Trust(ctx context.Context, pid peer.ID) error
 	Shutdown(ctx context.Context) error
 }
 
@@ -112,20 +115,49 @@ func NewClusterManager(cfg ClusterManagerConfig) *ClusterManager {
 	if cfg.DHT != nil {
 		dht = crdtRouting{cfg.DHT}
 	}
+	helpers := make(map[peer.ID]struct{})
+	if cfg.Host != nil {
+		helpers[cfg.Host.ID()] = struct{}{}
+	}
 	return &ClusterManager{
-		cfg:          cfg.Cfg,
-		host:         cfg.Host,
-		badBits:      cfg.BadBits,
-		pubsub:       cfg.PubSub,
-		dht:          dht,
-		datastore:    cfg.Datastore,
-		ipfsClient:   cfg.IPFSClient,
-		trustedPeers: cfg.TrustedPeers,
-		origin:       cfg.Origin,
-		onPinSynced:  cfg.OnPinSynced,
-		onPinRemoved: cfg.OnPinRemoved,
-		clusters:     make(map[string]*embeddedCluster),
-		signalTopics: make(map[string]*pubsub.Topic),
+		cfg:            cfg.Cfg,
+		host:           cfg.Host,
+		badBits:        cfg.BadBits,
+		pubsub:         cfg.PubSub,
+		dht:            dht,
+		datastore:      cfg.Datastore,
+		ipfsClient:     cfg.IPFSClient,
+		trustedPeers:   cfg.TrustedPeers,
+		trustedHelpers: helpers,
+		origin:         cfg.Origin,
+		onPinSynced:    cfg.OnPinSynced,
+		onPinRemoved:   cfg.OnPinRemoved,
+		clusters:       make(map[string]*embeddedCluster),
+		signalTopics:   make(map[string]*pubsub.Topic),
+	}
+}
+
+// trustAll reports whether every peer may write the shard CRDTs: an empty
+// trusted-peer list means open mode, even under "allowlist".
+func (cm *ClusterManager) trustAll() bool {
+	return cm.cfg.Security.TrustMode != "allowlist" || len(cm.trustedPeers) == 0
+}
+
+// TrustHelper lets helper write the shard CRDTs. It does nothing in open mode,
+// where every writer is trusted.
+func (cm *ClusterManager) TrustHelper(ctx context.Context, helper peer.ID) {
+	if helper == "" || cm.trustAll() {
+		return
+	}
+	cm.mu.Lock()
+	cm.trustedHelpers[helper] = struct{}{}
+	clusters := make([]*embeddedCluster, 0, len(cm.clusters))
+	for _, c := range cm.clusters {
+		clusters = append(clusters, c)
+	}
+	cm.mu.Unlock()
+	for _, c := range clusters {
+		_ = c.consensus.Trust(ctx, helper)
 	}
 }
 
@@ -148,15 +180,12 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string) error {
 
 	shardDS := namespace.Wrap(cm.datastore, datastore.NewKey(shardID))
 
-	// An empty trusted-peer list means open mode, even under "allowlist".
-	trustAll := cm.cfg.Security.TrustMode != "allowlist" || len(cm.trustedPeers) == 0
-
 	cfg := &crdt.Config{
 		ClusterName:         cm.cfg.PubsubTopicPrefix + "-" + cm.cfg.TopicName + "-crdt-" + shardID,
 		PeersetMetric:       "ping",
 		RebroadcastInterval: 30 * time.Second,
 		DatastoreNamespace:  datastore.NewKey("consensus").String(),
-		TrustAll:            trustAll,
+		TrustAll:            cm.trustAll(),
 		TrustedPeers:        cm.trustedPeers,
 		Batching: crdt.BatchingConfig{
 			MaxBatchSize: 50,
@@ -168,6 +197,9 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string) error {
 	consensus, err := crdt.New(cm.host, cm.dht, cm.pubsub, cfg, shardDS)
 	if err != nil {
 		return fmt.Errorf("failed to initialize CRDT for shard %s: %w", shardID, err)
+	}
+	for helper := range cm.trustedHelpers {
+		_ = consensus.Trust(ctx, helper)
 	}
 	// The CRDT calls PinTracker and PeerMonitor over gorpc and must never see
 	// a nil client. getPeers reads cm.peerProvider per call, so clusters
@@ -190,14 +222,14 @@ func (cm *ClusterManager) JoinShard(ctx context.Context, shardID string) error {
 	if !joined {
 		topic, err = cm.pubsub.Join(topicName)
 		if err != nil {
-			_ = consensus.Shutdown(context.Background())
+			_ = shutdownConsensus(shardID, consensus)
 			return fmt.Errorf("failed to join signal topic %s: %w", topicName, err)
 		}
 		cm.signalTopics[topicName] = topic
 	}
 	sub, err := topic.Subscribe()
 	if err != nil {
-		_ = consensus.Shutdown(context.Background())
+		_ = shutdownConsensus(shardID, consensus)
 		return fmt.Errorf("failed to subscribe to signal topic %s: %w", topicName, err)
 	}
 
@@ -246,14 +278,30 @@ func (cm *ClusterManager) LeaveShard(shardID string) error {
 	if cluster.pinTracker != nil {
 		cluster.pinTracker.Stop()
 	}
-	shutCtx, shutCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer shutCancel()
-	var shutdownErr error
-	if err := cluster.consensus.Shutdown(shutCtx); err != nil {
-		shutdownErr = fmt.Errorf("consensus shutdown for shard %s: %w", shardID, err)
-	}
+	shutdownErr := shutdownConsensus(shardID, cluster.consensus)
 	cluster.cancel()
 	return shutdownErr
+}
+
+// crdtSetupTimeout bounds how long shutdownConsensus waits for a CRDT's setup.
+var crdtSetupTimeout = 15 * time.Second
+
+// shutdownConsensus shuts down a shard's CRDT after its background setup has
+// finished. ipfs-cluster's Shutdown blocks forever after a failed setup, and
+// panics if the batching worker started by the setup is not yet in its loop.
+// State waits for the setup without taking the one-shot Ready signal.
+func shutdownConsensus(shardID string, consensus consensusClient) error {
+	ctx, cancel := context.WithTimeout(context.Background(), crdtSetupTimeout)
+	defer cancel()
+	if _, err := consensus.State(ctx); err != nil {
+		slog.Error("CRDT setup did not finish; not shutting it down", "shard", shardID, "error", err)
+		return fmt.Errorf("CRDT of shard %s did not finish its setup: %w", shardID, err)
+	}
+	time.Sleep(100 * time.Millisecond) // let the batching worker reach its loop
+	if err := consensus.Shutdown(ctx); err != nil {
+		return fmt.Errorf("consensus shutdown for shard %s: %w", shardID, err)
+	}
+	return nil
 }
 
 func (cm *ClusterManager) shardCluster(shardID string) (*embeddedCluster, error) {

@@ -138,20 +138,3 @@ func TestCheckManifestOrigin(t *testing.T) {
 		t.Fatalf("nil gate should allow: %v", err)
 	}
 }
-
-func TestAuthorizeIncomingSender_allowlist(t *testing.T) {
-	trusted := testutil.MustPeerID(t, "trusted")
-	other := testutil.MustPeerID(t, "other")
-	tm := NewTrustManager("allowlist")
-	if err := tm.AuthorizeIncomingSender(other, other); err != nil {
-		t.Fatalf("empty allowlist is open: %v", err)
-	}
-	tm.AddOrigins([]string{trusted.String()})
-
-	if err := tm.AuthorizeIncomingSender(trusted, trusted); err != nil {
-		t.Fatalf("trusted sender: %v", err)
-	}
-	if err := tm.AuthorizeIncomingSender(other, other); err == nil {
-		t.Fatal("untrusted sender should be rejected in allowlist mode")
-	}
-}

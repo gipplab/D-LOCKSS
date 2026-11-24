@@ -32,34 +32,38 @@ const (
 // Signer signs outgoing protocol messages and verifies incoming ones
 // according to the configured signature mode.
 type Signer struct {
-	cfg      *config.Config
-	h        host.Host
-	privKey  crypto.PrivKey
-	peerID   peer.ID
-	nonces   *nonceStore
-	trustMgr *trust.TrustManager
-	dht      common.DHTProvider
+	cfg     *config.Config
+	h       host.Host
+	privKey crypto.PrivKey
+	peerID  peer.ID
+	binding *schema.Binding
+	nonces  *nonceStore
+	nodes   *trust.Nodes
+	dht     common.DHTProvider
 }
 
 // SignerConfig holds all dependencies for a Signer.
 type SignerConfig struct {
-	Cfg      *config.Config
-	Host     host.Host
-	PrivKey  crypto.PrivKey
-	PeerID   peer.ID
-	TrustMgr *trust.TrustManager
-	DHT      common.DHTProvider
+	Cfg     *config.Config
+	Host    host.Host
+	PrivKey crypto.PrivKey
+	PeerID  peer.ID
+	// Binding is this helper's binding, sent with every message.
+	Binding *schema.Binding
+	Nodes   *trust.Nodes
+	DHT     common.DHTProvider
 }
 
 func NewSigner(cfg SignerConfig) *Signer {
 	return &Signer{
-		cfg:      cfg.Cfg,
-		h:        cfg.Host,
-		privKey:  cfg.PrivKey,
-		peerID:   cfg.PeerID,
-		nonces:   newNonceStore(),
-		trustMgr: cfg.TrustMgr,
-		dht:      cfg.DHT,
+		cfg:     cfg.Cfg,
+		h:       cfg.Host,
+		privKey: cfg.PrivKey,
+		peerID:  cfg.PeerID,
+		binding: cfg.Binding,
+		nonces:  newNonceStore(),
+		nodes:   cfg.Nodes,
+		dht:     cfg.DHT,
 	}
 }
 
@@ -130,6 +134,9 @@ func (s *Signer) SignProtocolMessage(msg schema.Signable) error {
 	}
 	env := msg.GetEnvelope()
 	env.SenderID = s.peerID
+	if s.binding != nil {
+		env.NodeID, env.NodeSig = s.binding.Node, s.binding.Sig
+	}
 	env.Timestamp = time.Now().Unix()
 	env.Nonce = nonce
 	env.Sig = nil
@@ -261,28 +268,38 @@ func (s *Signer) handleSignatureError(logContext string, err error) bool {
 	return false
 }
 
-// ShouldDropMessage returns true if the message should be dropped (auth/signature failed).
-func (s *Signer) ShouldDropMessage(receivedFrom, senderID peer.ID, timestamp int64, nonce, sig []byte, marshalForSigning func() ([]byte, error), logContext string) bool {
-	if s.trustMgr == nil {
-		slog.Warn("message dropped: trust manager missing", "context", logContext)
-		return true
+// Authenticate verifies msg, received from receivedFrom, and returns the node
+// its sender acts for. ok is false if msg must be dropped.
+func (s *Signer) Authenticate(receivedFrom peer.ID, msg schema.Signable, logContext string) (node peer.ID, ok bool) {
+	if s.nodes == nil {
+		slog.Warn("message dropped: node resolver missing", "context", logContext)
+		return "", false
 	}
-	if err := s.trustMgr.AuthorizeIncomingSender(receivedFrom, senderID); err != nil {
-		slog.Warn("message dropped", "context", logContext, "error", err)
-		return true
+	env := msg.GetEnvelope()
+	if env.SenderID == "" {
+		slog.Warn("message dropped: missing sender_id", "context", logContext)
+		return "", false
 	}
-
-	if s.signaturesDisabled() {
-		return false
+	if receivedFrom != "" && env.SenderID != receivedFrom {
+		slog.Warn("message dropped: sender_id mismatch", "context", logContext, "sender_id", env.SenderID, "received_from", receivedFrom)
+		return "", false
 	}
-	if marshalForSigning == nil {
-		slog.Warn("message dropped: marshal function missing", "context", logContext)
-		return true
+	// The signature covers the binding. In strict mode a bad signature drops
+	// msg before its binding is remembered.
+	if !s.signaturesDisabled() {
+		unsigned, err := msg.MarshalCBORForSigning()
+		if err != nil {
+			slog.Warn("message dropped: marshal failed", "context", logContext, "error", err)
+			return "", false
+		}
+		if s.handleSignatureError(logContext, s.verifySignedMessage(receivedFrom, env.SenderID, env.Timestamp, env.Nonce, env.Sig, unsigned)) {
+			return "", false
+		}
 	}
-	unsigned, err := marshalForSigning()
-	if err != nil {
-		slog.Warn("message dropped: marshal failed", "context", logContext, "error", err)
-		return true
+	node, ok = s.nodes.Resolve(env.SenderID, env.Binding())
+	if !ok {
+		slog.Warn("message dropped: sender's node not accepted", "context", logContext, "sender_id", env.SenderID)
+		return "", false
 	}
-	return s.handleSignatureError(logContext, s.verifySignedMessage(receivedFrom, senderID, timestamp, nonce, sig, unsigned))
+	return node, true
 }

@@ -45,9 +45,13 @@ func (m *mockIPFS) RecursivePins(context.Context) (map[cid.Cid]string, error) {
 	return nil, nil
 }
 func (m *mockIPFS) DAGSize(context.Context, cid.Cid) (uint64, error) { return 0, nil }
+func (m *mockIPFS) NodeID(context.Context) (peer.ID, error)          { return "", nil }
+func (m *mockIPFS) SignWithNodeKey(context.Context, []byte) ([]byte, error) {
+	return []byte("node-sig"), nil
+}
 
 type mockShardCoordinator struct {
-	peerID      peer.ID
+	nodeID      peer.ID
 	shardID     string
 	responsible bool
 
@@ -57,7 +61,7 @@ type mockShardCoordinator struct {
 	publishedTo []string
 }
 
-func (m *mockShardCoordinator) PeerID() peer.ID               { return m.peerID }
+func (m *mockShardCoordinator) NodeID() peer.ID               { return m.nodeID }
 func (m *mockShardCoordinator) GetShardInfo() string          { return m.shardID }
 func (m *mockShardCoordinator) AmIResponsibleFor(string) bool { return m.responsible }
 func (m *mockShardCoordinator) IsLocalNodeIngestor() bool     { return true }
@@ -162,7 +166,7 @@ func newTestProcessor(t *testing.T, cfg *config.Config, ipfsMock *mockIPFS, shar
 		IPFSClient: ipfsMock,
 		Shard:      shardMock,
 		Storage:    storageMock,
-		PrivKey:    nil,
+		NodeSigner: ipfsMock,
 		Signer:     signerMock,
 		BadBits:    badBitsFilter,
 	})
@@ -173,7 +177,7 @@ func newTestProcessor(t *testing.T, cfg *config.Config, ipfsMock *mockIPFS, shar
 func TestNewFileProcessorAndStop(t *testing.T) {
 	cfg := testConfig(t)
 	ipfsMock := &mockIPFS{}
-	shardMock := &mockShardCoordinator{peerID: "test-peer", shardID: "0", responsible: true}
+	shardMock := &mockShardCoordinator{nodeID: "test-node", shardID: "0", responsible: true}
 	storageMock := newMockStorage()
 	signerMock := &mockSigner{}
 
@@ -187,7 +191,7 @@ func TestNewFileProcessorAndStop(t *testing.T) {
 func TestTryEnqueue_AcceptsFiles(t *testing.T) {
 	cfg := testConfig(t)
 	ipfsMock := &mockIPFS{}
-	shardMock := &mockShardCoordinator{peerID: "test-peer", shardID: "0", responsible: true}
+	shardMock := &mockShardCoordinator{nodeID: "test-node", shardID: "0", responsible: true}
 	storageMock := newMockStorage()
 	signerMock := &mockSigner{}
 
@@ -204,7 +208,7 @@ func TestTryEnqueue_ReturnsFalseWhenFull(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Files.MaxConcurrentFileProcessing = 1 // queue size = 1 * 100 = 100
 	ipfsMock := &mockIPFS{}
-	shardMock := &mockShardCoordinator{peerID: "test-peer", shardID: "0", responsible: true}
+	shardMock := &mockShardCoordinator{nodeID: "test-node", shardID: "0", responsible: true}
 	storageMock := newMockStorage()
 	signerMock := &mockSigner{}
 
@@ -227,7 +231,7 @@ func TestEnqueueOrRetry_FallsBackToRetryQueue(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Files.MaxConcurrentFileProcessing = 1
 	ipfsMock := &mockIPFS{}
-	shardMock := &mockShardCoordinator{peerID: "test-peer", shardID: "0", responsible: true}
+	shardMock := &mockShardCoordinator{nodeID: "test-node", shardID: "0", responsible: true}
 	storageMock := newMockStorage()
 	signerMock := &mockSigner{}
 
@@ -255,7 +259,7 @@ func TestProcessNewFile_SkipsFilesOutsideWatchDir(t *testing.T) {
 			return fakeCID("should-not-import"), nil
 		},
 	}
-	shardMock := &mockShardCoordinator{peerID: "test-peer", shardID: "0", responsible: true}
+	shardMock := &mockShardCoordinator{nodeID: "test-node", shardID: "0", responsible: true}
 	storageMock := newMockStorage()
 	signerMock := &mockSigner{}
 
@@ -285,7 +289,7 @@ func TestProcessNewFile_SkipsTmpFiles(t *testing.T) {
 			return fakeCID("should-not-import"), nil
 		},
 	}
-	shardMock := &mockShardCoordinator{peerID: "test-peer", shardID: "0", responsible: true}
+	shardMock := &mockShardCoordinator{nodeID: "test-node", shardID: "0", responsible: true}
 	storageMock := newMockStorage()
 	signerMock := &mockSigner{}
 
@@ -313,7 +317,7 @@ func TestProcessNewFile_SkipsPartFiles(t *testing.T) {
 			return fakeCID("should-not-import"), nil
 		},
 	}
-	shardMock := &mockShardCoordinator{peerID: "test-peer", shardID: "0", responsible: true}
+	shardMock := &mockShardCoordinator{nodeID: "test-node", shardID: "0", responsible: true}
 	storageMock := newMockStorage()
 	signerMock := &mockSigner{}
 
@@ -341,7 +345,7 @@ func TestScanExistingFiles(t *testing.T) {
 			return fakeCID("scan"), nil
 		},
 	}
-	shardMock := &mockShardCoordinator{peerID: "test-peer", shardID: "0", responsible: true}
+	shardMock := &mockShardCoordinator{nodeID: "test-node", shardID: "0", responsible: true}
 	storageMock := newMockStorage()
 	signerMock := &mockSigner{}
 
@@ -382,7 +386,7 @@ func TestScanExistingFiles_IncludesSubdirectories(t *testing.T) {
 			return fakeCID("sub"), nil
 		},
 	}
-	shardMock := &mockShardCoordinator{peerID: "test-peer", shardID: "0", responsible: true}
+	shardMock := &mockShardCoordinator{nodeID: "test-node", shardID: "0", responsible: true}
 	storageMock := newMockStorage()
 	signerMock := &mockSigner{}
 
@@ -422,7 +426,7 @@ func TestTryEnqueue_SameFileTwice(t *testing.T) {
 			return fakeCID("dedup"), nil
 		},
 	}
-	shardMock := &mockShardCoordinator{peerID: "test-peer", shardID: "0", responsible: true}
+	shardMock := &mockShardCoordinator{nodeID: "test-node", shardID: "0", responsible: true}
 	storageMock := newMockStorage()
 	signerMock := &mockSigner{}
 
@@ -459,7 +463,7 @@ func TestProcessNewFile_FullPipeline(t *testing.T) {
 		},
 	}
 	shardMock := &mockShardCoordinator{
-		peerID:      "test-peer-full",
+		nodeID:      "test-peer-full",
 		shardID:     "0",
 		responsible: true,
 	}
@@ -519,7 +523,7 @@ func TestProcessNewFile_CIDDedup(t *testing.T) {
 			return fakeCID("manifest-dedup"), nil
 		},
 	}
-	shardMock := &mockShardCoordinator{peerID: "test-peer", shardID: "0", responsible: true}
+	shardMock := &mockShardCoordinator{nodeID: "test-node", shardID: "0", responsible: true}
 	storageMock := newMockStorage()
 	signerMock := &mockSigner{}
 
@@ -556,7 +560,7 @@ func TestProcessNewFile_CIDDedup(t *testing.T) {
 
 func TestProcessNewFile_NilIPFSClient(t *testing.T) {
 	cfg := testConfig(t)
-	shardMock := &mockShardCoordinator{peerID: "test-peer", shardID: "0", responsible: true}
+	shardMock := &mockShardCoordinator{nodeID: "test-node", shardID: "0", responsible: true}
 	storageMock := newMockStorage()
 	signerMock := &mockSigner{}
 
@@ -593,7 +597,7 @@ func TestProcessNewFile_NilIPFSClient(t *testing.T) {
 func TestWatchFolder_ContextCancellation(t *testing.T) {
 	cfg := testConfig(t)
 	ipfsMock := &mockIPFS{}
-	shardMock := &mockShardCoordinator{peerID: "test-peer", shardID: "0", responsible: true}
+	shardMock := &mockShardCoordinator{nodeID: "test-node", shardID: "0", responsible: true}
 	storageMock := newMockStorage()
 	signerMock := &mockSigner{}
 

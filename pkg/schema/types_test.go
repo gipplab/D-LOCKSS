@@ -2,11 +2,13 @@ package schema
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"testing"
 
 	"github.com/ipfs/go-cid"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multihash"
 )
@@ -62,6 +64,49 @@ func TestResearchObject_Uploader(t *testing.T) {
 	}
 	if got.Uploader != ro.Uploader || !bytes.Equal(got.UploaderSig, ro.UploaderSig) {
 		t.Fatalf("uploader lost in round trip: %v %v", got.Uploader, got.UploaderSig)
+	}
+}
+
+func TestResearchObject_VerifySignature(t *testing.T) {
+	priv, pub, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ingester, err := peer.IDFromPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := mustDecode(t, cid.Decode, kuboPayload)
+	ro := NewResearchObject("paper.pdf", ingester, payload, 6)
+	unsigned, err := ro.MarshalCBORForSigning()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ro.Signature, err = priv.Sign(append([]byte(KuboSignPrefix), unsigned...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ro.VerifySignature(); err != nil {
+		t.Fatalf("kubo-signed manifest: %v", err)
+	}
+	ro.Signature[0] ^= 1
+	if err := ro.VerifySignature(); !errors.Is(err, ErrManifestSignature) {
+		t.Fatalf("tampered sig: got %v", err)
+	}
+
+	// Before helpers had their own keys, D-LOCKSS signed with the node key
+	// directly, without Kubo's prefix.
+	ro.Signature, err = priv.Sign(unsigned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ro.VerifySignature(); err != nil {
+		t.Fatalf("manifest signed directly with the node key: %v", err)
+	}
+	other := NewResearchObject("other.pdf", ingester, payload, 6)
+	other.Signature = ro.Signature
+	if err := other.VerifySignature(); !errors.Is(err, ErrManifestSignature) {
+		t.Fatalf("signature of another manifest: got %v", err)
 	}
 }
 

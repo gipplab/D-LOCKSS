@@ -13,7 +13,7 @@ import (
 // No timestamp is included to ensure deterministic CIDs for deduplication.
 type ResearchObject struct {
 	MetadataRef string  `cbor:"meta_ref"`    // DOI or URL to external metadata
-	IngestedBy  peer.ID `cbor:"ingester_id"` // PeerID of the node that ingested this
+	IngestedBy  peer.ID `cbor:"ingester_id"` // Node (Kubo) ID of the node that ingested this
 	Signature   []byte  `cbor:"sig"`
 
 	Payload cid.Cid `cbor:"payload"` // Link to raw UnixFS DAG (file data)
@@ -108,17 +108,28 @@ func (ro *ResearchObject) UnmarshalCBOR(data []byte) error {
 // VerifyUpload checks that sig is uploader's signature of payload, made with
 // 'ipfs key sign' over the message "dlockss-upload <payload CID>".
 func VerifyUpload(uploader peer.ID, payload cid.Cid, sig []byte) error {
-	pub, err := uploader.ExtractPublicKey()
-	if err != nil {
-		return fmt.Errorf("uploader key: %w", err)
-	}
-	// Kubo KeyAPI.Sign prefixes the message.
-	ok, err := pub.Verify([]byte("libp2p-key signed message:dlockss-upload "+payload.String()), sig)
-	if err != nil || !ok {
+	if !verifyKuboSignature(uploader, []byte("dlockss-upload "+payload.String()), sig) {
 		return ErrUploadSignature
 	}
 	return nil
 }
+
+// VerifySignature checks that Signature is the ingesting node's signature
+// over MarshalCBORForSigning, made with 'ipfs key sign' or, in older
+// manifests, directly with the node key.
+func (ro *ResearchObject) VerifySignature() error {
+	unsigned, err := ro.MarshalCBORForSigning()
+	if err != nil {
+		return err
+	}
+	if !verifyKuboSignature(ro.IngestedBy, unsigned, ro.Signature) && !verifyRawSignature(ro.IngestedBy, unsigned, ro.Signature) {
+		return ErrManifestSignature
+	}
+	return nil
+}
+
+// ErrManifestSignature reports a manifest not signed by its ingester.
+var ErrManifestSignature = errors.New("manifest signature does not match its ingester")
 
 // ErrUploadSignature reports a signature that does not match the upload.
 var ErrUploadSignature = errors.New("signature does not match \"dlockss-upload <payload CID>\"")

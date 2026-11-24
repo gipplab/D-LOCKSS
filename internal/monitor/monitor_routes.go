@@ -43,6 +43,7 @@ func (m *Monitor) RegisterRoutes(mux *http.ServeMux) {
 type nodeSnap struct {
 	id            string
 	peerID        string
+	helperID      string
 	nodeName      string
 	currentShard  string
 	role          string
@@ -86,6 +87,7 @@ func (m *Monitor) snapshotNodes(filter func(id string, node *nodeState, shard st
 		snapshot = append(snapshot, nodeSnap{
 			id:            id,
 			peerID:        node.PeerID,
+			helperID:      node.HelperID,
 			nodeName:      node.NodeName,
 			currentShard:  node.CurrentShard,
 			role:          role,
@@ -116,11 +118,15 @@ func (m *Monitor) buildNodeResponse(snapshot []nodeSnap) map[string]interface{} 
 			},
 			UptimeSeconds: s.uptimeSeconds,
 		}
-		response[s.id] = map[string]interface{}{
+		entry := map[string]interface{}{
 			"data":      status,
 			"last_seen": s.lastSeen,
 			"node_name": s.nodeName,
 		}
+		if s.helperID != "" {
+			entry["helper_id"] = s.helperID
+		}
+		response[s.id] = entry
 	}
 	return response
 }
@@ -133,7 +139,8 @@ func (m *Monitor) handleNodes(w http.ResponseWriter, r *http.Request) {
 		}
 		return strings.Contains(strings.ToLower(id), query) ||
 			strings.Contains(strings.ToLower(node.CurrentShard), query) ||
-			strings.Contains(strings.ToLower(node.NodeName), query)
+			strings.Contains(strings.ToLower(node.NodeName), query) ||
+			strings.Contains(strings.ToLower(node.HelperID), query)
 	})
 	writeJSON(w, m.buildNodeResponse(snapshot))
 }
@@ -268,21 +275,35 @@ func (m *Monitor) handleIdentify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Identify dials the D-LOCKSS helper. The query may be a Kubo node ID.
+	dialID := pid
+	nodeID := peerIDStr
+	m.mu.RLock()
+	if ns, ok := m.nodes[peerIDStr]; ok {
+		if helper, err := peer.Decode(ns.HelperID); err == nil {
+			dialID = helper
+		}
+	} else if node, ok := m.helpers.Resolve(pid, nil); ok {
+		nodeID = node.String()
+	}
+	helperID := dialID.String()
+	m.mu.RUnlock()
+
 	connectCtx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
 
 	pstore := m.host.Peerstore()
-	if addrs := pstore.Addrs(pid); len(addrs) > 0 {
-		_ = m.host.Connect(connectCtx, peer.AddrInfo{ID: pid, Addrs: addrs})
+	if addrs := pstore.Addrs(dialID); len(addrs) > 0 {
+		_ = m.host.Connect(connectCtx, peer.AddrInfo{ID: dialID, Addrs: addrs})
 	}
 
-	connected := m.host.Network().Connectedness(pid) == network.Connected
+	connected := m.host.Network().Connectedness(dialID) == network.Connected
 
-	agentVersion, _ := pstore.Get(pid, "AgentVersion")
-	protocolVersion, _ := pstore.Get(pid, "ProtocolVersion")
-	protocols, _ := pstore.GetProtocols(pid)
+	agentVersion, _ := pstore.Get(dialID, "AgentVersion")
+	protocolVersion, _ := pstore.Get(dialID, "ProtocolVersion")
+	protocols, _ := pstore.GetProtocols(dialID)
 
-	addrs := pstore.Addrs(pid)
+	addrs := pstore.Addrs(dialID)
 	addrStrs := make([]string, 0, len(addrs))
 	for _, a := range addrs {
 		addrStrs = append(addrStrs, a.String())
@@ -294,7 +315,8 @@ func (m *Monitor) handleIdentify(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, map[string]interface{}{
-		"peer_id":          pid.String(),
+		"peer_id":          nodeID,
+		"helper_id":        helperID,
 		"agent_version":    fmt.Sprintf("%v", agentVersion),
 		"protocol_version": fmt.Sprintf("%v", protocolVersion),
 		"protocols":        protoStrs,

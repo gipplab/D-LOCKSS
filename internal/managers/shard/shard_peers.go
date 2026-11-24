@@ -52,9 +52,9 @@ func (sm *ShardManager) GetShardInfo() string {
 	return sm.getCurrentShard()
 }
 
-// PeerID returns the local peer's ID.
-func (sm *ShardManager) PeerID() peer.ID {
-	return sm.h.ID()
+// NodeID returns the ID of the Kubo node this D-LOCKSS helper acts for.
+func (sm *ShardManager) NodeID() peer.ID {
+	return sm.nodeID
 }
 
 func (sm *ShardManager) GetPeersForShard(shardID string) []peer.ID {
@@ -73,8 +73,8 @@ func (sm *ShardManager) GetPeersForShard(shardID string) []peer.ID {
 	meshPeers := sub.topic.ListPeers()
 	seen := make(map[peer.ID]struct{}, len(meshPeers))
 	for _, p := range meshPeers {
-		if p != sm.h.ID() {
-			seen[p] = struct{}{}
+		if node, ok := sm.nodes.Resolve(p, nil); ok && node != sm.nodeID {
+			seen[node] = struct{}{}
 		}
 	}
 	for p := range sm.peers.GetSeenPeers(shardID, sm.cfg.Sharding.SeenPeersWindow) {
@@ -135,7 +135,7 @@ func (sm *ShardManager) probeShardSilently(shardID string, probeTimeout time.Dur
 	defer psSub.Cancel()
 
 	// PROBE tells members this node is only probing, so they do not count it.
-	_ = t.Publish(sm.ctx, []byte(msgPrefixProbe+sm.h.ID().String()))
+	_ = t.Publish(sm.ctx, sm.probeMessage())
 
 	deadline := time.Now().Add(probeTimeout)
 	for time.Now().Before(deadline) {

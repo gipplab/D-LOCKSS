@@ -20,14 +20,14 @@ C -> IPFS: PinManifest(ManifestCID)
 C -> IPFS: PinRecursive(PayloadCID) as own root
 
 == File Ingestion ==
-A -> GS: IngestMessage(CBOR)\n{manifest_cid, shard_id, hint_size, sender_id, ts, nonce, sig}\n(topic: dlockss-creative-commons-shard-<id>)
+A -> GS: IngestMessage(CBOR)\n{manifest_cid, shard_id, hint_size, sender_id, node_id, node_sig, ts, nonce, sig}\n(topic: dlockss-creative-commons-shard-<id>)
 GS -> B: Forward message
 GS -> C: Forward message
 B -> B: Add to knownFiles\nIf AmIResponsibleFor(PayloadCID): Pin to cluster, AnnouncePinned
 C -> C: Add to knownFiles\nIf responsible: Pin to cluster, AnnouncePinned
 
 == Replication Request (handled by replicationManager) ==
-A -> GS: ReplicationRequest(CBOR)\n{manifest_cid, priority, deadline, sender_id, ts, nonce, sig} (shard topic)
+A -> GS: ReplicationRequest(CBOR)\n{manifest_cid, priority, deadline, sender_id, node_id, node_sig, ts, nonce, sig} (shard topic)
 GS -> B: Forward message
 GS -> C: Forward message
 B -> B: repl.handleRequest(msg, rr, shardID)\nverify signature, check legacy manifest

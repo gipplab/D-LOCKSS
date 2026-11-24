@@ -297,13 +297,14 @@
                 tbody.innerHTML = nodes.map(n => {
                     const m = meta[n.peer_id]; const alias = aliases[n.peer_id] || ''; const serverName = nodeNames[n.peer_id] || ''; const lastSeen = Math.floor((Date.now()/1000) - m.last_seen);
                     const peerIdEscaped = escapeJs(n.peer_id); const aliasEscaped = escapeJs(alias); const peerIdHtml = escapeHtml(n.peer_id); const aliasHtml = escapeHtml(alias); const serverNameHtml = escapeHtml(serverName); const shardHtml = escapeHtml(n.current_shard);
+                    const helperId = (m && m.helper_id) || ''; const helperHtml = helperId ? '<div style="font-size:0.75em; color:#888; margin-top:2px;">helper ' + escapeHtml(helperId) + '</div>' : '';
                     const displayName = aliasHtml || serverNameHtml || (peerIdHtml.slice(0,12) + '...');
                     const pinned = (n.storage.pinned_in_shard != null) ? n.storage.pinned_in_shard : n.storage.pinned_files;
                     const isPassive = n.role === 'PASSIVE';
                     const isReplicator = n.role === 'REPLICATOR';
                     const rowClass = isPassive ? 'node-passive' : '';
                     const statusTag = isPassive ? '<span class="status-text status-full">[FULL]</span>' : isReplicator ? '<span class="status-text" style="color:#06A77D;">[REPLICATOR]</span>' : '<span class="status-text status-online">[ACTIVE]</span>';
-                    return '<tr class="' + rowClass + '" data-peer-id="' + escapeHtml(n.peer_id.toLowerCase()) + '"><td><button class="btn-text alias-edit-btn" onclick="editAlias(\'' + peerIdEscaped + '\', \'' + aliasEscaped + '\', this)">EDIT</button></td><td class="peer-id-cell"><div class="alias-display-container"><div style="font-weight:600;">' + displayName + '</div><div style="font-size:0.8em; color:#4af; cursor:pointer; text-decoration:underline;" onclick="event.stopPropagation(); showIdentifyModal(\'' + peerIdEscaped + '\')">' + peerIdHtml + '</div></div></td><td><span class="shard-badge">' + shardHtml + '</span></td><td>' + n.peers_in_shard + '</td><td>' + pinned + '</td><td>' + n.storage.known_files + '</td><td>' + Math.floor(n.uptime_seconds/60) + 'm</td><td>' + statusTag + ' ' + lastSeen + 's ago</td></tr>';
+                    return '<tr class="' + rowClass + '" data-peer-id="' + escapeHtml(n.peer_id.toLowerCase()) + '"><td><button class="btn-text alias-edit-btn" onclick="editAlias(\'' + peerIdEscaped + '\', \'' + aliasEscaped + '\', this)">EDIT</button></td><td class="peer-id-cell"><div class="alias-display-container"><div style="font-weight:600;">' + displayName + '</div><div style="font-size:0.8em; color:#4af; cursor:pointer; text-decoration:underline;" onclick="event.stopPropagation(); showIdentifyModal(\'' + peerIdEscaped + '\')">' + peerIdHtml + '</div>' + helperHtml + '</div></td><td><span class="shard-badge">' + shardHtml + '</span></td><td>' + n.peers_in_shard + '</td><td>' + pinned + '</td><td>' + n.storage.known_files + '</td><td>' + Math.floor(n.uptime_seconds/60) + 'm</td><td>' + statusTag + ' ' + lastSeen + 's ago</td></tr>';
                 }).join('');
                 restoreEditingState();
             });
@@ -435,7 +436,8 @@
                 const addrs = (data.addresses || []).map(a => '<div style="padding:2px 0; font-size:0.85em;">' + escapeHtml(a) + '</div>').join('') || '<span style="color:#666;">none</span>';
                 const protos = (data.protocols || []).map(p => '<span style="display:inline-block; background:#ccc; border:1px solid #444; border-radius:3px; padding:1px 6px; margin:2px; font-size:0.8em;">' + escapeHtml(p) + '</span>').join('') || '<span style="color:#666;">none</span>';
                 c.innerHTML = '<table style="width:100%; border-collapse:collapse;">' +
-                    '<tr><td style="padding:6px 8px; color:#999; width:130px; vertical-align:top;">Peer ID</td><td style="padding:6px 8px; word-break:break-all;">' + escapeHtml(data.peer_id || peerId) + '</td></tr>' +
+                    '<tr><td style="padding:6px 8px; color:#999; width:130px; vertical-align:top;">Node ID</td><td style="padding:6px 8px; word-break:break-all;">' + escapeHtml(data.peer_id || peerId) + '</td></tr>' +
+                    (data.helper_id ? '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Helper ID</td><td style="padding:6px 8px; word-break:break-all;">' + escapeHtml(data.helper_id) + '</td></tr>' : '') +
                     '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Status</td><td style="padding:6px 8px;">' + connected + '</td></tr>' +
                     '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Agent</td><td style="padding:6px 8px;">' + escapeHtml(data.agent_version || '-') + '</td></tr>' +
                     '<tr><td style="padding:6px 8px; color:#999; vertical-align:top;">Protocol</td><td style="padding:6px 8px;">' + escapeHtml(data.protocol_version || '-') + '</td></tr>' +

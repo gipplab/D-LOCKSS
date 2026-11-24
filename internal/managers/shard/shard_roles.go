@@ -8,6 +8,8 @@ import (
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/peer"
+
+	"dlockss/pkg/schema"
 )
 
 type peerRole string
@@ -144,34 +146,19 @@ func (pt *peerTracker) PruneStale(maxAge time.Duration) {
 	}
 }
 
-func parseHeartbeatRole(data []byte) peerRole {
-	s := string(data)
-	if !strings.HasPrefix(s, msgPrefixHeartbeat) {
-		return roleActive
-	}
-	parts := strings.SplitN(s, ":", 4)
-	if len(parts) >= 4 {
-		r := peerRole(strings.ToUpper(parts[3]))
-		switch r {
-		case rolePassive, roleProbe, roleReplicator:
-			return r
-		}
+// parseRole normalises a HEARTBEAT role; unknown roles count as ACTIVE.
+func parseRole(s string) peerRole {
+	switch r := peerRole(strings.ToUpper(s)); r {
+	case rolePassive, roleProbe, roleReplicator:
+		return r
 	}
 	return roleActive
 }
 
-func parseJoinRole(data []byte) peerRole {
-	s := string(data)
-	if !strings.HasPrefix(s, msgPrefixJoin) {
-		return roleActive
-	}
-	parts := strings.SplitN(s, ":", 3)
-	if len(parts) >= 3 {
-		r := peerRole(strings.ToUpper(parts[2]))
-		switch r {
-		case rolePassive, roleReplicator:
-			return r
-		}
+// joinRole is parseRole for JOIN messages, which cannot announce PROBE.
+func joinRole(s string) peerRole {
+	if r := parseRole(s); r != roleProbe {
+		return r
 	}
 	return roleActive
 }
@@ -193,17 +180,20 @@ func (sm *ShardManager) processTextProtocolForProbe(msg *pubsub.Message, shardID
 	if len(data) == 0 {
 		return
 	}
-	from := msg.GetFrom()
-	sm.peers.RecordSeen(shardID, from)
+	node, ok := sm.nodes.Resolve(msg.GetFrom(), schema.AnnouncementBinding(data))
+	if !ok {
+		return
+	}
+	sm.peers.RecordSeen(shardID, node)
 
 	switch {
 	case bytes.HasPrefix(data, []byte(msgPrefixHeartbeat)):
-		sm.peers.RecordRole(shardID, from, parseHeartbeatRole(data))
+		sm.peers.RecordRole(shardID, node, parseRole(schema.ParseHeartbeat(data).Role))
 	case bytes.HasPrefix(data, []byte(msgPrefixJoin)):
-		sm.peers.RecordRole(shardID, from, parseJoinRole(data))
+		sm.peers.RecordRole(shardID, node, joinRole(schema.ParseJoin(data).Role))
 	case bytes.HasPrefix(data, []byte(msgPrefixLeave)):
-		sm.peers.RemoveRole(shardID, from)
+		sm.peers.RemoveRole(shardID, node)
 	case bytes.HasPrefix(data, []byte(msgPrefixProbe)):
-		sm.peers.RecordRole(shardID, from, roleProbe)
+		sm.peers.RecordRole(shardID, node, roleProbe)
 	}
 }

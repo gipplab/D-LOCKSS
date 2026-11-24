@@ -99,7 +99,7 @@ func (w *pinWatcher) setBlocked(reason string, args ...any) {
 
 func (w *pinWatcher) poll(ctx context.Context) {
 	if !w.fp.shardMgr.IsLocalNodeIngestor() {
-		w.setBlocked("this node is not on the ingest allowlist; pins are not ingested", "peer", w.fp.shardMgr.PeerID())
+		w.setBlocked("this node is not on the ingest allowlist; pins are not ingested", "node", w.fp.shardMgr.NodeID())
 		return
 	}
 	pins, err := w.fp.ipfsClient.RecursivePins(ctx)

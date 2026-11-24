@@ -20,6 +20,7 @@ Watcher -> FileOps: enqueue file via processNewFile(path)
 
 FileOps -> IPFS: Import file (UnixFS)\nPayloadCID
 FileOps -> FileOps: Build ResearchObject (CBOR)\n{meta_ref, ingester_id, payload, size}
+FileOps -> IPFS: key/sign(unsigned manifest)\nsig with the node key
 FileOps -> IPFS: PutDagCBOR(manifest)\nManifestCID
 FileOps -> FileOps: Check BadBits (ManifestCID)
 alt BadBits check fails

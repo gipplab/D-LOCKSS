@@ -38,7 +38,7 @@ func (fp *FileProcessor) IngestUpload(ctx context.Context, path, metaRef string,
 		return cid.Undef, fmt.Errorf("%w: got %s, signed %s", ErrPayloadMismatch, payloadCID, payload)
 	}
 
-	ro := schema.NewResearchObject(metaRef, fp.shardMgr.PeerID(), payloadCID, uint64(info.Size()))
+	ro := schema.NewResearchObject(metaRef, fp.shardMgr.NodeID(), payloadCID, uint64(info.Size()))
 	ro.Uploader = uploader
 	ro.UploaderSig = sig
 	manifestCID, err := fp.storeManifest(ctx, ro)

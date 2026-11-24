@@ -29,7 +29,7 @@ type lifecycleOps interface {
 	getLastMergeUpTime() time.Time
 	getLastMoveToDeeperShard() time.Time
 	getLastMessageTime() time.Time
-	localPeerID() peer.ID
+	localNodeID() peer.ID
 
 	getShardPeerCount(useMeshFallback bool) int
 	activePeersInCurrentShard() []peer.ID
@@ -132,7 +132,7 @@ func (lm *lifecycleManager) recordSplitAnnouncement(payload string) {
 // announced via SPLIT (needed by discovery to decide whether to move deeper).
 func (lm *lifecycleManager) hasKnownChildren(currentShard string) bool {
 	nextDepth := len(currentShard) + 1
-	targetChild := common.GetBinaryPrefix(lm.ops.localPeerID().String(), nextDepth)
+	targetChild := common.GetBinaryPrefix(lm.ops.localNodeID().String(), nextDepth)
 	siblingShard := getSiblingShard(targetChild)
 	lm.mu.Lock()
 	_, targetKnown := lm.knownChildShards[targetChild]
@@ -179,14 +179,14 @@ func (lm *lifecycleManager) checkAndSplitIfNeeded() {
 		return
 	}
 
-	child0, child1 := childCounts(currentShard, lm.ops.localPeerID(), lm.ops.activePeersInCurrentShard())
+	child0, child1 := childCounts(currentShard, lm.ops.localNodeID(), lm.ops.activePeersInCurrentShard())
 	if min(child0, child1) < lm.cfg.Sharding.MinPeersPerShard {
 		slog.Debug("split would leave a child below min peers", "shard", currentShard, "peers", peerCount, "max_peers", lm.cfg.Sharding.MaxPeersPerShard, "child0_peers", child0, "child1_peers", child1, "min_peers", lm.cfg.Sharding.MinPeersPerShard)
 		return
 	}
 
 	nextDepth := len(currentShard) + 1
-	targetChild := common.GetBinaryPrefix(lm.ops.localPeerID().String(), nextDepth)
+	targetChild := common.GetBinaryPrefix(lm.ops.localNodeID().String(), nextDepth)
 	childPeerCount := lm.ops.probeShard(targetChild, probeTimeoutForSplitChild)
 
 	canJoinExisting := childPeerCount >= 1
@@ -348,7 +348,7 @@ func (lm *lifecycleManager) discoverAndMoveToDeeperShard() {
 	}
 
 	nextDepth := len(currentShard) + 1
-	targetChild := common.GetBinaryPrefix(lm.ops.localPeerID().String(), nextDepth)
+	targetChild := common.GetBinaryPrefix(lm.ops.localNodeID().String(), nextDepth)
 	siblingShard := getSiblingShard(targetChild)
 	if !lm.hasKnownChildren(currentShard) {
 		if currentShard != "" {
@@ -364,7 +364,7 @@ func (lm *lifecycleManager) discoverAndMoveToDeeperShard() {
 		// left, this shard fell below MaxPeersPerShard and the split rule no
 		// longer fires for the members of the other half. The node creates its
 		// own child if enough current members hash into it.
-		zero, one := childCounts(currentShard, lm.ops.localPeerID(), lm.ops.activePeersInCurrentShard())
+		zero, one := childCounts(currentShard, lm.ops.localNodeID(), lm.ops.activePeersInCurrentShard())
 		ownChild := zero
 		if strings.HasSuffix(targetChild, "1") {
 			ownChild = one
@@ -387,7 +387,7 @@ func (lm *lifecycleManager) discoverAndMoveToDeeperShard() {
 	// count distinct peer IDs across the parent and both children.
 	known := append(lm.ops.activePeersInCurrentShard(), lm.ops.activePeersInShard(targetChild)...)
 	known = append(known, lm.ops.activePeersInShard(siblingShard)...)
-	zero, one := childCounts(currentShard, lm.ops.localPeerID(), uniquePeers(known))
+	zero, one := childCounts(currentShard, lm.ops.localNodeID(), uniquePeers(known))
 	projectedTarget, projectedSibling := zero, one
 	if strings.HasSuffix(targetChild, "1") {
 		projectedTarget, projectedSibling = one, zero

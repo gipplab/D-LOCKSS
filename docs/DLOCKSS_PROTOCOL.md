@@ -29,7 +29,7 @@ The protocol is built on top of the **IPFS** (InterPlanetary File System) and **
 The network is partitioned into PubSub topics for scalability:
 
 *   **Shard Topics (membership + protocol)**: `<version>-creative-commons-shard-<prefix>`
-    *   Version prefix: `DefaultPubsubVersion` (currently `dlockss-v0.0.3`). Bumped on breaking changes to isolate versions.
+    *   Version prefix: `DefaultPubsubVersion` (currently `dlockss-v0.0.4`, bumped for the helper binding). Bumped on breaking changes to isolate versions.
     *   Examples: `...-shard-`, `...-shard-0`, `...-shard-1`, `...-shard-01`.
     *   Used for: JOIN/HEARTBEAT/LEAVE, PINNED, IngestMessage, ReplicationRequest (CBOR).
     *   Nodes subscribe to the shard topic(s) they belong to (current shard; optionally target shard as tourist).
@@ -42,14 +42,16 @@ These plain-text messages are published to shard topics for membership and statu
 
 | Message | Format | Purpose |
 |---------|--------|---------|
-| `HEARTBEAT` | `HEARTBEAT:<PeerID>:<pinnedCount>:<role>:<nodeName>` | Periodic heartbeat with pinned file count, role (ACTIVE/PASSIVE/PROBE), and optional human-readable node name |
-| `JOIN` | `JOIN:<PeerID>:<role>:<nodeName>` | Announce membership in a shard (role + optional name) |
-| `LEAVE` | `LEAVE:<PeerID>` | Announce departure from a shard |
+| `HEARTBEAT` | `HEARTBEAT:<helper>:<pinnedCount>:<role>:<nodeID>:<bindingSig>:<nodeName>` | Periodic heartbeat with pinned file count, role (ACTIVE/PASSIVE/PROBE), binding, and optional human-readable node name |
+| `JOIN` | `JOIN:<helper>:<role>:<nodeID>:<bindingSig>:<nodeName>` | Announce membership in a shard (role, binding, optional name) |
+| `LEAVE` | `LEAVE:<helper>` | Announce departure from a shard |
 | `PINNED` | `PINNED:<ManifestCID>` | Announce a pinned file (sent in batches with heartbeat) |
-| `PROBE` | `PROBE:<PeerID>` | Observer presence (monitor/merge probes; not counted as membership) |
+| `PROBE` | `PROBE:<helper>:<nodeID>:<bindingSig>` | Observer presence (merge probes; not counted as membership). Monitors send `PROBE:<PeerID>` without binding |
 | `SPLIT` | `SPLIT:<child0>:<child1>` | Announce shard split to child shards |
 
-The `<nodeName>` field is optional; nodes without a configured name send an empty string. The trailing field is backward-compatible with older nodes that don't parse it.
+`<helper>` is the peer ID of the D-LOCKSS host that sends the message; `<nodeID>` is its Kubo node ID and `<bindingSig>` the node's signature over `dlockss-helper v1 <helper>` (unpadded base64url). The binding sits before the name, which may contain `:`. Receivers verify the binding against the libp2p sender of the message and count the message for the bound node (Section 7.1). LEAVE and PINNED carry no binding and count for the node the sender's earlier binding named; other messages without a binding do not count.
+
+The `<nodeName>` field is optional; nodes without a configured name send an empty string.
 
 ---
 
@@ -64,8 +66,8 @@ The immutable record representing a preserved digital artifact. Defined in `pkg/
 ```go
 type ResearchObject struct {
     MetadataRef string  `cbor:"meta_ref"`    // DOI/URL or file path reference
-    IngestedBy  peer.ID `cbor:"ingester_id"` // PeerID of ingesting node
-    Signature   []byte  `cbor:"sig"`         // Signature of the object
+    IngestedBy  peer.ID `cbor:"ingester_id"` // Kubo node ID of the ingesting node
+    Signature   []byte  `cbor:"sig"`         // Kubo 'key sign' signature by ingester_id
     Timestamp   int64   `cbor:"ts"`          // Unix timestamp of creation
     Payload     cid.Cid `cbor:"payload"`     // CID of the raw content (UnixFS DAG root)
     TotalSize   uint64  `cbor:"size"`        // Size of Payload in bytes
@@ -97,7 +99,9 @@ Broadcast when a node ingests a new file.
   "manifest_cid": <CID>,
   "shard_id": <string>,    // e.g. "01"
   "hint_size": <uint64>,
-  "sender_id": <PeerID>,
+  "sender_id": <PeerID>,   // D-LOCKSS helper
+  "node_id": <PeerID>,     // Kubo node of the helper (binding)
+  "node_sig": <bytes>,     // node's signature over "dlockss-helper v1 <sender_id>"
   "ts": <int64>,
   "nonce": <bytes>,
   "sig": <bytes>
@@ -114,7 +118,9 @@ Broadcast when a node detects a file is under-replicated.
   "manifest_cid": <CID>,
   "priority": <uint8>,     // 0=Low, 1=High
   "deadline": <int64>,     // 0 = no deadline
-  "sender_id": <PeerID>,
+  "sender_id": <PeerID>,   // D-LOCKSS helper
+  "node_id": <PeerID>,     // binding, as in IngestMessage
+  "node_sig": <bytes>,
   "ts": <int64>,
   "nonce": <bytes>,
   "sig": <bytes>
@@ -129,7 +135,7 @@ D-LOCKSS uses dynamic sharding to partition responsibility.
 
 ### 5.1 Responsibility Assignment
 
-*   **Node Identity**: Each node has a `currentShard` (binary string, e.g., "01"). This is a prefix of its PeerID (SHA-256 hash).
+*   **Node Identity**: Each node has a `currentShard` (binary string, e.g., "01"). This is a prefix of the SHA-256 hash of its Kubo node ID (not the helper ID).
 *   **File Assignment**: A file's `PayloadCID` is hashed (SHA-256).
 *   **Match Rule**: A node is responsible for a file if the node's `currentShard` is a prefix of the file hash.
 
@@ -155,7 +161,7 @@ Nodes in any shard (not just root) periodically run discovery to join existing d
 ### 6.1 File Ingestion
 
 1.  **Import**: Node imports file to IPFS, getting `PayloadCID`.
-2.  **Manifest**: Node creates and signs `ResearchObject` (meta_ref, ingester_id, payload, size) and stores it in IPFS; gets `ManifestCID`.
+2.  **Manifest**: Node creates `ResearchObject` (meta_ref, ingester_id = Kubo node ID, payload, size), has its Kubo node sign it (`key/sign`) and stores it in IPFS; gets `ManifestCID`.
 3.  **Pin**: Node pins `ManifestCID` recursively (BadBits check first). Tracks via StorageManager.PinFile and announces PINNED on current shard topic.
 4.  **Check Responsibility** (AmIResponsibleFor(PayloadCID)):
     *   **If Responsible**:
@@ -213,30 +219,50 @@ Cluster data is advertised to the **public IPFS DHT** (manifest and payload when
 
 ### 7.1 Node Identity & Key Storage
 
-A node's **Peer ID** is derived from its Ed25519 private key. This key is used for all message signing, libp2p authentication, and shard assignment. The key is resolved at startup in the following order:
+The **node ID** is the Kubo peer ID. It names the node in allowlists (`trusted_peers.json`, `DLOCKSS_INGEST_ALLOWLIST`), in a manifest's `ingester_id`, for shard placement, in DHT provider records and in the monitor. D-LOCKSS runs its own libp2p host with a separate **helper** key (the **helper ID**) and never reads Kubo's private key. Two hosts with one peer ID would mix their addresses in the DHT and peerstores, so a dial by peer ID could reach the Kubo host, which speaks neither gossipsub nor the CRDT protocols.
 
-| Priority | Source | When used | Storage location |
-|----------|--------|-----------|------------------|
-| 1 | IPFS config | `DLOCKSS_IPFS_CONFIG` is set | Kubo config JSON at that path (`Identity.PrivKey`) |
-| 2 | Persistent key file | `DLOCKSS_IPFS_CONFIG` unset | `DLOCKSS_IDENTITY_PATH` (default: `{DLOCKSS_DATA_DIR}/../dlockss.key`) |
-| 3 | Auto-generated | No existing key found | Saved to the path from priority 2 |
+#### Helper binding
+
+A helper proves which node it serves with a **binding**. At startup D-LOCKSS reads the node ID from Kubo (`/api/v0/id`) and has Kubo sign this text with the node key (`/api/v0/key/sign`):
+
+```
+dlockss-helper v1 <helper peer ID>
+```
+
+Kubo signs `libp2p-key signed message:` followed by the text. A binding is the pair (node ID, signature). It travels in HEARTBEAT, JOIN and PROBE (Section 2.2) and as `node_id`/`node_sig` in the signed envelopes (Sections 4.2, 4.3), so every message stands on its own.
+
+Receivers take the public key from the node ID and check the signature over the text built from the **libp2p sender** of the message. A copied binding is useless, because it verifies only for the helper it names. Verified bindings are cached as a map from helper ID to node ID, so LEAVE and PINNED, which carry none, count for the bound node.
+
+Limitations: node IDs must be Ed25519 (`12D3KooW...`), because RSA peer IDs do not contain their public key. A binding does not expire and cannot be revoked; a new helper key gets a new binding, but a leaked helper key stays valid.
+
+#### Helper key
+
+The helper key is resolved at startup in order:
+
+| Priority | Source | Storage location |
+|----------|--------|------------------|
+| 1 | Persistent key file | `DLOCKSS_IDENTITY_PATH` (default: `{DLOCKSS_DATA_DIR}/../dlockss.key`) |
+| 2 | Legacy working-directory key | `./dlockss.key` (migrated to the path above) |
+| 3 | Auto-generated Ed25519 | Saved to the path from priority 1 |
+
+`DLOCKSS_IPFS_CONFIG` supplies the Kubo RPC token when `DLOCKSS_IPFS_TOKEN` is unset; it is not used for the helper key.
 
 **Default file layout** (with `DLOCKSS_DATA_DIR=./data`):
 
 ```
 ./
 ├── data/              ← ingest directory (DLOCKSS_DATA_DIR), watched for new files
-├── dlockss.key        ← identity private key (auto-generated or migrated)
+├── dlockss.key        ← helper private key (auto-generated or migrated)
 ├── node_name          ← persisted node name
 └── cluster_store/     ← CRDT state (LevelDB)
 ```
 
 State files are placed in the **parent** of the data directory so the file watcher does not ingest them. The node validates this at startup and refuses to start if any state file resolves inside the ingest directory.
 
-**Docker / remote Kubo:** Mount the Kubo config JSON read-only and set `DLOCKSS_IPFS_CONFIG` to its path inside the container. This lets D-LOCKSS derive its identity from the IPFS daemon without mounting the entire repo. Alternatively, mount a persistent volume, point `DLOCKSS_DATA_DIR` to a subdirectory on it, and optionally set `DLOCKSS_IDENTITY_PATH` explicitly.
+**Docker / remote Kubo:** Mount a persistent volume for the helper key and cluster store. Optionally mount the Kubo config read-only for RPC auth.
 
 ```yaml
-# Minimal Docker Compose: D-LOCKSS sharing identity with Kubo
+# Minimal Docker Compose: D-LOCKSS beside Kubo
 services:
   ipfs:
     image: ipfs/kubo:v0.43.1
@@ -259,12 +285,14 @@ volumes:
   ipfs-data:
 ```
 
-**Legacy migration:** If a `dlockss.key` exists in the working directory but not at the configured identity path (e.g. after upgrading), it is automatically copied to the new location so the node retains its Peer ID.
+**Legacy migration:** If a `dlockss.key` exists in the working directory but not at the configured identity path (e.g. after upgrading), it is automatically copied to the new location so the helper keeps its ID.
 
 ### 7.2 Integrity & Authenticity
 *   **Content Addressing**: CIDs guarantee content integrity.
-*   **Signatures**: All `ResearchObjects` and protocol messages are signed by the sender's private key. The `Signer` type (in `internal/signing/`) handles signing and verification, with `verifySignedMessage` decomposed into focused steps: field validation (`validateMessageFields`), timestamp checking (`checkTimestamp`), public key retrieval (`fetchPublicKey`), and cryptographic verification (`verifySignatureBytes`).
+*   **Signatures**: `ResearchObjects` are signed by the ingesting Kubo node (`key/sign`, which prefixes `libp2p-key signed message:`), so they verify against `ingester_id` alone (`ResearchObject.VerifySignature`, which also accepts manifests that older versions signed directly with the node key). Protocol messages are signed with the helper key; the signature also covers the binding (`node_id`, `node_sig`). `Signer.Authenticate` checks the signature first, then resolves the sender to its node: the binding must verify for the libp2p sender, and in `allowlist` mode the node must be listed. Messages from a sender without a valid binding are dropped. The `Signer` type (in `internal/signing/`) handles signing and verification, with `verifySignedMessage` decomposed into focused steps: field validation (`validateMessageFields`), timestamp checking (`checkTimestamp`), public key retrieval (`fetchPublicKey`), and cryptographic verification (`verifySignatureBytes`).
 *   **Nonces**: Protocol messages include nonces (generated by the signing package's internal `newNonce` function) to prevent replay attacks. A `nonceStore` tracks recently seen nonces.
+*   **Shard membership**: HEARTBEAT, JOIN, PROBE, PINNED and LEAVE count only for an accepted node and are recorded under its node ID; these counts drive splits, merges and replication targets. In `open` mode a sender counts if its binding verifies; in `allowlist` mode with a non-empty list its node must also be listed. Monitors and other hosts without binding do not count.
+*   **CRDT writers**: In `allowlist` mode the shard CRDTs accept heads from helpers whose binding to a listed node has verified (`Consensus.Trust`). Heads from a helper not yet trusted are ignored and arrive again with the next rebroadcast (30 s). `open` mode trusts every writer.
 
 ### 7.3 Liar Detection
 *   Nodes verify that the actual file size matches the `TotalSize` claimed in the `ResearchObject` manifest.

@@ -103,18 +103,8 @@ func (tm *TrustManager) AllowsOrigin(id peer.ID) bool {
 	return tm.trustedPeers.Has(id)
 }
 
-// AuthorizeIncomingSender enforces:
-//   - SenderID must match libp2p's ReceivedFrom (prevents in-message spoofing).
-//   - If TrustMode is "allowlist" and the list is non-empty, the sender must be listed.
-func (tm *TrustManager) AuthorizeIncomingSender(receivedFrom, peerID peer.ID) error {
-	if peerID == "" {
-		return fmt.Errorf("missing sender_id")
-	}
-	if receivedFrom != "" && peerID != receivedFrom {
-		return fmt.Errorf("sender_id mismatch: sender_id=%s received_from=%s", peerID.String(), receivedFrom.String())
-	}
-	if tm.trustMode == "allowlist" && tm.RestrictsOrigins() && !tm.trustedPeers.Has(peerID) {
-		return fmt.Errorf("sender not trusted: %s", peerID.String())
-	}
-	return nil
+// acceptsNode reports whether messages of node count: in allowlist mode with a
+// non-empty allowlist, node must be on it.
+func (tm *TrustManager) acceptsNode(node peer.ID) bool {
+	return tm.trustMode != "allowlist" || !tm.RestrictsOrigins() || tm.trustedPeers.Has(node)
 }

@@ -13,22 +13,9 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/peer"
 	ma "github.com/multiformats/go-multiaddr"
-	mh "github.com/multiformats/go-multihash"
 
 	"dlockss/pkg/schema"
 )
-
-// decodePeerIDWithFallback decodes a peer ID string, falling back to raw
-// multihash decoding for legacy base58-encoded IDs.
-func decodePeerIDWithFallback(s string) (peer.ID, error) {
-	pid, err := peer.Decode(s)
-	if err != nil {
-		if mhBytes, mhErr := mh.FromB58String(s); mhErr == nil {
-			pid, err = peer.IDFromBytes(mhBytes)
-		}
-	}
-	return pid, err
-}
 
 // shardIDsUpToDepth returns all shard IDs in the binary tree up to the given depth.
 // Depth 0: [""]. Depth 1: ["", "0", "1"]. Depth 2: ["", "0", "1", "00", "01", "10", "11"].
@@ -145,28 +132,28 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 			// Ignore probe messages from other monitors.
 
 		case hasPrefix(data, "LEAVE:"):
-			if peerStr := strings.TrimSpace(string(data[len("LEAVE:"):])); peerStr != "" {
-				if leaveID, err := decodePeerIDWithFallback(peerStr); err == nil {
-					m.handleLeaveShard(ctx, leaveID, shardID)
-					slog.Info("shard leave", "peer", leaveID.String(), "shard", shardLabel(shardID))
-				}
-			}
+			m.dispatchLeave(ctx, senderID, shardID)
 
 		case hasPrefix(data, "JOIN:"):
-			m.dispatchJoin(ctx, data[len("JOIN:"):], senderID, shardID, ip)
+			m.dispatchJoin(ctx, data, senderID, shardID, ip)
 
 		case hasPrefix(data, "PINNED:"):
-			m.handleHeartbeat(ctx, senderID, shardID, ip, -1, "", "")
+			nodeID, ok := m.helpers.Resolve(senderID, nil)
+			if !ok {
+				break
+			}
+			m.handleHeartbeat(ctx, nodeID, senderID, shardID, ip, -1, "", "")
 			if manifestCID, err := cid.Decode(string(data[len("PINNED:"):])); err == nil {
 				im := schema.IngestMessage{SignedEnvelope: schema.SignedEnvelope{ManifestCID: manifestCID}, ShardID: shardID}
-				m.handleIngestMessage(ctx, &im, senderID, shardID, ip)
+				m.handleIngestMessage(ctx, &im, nodeID, senderID, shardID, ip)
 			}
 
 		default:
-			m.handleHeartbeat(ctx, senderID, shardID, ip, -1, "", "")
 			var im schema.IngestMessage
 			if err := im.UnmarshalCBOR(data); err == nil {
 				m.dispatchIngestMessage(ctx, &im, senderID, shardID, ip)
+			} else if nodeID, ok := m.helpers.Resolve(senderID, nil); ok {
+				m.handleHeartbeat(ctx, nodeID, senderID, shardID, ip, -1, "", "")
 			}
 		}
 	}
@@ -176,65 +163,43 @@ func hasPrefix(data []byte, prefix string) bool {
 	return len(data) >= len(prefix) && string(data[:len(prefix)]) == prefix
 }
 
-// dispatchHeartbeat parses a HEARTBEAT:<peerID>:<pinned>:<role>:<name> message.
+// dispatchHeartbeat parses a HEARTBEAT message and records it for the node
+// its binding names.
 func (m *Monitor) dispatchHeartbeat(ctx context.Context, data []byte, senderID peer.ID, shardID, ip string) {
 	if len(data) > 500 {
 		return
 	}
-	parts := strings.SplitN(string(data), ":", 5)
-	if len(parts) < 2 || parts[1] == "" {
-		m.handleHeartbeat(ctx, senderID, shardID, ip, -1, "", "")
+	hb := schema.ParseHeartbeat(data)
+	nodeID, ok := m.helpers.Resolve(senderID, hb.Binding)
+	if !ok {
 		return
 	}
-
-	authorID, err := decodePeerIDWithFallback(parts[1])
-	if err != nil {
-		authorID = senderID
-	}
-	pinnedCount := -1
-	if len(parts) >= 3 {
-		if n, err := fmt.Sscanf(parts[2], "%d", &pinnedCount); n == 0 || err != nil {
-			pinnedCount = -1
-		}
-	}
-	role := "ACTIVE"
-	if len(parts) >= 4 {
-		role = parseRole(parts[3])
-	}
-	var nodeName string
-	if len(parts) >= 5 {
-		nodeName = parts[4]
-	}
-
+	role := parseRole(hb.Role)
 	if shardID != "" {
-		slog.Info("heartbeat", "shard", shardID, "author", peerLabel(authorID.String(), nodeName), "pinned", pinnedCount, "role", role)
+		slog.Info("heartbeat", "shard", shardID, "author", peerLabel(nodeID.String(), hb.Name), "pinned", hb.Pinned, "role", role)
 	}
-	m.handleHeartbeat(ctx, authorID, shardID, ip, pinnedCount, role, nodeName)
+	m.handleHeartbeat(ctx, nodeID, senderID, shardID, ip, hb.Pinned, role, hb.Name)
 }
 
-// dispatchJoin parses a JOIN:<peerID>:<role>:<name> message (data starts after "JOIN:").
+// dispatchLeave handles a LEAVE message. It counts for the sender's node,
+// whatever peer ID the message names.
+func (m *Monitor) dispatchLeave(ctx context.Context, senderID peer.ID, shardID string) {
+	if nodeID, ok := m.helpers.Resolve(senderID, nil); ok {
+		m.handleLeaveShard(ctx, nodeID, shardID)
+		slog.Info("shard leave", "peer", nodeID.String(), "shard", shardLabel(shardID))
+	}
+}
+
+// dispatchJoin parses a JOIN message.
 func (m *Monitor) dispatchJoin(ctx context.Context, data []byte, senderID peer.ID, shardID, ip string) {
-	parts := strings.SplitN(string(data), ":", 3)
-	peerStr := strings.TrimSpace(parts[0])
-	if peerStr == "" {
+	j := schema.ParseJoin(data)
+	nodeID, ok := m.helpers.Resolve(senderID, j.Binding)
+	if !ok {
 		return
 	}
-	joinID, err := decodePeerIDWithFallback(peerStr)
-	if err != nil {
-		return
-	}
-
-	role := "ACTIVE"
-	if len(parts) >= 2 {
-		role = parseRole(parts[1])
-	}
-	var nodeName string
-	if len(parts) >= 3 {
-		nodeName = parts[2]
-	}
-
-	if m.handleHeartbeat(ctx, joinID, shardID, ip, -1, role, nodeName) {
-		slog.Info("shard join", "peer", peerLabel(joinID.String(), nodeName), "shard", shardLabel(shardID), "role", role)
+	role := parseRole(j.Role)
+	if m.handleHeartbeat(ctx, nodeID, senderID, shardID, ip, -1, role, j.Name) {
+		slog.Info("shard join", "peer", peerLabel(nodeID.String(), j.Name), "shard", shardLabel(shardID), "role", role)
 	}
 }
 
@@ -250,13 +215,13 @@ func (m *Monitor) dispatchIngestMessage(ctx context.Context, im *schema.IngestMe
 			m.ensureShardSubscription(context.Background(), targetShard)
 		}
 	}
-	authorID := im.SenderID
-	if authorID == "" {
-		authorID = senderID
+	nodeID, ok := m.helpers.Resolve(senderID, im.Binding())
+	if !ok {
+		return
 	}
-	m.handleIngestMessage(ctx, im, authorID, targetShard, ip)
-	m.ensureMinPinnedForPeer(ctx, authorID.String(), 1)
-	m.handleHeartbeat(ctx, authorID, targetShard, ip, -1, "", "")
+	m.handleIngestMessage(ctx, im, nodeID, senderID, targetShard, ip)
+	m.ensureMinPinnedForPeer(ctx, nodeID.String(), 1)
+	m.handleHeartbeat(ctx, nodeID, senderID, targetShard, ip, -1, "", "")
 }
 
 // subscribeToActiveShards runs in the background and periodically subscribes

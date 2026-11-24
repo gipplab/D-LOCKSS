@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/ipfs/go-cid"
-	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"dlockss/internal/badbits"
@@ -26,7 +25,7 @@ const (
 
 // ShardIdentity provides the node's identity and shard membership queries.
 type ShardIdentity interface {
-	PeerID() peer.ID
+	NodeID() peer.ID
 	GetShardInfo() string
 	AnnouncePinned(manifestCID string)
 	AmIResponsibleFor(key string) bool
@@ -68,6 +67,11 @@ type MessageSigner interface {
 	SignProtocolMessage(msg schema.Signable) error
 }
 
+// NodeSigner signs data with the Kubo node's key ('ipfs key sign').
+type NodeSigner interface {
+	SignWithNodeKey(ctx context.Context, data []byte) ([]byte, error)
+}
+
 // FileProcessor handles file ingestion and processing.
 type FileProcessor struct {
 	cfg        *config.Config
@@ -75,17 +79,20 @@ type FileProcessor struct {
 	badBits    *badbits.Filter
 	shardMgr   ShardCoordinator
 	storageMgr StorageTracker
-	privKey    crypto.PrivKey
+	nodeSigner NodeSigner
 	jobQueue   chan string
 	signer     MessageSigner
 	ctx        context.Context
 	cancel     context.CancelFunc
+	loops      sync.WaitGroup // workers and the retry loop
 
 	retryQueue []string
 	retryMu    sync.Mutex
 
 	recentIngestMu sync.Mutex
 	recentIngests  map[string]time.Time
+
+	manifests manifestIndex
 
 	deduperMu   sync.Mutex
 	deduperInfo map[string]fileEventInfo
@@ -103,7 +110,7 @@ type FileProcessorConfig struct {
 	IPFSClient ipfs.IPFSClient
 	Shard      ShardCoordinator
 	Storage    StorageTracker
-	PrivKey    crypto.PrivKey
+	NodeSigner NodeSigner
 	Signer     MessageSigner
 	BadBits    *badbits.Filter
 }
@@ -117,7 +124,7 @@ func NewFileProcessor(cfg FileProcessorConfig) *FileProcessor {
 		badBits:        cfg.BadBits,
 		shardMgr:       cfg.Shard,
 		storageMgr:     cfg.Storage,
-		privKey:        cfg.PrivKey,
+		nodeSigner:     cfg.NodeSigner,
 		signer:         cfg.Signer,
 		jobQueue:       make(chan string, cfg.Cfg.Files.MaxConcurrentFileProcessing*100),
 		ctx:            ctx,
@@ -128,13 +135,13 @@ func NewFileProcessor(cfg FileProcessorConfig) *FileProcessor {
 		stabilityTimer: make(map[string]*time.Timer),
 	}
 	fp.startWorkers()
-	go fp.retryLoop()
+	fp.loops.Go(fp.retryLoop)
 	return fp
 }
 
 func (fp *FileProcessor) startWorkers() {
 	for i := 0; i < fp.cfg.Files.MaxConcurrentFileProcessing; i++ {
-		go fp.workerLoop()
+		fp.loops.Go(fp.workerLoop)
 	}
 }
 
@@ -149,9 +156,11 @@ func (fp *FileProcessor) workerLoop() {
 	}
 }
 
-// Stop stops the file processor workers.
+// Stop stops the file processor workers and waits until they have exited, so
+// that no job is taken from the queue afterwards.
 func (fp *FileProcessor) Stop() {
 	fp.cancel()
+	fp.loops.Wait()
 }
 
 // retryLoop periodically drains the retry queue and re-attempts enqueue.
@@ -195,6 +204,9 @@ func (fp *FileProcessor) drainRetryQueue() {
 
 // ScanExistingFiles walks the data directory and processes any existing files.
 func (fp *FileProcessor) ScanExistingFiles() {
+	if fp.shardMgr.IsLocalNodeIngestor() {
+		fp.loadManifestIndex()
+	}
 	var fileCount int
 	err := filepath.Walk(fp.cfg.FileWatchFolder, func(path string, info os.FileInfo, err error) error {
 		if err != nil {

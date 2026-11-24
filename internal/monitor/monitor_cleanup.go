@@ -33,17 +33,7 @@ func (m *Monitor) PruneStaleNodes() {
 		if now.Sub(node.LastSeen) <= timeout {
 			continue
 		}
-		delete(m.nodes, id)
-		delete(m.nodeFiles, id)
-		delete(m.peerShardLastSeen, id)
-		delete(m.peerLastSiblingMove, id)
-		for manifest, peers := range m.manifestReplication {
-			delete(peers, id)
-			if len(peers) == 0 {
-				delete(m.manifestReplication, manifest)
-				delete(m.manifestShard, manifest)
-			}
-		}
+		m.forgetNodeLocked(id)
 		pruned++
 	}
 	if pruned > 0 {
@@ -52,6 +42,26 @@ func (m *Monitor) PruneStaleNodes() {
 		m.pruneOrphanedSplitEvents()
 	}
 	m.pruneOldSplitEvents(now)
+}
+
+// forgetNodeLocked removes node id and everything recorded for it.
+func (m *Monitor) forgetNodeLocked(id string) {
+	if ns, ok := m.nodes[id]; ok && ns.HelperID != "" {
+		if helper, err := peer.Decode(ns.HelperID); err == nil {
+			m.helpers.Forget(helper)
+		}
+	}
+	delete(m.nodes, id)
+	delete(m.nodeFiles, id)
+	delete(m.peerShardLastSeen, id)
+	delete(m.peerLastSiblingMove, id)
+	for manifest, peers := range m.manifestReplication {
+		delete(peers, id)
+		if len(peers) == 0 {
+			delete(m.manifestReplication, manifest)
+			delete(m.manifestShard, manifest)
+		}
+	}
 }
 
 func (m *Monitor) pruneOldSplitEvents(now time.Time) {

@@ -133,7 +133,7 @@ func (fp *FileProcessor) importFileToIPFS(ctx context.Context, path string) (cid
 // buildAndStoreManifest signs and stores the manifest for payloadCID. On
 // failure it calls cleanupPayload.
 func (fp *FileProcessor) buildAndStoreManifest(ctx context.Context, metaRef string, size uint64, payloadCID cid.Cid, cleanupPayload func()) (cid.Cid, string, error) {
-	ro := schema.NewResearchObject(metaRef, fp.shardMgr.PeerID(), payloadCID, size)
+	ro := schema.NewResearchObject(metaRef, fp.shardMgr.NodeID(), payloadCID, size)
 	manifestCID, err := fp.storeManifest(ctx, ro)
 	if err != nil {
 		cleanupPayload()
@@ -142,8 +142,14 @@ func (fp *FileProcessor) buildAndStoreManifest(ctx context.Context, metaRef stri
 	return manifestCID, manifestCID.String(), nil
 }
 
+// storeManifest signs ro and stores it in IPFS, or returns this node's pinned
+// manifest with the same content.
 func (fp *FileProcessor) storeManifest(ctx context.Context, ro *schema.ResearchObject) (cid.Cid, error) {
-	if err := fp.signResearchObject(ro); err != nil {
+	if c, ok := fp.existingManifest(ro); ok {
+		slog.Debug("reusing existing manifest", "manifest", c, "payload", ro.Payload)
+		return c, nil
+	}
+	if err := fp.signResearchObject(ctx, ro); err != nil {
 		return cid.Cid{}, err
 	}
 	roBytes, err := ro.MarshalCBOR()
@@ -157,9 +163,10 @@ func (fp *FileProcessor) storeManifest(ctx context.Context, ro *schema.ResearchO
 	return manifestCID, nil
 }
 
-func (fp *FileProcessor) signResearchObject(ro *schema.ResearchObject) error {
-	if fp.privKey == nil {
-		slog.Warn("missing private key, manifest will not be signed")
+// signResearchObject has the Kubo node sign ro.
+func (fp *FileProcessor) signResearchObject(ctx context.Context, ro *schema.ResearchObject) error {
+	if fp.nodeSigner == nil {
+		slog.Warn("no node signer, manifest will not be signed")
 		return nil
 	}
 
@@ -168,7 +175,7 @@ func (fp *FileProcessor) signResearchObject(ro *schema.ResearchObject) error {
 		return fmt.Errorf("failed to marshal for signing: %w", err)
 	}
 
-	sig, err := fp.privKey.Sign(unsignedBytes)
+	sig, err := fp.nodeSigner.SignWithNodeKey(ctx, unsignedBytes)
 	if err != nil {
 		return fmt.Errorf("failed to sign: %w", err)
 	}

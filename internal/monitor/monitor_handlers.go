@@ -25,9 +25,9 @@ func writeJSONError(w http.ResponseWriter, msg string, code int) {
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
-func (m *Monitor) handleIngestMessage(ctx context.Context, im *schema.IngestMessage, senderID peer.ID, shardID string, ip string) {
+func (m *Monitor) handleIngestMessage(ctx context.Context, im *schema.IngestMessage, nodeID peer.ID, helperID peer.ID, shardID string, ip string) {
 	now := time.Now()
-	peerIDStr := senderID.String()
+	peerIDStr := nodeID.String()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -50,6 +50,7 @@ func (m *Monitor) handleIngestMessage(ctx context.Context, im *schema.IngestMess
 		m.nodeFiles[peerIDStr] = make(map[string]time.Time)
 		m.treeDirty = true
 	}
+	ns.setHelper(helperID)
 
 	ns.LastSeen = now
 	manifestCIDStr := im.ManifestCID.String()
@@ -114,11 +115,19 @@ func (m *Monitor) dropPeerReplicasLocked(peerIDStr string, drop func(manifest st
 	return removed
 }
 
-// handleHeartbeat records that a peer is alive in shardID. A negative
+// setHelper records the D-LOCKSS helper that last spoke for the node.
+func (ns *nodeState) setHelper(helper peer.ID) {
+	if helper != "" {
+		ns.HelperID = helper.String()
+	}
+}
+
+// handleHeartbeat records that a node is alive in shardID. nodeID is the Kubo
+// node; helperID is the D-LOCKSS helper that sent the message. A negative
 // pinnedCount means the message carried no pin count.
-func (m *Monitor) handleHeartbeat(ctx context.Context, senderID peer.ID, shardID string, ip string, pinnedCount int, role string, nodeName string) (shardUpdated bool) {
+func (m *Monitor) handleHeartbeat(ctx context.Context, nodeID peer.ID, helperID peer.ID, shardID string, ip string, pinnedCount int, role string, nodeName string) (shardUpdated bool) {
 	now := time.Now()
-	peerIDStr := senderID.String()
+	peerIDStr := nodeID.String()
 	if role == "" {
 		role = "ACTIVE"
 	}
@@ -134,7 +143,7 @@ func (m *Monitor) handleHeartbeat(ctx context.Context, senderID peer.ID, shardID
 	ns, exists := m.nodes[peerIDStr]
 	if !exists {
 		slog.Info("new node discovered via heartbeat", "peer", peerLabel(peerIDStr, nodeName), "shard", shardLabel(shardID), "pinned", pinnedCount, "role", role)
-		m.nodes[peerIDStr] = &nodeState{
+		ns = &nodeState{
 			PeerID:         peerIDStr,
 			NodeName:       nodeName,
 			CurrentShard:   shardID,
@@ -145,9 +154,12 @@ func (m *Monitor) handleHeartbeat(ctx context.Context, senderID peer.ID, shardID
 			IPAddress:      ip,
 			announcedFiles: make(map[string]time.Time),
 		}
+		ns.setHelper(helperID)
+		m.nodes[peerIDStr] = ns
 		m.treeDirty = true
 		return true
 	}
+	ns.setHelper(helperID)
 	ns.LastSeen = now
 	ns.Role = role
 	if nodeName != "" {

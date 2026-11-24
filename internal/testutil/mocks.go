@@ -4,12 +4,16 @@ package testutil
 
 import (
 	"context"
+	"crypto/rand"
 	"testing"
 
 	"github.com/ipfs/go-cid"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/multiformats/go-multihash"
+
+	"dlockss/pkg/schema"
 )
 
 // MockIPFSClient is a no-op implementation of ipfs.IPFSClient.
@@ -32,6 +36,10 @@ func (m *MockIPFSClient) RecursivePins(ctx context.Context) (map[cid.Cid]string,
 	return nil, nil
 }
 func (m *MockIPFSClient) DAGSize(ctx context.Context, c cid.Cid) (uint64, error) { return 0, nil }
+func (m *MockIPFSClient) NodeID(context.Context) (peer.ID, error)                { return "", nil }
+func (m *MockIPFSClient) SignWithNodeKey(ctx context.Context, data []byte) ([]byte, error) {
+	return nil, nil
+}
 
 // MockDHTProvider is a no-op implementation of common.DHTProvider that also
 // satisfies routing.Routing.
@@ -91,4 +99,40 @@ func MustPeerID(t *testing.T, seed string) peer.ID {
 		t.Fatalf("peer.IDFromBytes: %v", err)
 	}
 	return pid
+}
+
+// Key is an Ed25519 key and its peer ID, for a Kubo node or a D-LOCKSS helper.
+type Key struct {
+	Priv crypto.PrivKey
+	ID   peer.ID
+}
+
+// NewKey generates a Key.
+func NewKey(t *testing.T) Key {
+	t.Helper()
+	priv, pub, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := peer.IDFromPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Key{Priv: priv, ID: id}
+}
+
+// SignWithNodeKey signs data as 'ipfs key sign' does, so a Key can stand in
+// for a Kubo node.
+func (k Key) SignWithNodeKey(_ context.Context, data []byte) ([]byte, error) {
+	return k.Priv.Sign(append([]byte(schema.KuboSignPrefix), data...))
+}
+
+// Bind returns k's binding for helper.
+func (k Key) Bind(t *testing.T, helper peer.ID) *schema.Binding {
+	t.Helper()
+	sig, err := k.SignWithNodeKey(context.Background(), schema.BindingMessage(helper))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &schema.Binding{Node: k.ID, Sig: sig}
 }

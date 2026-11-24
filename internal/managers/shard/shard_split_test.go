@@ -16,7 +16,7 @@ func TestSplitShard_NoDeadlock(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		currentShard := sm.getCurrentShard()
-		targetChild := common.GetBinaryPrefix(sm.h.ID().String(), len(currentShard)+1)
+		targetChild := common.GetBinaryPrefix(sm.nodeID.String(), len(currentShard)+1)
 		sm.moveToShard(currentShard, targetChild, false)
 		close(done)
 	}()
@@ -27,7 +27,7 @@ func TestSplitShard_NoDeadlock(t *testing.T) {
 		t.Fatal("splitShard timed out - likely deadlock")
 	}
 
-	expectedShard := common.GetBinaryPrefix(sm.h.ID().String(), 1)
+	expectedShard := common.GetBinaryPrefix(sm.nodeID.String(), 1)
 	if currentShard := sm.GetShardInfo(); currentShard != expectedShard {
 		t.Errorf("expected shard %s, got %s", expectedShard, currentShard)
 	}

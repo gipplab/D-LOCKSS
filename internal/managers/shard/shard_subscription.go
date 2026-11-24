@@ -163,7 +163,7 @@ func (sm *ShardManager) LeaveShard(shardID string) {
 
 	delete(sm.observerOnlyShards, shardID)
 	if !sub.observerOnly {
-		_ = sub.topic.Publish(sm.ctx, []byte(msgPrefixLeave+sm.h.ID().String()))
+		_ = sub.topic.Publish(sm.ctx, sm.leaveMessage())
 		// The lock is released while LEAVE goes out, so the subscription can
 		// be removed, replaced or joined again in the meantime.
 		sm.mu.Unlock()

@@ -2,6 +2,7 @@ package ipfs
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -9,8 +10,10 @@ import (
 	"os"
 	"strings"
 
+	"github.com/ipfs/boxo/files"
 	"github.com/ipfs/go-cid"
 	ipfsapi "github.com/ipfs/go-ipfs-api"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 // IPFSClient is the interface for IPFS node operations.
@@ -24,6 +27,8 @@ type IPFSClient interface {
 	IsPinned(ctx context.Context, root cid.Cid) (bool, error)
 	RecursivePins(ctx context.Context) (map[cid.Cid]string, error)
 	DAGSize(ctx context.Context, root cid.Cid) (uint64, error)
+	NodeID(ctx context.Context) (peer.ID, error)
+	SignWithNodeKey(ctx context.Context, data []byte) ([]byte, error)
 }
 
 // ManifestPinName labels the Kubo pins of D-LOCKSS manifests, so pin-based
@@ -204,4 +209,27 @@ func (c *Client) IsPinned(ctx context.Context, root cid.Cid) (bool, error) {
 	}
 	_, ok := raw.Keys[root.String()]
 	return ok, nil
+}
+
+// NodeID returns the peer ID of the Kubo node.
+func (c *Client) NodeID(ctx context.Context) (peer.ID, error) {
+	var out struct{ ID string }
+	if err := c.api.Request("id").Exec(ctx, &out); err != nil {
+		return "", fmt.Errorf("id failed: %w", err)
+	}
+	return peer.Decode(out.ID)
+}
+
+// SignWithNodeKey signs data with the Kubo node's key, as 'ipfs key sign' does.
+func (c *Client) SignWithNodeKey(ctx context.Context, data []byte) ([]byte, error) {
+	var out struct{ Signature string }
+	body := files.NewSliceDirectory([]files.DirEntry{files.FileEntry("", files.NewBytesFile(data))})
+	if err := c.api.Request("key/sign").Body(files.NewMultiFileReader(body, true, false)).Exec(ctx, &out); err != nil {
+		return nil, fmt.Errorf("key/sign failed: %w", err)
+	}
+	sig, ok := strings.CutPrefix(out.Signature, "u")
+	if !ok {
+		return nil, fmt.Errorf("key/sign returned an unexpected signature encoding %q", out.Signature)
+	}
+	return base64.RawURLEncoding.DecodeString(sig)
 }
