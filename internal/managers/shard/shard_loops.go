@@ -47,67 +47,48 @@ func (sm *ShardManager) sendHeartbeat() {
 
 	sm.announcePinnedFilesBatch(sub.topic, 20)
 
-	sm.reprovideNextPinnedFile()
+	sm.completeNextPinnedFile()
 }
 
-// reprovideNextPinnedFile re-pins one manifest each heartbeat (fetching any
-// missing blocks), then provides both manifest and payload CIDs to the DHT.
-// This gradually completes incomplete DAGs on resource-constrained nodes
-// and keeps DHT provider records fresh (~24h expiry).
-// A CAS guard prevents concurrent iterations from piling up.
-func (sm *ShardManager) reprovideNextPinnedFile() {
-	if !sm.reprovideInFlight.CompareAndSwap(false, true) {
+// completeNextPinnedFile re-pins the next pinned manifest that is not yet
+// known to be complete, which fetches blocks that a failed first pin left
+// out (e.g. OOM or a timeout on a Pi), and pins its payload as its own root.
+// Kubo re-pins by walking the whole DAG, so complete files are skipped.
+// Kubo's reprovider announces pin roots. A CAS guard keeps one run at a time.
+func (sm *ShardManager) completeNextPinnedFile() {
+	if !sm.repinInFlight.CompareAndSwap(false, true) {
 		return
 	}
 	manifestCIDStr := sm.storageMgr.GetNextFileToAnnounce()
-	if manifestCIDStr == "" {
-		sm.reprovideInFlight.Store(false)
+	if manifestCIDStr == "" || sm.storageMgr.IsComplete(manifestCIDStr) {
+		sm.repinInFlight.Store(false)
 		return
 	}
 	go func() {
-		defer sm.reprovideInFlight.Store(false)
+		defer sm.repinInFlight.Store(false)
 
 		manifestCID, err := cid.Decode(manifestCIDStr)
 		if err != nil {
 			return
 		}
-
-		// Re-pin to fetch any blocks missed by the initial PinRecursive
-		// (e.g. OOM/timeout on low-memory Pis). Idempotent: returns
-		// quickly when the DAG is already complete locally.
-		pinCtx, pinCancel := context.WithTimeout(sm.ctx, 2*time.Minute)
-		err = sm.ipfsClient.PinManifest(pinCtx, manifestCID)
-		pinCancel()
-		if err != nil {
-			slog.Debug("reprovide pin failed, will retry", "manifest", manifestCIDStr, "error", err)
+		ctx, cancel := context.WithTimeout(sm.ctx, 2*time.Minute)
+		defer cancel()
+		if err := sm.ipfsClient.PinManifest(ctx, manifestCID); err != nil {
+			slog.Debug("re-pin failed, will retry", "manifest", manifestCIDStr, "error", err)
 			return
 		}
-
-		pctx, pcancel := context.WithTimeout(sm.ctx, sm.cfg.Files.DHTProvideTimeout)
-		defer pcancel()
-		sm.storageMgr.ProvideFile(pctx, manifestCIDStr)
-
-		block, err := sm.ipfsClient.GetBlock(pctx, manifestCID)
+		block, err := sm.ipfsClient.GetBlock(ctx, manifestCID)
 		if err != nil {
 			return
 		}
 		var ro schema.ResearchObject
-		if err := ro.UnmarshalCBOR(block); err != nil {
-			return
+		if err := ro.UnmarshalCBOR(block); err == nil && !ro.HasLegacyTimestamp && ro.Payload.Defined() {
+			if err := sm.ipfsClient.PinRecursive(ctx, ro.Payload); err != nil {
+				slog.Debug("re-pin payload failed, will retry", "payload", ro.Payload, "error", err)
+				return
+			}
 		}
-		if ro.HasLegacyTimestamp {
-			return
-		}
-		payloadCID := ro.Payload
-		if !payloadCID.Defined() {
-			return
-		}
-		if err := sm.ipfsClient.PinRecursive(sm.ctx, payloadCID); err != nil {
-			slog.Debug("reprovide pin payload failed", "payload", payloadCID, "error", err)
-		}
-		pctx2, pcancel2 := context.WithTimeout(sm.ctx, sm.cfg.Files.DHTProvideTimeout)
-		defer pcancel2()
-		sm.storageMgr.ProvideFile(pctx2, payloadCID.String())
+		sm.storageMgr.MarkComplete(manifestCIDStr)
 	}()
 }
 

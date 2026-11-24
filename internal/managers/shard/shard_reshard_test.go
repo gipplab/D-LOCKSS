@@ -24,6 +24,8 @@ type recordingStorage struct {
 	providers      int            // reported by ProviderCount for every key
 	providersByKey map[string]int // per-key override; nil keeps providers
 	lookups        int            // ProviderCount calls
+	next           string         // returned by GetNextFileToAnnounce
+	complete       map[string]bool
 }
 
 func newRecordingStorage() *recordingStorage {
@@ -31,12 +33,23 @@ func newRecordingStorage() *recordingStorage {
 		knownFiles:  make(map[string]bool),
 		pinnedFiles: make(map[string]bool),
 		pinTimes:    make(map[string]time.Time),
+		complete:    make(map[string]bool),
 	}
 }
 
 func (s *recordingStorage) CanAcceptCustodialFile() bool  { return true }
-func (s *recordingStorage) GetNextFileToAnnounce() string { return "" }
-func (s *recordingStorage) GetPinnedCount() int           { return len(s.pinnedFiles) }
+func (s *recordingStorage) GetNextFileToAnnounce() string { return s.next }
+func (s *recordingStorage) IsComplete(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.complete[key]
+}
+func (s *recordingStorage) MarkComplete(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.complete[key] = true
+}
+func (s *recordingStorage) GetPinnedCount() int { return len(s.pinnedFiles) }
 func (s *recordingStorage) GetPinnedManifests() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()

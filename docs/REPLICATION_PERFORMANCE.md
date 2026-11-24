@@ -63,15 +63,15 @@ At most 50 `ReplicationRequest` messages are sent per checker cycle. With thousa
 
 ## Heartbeat-Driven Gradual DAG Completion (Built-In)
 
-Every heartbeat (~10s), each node picks **one** pinned manifest CID (round-robin) and:
+Every heartbeat (~10s), each node picks **one** pinned manifest CID (round-robin). Unless the file is already known to be complete, it:
 
-1. **Re-pins the ManifestCID recursively** (`PinManifest`, 2-minute timeout). Idempotent: it returns instantly when the DAG is already complete locally and fetches missing blocks otherwise.
-2. **Pins the PayloadCID as its own root** so Kubo's reprovider (`pinned` strategy) re-announces it.
-3. **Provides both CIDs to the DHT** (only if the re-pin succeeded).
+1. **Re-pins the ManifestCID recursively** (`PinManifest`, 2-minute timeout), fetching missing blocks.
+2. **Pins the PayloadCID as its own root** so Kubo's reprovider announces it.
+3. **Marks the file complete** once both pins succeed, so it is not re-pinned again until it is unpinned.
 
-A `CompareAndSwap` guard prevents concurrent re-provides from piling up.
+A `CompareAndSwap` guard keeps one re-pin at a time.
 
-**Impact**: Resource-constrained nodes (e.g., Raspberry Pis) that failed the initial pin gradually complete the DAG over successive heartbeats without manual intervention. DHT provider records (which expire after ~24h) are kept fresh.
+**Impact**: Resource-constrained nodes (e.g., Raspberry Pis) that failed the initial pin gradually complete the DAG over successive heartbeats without manual intervention. Complete files cost nothing per heartbeat; Kubo's reprovider keeps DHT provider records fresh.
 
 ## Optimization Options
 

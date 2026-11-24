@@ -68,7 +68,7 @@ class ShardManager {
     - observerOnlyShards: map[string]struct{}
     - reshardedFiles: *common.KnownFiles
     - orphanHandoffSent: map[...]
-    - reprovideInFlight: atomic.Bool
+    - repinInFlight: atomic.Bool
     - repl: *replicationManager
     - lifecycle: *lifecycleManager
     --

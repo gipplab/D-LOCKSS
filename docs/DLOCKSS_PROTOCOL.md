@@ -183,23 +183,21 @@ Replication is handled by the **Cluster Manager**, **LocalPinTracker**, and **re
     *   **Not pinned (auto-replication)**: Fetch and pin the manifest via `PinManifest` (timeout: 5 minutes), add to cluster via `ClusterPinIfAbsent`, and trigger sync. Concurrency is bounded by a semaphore (default: 5 concurrent auto-replications).
     *   Legacy manifests (containing a `ts` field) are silently ignored.
 
-### 6.2.1 Heartbeat-Driven Re-Pin and Re-Provide
+### 6.2.1 Heartbeat-Driven Re-Pin
 
-Each heartbeat cycle (~10s), every node picks **one** pinned manifest CID (round-robin) and:
+Each heartbeat cycle (~10s), every node picks **one** pinned manifest CID (round-robin). Unless the node already knows the file is complete, it:
 
-1. **Re-pins the ManifestCID recursively** (`PinManifest`, 2min timeout). This is idempotent: it returns instantly when the DAG is already complete locally and fetches missing blocks otherwise. It also names manifest pins created before pins were named. On resource-constrained nodes (e.g. Raspberry Pis) where the initial pin may have timed out or been OOM-killed before completing the full DAG, this gradually fills in the missing blocks over successive heartbeats.
-2. **Pins the PayloadCID as its own root** so Kubo's reprovider (`pinned` strategy) re-announces it. Blocks are already local from step 1, so this returns quickly.
-3. **Provides the manifest CID and its payload CID to the DHT** (only if the re-pin succeeded).
+1. **Re-pins the ManifestCID recursively** (`PinManifest`, 2min timeout), which fetches missing blocks and names manifest pins created before pins were named. On resource-constrained nodes (e.g. Raspberry Pis) where the initial pin may have timed out or been OOM-killed before completing the full DAG, this fills in the missing blocks over successive heartbeats.
+2. **Pins the PayloadCID as its own root**, so Kubo's reprovider announces it.
+3. **Marks the file complete** once both pins succeed. Kubo re-pins by walking the whole DAG, so complete files are skipped until they are unpinned; after a restart each file is checked once more.
 
-A `CompareAndSwap` guard prevents concurrent re-provides from piling up; if the previous heartbeat's re-pin is still in flight, the current one is skipped.
+A `CompareAndSwap` guard keeps one re-pin at a time; if the previous heartbeat's re-pin is still in flight, the current one is skipped.
 
-This mechanism serves two purposes:
-- **DAG completion**: Pis that failed to fully fetch a large file on first pin will eventually complete it without any manual intervention.
-- **DHT freshness**: Provider records expire after ~24h; periodic re-provides keep them live.
+DHT provider records are kept fresh by Kubo's reprovider, which announces the pin roots (manifest and payload) on its own schedule.
 
 ### 6.2.2 Public retrieval (e.g. ipfs.io)
 
-Cluster data is advertised to the **public IPFS DHT** (manifest and payload when responsible; manifest and payload when a replica syncs a pin; and periodically via heartbeat re-provide). Public gateways such as ipfs.io use the same DHT to find providers. For gateways to **actually fetch** content, nodes that hold the data must be **reachable** from the internet (e.g. public IP or relay). Nodes behind NAT with no port forwarding may appear as providers in the DHT but fail to accept connections from the gateway.
+Cluster data is advertised to the **public IPFS DHT** (manifest and payload when responsible; manifest and payload when a replica syncs a pin; and periodically by Kubo's reprovider). Public gateways such as ipfs.io use the same DHT to find providers. For gateways to **actually fetch** content, nodes that hold the data must be **reachable** from the internet (e.g. public IP or relay). Nodes behind NAT with no port forwarding may appear as providers in the DHT but fail to accept connections from the gateway.
 
 ### 6.3 Custodial Handoff (Tourist)
 

@@ -22,8 +22,11 @@ type StorageManager struct {
 	badBits     *badbits.Filter
 	disk        *DiskMonitor
 	pinnedFiles *common.PinnedSet
-	knownFiles  *common.KnownFiles
-	provideSem  chan struct{}
+	// completeFiles holds pinned manifests whose DAG is known to be fully
+	// stored locally.
+	completeFiles *common.PinnedSet
+	knownFiles    *common.KnownFiles
+	provideSem    chan struct{}
 
 	announceMu        sync.Mutex
 	announceIndex     int
@@ -38,13 +41,14 @@ func NewStorageManager(cfg *config.Config, dht common.DHTProvider, badBits *badb
 		maxProvides = 8
 	}
 	return &StorageManager{
-		cfg:         cfg,
-		dht:         dht,
-		badBits:     badBits,
-		disk:        NewDiskMonitor(cfg.FileWatchFolder, cfg.DiskUsageHighWaterMark),
-		pinnedFiles: common.NewPinnedSet(),
-		knownFiles:  common.NewKnownFiles(),
-		provideSem:  make(chan struct{}, maxProvides),
+		cfg:           cfg,
+		dht:           dht,
+		badBits:       badBits,
+		disk:          NewDiskMonitor(cfg.FileWatchFolder, cfg.DiskUsageHighWaterMark),
+		pinnedFiles:   common.NewPinnedSet(),
+		completeFiles: common.NewPinnedSet(),
+		knownFiles:    common.NewKnownFiles(),
+		provideSem:    make(chan struct{}, maxProvides),
 	}
 }
 
@@ -116,6 +120,7 @@ func (sm *StorageManager) PinFile(manifestCIDStr string) bool {
 
 // UnpinFile removes a file/manifest from the pinned set.
 func (sm *StorageManager) UnpinFile(key string) {
+	sm.completeFiles.RemoveIfPresent(key)
 	pinTime, ok := sm.pinnedFiles.RemoveIfPresent(key)
 	if ok {
 		sm.invalidateAnnounceKeys()
@@ -130,6 +135,18 @@ func (sm *StorageManager) IsPinned(key string) bool {
 	return sm.pinnedFiles.Has(key)
 }
 
+// MarkComplete records that the DAG of the pinned manifest key is fully
+// stored locally. UnpinFile forgets it.
+func (sm *StorageManager) MarkComplete(key string) {
+	sm.completeFiles.Add(key)
+}
+
+// IsComplete reports whether MarkComplete was called for key since it was
+// last unpinned.
+func (sm *StorageManager) IsComplete(key string) bool {
+	return sm.completeFiles.Has(key)
+}
+
 // AddKnownFile adds a file/manifest to the known files set.
 func (sm *StorageManager) AddKnownFile(key string) {
 	sm.knownFiles.Add(key)
@@ -137,8 +154,8 @@ func (sm *StorageManager) AddKnownFile(key string) {
 
 // ProvideFile announces a file/manifest to the DHT.
 // Concurrency is bounded by MaxConcurrentDHTProvides. If all slots are busy
-// the call returns immediately; the heartbeat re-provide loop picks up any
-// files skipped during bulk syncs.
+// the call returns immediately; Kubo's reprovider announces pin roots on its
+// own schedule.
 func (sm *StorageManager) ProvideFile(ctx context.Context, key string) {
 	if sm.dht == nil {
 		return

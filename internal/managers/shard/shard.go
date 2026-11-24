@@ -37,6 +37,7 @@ type StorageReader interface {
 	GetPinnedManifests() []string
 	GetPinnedCount() int
 	GetNextFileToAnnounce() string
+	IsComplete(key string) bool
 	ProviderCount(ctx context.Context, key string, self peer.ID, limit int) int
 }
 
@@ -45,6 +46,7 @@ type StorageWriter interface {
 	PinFile(manifestCIDStr string) bool
 	UnpinFile(key string)
 	AddKnownFile(key string)
+	MarkComplete(key string)
 	ProvideFile(ctx context.Context, key string)
 }
 
@@ -131,7 +133,7 @@ type ShardManager struct {
 
 	reshardedFiles    *common.KnownFiles
 	orphanHandoffSent map[string]map[string]*orphanHandoffInfo
-	reprovideInFlight atomic.Bool
+	repinInFlight     atomic.Bool
 	// custodialChecked is the time of each pinned file's last custodial
 	// provider lookup. Only RunCustodialRetryPass uses it.
 	custodialChecked map[string]time.Time
