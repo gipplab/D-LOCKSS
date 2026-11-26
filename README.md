@@ -34,9 +34,9 @@
     *(Windows: `dlockss.exe`)*
 
 2.  **Add Files:**
-    Either pin content in the node's Kubo (`ipfs pin add <cid>`, or "Set pinning" in the Kubo WebUI / IPFS Desktop),
-    or copy any file (e.g., PDF) into the data directory (default `./data` or `DLOCKSS_DATA_DIR`).
-    The node will automatically detect, ingest, pin, and replicate it.
+    Pin content in the node's Kubo (`ipfs pin add <cid>`, or "Set pinning" in the Kubo WebUI / IPFS Desktop).
+    The node will automatically detect, ingest, and replicate it. D-LOCKSS ingests only what reaches Kubo: pins,
+    and uploads to a node with `DLOCKSS_WIKI_API` set (below).
 
     A pinned directory is ingested as one object. A pin name (`ipfs pin add --name paper.pdf <cid>`) becomes the
     metadata reference, otherwise `ipfs://<cid>`. Files that are only in the WebUI's *Files* view (MFS) are not
@@ -44,23 +44,40 @@
     or the payloads they reference. Unpinning in Kubo does not remove ingested content from D-LOCKSS.
     Disable with `DLOCKSS_PIN_INGEST=false`; the poll interval is `DLOCKSS_PIN_INGEST_INTERVAL` (default `1m`).
 
-3.  **Upload to Another Node:**
-    A node with `DLOCKSS_WIKI_API` set (e.g. `https://portal.mardi4nfdi.de/w/rest.php`) accepts uploads signed with
-    a key that the wiki trusts. Create a key with `ipfs key gen mykey`, register it in the wiki, then:
+3.  **Signed Files (`DLOCKSS_WIKI_API`):**
+    With `DLOCKSS_WIKI_API` set (e.g. `https://portal.mardi4nfdi.de/w/rest.php`), the node ingests only files that a
+    user signed with a key the wiki knows, and accepts uploads. Files that other nodes ingested are still replicated,
+    signed or not. Without it, pins are ingested unsigned and uploads are disabled.
+
+    Each manifest records one user's key and signature (`uploader`, `uploader_sig`); a file that several users
+    signed gets one manifest per signature. So a user's files can be found by the key alone: a user who moves to
+    another institution keeps the key, and the node there can find and check their files by its peer ID.
+
+    **Upload to a node.** Create a key with `ipfs key gen mykey`, register it in the wiki, then:
     ```bash
     cid=$(ipfs add -Q -n --cid-version=1 --raw-leaves --chunker=size-1048576 --hash=sha2-256 --max-file-links=1024 paper.pdf)
     sig=$(printf 'dlockss-upload %s' "$cid" | ipfs key sign -k mykey | jq -r .Signature)
     key=$(ipfs key list -l --ipns-base=b58mh | awk '$2=="mykey"{print $1}')
     curl --data-binary @paper.pdf "http://<node>:5050/upload?cid=$cid&key=$key&sig=$sig&name=paper.pdf"
     ```
-    The manifest records the key and the signature. While the wiki is unreachable, the node uses its last answer
-    for a key.
+    On every upload the node asks `GET {DLOCKSS_WIKI_API}/math/v0/key/{peer ID}` whether the wiki knows the key;
+    while the wiki is unreachable, uploads are refused.
+
+    **Pinned files.** For a pin, the node asks the wiki who signed the file:
+    `GET {DLOCKSS_WIKI_API}/math/v0/signatures/{cid}` answers `[{"key":"12D3KooW...","signature":"u..."}, ...]`, each
+    signature made like `sig` above. Every key whose signature verifies gets a manifest; other entries are logged and
+    left out. A file nobody signed is not ingested; an answer of 400 (a CID the wiki cannot sign, such as CIDv0) or
+    404 counts as nobody signed. The node asks when it sees a new pin and again 1 hour, 1 day, 1 week and 1 month
+    later, so a signature the wiki stores later adds a manifest. While the wiki cannot be reached, the node tries
+    again every 30 minutes without using up a check. After a restart the checks start over for pins without a
+    manifest; files ingested before the restart are not checked again.
 
 ### Configuration
 Configure via environment variables:
 
 ```bash
-# Data Directory
+# State: the helper key, node name and cluster store live in the parent of this
+# directory; its disk is the one checked against DLOCKSS_DISK_USAGE_HIGH_WATER_MARK
 export DLOCKSS_DATA_DIR="$HOME/my-data"
 
 # Node Identity
@@ -77,7 +94,9 @@ export DLOCKSS_MAX_PEERS_PER_SHARD=12
 export DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/5001"
 export DLOCKSS_IPFS_TOKEN="" # Kubo RPC token or AuthSecret (bearer:<token>, basic:<user>:<pass>)
 
-# Uploads (empty: disabled); keys are checked with GET {DLOCKSS_WIKI_API}/math/v0/key/{peer ID}
+# Signed files only, and uploads (empty: pins are ingested unsigned, uploads disabled).
+# Keys are checked with GET {DLOCKSS_WIKI_API}/math/v0/key/{peer ID},
+# pinned files get their signatures from GET {DLOCKSS_WIKI_API}/math/v0/signatures/{cid}
 export DLOCKSS_WIKI_API="https://portal.mardi4nfdi.de/w/rest.php"
 
 # DHT tuning
@@ -91,7 +110,7 @@ export DLOCKSS_VERBOSE_LOGGING=true # Enable detailed metrics and status logs
 
 # Who this node will store data from (libp2p peer IDs).
 # A non-empty trusted_peers.json next to the data directory enables the same gate.
-# Include this node's own peer ID if it should ingest local files.
+# Include this node's own peer ID if it should ingest pins and uploads.
 export DLOCKSS_INGEST_ALLOWLIST="12D3KooWPublisherA,12D3KooWPublisherB"
 # export DLOCKSS_TRUST_STORE="/data/trusted_peers.json"
 # export DLOCKSS_TRUST_MODE=allowlist   # also restrict protocol/CRDT writers
@@ -129,8 +148,6 @@ The **node ID** is the Kubo peer ID. D-LOCKSS runs its own libp2p host with a se
 
 For Docker deployments: mount a persistent volume and set `DLOCKSS_DATA_DIR` to a subdirectory on it. The helper key, node name, and cluster state live alongside the data directory.
 
-> **Path safety:** The node refuses to start if the identity key, node name, or cluster store would be placed *inside* the ingest directory (`DLOCKSS_DATA_DIR`), since the file watcher would try to ingest them. Always set `DLOCKSS_DATA_DIR` to a dedicated subdirectory (e.g. `./data`, not `.`).
-
 #### Upgrading from a shared peer ID
 
 Earlier versions read `Identity.PrivKey` from `DLOCKSS_IPFS_CONFIG` and ran D-LOCKSS with Kubo's peer ID. The helper binding changes the protocol, so the pubsub prefix moved from `dlockss-v0.0.3` to `dlockss-v0.0.4`: updated and old nodes do not see each other. Update the monitor together with the first node; it then lists only updated nodes. For each node:
@@ -140,9 +157,16 @@ Earlier versions read `Identity.PrivKey` from `DLOCKSS_IPFS_CONFIG` and ran D-LO
 
 Until all nodes are updated, files ingested on an old node do not reach updated nodes and vice versa. Stored data is not at risk: each node keeps its CRDT state, and updated nodes reconcile their pin lists once they see each other.
 
-The startup scan re-ingests the files in `DLOCKSS_DATA_DIR`. Kubo signs manifests with a prefix, so a newly signed manifest would get a new CID; the node reuses its pinned manifest with the same content instead. Old manifests keep their old signature, which still verifies.
+When a file is ingested again, e.g. uploaded a second time, the node reuses its pinned manifest with the same content: Kubo signs manifests with a prefix, so a newly signed manifest would get a new CID. Old manifests keep their old signature, which still verifies.
 
 A node that ran without `DLOCKSS_IPFS_CONFIG` had a peer ID of its own. Its node ID is now the Kubo ID (`ipfs id`): put that on allowlists. The node may move shard, and its files get new manifests because `ingester_id` changes.
+
+#### Upgrading to ingest through Kubo only
+
+Files enter D-LOCKSS only through Kubo now: pins and uploads. Manifests keep their format, so updated and older nodes read each other's manifests, and existing manifests are not changed. For each node:
+
+1. Files copied into `DLOCKSS_DATA_DIR` are no longer ingested, and nothing reports that. Pin them in Kubo instead (`ipfs add --pin-name=<name> <file>`). `DLOCKSS_DATA_DIR` still places the node's state. `DLOCKSS_FILE_PROCESSING_DELAY`, `DLOCKSS_FILE_STABILITY_DELAY` and `DLOCKSS_MAX_CONCURRENT_FILE_PROCESSING` are ignored.
+2. With `DLOCKSS_WIKI_API` set, the node ingests only pins that a user signed in the wiki. Set it only once the wiki answers `GET {DLOCKSS_WIKI_API}/math/v0/signatures/{cid}`; before that, the node ingests no pins. `DLOCKSS_ALLOW_UNSIGNED` and `DLOCKSS_PIN_INGEST_DELAY` are ignored.
 
 #### Docker Compose Example
 
@@ -153,12 +177,12 @@ services:
     restart: unless-stopped
     environment:
       DLOCKSS_IPFS_NODE: "/dns4/ipfs/tcp/5001"   # "ipfs" resolves to the Kubo service below
-      DLOCKSS_DATA_DIR: "/data/ingest"           # location that D-LOCKSS monitors for ingesting files
+      DLOCKSS_DATA_DIR: "/data/ingest"           # D-LOCKSS state lives in its parent, /data
       DLOCKSS_IPFS_CONFIG: "/ipfs-repo/config"   # Kubo RPC auth (when DLOCKSS_IPFS_TOKEN is unset)
       # DLOCKSS_NODE_NAME: my-node               # human-readable name shown in the monitor;
       #                                          # if empty the node ID is displayed instead
     volumes:
-      - ./dlockss-files:/data                    # persistent D-LOCKSS data (helper key, cluster state, ingested files)
+      - ./dlockss-files:/data                    # persistent D-LOCKSS state (helper key, node name, cluster state)
       - ipfs-data:/ipfs-repo:ro                  # read-only access to Kubo config for RPC auth
       # Place trusted_peers.json at ./dlockss-files/trusted_peers.json
       # (inside the container: /data/trusted_peers.json). Restart to apply.
@@ -200,7 +224,7 @@ services:
 
 volumes:
   ipfs-staging:  # IPFS staging area on /export
-  ipfs-data:     # IPFS repo on /data/ipfs (shared read-only with D-LOCKSS for identity)
+  ipfs-data:     # IPFS repo on /data/ipfs (shared read-only with D-LOCKSS for RPC auth)
 ```
 
 Ingest uses the IPIP-0499 **`unixfs-v1-2025`** profile (CIDv1, 1 MiB raw leaves). `IPFS_PROFILE` applies only when the Kubo volume is first initialized; mount `docker/ipfs-init.d` as above so existing volumes get the same import settings. One-shot on a running host: `docker compose exec ipfs ipfs config profile apply unixfs-v1-2025` then restart the `ipfs` service.
@@ -216,7 +240,7 @@ D-LOCKSS acts as a self-healing, sharded storage cluster using the IPFS/Libp2p s
 ### Key Components
 1.  **Shard Manager:** Dynamically splits responsibilities based on peer count to maintain scalability. Delegates lifecycle decisions (split/merge/discovery) to a `lifecycleManager` and replication to a `replicationManager`.
 2.  **Cluster Manager:** Manages embedded **IPFS Cluster** instances (one per shard) using **CRDTs** for state consensus; nodes in a shard sync and pin content assigned to that shard.
-3.  **File Watcher:** Monitors the data directory to automatically ingest content (via `handleWatcherEvent` / `handleNewDirectory`), and polls Kubo's recursive pins to ingest those created by users (`WatchPins`).
+3.  **Pin Watcher:** Polls Kubo's recursive pins to ingest those created by users (`WatchPins`); uploads arrive through `POST /upload`. With `DLOCKSS_WIKI_API` set, both accept only signed files.
 4.  **Storage Monitor:** Protects nodes from disk exhaustion by rejecting custodial requests when full.
 5.  **BadBits Manager:** Enforces content blocking (e.g., DMCA) based on configured country codes.
 

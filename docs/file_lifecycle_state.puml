@@ -1,6 +1,6 @@
 @startuml File Lifecycle State Diagram
 
-[*] --> Discovered: File detected in ./data
+[*] --> Discovered: User pin in Kubo, or upload\n(signed only, if DLOCKSS_WIKI_API is set)
 
 Discovered --> Pinned: PinManifest(ManifestCID)\nPinFile(ManifestCID)
 

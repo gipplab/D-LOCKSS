@@ -18,8 +18,8 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.PubsubTopicPrefix != DefaultPubsubVersion {
 		t.Errorf("PubsubTopicPrefix = %q, want %q", cfg.PubsubTopicPrefix, DefaultPubsubVersion)
 	}
-	if cfg.FileWatchFolder != "./data" {
-		t.Errorf("FileWatchFolder = %q, want ./data", cfg.FileWatchFolder)
+	if cfg.DataDir != "./data" {
+		t.Errorf("DataDir = %q, want ./data", cfg.DataDir)
 	}
 	if cfg.BadBitsPath != "badBits.csv" {
 		t.Errorf("BadBitsPath = %q, want badBits.csv", cfg.BadBitsPath)
@@ -82,8 +82,8 @@ func TestLoadFromEnv(t *testing.T) {
 
 	cfg := LoadFromEnv()
 
-	if cfg.FileWatchFolder != "/custom/data" {
-		t.Errorf("FileWatchFolder = %q, want /custom/data", cfg.FileWatchFolder)
+	if cfg.DataDir != "/custom/data" {
+		t.Errorf("DataDir = %q, want /custom/data", cfg.DataDir)
 	}
 	if cfg.DiscoveryServiceTag != "dlockss-test" {
 		t.Errorf("DiscoveryServiceTag = %q, want dlockss-test", cfg.DiscoveryServiceTag)
@@ -179,21 +179,6 @@ func TestValidate_ValidSignatureModes(t *testing.T) {
 		if cfg.Security.SignatureMode != mode {
 			t.Errorf("SignatureMode %q was changed to %q", mode, cfg.Security.SignatureMode)
 		}
-	}
-}
-
-func TestValidate_MaxConcurrentFileProcessing(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.Files.MaxConcurrentFileProcessing = 0
-	cfg.Validate()
-	if cfg.Files.MaxConcurrentFileProcessing != 5 {
-		t.Errorf("MaxConcurrentFileProcessing = %d, want 5", cfg.Files.MaxConcurrentFileProcessing)
-	}
-
-	cfg.Files.MaxConcurrentFileProcessing = -1
-	cfg.Validate()
-	if cfg.Files.MaxConcurrentFileProcessing != 5 {
-		t.Errorf("MaxConcurrentFileProcessing (negative) = %d, want 5", cfg.Files.MaxConcurrentFileProcessing)
 	}
 }
 

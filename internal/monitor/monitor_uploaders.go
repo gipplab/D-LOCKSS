@@ -19,8 +19,8 @@ const (
 )
 
 // RunUploaderIndex reads each announced manifest once and records its
-// uploader ("" for manifests that were not uploaded with a key), so the
-// files of a key can be listed.
+// uploader ("" for manifests without a valid user signature), so the files
+// of a key can be listed, e.g. by a node that a user moves to.
 func (m *Monitor) RunUploaderIndex(ctx context.Context) {
 	ticker := time.NewTicker(uploaderScanEvery)
 	defer ticker.Stop()
@@ -52,9 +52,19 @@ func (m *Monitor) scanUploaders(ctx context.Context) {
 			slog.Debug("uploader index: cannot read manifest", "manifest", c, "error", err)
 			continue
 		}
+		// Anyone can write a key into a manifest; only a signature that
+		// verifies puts the file under it.
+		uploader := ""
+		if ro.Uploader != "" {
+			if err := schema.VerifyUpload(ro.Uploader, ro.Payload, ro.UploaderSig); err != nil {
+				slog.Warn("uploader index: signature does not verify, file not listed under its key", "manifest", c, "key", ro.Uploader, "error", err)
+			} else {
+				uploader = ro.Uploader.String()
+			}
+		}
 		m.mu.Lock()
 		if _, ok := m.uniqueCIDs[c]; ok {
-			m.manifestUploader[c] = ro.Uploader.String()
+			m.manifestUploader[c] = uploader
 		}
 		m.mu.Unlock()
 	}

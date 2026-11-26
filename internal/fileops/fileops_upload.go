@@ -38,19 +38,11 @@ func (fp *FileProcessor) IngestUpload(ctx context.Context, path, metaRef string,
 		return cid.Undef, fmt.Errorf("%w: got %s, signed %s", ErrPayloadMismatch, payloadCID, payload)
 	}
 
-	ro := schema.NewResearchObject(metaRef, fp.shardMgr.NodeID(), payloadCID, uint64(info.Size()))
-	ro.Uploader = uploader
-	ro.UploaderSig = sig
-	manifestCID, err := fp.storeManifest(ctx, ro)
+	manifestCID, err := fp.ingestManifest(ctx, metaRef, uint64(info.Size()), payloadCID,
+		schema.UploaderSignature{Key: uploader, Sig: sig}, cleanupPayload)
 	if err != nil {
-		cleanupPayload()
 		return cid.Undef, err
 	}
-	manifestCIDStr := manifestCID.String()
-	if !fp.checkBadBitsAndPin(ctx, manifestCID, manifestCIDStr, metaRef, cleanupPayload) {
-		return cid.Undef, errors.New("blocked or pinning failed")
-	}
-	fp.trackAndAnnounceFile(manifestCID, manifestCIDStr, payloadCID)
-	slog.Info("upload ingested", "uploader", uploader, "payload", payloadCID, "manifest", manifestCIDStr)
+	slog.Info("upload ingested", "uploader", uploader, "payload", payloadCID, "manifest", manifestCID)
 	return manifestCID, nil
 }

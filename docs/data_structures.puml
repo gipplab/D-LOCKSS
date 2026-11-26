@@ -148,13 +148,16 @@ class ResearchObject {
     + MetadataRef: string
     + IngestedBy: peer.ID
     + Signature: []byte
-    + Timestamp: int64
     + Payload: cid.Cid
     + TotalSize: uint64
+    + Uploader: peer.ID
+    + UploaderSig: []byte
 }
 note right of ResearchObject
   pkg/schema/types.go
   No Title/Authors/References in code.
+  At most one user signature per manifest;
+  several signers mean several manifests.
 end note
 
 class IngestMessage {
@@ -275,7 +278,7 @@ class Config {
     + DiscoveryServiceTag: string
     + PubsubTopicPrefix: string
     + TopicName: string
-    + FileWatchFolder: string
+    + DataDir: string
     + NodeName: string
     + IPFSNodeAddress: string
     + ...

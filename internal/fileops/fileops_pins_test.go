@@ -17,20 +17,26 @@ import (
 )
 
 // pinKubo is an in-memory Kubo: pins with names and dag-cbor blocks
-// addressed by their real CIDs.
+// addressed by their real CIDs. ImportFile pins and returns imported.
 type pinKubo struct {
 	mu        sync.Mutex
 	pins      map[cid.Cid]string
 	blocks    map[cid.Cid][]byte
 	badBlocks map[cid.Cid]bool
 	manifests []cid.Cid
+	imported  cid.Cid
 }
 
 func newPinKubo() *pinKubo {
 	return &pinKubo{pins: map[cid.Cid]string{}, blocks: map[cid.Cid][]byte{}, badBlocks: map[cid.Cid]bool{}}
 }
 
-func (k *pinKubo) ImportFile(context.Context, string) (cid.Cid, error) { return cid.Undef, nil }
+func (k *pinKubo) ImportFile(context.Context, string) (cid.Cid, error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.pins[k.imported] = ""
+	return k.imported, nil
+}
 func (k *pinKubo) PutDagCBOR(_ context.Context, block []byte) (cid.Cid, error) {
 	h, err := mh.Sum(block, mh.SHA2_256, -1)
 	if err != nil {
@@ -159,7 +165,6 @@ func (pinSigner) SignProtocolMessage(schema.Signable) error { return nil }
 func newPinRig(t *testing.T) (*pinWatcher, *pinKubo, *pinShard) {
 	t.Helper()
 	cfg := config.DefaultConfig()
-	cfg.FileWatchFolder = t.TempDir()
 	cfg.Files.FileImportTimeout = 5 * time.Second
 	cfg.Files.DHTProvideTimeout = time.Second
 	kubo := newPinKubo()
@@ -178,12 +183,18 @@ func dagPB(t *testing.T, label string) cid.Cid {
 	return cid.NewCidV1(cid.DagProtobuf, h)
 }
 
-// storeManifest puts a D-LOCKSS manifest for payload into kubo without
+// storeManifest puts another node's manifest for payload into kubo without
 // pinning it.
 func storeManifest(t *testing.T, kubo *pinKubo, payload cid.Cid) cid.Cid {
 	t.Helper()
 	other, _ := peer.Decode("12D3KooWCFyKj1WuxUpsNdCNqzTAcZpSCNxCZ3ybSH5dVssV4YVT")
-	b, err := schema.NewResearchObject("file://x", other, payload, 1).MarshalCBOR()
+	return putManifest(t, kubo, schema.NewResearchObject("file://x", other, payload, 1))
+}
+
+// putManifest puts ro into kubo without pinning it.
+func putManifest(t *testing.T, kubo *pinKubo, ro *schema.ResearchObject) cid.Cid {
+	t.Helper()
+	b, err := ro.MarshalCBOR()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,9 +267,9 @@ func TestPinWatcher_SkipsDlockssPins(t *testing.T) {
 	}
 }
 
-func TestPinWatcher_FolderIngestRaceIsNotIngested(t *testing.T) {
+func TestPinWatcher_UploadRaceIsNotIngested(t *testing.T) {
 	w, kubo, _ := newPinRig(t)
-	payload := dagPB(t, "from-folder")
+	payload := dagPB(t, "uploaded")
 	kubo.userPin(payload, "")
 	w.poll(context.Background())
 
@@ -293,5 +304,141 @@ func TestPinWatcher_UnreadablePinBlocksPass(t *testing.T) {
 	w.poll(context.Background())
 	if n := len(kubo.manifestPins()); n != 0 {
 		t.Fatalf("once readable the manifest covers its payload, got %d", n)
+	}
+}
+
+type fakeSignatures struct {
+	sigs  []schema.UploaderSignature
+	err   error
+	asked int
+}
+
+func (f *fakeSignatures) Signatures(context.Context, cid.Cid) ([]schema.UploaderSignature, error) {
+	f.asked++
+	return f.sigs, f.err
+}
+
+var (
+	alice, _ = peer.Decode("12D3KooWNEd5gaYNKe9nAesWuQ1HMgyH3sjXrNQYgbBK1H1ixuN9")
+	bob, _   = peer.Decode("12D3KooWCFyKj1WuxUpsNdCNqzTAcZpSCNxCZ3ybSH5dVssV4YVT")
+)
+
+// signedRig is a pin rig whose node asks src for signatures, with a clock
+// the test moves.
+func signedRig(t *testing.T, src *fakeSignatures) (*pinWatcher, *pinKubo, *time.Time) {
+	t.Helper()
+	w, kubo, _ := newPinRig(t)
+	w.fp.signatures = src
+	clock := time.Now()
+	w.now = func() time.Time { return clock }
+	return w, kubo, &clock
+}
+
+// uploaders returns the uploader of each manifest pinned so far.
+func (k *pinKubo) uploaders(t *testing.T) []peer.ID {
+	t.Helper()
+	var out []peer.ID
+	for _, c := range k.manifestPins() {
+		out = append(out, k.manifest(t, c).Uploader)
+	}
+	return out
+}
+
+func TestPinWatcher_OneManifestPerSignature(t *testing.T) {
+	src := &fakeSignatures{sigs: []schema.UploaderSignature{{Key: alice, Sig: []byte{1}}, {Key: bob, Sig: []byte{2}}}}
+	w, kubo, _ := signedRig(t, src)
+	paper := dagPB(t, "paper")
+	kubo.userPin(paper, "paper.pdf")
+	w.poll(context.Background())
+	w.poll(context.Background())
+
+	got := kubo.uploaders(t)
+	if len(got) != 2 || got[0] == got[1] {
+		t.Fatalf("want one manifest for alice and one for bob, got uploaders %v", got)
+	}
+	for _, c := range kubo.manifestPins() {
+		ro := kubo.manifest(t, c)
+		if !ro.Payload.Equals(paper) || ro.MetadataRef != "paper.pdf" || len(ro.UploaderSig) != 1 {
+			t.Fatalf("unexpected manifest %+v", ro)
+		}
+	}
+}
+
+func TestPinWatcher_UnsignedIsNotIngested(t *testing.T) {
+	src := &fakeSignatures{}
+	w, kubo, clock := signedRig(t, src)
+	kubo.userPin(dagPB(t, "paper"), "paper.pdf")
+
+	// Through the whole schedule and beyond, nobody signs.
+	for step := 0; step < 2*len(signatureChecks)+2; step++ {
+		w.poll(context.Background())
+		*clock = clock.Add(16 * 24 * time.Hour)
+	}
+	if n := len(kubo.manifestPins()); n != 0 {
+		t.Fatalf("a file nobody signed must not be ingested, got %d manifests", n)
+	}
+	if src.asked != len(signatureChecks) {
+		t.Fatalf("the wiki is asked once per check, asked %d times, want %d", src.asked, len(signatureChecks))
+	}
+}
+
+func TestPinWatcher_LaterSignatureAddsManifest(t *testing.T) {
+	src := &fakeSignatures{sigs: []schema.UploaderSignature{{Key: alice, Sig: []byte{1}}}}
+	w, kubo, clock := signedRig(t, src)
+	kubo.userPin(dagPB(t, "paper"), "paper.pdf")
+	w.poll(context.Background())
+	w.poll(context.Background())
+	if got := kubo.uploaders(t); len(got) != 1 || got[0] != alice {
+		t.Fatalf("want alice's manifest, got uploaders %v", got)
+	}
+
+	src.sigs = append(src.sigs, schema.UploaderSignature{Key: bob, Sig: []byte{2}})
+	*clock = clock.Add(59 * time.Minute)
+	w.poll(context.Background())
+	if src.asked != 1 {
+		t.Fatalf("the next check is due after an hour, asked %d times", src.asked)
+	}
+	*clock = clock.Add(time.Minute)
+	w.poll(context.Background())
+	got := kubo.uploaders(t)
+	if len(got) != 2 || got[1] != bob {
+		t.Fatalf("a later signature adds a manifest and keeps the first, got uploaders %v", got)
+	}
+}
+
+func TestPinWatcher_WikiDownIsRetried(t *testing.T) {
+	src := &fakeSignatures{err: fmt.Errorf("wiki answered 502")}
+	w, kubo, clock := signedRig(t, src)
+	kubo.userPin(dagPB(t, "paper"), "paper.pdf")
+	w.poll(context.Background())
+	w.poll(context.Background())
+
+	src.err, src.sigs = nil, []schema.UploaderSignature{{Key: alice, Sig: []byte{1}}}
+	*clock = clock.Add(pinIngestRetryAfter - time.Minute)
+	w.poll(context.Background())
+	if n := len(kubo.manifestPins()); n != 0 || src.asked != 1 {
+		t.Fatalf("a failed attempt waits %v, got %d manifests after %d questions", pinIngestRetryAfter, n, src.asked)
+	}
+	*clock = clock.Add(time.Minute)
+	w.poll(context.Background())
+	if got := kubo.uploaders(t); len(got) != 1 || got[0] != alice {
+		t.Fatalf("once the wiki answers the file is ingested, got uploaders %v", got)
+	}
+}
+
+func TestPinWatcher_LeavesFilesIngestedBeforeStart(t *testing.T) {
+	src := &fakeSignatures{sigs: []schema.UploaderSignature{{Key: alice, Sig: []byte{1}}, {Key: bob, Sig: []byte{2}}}}
+	w, kubo, _ := signedRig(t, src)
+	paper := dagPB(t, "paper")
+	kubo.userPin(paper, "paper.pdf")
+	ro := schema.NewResearchObject("paper.pdf", w.fp.shardMgr.NodeID(), paper, 42)
+	ro.Uploader, ro.UploaderSig = alice, []byte{1}
+	_ = kubo.PinManifest(context.Background(), putManifest(t, kubo, ro))
+
+	for i := 0; i < 3; i++ {
+		w.poll(context.Background())
+	}
+	if n := len(kubo.manifestPins()); n != 1 || src.asked != 0 {
+		t.Fatalf("a file this node ingested before it started is not checked again, got %d manifests after %d questions", n, src.asked)
 	}
 }

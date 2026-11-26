@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -50,9 +48,8 @@ func UploadHandler(trust KeyTrust, ingester Ingester) http.Handler {
 			http.Error(w, "key: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		sig, ok := strings.CutPrefix(q.Get("sig"), "u")
-		rawSig, err := base64.RawURLEncoding.DecodeString(sig)
-		if !ok || err != nil {
+		rawSig, err := schema.DecodeKuboSignature(q.Get("sig"))
+		if err != nil {
 			http.Error(w, "sig: want the Signature of 'ipfs key sign' (multibase base64url)", http.StatusBadRequest)
 			return
 		}

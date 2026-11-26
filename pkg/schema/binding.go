@@ -18,6 +18,21 @@ type Binding struct {
 // KuboSignPrefix is what 'ipfs key sign' signs in front of the message.
 const KuboSignPrefix = "libp2p-key signed message:"
 
+// ErrKuboSignatureEncoding reports a signature that is not written the way
+// 'ipfs key sign' prints it.
+var ErrKuboSignatureEncoding = errors.New("not the Signature of 'ipfs key sign' (multibase base64url)")
+
+// DecodeKuboSignature decodes a signature as 'ipfs key sign' prints it:
+// "u" (multibase base64url) followed by unpadded base64url.
+func DecodeKuboSignature(s string) ([]byte, error) {
+	b64, ok := strings.CutPrefix(s, "u")
+	raw, err := base64.RawURLEncoding.DecodeString(b64)
+	if !ok || err != nil {
+		return nil, ErrKuboSignatureEncoding
+	}
+	return raw, nil
+}
+
 // ErrBindingSignature reports a binding that does not name the helper.
 var ErrBindingSignature = errors.New("binding signature does not match")
 

@@ -44,7 +44,7 @@ func NewStorageManager(cfg *config.Config, dht common.DHTProvider, badBits *badb
 		cfg:           cfg,
 		dht:           dht,
 		badBits:       badBits,
-		disk:          NewDiskMonitor(cfg.FileWatchFolder, cfg.DiskUsageHighWaterMark),
+		disk:          NewDiskMonitor(cfg.DataDir, cfg.DiskUsageHighWaterMark),
 		pinnedFiles:   common.NewPinnedSet(),
 		completeFiles: common.NewPinnedSet(),
 		knownFiles:    common.NewKnownFiles(),

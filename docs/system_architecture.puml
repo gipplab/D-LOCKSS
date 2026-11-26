@@ -32,7 +32,6 @@ package "libp2p Stack" {
 
 package "File System" {
     [./data Directory] as dataDir
-    [File Watcher] as watcher
     [Cluster Store] as clusterStore
 }
 
@@ -74,8 +73,7 @@ pinTracker --> ipfsClient : pins content
 
 fileOps --> storage : pins/unpins (via mgr)
 fileOps --> shardMgr : checks responsibility
-fileOps --> watcher : triggered by
-fileOps --> ipfsClient : imports/pins
+fileOps --> ipfsClient : polls user pins, imports uploads, pins
 fileOps --> signingTrust : signs manifests/messages
 
 storage --> dht : provides files
@@ -100,7 +98,6 @@ dht --> ipfsNet : queries providers
 pubsub --> peers : broadcasts messages
 mdns --> peers : discovers locally
 
-watcher --> dataDir : monitors
 
 subMgr --> pubsub : subscribes to all shard topics
 subMgr --> dashboard : feeds node/shard state

@@ -2,11 +2,6 @@ package fileops
 
 import (
 	"context"
-	"log/slog"
-	"os"
-	"path/filepath"
-	"sync"
-	"time"
 
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -15,12 +10,6 @@ import (
 	"dlockss/internal/config"
 	"dlockss/pkg/ipfs"
 	"dlockss/pkg/schema"
-)
-
-const (
-	maxRetryQueueSize  = 1000
-	retryDrainInterval = 10 * time.Second
-	recentIngestTTL    = 30 * time.Second
 )
 
 // ShardIdentity provides the node's identity and shard membership queries.
@@ -72,7 +61,14 @@ type NodeSigner interface {
 	SignWithNodeKey(ctx context.Context, data []byte) ([]byte, error)
 }
 
-// FileProcessor handles file ingestion and processing.
+// SignatureSource returns the users' signatures of a payload, one per key,
+// see schema.VerifyUpload (trust.WikiSignatures).
+type SignatureSource interface {
+	Signatures(ctx context.Context, payload cid.Cid) ([]schema.UploaderSignature, error)
+}
+
+// FileProcessor ingests the files that reach Kubo: uploads through the
+// node's API and pins that users create.
 type FileProcessor struct {
 	cfg        *config.Config
 	ipfsClient ipfs.IPFSClient
@@ -80,28 +76,12 @@ type FileProcessor struct {
 	shardMgr   ShardCoordinator
 	storageMgr StorageTracker
 	nodeSigner NodeSigner
-	jobQueue   chan string
+	signatures SignatureSource
 	signer     MessageSigner
 	ctx        context.Context
 	cancel     context.CancelFunc
-	loops      sync.WaitGroup // workers and the retry loop
-
-	retryQueue []string
-	retryMu    sync.Mutex
-
-	recentIngestMu sync.Mutex
-	recentIngests  map[string]time.Time
 
 	manifests manifestIndex
-
-	deduperMu   sync.Mutex
-	deduperInfo map[string]fileEventInfo
-
-	// stabilityPath and stabilityTimer track files whose size must settle
-	// before they are enqueued.
-	stabilityMu    sync.Mutex
-	stabilityPath  map[string]int64
-	stabilityTimer map[string]*time.Timer
 }
 
 // FileProcessorConfig holds all dependencies for a FileProcessor.
@@ -113,143 +93,30 @@ type FileProcessorConfig struct {
 	NodeSigner NodeSigner
 	Signer     MessageSigner
 	BadBits    *badbits.Filter
+	// Signatures, if not nil (DLOCKSS_WIKI_API is set), makes pin ingest
+	// accept only files that a user signed, with one manifest per signature.
+	Signatures SignatureSource
 }
 
 // NewFileProcessor creates a new FileProcessor with dependencies.
 func NewFileProcessor(cfg FileProcessorConfig) *FileProcessor {
 	ctx, cancel := context.WithCancel(context.Background())
-	fp := &FileProcessor{
-		cfg:            cfg.Cfg,
-		ipfsClient:     cfg.IPFSClient,
-		badBits:        cfg.BadBits,
-		shardMgr:       cfg.Shard,
-		storageMgr:     cfg.Storage,
-		nodeSigner:     cfg.NodeSigner,
-		signer:         cfg.Signer,
-		jobQueue:       make(chan string, cfg.Cfg.Files.MaxConcurrentFileProcessing*100),
-		ctx:            ctx,
-		cancel:         cancel,
-		recentIngests:  make(map[string]time.Time),
-		deduperInfo:    make(map[string]fileEventInfo),
-		stabilityPath:  make(map[string]int64),
-		stabilityTimer: make(map[string]*time.Timer),
-	}
-	fp.startWorkers()
-	fp.loops.Go(fp.retryLoop)
-	return fp
-}
-
-func (fp *FileProcessor) startWorkers() {
-	for i := 0; i < fp.cfg.Files.MaxConcurrentFileProcessing; i++ {
-		fp.loops.Go(fp.workerLoop)
+	return &FileProcessor{
+		cfg:        cfg.Cfg,
+		ipfsClient: cfg.IPFSClient,
+		badBits:    cfg.BadBits,
+		shardMgr:   cfg.Shard,
+		storageMgr: cfg.Storage,
+		nodeSigner: cfg.NodeSigner,
+		signatures: cfg.Signatures,
+		signer:     cfg.Signer,
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 }
 
-func (fp *FileProcessor) workerLoop() {
-	for {
-		select {
-		case <-fp.ctx.Done():
-			return
-		case path := <-fp.jobQueue:
-			fp.processNewFile(path)
-		}
-	}
-}
-
-// Stop stops the file processor workers and waits until they have exited, so
-// that no job is taken from the queue afterwards.
+// Stop cancels the work the processor started in the background, such as
+// DHT provides.
 func (fp *FileProcessor) Stop() {
 	fp.cancel()
-	fp.loops.Wait()
-}
-
-// retryLoop periodically drains the retry queue and re-attempts enqueue.
-func (fp *FileProcessor) retryLoop() {
-	ticker := time.NewTicker(retryDrainInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-fp.ctx.Done():
-			return
-		case <-ticker.C:
-			fp.drainRetryQueue()
-		}
-	}
-}
-
-func (fp *FileProcessor) drainRetryQueue() {
-	fp.retryMu.Lock()
-	toRetry := fp.retryQueue
-	fp.retryQueue = nil
-	fp.retryMu.Unlock()
-
-	var stillPending []string
-	for _, path := range toRetry {
-		if !fp.TryEnqueue(path) {
-			stillPending = append(stillPending, path)
-		}
-	}
-	if len(stillPending) > 0 {
-		fp.retryMu.Lock()
-		space := maxRetryQueueSize - len(fp.retryQueue)
-		add := len(stillPending)
-		if add > space {
-			add = space
-			slog.Warn("retry queue full, dropping paths", "dropped", len(stillPending)-space)
-		}
-		fp.retryQueue = append(fp.retryQueue, stillPending[:add]...)
-		fp.retryMu.Unlock()
-	}
-}
-
-// ScanExistingFiles walks the data directory and processes any existing files.
-func (fp *FileProcessor) ScanExistingFiles() {
-	if fp.shardMgr.IsLocalNodeIngestor() {
-		fp.loadManifestIndex()
-	}
-	var fileCount int
-	err := filepath.Walk(fp.cfg.FileWatchFolder, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			slog.Warn("error accessing path", "path", path, "error", err)
-			return nil
-		}
-		if info.IsDir() {
-			return nil
-		}
-		fp.EnqueueOrRetry(path)
-		fileCount++
-		return nil
-	})
-	if err != nil {
-		slog.Error("error scanning existing files", "error", err)
-		return
-	}
-	slog.Info("found existing files", "count", fileCount)
-}
-
-// TryEnqueue attempts to add a file to the processing queue.
-func (fp *FileProcessor) TryEnqueue(path string) bool {
-	select {
-	case fp.jobQueue <- path:
-		return true
-	default:
-		return false
-	}
-}
-
-// EnqueueOrRetry tries to enqueue; on backpressure, adds to retry queue for later.
-func (fp *FileProcessor) EnqueueOrRetry(path string) bool {
-	if fp.TryEnqueue(path) {
-		return true
-	}
-	fp.retryMu.Lock()
-	if len(fp.retryQueue) < maxRetryQueueSize {
-		fp.retryQueue = append(fp.retryQueue, path)
-		fp.retryMu.Unlock()
-		slog.Warn("queue full, queued for retry", "path", path)
-		return true
-	}
-	fp.retryMu.Unlock()
-	slog.Warn("queue and retry full, dropping file", "path", path)
-	return false
 }

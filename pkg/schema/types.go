@@ -20,9 +20,13 @@ type ResearchObject struct {
 
 	TotalSize uint64 `cbor:"size"` // Total size in bytes
 
-	// Uploader and UploaderSig are set for uploads through the node's HTTP
-	// API: the uploader's key and its signature, see VerifyUpload. They are
-	// only serialized when set, so other manifests keep their CIDs.
+	// Uploader and UploaderSig are a user's key and its signature of the
+	// payload, see VerifyUpload: the uploader of /upload, or a signature the
+	// wiki holds for a pinned file. A file that several users signed gets one
+	// manifest per signature, so a signature found later adds a manifest
+	// instead of changing one. Anyone holding the key's peer ID can find and
+	// check the user's files. Only serialized when set, so other manifests
+	// keep their CIDs.
 	Uploader    peer.ID `cbor:"uploader"`
 	UploaderSig []byte  `cbor:"uploader_sig"`
 
@@ -31,6 +35,13 @@ type ResearchObject struct {
 	// different ManifestCID on each ingest) and should be ignored. It is set
 	// by UnmarshalCBOR and never serialized.
 	HasLegacyTimestamp bool `cbor:"-"`
+}
+
+// UploaderSignature is a user's key and its signature of a payload, see
+// VerifyUpload.
+type UploaderSignature struct {
+	Key peer.ID
+	Sig []byte
 }
 
 // MarshalCBOR serializes the ResearchObject to CBOR format.

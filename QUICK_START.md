@@ -43,20 +43,22 @@ You should see:
 [Sharding] Joined shard  (Topic: dlockss-creative-commons-shard-)
 [Config] ...
 [API] Starting observability server on :5050
-[FileWatcher] Watching ./data (and subdirectories) for new files...
+pin ingest: scanned kubo pins ...
 ```
 If no name is set via `DLOCKSS_NODE_NAME`, you will be prompted to enter one (press Enter to skip).
 
 ## Add Your First File
 
 ```bash
-# Copy a file to the data directory
-cp my-document.pdf ./data/
+# Add and pin the file in Kubo; the pin name becomes its metadata reference
+ipfs add --pin-name=my-document.pdf my-document.pdf
 
-# Watch the logs - you'll see:
-# [FileOps] Importing file...
-# [Core] I am responsible for PayloadCID...
+# Within a minute or two the logs show:
+# pin ingest: new pin found, ingesting on the next poll ...
+# pinned content ingested ...
 ```
+
+D-LOCKSS ingests only what is pinned in Kubo (or uploaded with `POST /upload`). With `DLOCKSS_WIKI_API` set, only files a user signed are ingested; see the [README](README.md#usage).
 
 ## Common Commands
 

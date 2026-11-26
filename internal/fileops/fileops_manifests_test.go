@@ -37,7 +37,6 @@ func newManifestRig(t *testing.T) *manifestRig {
 	t.Helper()
 	key := testutil.NewKey(t)
 	cfg := config.DefaultConfig()
-	cfg.FileWatchFolder = t.TempDir()
 	cfg.Files.FileImportTimeout = 5 * time.Second
 	kubo := newPinKubo()
 	fp := NewFileProcessor(FileProcessorConfig{
@@ -95,7 +94,7 @@ func TestStoreManifest_ReusesPreHelperManifest(t *testing.T) {
 	payload := dagPB(t, "paper")
 	old := r.pinOld(t, schema.NewResearchObject("file://paper.pdf", r.key.ID, payload, 7))
 
-	r.fp.ScanExistingFiles() // loads the index; the watch folder is empty
+	r.fp.LoadManifestIndex()
 	blocks := r.blockCount()
 
 	got, err := r.fp.storeManifest(context.Background(), schema.NewResearchObject("file://paper.pdf", r.key.ID, payload, 7))
@@ -114,7 +113,7 @@ func TestStoreManifest_NewManifestWhenContentDiffers(t *testing.T) {
 	r := newManifestRig(t)
 	payload := dagPB(t, "paper")
 	old := r.pinOld(t, schema.NewResearchObject("file://paper.pdf", r.key.ID, payload, 7))
-	r.fp.loadManifestIndex()
+	r.fp.LoadManifestIndex()
 
 	got, err := r.fp.storeManifest(context.Background(), schema.NewResearchObject("file://renamed.pdf", r.key.ID, payload, 7))
 	if err != nil {
@@ -142,7 +141,7 @@ func TestStoreManifest_IgnoresUnusableManifests(t *testing.T) {
 	legacy := dagPB(t, "legacy")
 	legacyCID := r.pinBlock(t, legacyManifest(t, r, "file://legacy", legacy, 2))
 
-	r.fp.loadManifestIndex()
+	r.fp.LoadManifestIndex()
 	for _, tc := range []struct {
 		name    string
 		payload cid.Cid

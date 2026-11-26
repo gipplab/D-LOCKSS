@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -21,10 +22,15 @@ func TestUploaderIndex(t *testing.T) {
 	uploader, _ := peer.Decode("12D3KooWNEd5gaYNKe9nAesWuQ1HMgyH3sjXrNQYgbBK1H1ixuN9")
 	payload, _ := cid.Decode("bafkreicysg23kiwv34eg2d7qweipxwosdo2py4ldv42nbauguluen5v6am")
 
+	// Made with Kubo 0.43.1: printf 'dlockss-upload <payload>' | ipfs key sign
+	sig, _ := base64.RawURLEncoding.DecodeString("0UeavBivwyduao91YLSf41jA6XUNhOAMvh9JHLi1L4_DwV98Z5155wkOnkpCFAgFvcfe6XRiqhFFQDTM31kMBw")
 	uploaded := schema.NewResearchObject("paper.pdf", ingester, payload, 6)
-	uploaded.Uploader, uploaded.UploaderSig = uploader, []byte{1}
+	uploaded.Uploader, uploaded.UploaderSig = uploader, sig
+	forged := schema.NewResearchObject("forged.pdf", ingester, payload, 6)
+	forged.Uploader, forged.UploaderSig = uploader, []byte{1}
 	blocks := map[string]*schema.ResearchObject{
 		"uploaded": uploaded,
+		"forged":   forged,
 		"plain":    schema.NewResearchObject("file://x", ingester, payload, 6),
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -41,13 +47,13 @@ func TestUploaderIndex(t *testing.T) {
 	m := NewMonitor(DefaultConfig())
 	m.SetKeywords(keywords.NewStore(keywords.Config{Gateway: srv.URL}))
 	now := time.Now()
-	for _, c := range []string{"uploaded", "plain", "missing"} {
+	for _, c := range []string{"uploaded", "forged", "plain", "missing"} {
 		m.uniqueCIDs[c] = now
 	}
 	m.scanUploaders(context.Background())
 
-	if got := m.manifestUploader; len(got) != 2 || got["uploaded"] != uploader.String() || got["plain"] != "" {
-		t.Fatalf("index = %v; want the uploader of 'uploaded', '' for 'plain', and 'missing' left for a later pass", got)
+	if got := m.manifestUploader; len(got) != 3 || got["uploaded"] != uploader.String() || got["forged"] != "" || got["plain"] != "" {
+		t.Fatalf("index = %v; want the uploader of 'uploaded', '' for 'forged' and 'plain', and 'missing' left for a later pass", got)
 	}
 
 	var ups struct{ Uploaders []uploaderEntry }

@@ -68,11 +68,14 @@ type ResearchObject struct {
     MetadataRef string  `cbor:"meta_ref"`    // DOI/URL or file path reference
     IngestedBy  peer.ID `cbor:"ingester_id"` // Kubo node ID of the ingesting node
     Signature   []byte  `cbor:"sig"`         // Kubo 'key sign' signature by ingester_id
-    Timestamp   int64   `cbor:"ts"`          // Unix timestamp of creation
     Payload     cid.Cid `cbor:"payload"`     // CID of the raw content (UnixFS DAG root)
     TotalSize   uint64  `cbor:"size"`        // Size of Payload in bytes
+    Uploader    peer.ID `cbor:"uploader"`     // optional: a user's key
+    UploaderSig []byte  `cbor:"uploader_sig"` // its 'key sign' signature of "dlockss-upload <payload CID>"
 }
 ```
+
+Manifests carry no timestamp, so the same content from the same node always has the same `ManifestCID`; older manifests with a `ts` field are removed. `uploader` and `uploader_sig` are only encoded when set. A manifest holds at most one user signature: a file that several users signed gets one manifest per signature, and a signature found later adds a manifest instead of changing one. The signature covers only the payload CID, so anyone who knows a user's key (its peer ID) can find that user's files and check them without the ingesting node or the wiki, e.g. a node at an institution the user moves to.
 
 ---
 
@@ -160,8 +163,8 @@ Nodes in any shard (not just root) periodically run discovery to join existing d
 
 ### 6.1 File Ingestion
 
-1.  **Import**: Node imports file to IPFS, getting `PayloadCID`.
-2.  **Manifest**: Node creates `ResearchObject` (meta_ref, ingester_id = Kubo node ID, payload, size), has its Kubo node sign it (`key/sign`) and stores it in IPFS; gets `ManifestCID`.
+1.  **Source**: Files enter through Kubo only: a recursive pin that a user created (pin ingest, polled every `DLOCKSS_PIN_INGEST_INTERVAL`), or an upload (`POST /upload`), which the node imports to IPFS. Either way the node has the `PayloadCID`. With `DLOCKSS_WIKI_API` set, the node ingests only signed files: an upload must be signed with a key the wiki knows (`/math/v0/key/{peer ID}`), and a pin needs at least one valid signature from `/math/v0/signatures/{cid}`. The wiki is asked about a pin when it is first seen and again after 1 hour, 1 day, 1 week and 1 month, so later signatures add manifests. Files that other nodes ingested are replicated whether they are signed or not.
+2.  **Manifest**: Node creates `ResearchObject` (meta_ref, ingester_id = Kubo node ID, payload, size, and the user's key and signature if any; one manifest per signature), has its Kubo node sign it (`key/sign`) and stores it in IPFS; gets `ManifestCID`.
 3.  **Pin**: Node pins `ManifestCID` recursively (BadBits check first). Tracks via StorageManager.PinFile and announces PINNED on current shard topic.
 4.  **Check Responsibility** (AmIResponsibleFor(PayloadCID)):
     *   **If Responsible**:
@@ -251,13 +254,13 @@ The helper key is resolved at startup in order:
 
 ```
 ./
-├── data/              ← ingest directory (DLOCKSS_DATA_DIR), watched for new files
+├── data/              ← DLOCKSS_DATA_DIR; its disk is checked against the high-water mark
 ├── dlockss.key        ← helper private key (auto-generated or migrated)
 ├── node_name          ← persisted node name
 └── cluster_store/     ← CRDT state (LevelDB)
 ```
 
-State files are placed in the **parent** of the data directory so the file watcher does not ingest them. The node validates this at startup and refuses to start if any state file resolves inside the ingest directory.
+State files are placed in the **parent** of the data directory. Nothing is ingested from the data directory; files enter through Kubo (Section 6.1).
 
 **Docker / remote Kubo:** Mount a persistent volume for the helper key and cluster store. Optionally mount the Kubo config read-only for RPC auth.
 
