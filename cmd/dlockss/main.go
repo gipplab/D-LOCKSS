@@ -251,6 +251,10 @@ func main() {
 	clusterMgr.SetShardPeerProvider(shardMgr) // CRDT Peers() and allocations use real shard membership
 	announcePinned = shardMgr.AnnouncePinned
 
+	var signatures fileops.SignatureSource
+	if cfg.WikiAPI != "" {
+		signatures = trust.NewWikiSignatures(cfg.WikiAPI)
+	}
 	fp := fileops.NewFileProcessor(fileops.FileProcessorConfig{
 		Cfg:        cfg,
 		IPFSClient: ipfsClient,
@@ -259,6 +263,7 @@ func main() {
 		NodeSigner: ipfsClient,
 		Signer:     signer,
 		BadBits:    badBitsFilter,
+		Signatures: signatures,
 	})
 
 	var upload http.Handler

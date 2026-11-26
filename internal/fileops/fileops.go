@@ -72,6 +72,12 @@ type NodeSigner interface {
 	SignWithNodeKey(ctx context.Context, data []byte) ([]byte, error)
 }
 
+// SignatureSource returns the users' signatures of a payload, see
+// schema.VerifyUpload (trust.WikiSignatures).
+type SignatureSource interface {
+	Signatures(ctx context.Context, payload cid.Cid) ([]schema.UploaderSignature, error)
+}
+
 // FileProcessor handles file ingestion and processing.
 type FileProcessor struct {
 	cfg        *config.Config
@@ -80,6 +86,7 @@ type FileProcessor struct {
 	shardMgr   ShardCoordinator
 	storageMgr StorageTracker
 	nodeSigner NodeSigner
+	signatures SignatureSource
 	jobQueue   chan string
 	signer     MessageSigner
 	ctx        context.Context
@@ -113,6 +120,8 @@ type FileProcessorConfig struct {
 	NodeSigner NodeSigner
 	Signer     MessageSigner
 	BadBits    *badbits.Filter
+	// Signatures, if not nil, gives the uploaders of pinned files.
+	Signatures SignatureSource
 }
 
 // NewFileProcessor creates a new FileProcessor with dependencies.
@@ -125,6 +134,7 @@ func NewFileProcessor(cfg FileProcessorConfig) *FileProcessor {
 		shardMgr:       cfg.Shard,
 		storageMgr:     cfg.Storage,
 		nodeSigner:     cfg.NodeSigner,
+		signatures:     cfg.Signatures,
 		signer:         cfg.Signer,
 		jobQueue:       make(chan string, cfg.Cfg.Files.MaxConcurrentFileProcessing*100),
 		ctx:            ctx,

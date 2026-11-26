@@ -53,8 +53,17 @@
     key=$(ipfs key list -l --ipns-base=b58mh | awk '$2=="mykey"{print $1}')
     curl --data-binary @paper.pdf "http://<node>:5050/upload?cid=$cid&key=$key&sig=$sig&name=paper.pdf"
     ```
-    The manifest records the key and the signature. While the wiki is unreachable, the node uses its last answer
-    for a key.
+    The manifest records the key and the signature in its `uploaders` list. Keys are checked on every upload;
+    while the wiki is unreachable, uploads are refused.
+
+    **Signatures from the wiki.** With `DLOCKSS_WIKI_API` set, pin ingest also asks the wiki who signed a file:
+    `GET {DLOCKSS_WIKI_API}/math/v0/signatures/{cid}` answers `[{"key":"12D3KooW…","signature":"u…"}, …]`, each
+    signature made like `sig` above. The manifest lists every entry whose signature verifies, sorted by key, in
+    `uploaders`; others are logged and left out. A file without a valid signature, or whose signatures cannot be
+    fetched, gets no manifest; the node asks again after 30 minutes. `DLOCKSS_ALLOW_UNSIGNED=true` ingests such
+    files without uploaders. Manifests are not updated later, so set `DLOCKSS_PIN_INGEST_DELAY` (e.g. `10m`,
+    default `0`) to give the wiki time to store the signatures after it adds a file to Kubo. Older manifests with
+    a single `uploader`/`uploader_sig` stay valid.
 
 ### Configuration
 Configure via environment variables:
@@ -77,8 +86,11 @@ export DLOCKSS_MAX_PEERS_PER_SHARD=12
 export DLOCKSS_IPFS_NODE="/ip4/127.0.0.1/tcp/5001"
 export DLOCKSS_IPFS_TOKEN="" # Kubo RPC token or AuthSecret (bearer:<token>, basic:<user>:<pass>)
 
-# Uploads (empty: disabled); keys are checked with GET {DLOCKSS_WIKI_API}/math/v0/key/{peer ID}
+# Uploads (empty: disabled); keys are checked with GET {DLOCKSS_WIKI_API}/math/v0/key/{peer ID},
+# pinned files get their signatures from GET {DLOCKSS_WIKI_API}/math/v0/signatures/{cid}
 export DLOCKSS_WIKI_API="https://portal.mardi4nfdi.de/w/rest.php"
+export DLOCKSS_PIN_INGEST_DELAY=10m   # wait before a pinned file's manifest is made (default 0)
+export DLOCKSS_ALLOW_UNSIGNED=false   # true: also ingest pinned files nobody signed (default false)
 
 # DHT tuning
 export DLOCKSS_MAX_CONCURRENT_DHT_PROVIDES=8 # Limit concurrent DHT provide operations

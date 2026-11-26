@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -22,9 +23,12 @@ func TestUploaderIndex(t *testing.T) {
 	payload, _ := cid.Decode("bafkreicysg23kiwv34eg2d7qweipxwosdo2py4ldv42nbauguluen5v6am")
 
 	uploaded := schema.NewResearchObject("paper.pdf", ingester, payload, 6)
-	uploaded.Uploader, uploaded.UploaderSig = uploader, []byte{1}
+	uploaded.Uploader, uploaded.UploaderSig = uploader, []byte{1} // before the uploaders list
+	signed := schema.NewResearchObject("paper.pdf", ingester, payload, 6)
+	signed.Uploaders = []schema.UploaderSignature{{Key: ingester, Sig: []byte{2}}, {Key: uploader, Sig: []byte{3}}}
 	blocks := map[string]*schema.ResearchObject{
 		"uploaded": uploaded,
+		"signed":   signed,
 		"plain":    schema.NewResearchObject("file://x", ingester, payload, 6),
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -41,23 +45,26 @@ func TestUploaderIndex(t *testing.T) {
 	m := NewMonitor(DefaultConfig())
 	m.SetKeywords(keywords.NewStore(keywords.Config{Gateway: srv.URL}))
 	now := time.Now()
-	for _, c := range []string{"uploaded", "plain", "missing"} {
+	for _, c := range []string{"uploaded", "signed", "plain", "missing"} {
 		m.uniqueCIDs[c] = now
 	}
 	m.scanUploaders(context.Background())
 
-	if got := m.manifestUploader; len(got) != 2 || got["uploaded"] != uploader.String() || got["plain"] != "" {
-		t.Fatalf("index = %v; want the uploader of 'uploaded', '' for 'plain', and 'missing' left for a later pass", got)
+	got := m.manifestUploader
+	if len(got) != 3 || !slices.Equal(got["uploaded"], []string{uploader.String()}) ||
+		!slices.Equal(got["signed"], []string{ingester.String(), uploader.String()}) || len(got["plain"]) != 0 {
+		t.Fatalf("index = %v; want the uploaders of 'uploaded' and 'signed', none for 'plain', and 'missing' left for a later pass", got)
 	}
 
 	var ups struct{ Uploaders []uploaderEntry }
 	get(t, m.handleUploaders, "/api/uploaders", &ups)
-	if len(ups.Uploaders) != 1 || ups.Uploaders[0] != (uploaderEntry{Key: uploader.String(), Files: 1}) {
-		t.Fatalf("uploaders = %+v", ups.Uploaders)
+	want := []uploaderEntry{{Key: uploader.String(), Files: 2}, {Key: ingester.String(), Files: 1}}
+	if !slices.Equal(ups.Uploaders, want) {
+		t.Fatalf("uploaders = %+v, want %+v", ups.Uploaders, want)
 	}
 	var files struct{ CIDs []cidEntry }
 	get(t, m.handleUploaderFiles, "/api/uploader-files?key="+uploader.String(), &files)
-	if len(files.CIDs) != 1 || files.CIDs[0].CID != "uploaded" {
+	if len(files.CIDs) != 2 {
 		t.Fatalf("files = %+v", files.CIDs)
 	}
 }

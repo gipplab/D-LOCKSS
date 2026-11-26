@@ -12,7 +12,6 @@ import (
 const (
 	trustedKey   = "12D3KooW9syRZpRZKiJbLrrxbcuymbhT5BTF9hjG6bykH42q29Mb"
 	untrustedKey = "12D3KooWCFyKj1WuxUpsNdCNqzTAcZpSCNxCZ3ybSH5dVssV4YVT"
-	unknownKey   = "12D3KooWLb7WFH45GCF4ZKvxvH1ZbMvWDqBvsGYtMpsCACvuLSiC"
 )
 
 func TestWikiKeys(t *testing.T) {
@@ -41,12 +40,7 @@ func TestWikiKeys(t *testing.T) {
 	}
 
 	down = true
-	w.answers[trusted] = wikiAnswer{trusted: true}
-	if ok, err := w.Trusted(ctx, trusted); !ok || err != nil {
-		t.Fatalf("while the wiki is down, its last answer counts, got %v, %v", ok, err)
-	}
-	unknown, _ := peer.Decode(unknownKey)
-	if _, err := w.Trusted(ctx, unknown); err == nil {
-		t.Fatal("a key the wiki never answered for cannot be checked while it is down")
+	if ok, err := w.Trusted(ctx, trusted); ok || err == nil {
+		t.Fatalf("answers are not cached: while the wiki is down no key is trusted, got %v, %v", ok, err)
 	}
 }

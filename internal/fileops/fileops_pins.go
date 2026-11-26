@@ -46,10 +46,13 @@ type pinWatcher struct {
 	// classes caches the classification of each pinned CID. Blocks are
 	// immutable, so only pinUnknown is ever looked at again.
 	classes map[cid.Cid]pinClass
-	// pending holds user pins seen in the previous poll. A pin is ingested on
-	// its second sighting, because an ingest from the watch folder pins the
-	// payload before its manifest exists.
-	pending map[string]struct{}
+	// pending holds the user pins seen in the previous poll, with the time
+	// each was first seen. A pin is ingested on its second sighting, because
+	// an ingest from the watch folder pins the payload before its manifest
+	// exists, and not before PinIngestDelay has passed, so the wiki can
+	// store its users' signatures first.
+	pending map[string]time.Time
+	now     func() time.Time
 	// failed holds the time of the last failed ingest per pin.
 	failed map[string]time.Time
 	// blocked is the reason the last poll ingested nothing, so each reason
@@ -62,8 +65,9 @@ func newPinWatcher(fp *FileProcessor) *pinWatcher {
 	return &pinWatcher{
 		fp:      fp,
 		classes: make(map[cid.Cid]pinClass),
-		pending: make(map[string]struct{}),
+		pending: make(map[string]time.Time),
 		failed:  make(map[string]time.Time),
+		now:     time.Now,
 	}
 }
 
@@ -143,8 +147,9 @@ func (w *pinWatcher) poll(ctx context.Context) {
 	}
 	w.setBlocked("")
 
-	now := time.Now()
-	pending := make(map[string]struct{})
+	now := w.now()
+	delay := w.fp.cfg.Files.PinIngestDelay
+	pending := make(map[string]time.Time)
 	failed := make(map[string]time.Time)
 	ingested := 0
 	for c, cl := range classes {
@@ -155,13 +160,20 @@ func (w *pinWatcher) poll(ctx context.Context) {
 		if _, ok := covered[key]; ok {
 			continue
 		}
-		pending[key] = struct{}{}
+		firstSeen, seen := w.pending[key]
+		if !seen {
+			firstSeen = now
+		}
+		pending[key] = firstSeen
 		if t, ok := w.failed[key]; ok && now.Sub(t) < pinIngestRetryAfter {
 			failed[key] = t
 			continue
 		}
-		if _, seen := w.pending[key]; !seen {
-			slog.Info("pin ingest: new pin found, ingesting on the next poll", "cid", c, "name", pins[c])
+		if !seen {
+			slog.Info("pin ingest: new pin found", "cid", c, "name", pins[c], "ingest_after", delay)
+			continue
+		}
+		if now.Sub(firstSeen) < delay {
 			continue
 		}
 		if ctx.Err() != nil {
@@ -208,6 +220,11 @@ func (w *pinWatcher) classify(ctx context.Context, c cid.Cid, name string) pinCl
 // the pin is now handled.
 func (fp *FileProcessor) ingestPinned(ctx context.Context, payloadCID cid.Cid, name string) bool {
 	payloadCIDStr := payloadCID.String()
+	// Before the claim, so a file that may not be ingested yet is retried.
+	uploaders, ok := fp.uploadersOf(ctx, payloadCID)
+	if !ok {
+		return false
+	}
 	if !fp.claimRecentIngest(payloadCIDStr) {
 		return true
 	}
@@ -224,8 +241,8 @@ func (fp *FileProcessor) ingestPinned(ctx context.Context, payloadCID cid.Cid, n
 	}
 	keepPin := func() {}
 
-	slog.Info("ingesting pinned content", "payload", payloadCIDStr, "meta_ref", metaRef, "size", size)
-	manifestCID, manifestCIDStr, err := fp.buildAndStoreManifest(ctx, metaRef, size, payloadCID, keepPin)
+	slog.Info("ingesting pinned content", "payload", payloadCIDStr, "meta_ref", metaRef, "size", size, "uploaders", len(uploaders))
+	manifestCID, manifestCIDStr, err := fp.buildAndStoreManifest(ctx, metaRef, size, payloadCID, uploaders, keepPin)
 	if err != nil {
 		slog.Error("pin ingest: failed to build manifest", "payload", payloadCIDStr, "error", err)
 		return false
@@ -236,4 +253,27 @@ func (fp *FileProcessor) ingestPinned(ctx context.Context, payloadCID cid.Cid, n
 	fp.trackAndAnnounceFile(manifestCID, manifestCIDStr, payloadCID)
 	slog.Info("pinned content ingested", "payload", payloadCIDStr, "manifest", manifestCIDStr)
 	return true
+}
+
+// uploadersOf returns the users' signatures of payload and whether a
+// manifest may be made. With a signature source (DLOCKSS_WIKI_API), it may
+// only if a signature verifies, unless AllowUnsigned is set; then a file
+// whose signatures cannot be fetched is ingested without them.
+func (fp *FileProcessor) uploadersOf(ctx context.Context, payload cid.Cid) ([]schema.UploaderSignature, bool) {
+	if fp.signatures == nil {
+		return nil, true
+	}
+	uploaders, err := fp.signatures.Signatures(ctx, payload)
+	switch {
+	case err != nil && fp.cfg.AllowUnsigned:
+		slog.Warn("pin ingest: cannot fetch the uploaders' signatures, ingesting unsigned", "payload", payload, "error", err)
+		return nil, true
+	case err != nil:
+		slog.Warn("pin ingest: cannot fetch the uploaders' signatures, retrying later", "payload", payload, "error", err, "retry_after", pinIngestRetryAfter)
+		return nil, false
+	case len(uploaders) == 0 && !fp.cfg.AllowUnsigned:
+		slog.Info("pin ingest: no valid signature in the wiki, not ingested yet", "payload", payload, "retry_after", pinIngestRetryAfter)
+		return nil, false
+	}
+	return uploaders, true
 }

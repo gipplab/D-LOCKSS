@@ -39,8 +39,7 @@ func (fp *FileProcessor) IngestUpload(ctx context.Context, path, metaRef string,
 	}
 
 	ro := schema.NewResearchObject(metaRef, fp.shardMgr.NodeID(), payloadCID, uint64(info.Size()))
-	ro.Uploader = uploader
-	ro.UploaderSig = sig
+	ro.Uploaders = []schema.UploaderSignature{{Key: uploader, Sig: sig}}
 	manifestCID, err := fp.storeManifest(ctx, ro)
 	if err != nil {
 		cleanupPayload()

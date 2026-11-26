@@ -123,6 +123,9 @@ type FileConfig struct {
 	// PinIngestEnabled ingests recursive pins that users create in Kubo.
 	PinIngestEnabled  bool
 	PinIngestInterval time.Duration
+	// PinIngestDelay is the least time between finding a user pin and
+	// creating its manifest, so the wiki can store its users' signatures.
+	PinIngestDelay time.Duration
 }
 
 // SecurityConfig holds trust, signing, and nonce parameters.
@@ -145,17 +148,20 @@ type OrphanConfig struct {
 
 // Config holds all runtime configuration for a D-LOCKSS node.
 type Config struct {
-	DiscoveryServiceTag    string
-	PubsubTopicPrefix      string
-	TopicName              string
-	IngestAllowlist        []string
-	FileWatchFolder        string
-	ClusterStorePath       string
-	BadBitsPath            string
-	IPFSNodeAddress        string
-	IPFSToken              string
-	APIPort                int
-	WikiAPI                string
+	DiscoveryServiceTag string
+	PubsubTopicPrefix   string
+	TopicName           string
+	IngestAllowlist     []string
+	FileWatchFolder     string
+	ClusterStorePath    string
+	BadBitsPath         string
+	IPFSNodeAddress     string
+	IPFSToken           string
+	APIPort             int
+	WikiAPI             string
+	// AllowUnsigned lets pin ingest make manifests for files that no user
+	// of the wiki (WikiAPI) signed. Without WikiAPI every file is ingested.
+	AllowUnsigned          bool
 	BootstrapTimeout       time.Duration
 	HeartbeatInterval      time.Duration
 	VerboseLogging         bool
@@ -276,6 +282,7 @@ func LoadFromEnv() *Config {
 	cfg.IPFSToken = getEnvString("DLOCKSS_IPFS_TOKEN", "")
 	cfg.APIPort = getEnvInt("DLOCKSS_API_PORT", cfg.APIPort)
 	cfg.WikiAPI = getEnvString("DLOCKSS_WIKI_API", "")
+	cfg.AllowUnsigned = getEnvBool("DLOCKSS_ALLOW_UNSIGNED", false)
 	cfg.BootstrapTimeout = getEnvDuration("DLOCKSS_BOOTSTRAP_TIMEOUT", cfg.BootstrapTimeout)
 	cfg.HeartbeatInterval = getEnvDuration("DLOCKSS_HEARTBEAT_INTERVAL", cfg.HeartbeatInterval)
 	cfg.VerboseLogging = getEnvBool("DLOCKSS_VERBOSE_LOGGING", cfg.VerboseLogging)
@@ -326,6 +333,7 @@ func LoadFromEnv() *Config {
 	cfg.Files.ReshardHandoffDelay = getEnvDuration("DLOCKSS_RESHARD_HANDOFF_DELAY", cfg.Files.ReshardHandoffDelay)
 	cfg.Files.PinIngestEnabled = getEnvBool("DLOCKSS_PIN_INGEST", cfg.Files.PinIngestEnabled)
 	cfg.Files.PinIngestInterval = getEnvDuration("DLOCKSS_PIN_INGEST_INTERVAL", cfg.Files.PinIngestInterval)
+	cfg.Files.PinIngestDelay = getEnvDuration("DLOCKSS_PIN_INGEST_DELAY", cfg.Files.PinIngestDelay)
 
 	cfg.Security.TrustMode = getEnvString("DLOCKSS_TRUST_MODE", cfg.Security.TrustMode)
 	cfg.Security.TrustStorePath = getEnvString("DLOCKSS_TRUST_STORE", filepath.Join(filepath.Dir(dataDir), "trusted_peers.json"))
@@ -422,6 +430,7 @@ func (c *Config) Log() {
 		"ipfs_node", c.IPFSNodeAddress,
 		"api_port", c.APIPort,
 		"wiki_api", c.WikiAPI,
+		"allow_unsigned", c.AllowUnsigned,
 		"bootstrap_timeout", c.BootstrapTimeout,
 		"conn_low_water", c.ConnLowWater,
 		"conn_high_water", c.ConnHighWater,
@@ -467,6 +476,7 @@ func (c *Config) Log() {
 		"reshard_handoff_delay", c.Files.ReshardHandoffDelay,
 		"pin_ingest", c.Files.PinIngestEnabled,
 		"pin_ingest_interval", c.Files.PinIngestInterval,
+		"pin_ingest_delay", c.Files.PinIngestDelay,
 	)
 	slog.Info("config: orphan",
 		"unpin_grace", c.Orphan.UnpinGracePeriod,

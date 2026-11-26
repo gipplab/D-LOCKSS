@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"time"
 
@@ -19,8 +20,8 @@ const (
 )
 
 // RunUploaderIndex reads each announced manifest once and records its
-// uploader ("" for manifests that were not uploaded with a key), so the
-// files of a key can be listed.
+// uploaders (none for manifests that nobody signed), so the files of a key
+// can be listed.
 func (m *Monitor) RunUploaderIndex(ctx context.Context) {
 	ticker := time.NewTicker(uploaderScanEvery)
 	defer ticker.Stop()
@@ -54,7 +55,11 @@ func (m *Monitor) scanUploaders(ctx context.Context) {
 		}
 		m.mu.Lock()
 		if _, ok := m.uniqueCIDs[c]; ok {
-			m.manifestUploader[c] = ro.Uploader.String()
+			keys := []string{}
+			for _, u := range ro.AllUploaders() {
+				keys = append(keys, u.Key.String())
+			}
+			m.manifestUploader[c] = keys
 		}
 		m.mu.Unlock()
 	}
@@ -95,8 +100,8 @@ type uploaderEntry struct {
 func (m *Monitor) handleUploaders(w http.ResponseWriter, _ *http.Request) {
 	m.mu.RLock()
 	counts := make(map[string]int)
-	for _, key := range m.manifestUploader {
-		if key != "" {
+	for _, keys := range m.manifestUploader {
+		for _, key := range keys {
 			counts[key]++
 		}
 	}
@@ -122,8 +127,8 @@ func (m *Monitor) handleUploaderFiles(w http.ResponseWriter, r *http.Request) {
 	}
 	m.mu.RLock()
 	files := make(map[string]time.Time)
-	for c, uploader := range m.manifestUploader {
-		if uploader == key {
+	for c, keys := range m.manifestUploader {
+		if slices.Contains(keys, key) {
 			files[c] = m.uniqueCIDs[c]
 		}
 	}

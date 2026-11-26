@@ -84,7 +84,7 @@ func (fp *FileProcessor) processNewFile(path string) {
 		slog.Error("failed to stat file", "path", path, "error", err)
 		return
 	}
-	manifestCID, manifestCIDStr, err := fp.buildAndStoreManifest(ctx, "file://"+filepath.Base(path), uint64(info.Size()), payloadCID, cleanupPayload)
+	manifestCID, manifestCIDStr, err := fp.buildAndStoreManifest(ctx, "file://"+filepath.Base(path), uint64(info.Size()), payloadCID, nil, cleanupPayload)
 	if err != nil {
 		slog.Error("failed to build manifest", "path", path, "error", err)
 		return
@@ -132,8 +132,9 @@ func (fp *FileProcessor) importFileToIPFS(ctx context.Context, path string) (cid
 
 // buildAndStoreManifest signs and stores the manifest for payloadCID. On
 // failure it calls cleanupPayload.
-func (fp *FileProcessor) buildAndStoreManifest(ctx context.Context, metaRef string, size uint64, payloadCID cid.Cid, cleanupPayload func()) (cid.Cid, string, error) {
+func (fp *FileProcessor) buildAndStoreManifest(ctx context.Context, metaRef string, size uint64, payloadCID cid.Cid, uploaders []schema.UploaderSignature, cleanupPayload func()) (cid.Cid, string, error) {
 	ro := schema.NewResearchObject(metaRef, fp.shardMgr.NodeID(), payloadCID, size)
+	ro.Uploaders = uploaders
 	manifestCID, err := fp.storeManifest(ctx, ro)
 	if err != nil {
 		cleanupPayload()

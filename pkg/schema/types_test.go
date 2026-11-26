@@ -118,3 +118,48 @@ func mustDecode[T any](t *testing.T, decode func(string) (T, error), s string) T
 	}
 	return v
 }
+
+func TestResearchObject_Uploaders(t *testing.T) {
+	ingester := mustDecode(t, peer.Decode, kuboKey)
+	payload := mustDecode(t, cid.Decode, kuboPayload)
+
+	ro := NewResearchObject("paper.pdf", ingester, payload, 6)
+	ro.Uploaders = []UploaderSignature{{ingester, []byte{1}}, {ingester, []byte{2}}}
+	b, err := ro.MarshalCBOR()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got ResearchObject
+	if err := got.UnmarshalCBOR(b); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Uploaders) != 2 || got.Uploaders[1].Key != ingester || !bytes.Equal(got.Uploaders[1].Sig, []byte{2}) || got.Uploader != "" {
+		t.Fatalf("uploaders lost in round trip: %+v", got)
+	}
+	again, err := got.MarshalCBOR()
+	if err != nil || !bytes.Equal(again, b) {
+		t.Fatal("re-encoding changes the manifest, so its signature would no longer verify")
+	}
+}
+
+func TestResearchObject_OldUploaderStaysValid(t *testing.T) {
+	ingester := mustDecode(t, peer.Decode, kuboKey)
+	payload := mustDecode(t, cid.Decode, kuboPayload)
+
+	old := NewResearchObject("paper.pdf", ingester, payload, 6)
+	old.Uploader, old.UploaderSig = ingester, []byte{1, 2, 3}
+	b, err := old.MarshalCBOR()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got ResearchObject
+	if err := got.UnmarshalCBOR(b); err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := got.MarshalCBOR(); !bytes.Equal(again, b) {
+		t.Fatal("an old manifest re-encodes differently, so its signature would no longer verify")
+	}
+	if all := got.AllUploaders(); len(all) != 1 || all[0].Key != ingester || !bytes.Equal(all[0].Sig, []byte{1, 2, 3}) {
+		t.Fatalf("AllUploaders = %+v", all)
+	}
+}

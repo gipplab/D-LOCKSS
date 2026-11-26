@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/ipfs/go-cid"
+	"github.com/ipld/go-ipld-prime/datamodel"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -20,9 +21,16 @@ type ResearchObject struct {
 
 	TotalSize uint64 `cbor:"size"` // Total size in bytes
 
-	// Uploader and UploaderSig are set for uploads through the node's HTTP
-	// API: the uploader's key and its signature, see VerifyUpload. They are
-	// only serialized when set, so other manifests keep their CIDs.
+	// Uploaders are the users who signed the payload, see VerifyUpload:
+	// the uploader of /upload, or the signatures the wiki holds for a
+	// pinned file. Sorted by key; only serialized when set, so other
+	// manifests keep their CIDs.
+	Uploaders []UploaderSignature `cbor:"uploaders"`
+
+	// Uploader and UploaderSig are the single uploader of manifests made
+	// before Uploaders existed. They are read and re-encoded, so such
+	// manifests keep their signatures, but no longer written.
+	// AllUploaders includes them.
 	Uploader    peer.ID `cbor:"uploader"`
 	UploaderSig []byte  `cbor:"uploader_sig"`
 
@@ -31,6 +39,20 @@ type ResearchObject struct {
 	// different ManifestCID on each ingest) and should be ignored. It is set
 	// by UnmarshalCBOR and never serialized.
 	HasLegacyTimestamp bool `cbor:"-"`
+}
+
+// UploaderSignature is a user's key and its signature of the payload.
+type UploaderSignature struct {
+	Key peer.ID
+	Sig []byte
+}
+
+// AllUploaders returns the uploaders of the manifest, old format included.
+func (ro *ResearchObject) AllUploaders() []UploaderSignature {
+	if ro.Uploader == "" {
+		return ro.Uploaders
+	}
+	return append([]UploaderSignature{{ro.Uploader, ro.UploaderSig}}, ro.Uploaders...)
 }
 
 // MarshalCBOR serializes the ResearchObject to CBOR format.
@@ -60,6 +82,13 @@ func (ro *ResearchObject) marshalCBOR(includeSig bool) ([]byte, error) {
 			cborKV{"uploader", ro.Uploader.String()},
 			cborKV{"uploader_sig", ro.UploaderSig},
 		)
+	}
+	if len(ro.Uploaders) > 0 {
+		list := make([][]cborKV, len(ro.Uploaders))
+		for i, u := range ro.Uploaders {
+			list[i] = []cborKV{{"key", u.Key.String()}, {"sig", u.Sig}}
+		}
+		fields = append(fields, cborKV{"uploaders", list})
 	}
 	b, err := marshalCBORMap(fields)
 	if err != nil {
@@ -102,7 +131,37 @@ func (ro *ResearchObject) UnmarshalCBOR(data []byte) error {
 			return fmt.Errorf("failed to read uploader_sig: %w", err)
 		}
 	}
+	if ro.Uploaders, err = readUploaders(node); err != nil {
+		return fmt.Errorf("failed to read uploaders: %w", err)
+	}
 	return nil
+}
+
+func readUploaders(node datamodel.Node) ([]UploaderSignature, error) {
+	list, err := node.LookupByString("uploaders")
+	if err != nil {
+		return nil, nil
+	}
+	var out []UploaderSignature
+	it := list.ListIterator()
+	if it == nil {
+		return nil, errors.New("not a list")
+	}
+	for !it.Done() {
+		_, entry, err := it.Next()
+		if err != nil {
+			return nil, err
+		}
+		var u UploaderSignature
+		if u.Key, err = readPeerID(entry, "key"); err != nil {
+			return nil, err
+		}
+		if u.Sig, err = readBytes(entry, "sig"); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, nil
 }
 
 // VerifyUpload checks that sig is uploader's signature of payload, made with
