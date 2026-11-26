@@ -260,13 +260,6 @@ func (m *Monitor) handleManifestPayload(w http.ResponseWriter, r *http.Request) 
 		manifest["uploader"] = ro.Uploader.String()
 		manifest["uploader_sig"] = base64.StdEncoding.EncodeToString(ro.UploaderSig)
 	}
-	if len(ro.Uploaders) > 0 {
-		uploaders := make([]map[string]string, len(ro.Uploaders))
-		for i, u := range ro.Uploaders {
-			uploaders[i] = map[string]string{"key": u.Key.String(), "sig": base64.StdEncoding.EncodeToString(u.Sig)}
-		}
-		manifest["uploaders"] = uploaders
-	}
 	writeJSON(w, map[string]interface{}{"payload_cid": ro.Payload.String(), "manifest": manifest})
 }
 

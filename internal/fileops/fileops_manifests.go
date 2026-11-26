@@ -25,10 +25,12 @@ type manifestIndex struct {
 	byContent map[[32]byte]cid.Cid
 }
 
-// loadManifestIndex fills the index from the manifests pinned in Kubo. Until
-// it has run, or if it fails, ingests store new manifests.
-func (fp *FileProcessor) loadManifestIndex() {
-	if fp.ipfsClient == nil {
+// LoadManifestIndex fills the index from this node's manifests pinned in
+// Kubo, so that ingesting a file again reuses its manifest. Until it has
+// run, or if it fails, ingests store new manifests. Call it once the node
+// has joined its shard, before pins are ingested.
+func (fp *FileProcessor) LoadManifestIndex() {
+	if !fp.shardMgr.IsLocalNodeIngestor() {
 		return
 	}
 

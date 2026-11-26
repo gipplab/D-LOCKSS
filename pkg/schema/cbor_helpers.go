@@ -12,7 +12,7 @@ import (
 )
 
 // cborKV is a key-value pair for ordered CBOR map serialization.
-// Val must be int64, string, []byte, or [][]cborKV (a list of maps).
+// Val must be int64, string, or []byte.
 type cborKV struct {
 	Key string
 	Val any
@@ -21,24 +21,13 @@ type cborKV struct {
 // marshalCBORMap encodes an ordered slice of key-value pairs as a CBOR map.
 func marshalCBORMap(fields []cborKV) ([]byte, error) {
 	nb := basicnode.Prototype.Map.NewBuilder()
-	if err := assembleMap(nb, fields); err != nil {
-		return nil, err
-	}
-	var buf bytes.Buffer
-	if err := dagcbor.Encode(nb.Build(), &buf); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-func assembleMap(na datamodel.NodeAssembler, fields []cborKV) error {
-	ma, err := na.BeginMap(int64(len(fields)))
+	ma, err := nb.BeginMap(int64(len(fields)))
 	if err != nil {
-		return fmt.Errorf("begin map: %w", err)
+		return nil, fmt.Errorf("begin map: %w", err)
 	}
 	for _, f := range fields {
 		if err := ma.AssembleKey().AssignString(f.Key); err != nil {
-			return err
+			return nil, err
 		}
 		switch v := f.Val.(type) {
 		case int64:
@@ -47,29 +36,21 @@ func assembleMap(na datamodel.NodeAssembler, fields []cborKV) error {
 			err = ma.AssembleValue().AssignString(v)
 		case []byte:
 			err = ma.AssembleValue().AssignBytes(v)
-		case [][]cborKV:
-			err = assembleList(ma.AssembleValue(), v)
 		default:
-			return fmt.Errorf("unsupported CBOR value type %T for key %q", f.Val, f.Key)
+			return nil, fmt.Errorf("unsupported CBOR value type %T for key %q", f.Val, f.Key)
 		}
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return ma.Finish()
-}
-
-func assembleList(na datamodel.NodeAssembler, maps [][]cborKV) error {
-	la, err := na.BeginList(int64(len(maps)))
-	if err != nil {
-		return err
+	if err := ma.Finish(); err != nil {
+		return nil, err
 	}
-	for _, m := range maps {
-		if err := assembleMap(la.AssembleValue(), m); err != nil {
-			return err
-		}
+	var buf bytes.Buffer
+	if err := dagcbor.Encode(nb.Build(), &buf); err != nil {
+		return nil, err
 	}
-	return la.Finish()
+	return buf.Bytes(), nil
 }
 
 // decodeCBORMap decodes CBOR bytes into an IPLD map node.

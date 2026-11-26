@@ -1,7 +1,6 @@
 package config
 
 import (
-	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -112,20 +111,14 @@ type ReplicationConfig struct {
 
 // FileConfig holds parameters for file ingestion and DHT operations.
 type FileConfig struct {
-	FileImportTimeout           time.Duration
-	DHTProvideTimeout           time.Duration
-	MaxConcurrentDHTProvides    int
-	FileProcessingDelay         time.Duration
-	FileStabilityDelay          time.Duration
-	MaxConcurrentFileProcessing int
-	ReshardDelay                time.Duration
-	ReshardHandoffDelay         time.Duration
+	FileImportTimeout        time.Duration
+	DHTProvideTimeout        time.Duration
+	MaxConcurrentDHTProvides int
+	ReshardDelay             time.Duration
+	ReshardHandoffDelay      time.Duration
 	// PinIngestEnabled ingests recursive pins that users create in Kubo.
 	PinIngestEnabled  bool
 	PinIngestInterval time.Duration
-	// PinIngestDelay is the least time between finding a user pin and
-	// creating its manifest, so the wiki can store its users' signatures.
-	PinIngestDelay time.Duration
 }
 
 // SecurityConfig holds trust, signing, and nonce parameters.
@@ -152,16 +145,19 @@ type Config struct {
 	PubsubTopicPrefix   string
 	TopicName           string
 	IngestAllowlist     []string
-	FileWatchFolder     string
-	ClusterStorePath    string
-	BadBitsPath         string
-	IPFSNodeAddress     string
-	IPFSToken           string
-	APIPort             int
-	WikiAPI             string
-	// AllowUnsigned lets pin ingest make manifests for files that no user
-	// of the wiki (WikiAPI) signed. Without WikiAPI every file is ingested.
-	AllowUnsigned          bool
+	// DataDir places the node's state: the helper key, node name, cluster
+	// store and trust store live in its parent. Its disk is the one checked
+	// against DiskUsageHighWaterMark.
+	DataDir          string
+	ClusterStorePath string
+	BadBitsPath      string
+	IPFSNodeAddress  string
+	IPFSToken        string
+	APIPort          int
+	// WikiAPI, if set, enables /upload and makes this node ingest only
+	// files that a user signed with a key the wiki knows. Files that other
+	// nodes ingested are replicated either way.
+	WikiAPI                string
 	BootstrapTimeout       time.Duration
 	HeartbeatInterval      time.Duration
 	VerboseLogging         bool
@@ -198,7 +194,7 @@ func DefaultConfig() *Config {
 		DiscoveryServiceTag:    "dlockss-prod",
 		PubsubTopicPrefix:      DefaultPubsubVersion,
 		TopicName:              DefaultTopicName,
-		FileWatchFolder:        dataDir,
+		DataDir:                dataDir,
 		ClusterStorePath:       filepath.Join(filepath.Dir(dataDir), "cluster_store"),
 		BadBitsPath:            "badBits.csv",
 		IPFSNodeAddress:        "/ip4/127.0.0.1/tcp/5001",
@@ -236,16 +232,13 @@ func DefaultConfig() *Config {
 			PinReannounceInterval:          2 * time.Minute,
 		},
 		Files: FileConfig{
-			FileImportTimeout:           2 * time.Minute,
-			DHTProvideTimeout:           60 * time.Second,
-			MaxConcurrentDHTProvides:    8,
-			FileProcessingDelay:         100 * time.Millisecond,
-			FileStabilityDelay:          3 * time.Second,
-			MaxConcurrentFileProcessing: 5,
-			ReshardDelay:                5 * time.Second,
-			ReshardHandoffDelay:         3 * time.Second,
-			PinIngestEnabled:            true,
-			PinIngestInterval:           time.Minute,
+			FileImportTimeout:        2 * time.Minute,
+			DHTProvideTimeout:        60 * time.Second,
+			MaxConcurrentDHTProvides: 8,
+			ReshardDelay:             5 * time.Second,
+			ReshardHandoffDelay:      3 * time.Second,
+			PinIngestEnabled:         true,
+			PinIngestInterval:        time.Minute,
 		},
 		Security: SecurityConfig{
 			TrustMode:           "open",
@@ -275,14 +268,13 @@ func LoadFromEnv() *Config {
 	cfg.PubsubTopicPrefix = getEnvString("DLOCKSS_PUBSUB_TOPIC_PREFIX", cfg.PubsubTopicPrefix)
 	cfg.TopicName = getEnvString("DLOCKSS_TOPIC_NAME", cfg.TopicName)
 	cfg.IngestAllowlist = getEnvStringSlice("DLOCKSS_INGEST_ALLOWLIST")
-	cfg.FileWatchFolder = dataDir
+	cfg.DataDir = dataDir
 	cfg.ClusterStorePath = clusterStorePath(dataDir)
 	cfg.BadBitsPath = getEnvString("DLOCKSS_BADBITS_PATH", cfg.BadBitsPath)
 	cfg.IPFSNodeAddress = getEnvString("DLOCKSS_IPFS_NODE", cfg.IPFSNodeAddress)
 	cfg.IPFSToken = getEnvString("DLOCKSS_IPFS_TOKEN", "")
 	cfg.APIPort = getEnvInt("DLOCKSS_API_PORT", cfg.APIPort)
 	cfg.WikiAPI = getEnvString("DLOCKSS_WIKI_API", "")
-	cfg.AllowUnsigned = getEnvBool("DLOCKSS_ALLOW_UNSIGNED", false)
 	cfg.BootstrapTimeout = getEnvDuration("DLOCKSS_BOOTSTRAP_TIMEOUT", cfg.BootstrapTimeout)
 	cfg.HeartbeatInterval = getEnvDuration("DLOCKSS_HEARTBEAT_INTERVAL", cfg.HeartbeatInterval)
 	cfg.VerboseLogging = getEnvBool("DLOCKSS_VERBOSE_LOGGING", cfg.VerboseLogging)
@@ -326,14 +318,10 @@ func LoadFromEnv() *Config {
 	cfg.Files.FileImportTimeout = getEnvDuration("DLOCKSS_FILE_IMPORT_TIMEOUT", cfg.Files.FileImportTimeout)
 	cfg.Files.DHTProvideTimeout = getEnvDuration("DLOCKSS_DHT_PROVIDE_TIMEOUT", cfg.Files.DHTProvideTimeout)
 	cfg.Files.MaxConcurrentDHTProvides = getEnvInt("DLOCKSS_MAX_CONCURRENT_DHT_PROVIDES", cfg.Files.MaxConcurrentDHTProvides)
-	cfg.Files.FileProcessingDelay = getEnvDuration("DLOCKSS_FILE_PROCESSING_DELAY", cfg.Files.FileProcessingDelay)
-	cfg.Files.FileStabilityDelay = getEnvDuration("DLOCKSS_FILE_STABILITY_DELAY", cfg.Files.FileStabilityDelay)
-	cfg.Files.MaxConcurrentFileProcessing = getEnvInt("DLOCKSS_MAX_CONCURRENT_FILE_PROCESSING", cfg.Files.MaxConcurrentFileProcessing)
 	cfg.Files.ReshardDelay = getEnvDuration("DLOCKSS_RESHARD_DELAY", cfg.Files.ReshardDelay)
 	cfg.Files.ReshardHandoffDelay = getEnvDuration("DLOCKSS_RESHARD_HANDOFF_DELAY", cfg.Files.ReshardHandoffDelay)
 	cfg.Files.PinIngestEnabled = getEnvBool("DLOCKSS_PIN_INGEST", cfg.Files.PinIngestEnabled)
 	cfg.Files.PinIngestInterval = getEnvDuration("DLOCKSS_PIN_INGEST_INTERVAL", cfg.Files.PinIngestInterval)
-	cfg.Files.PinIngestDelay = getEnvDuration("DLOCKSS_PIN_INGEST_DELAY", cfg.Files.PinIngestDelay)
 
 	cfg.Security.TrustMode = getEnvString("DLOCKSS_TRUST_MODE", cfg.Security.TrustMode)
 	cfg.Security.TrustStorePath = getEnvString("DLOCKSS_TRUST_STORE", filepath.Join(filepath.Dir(dataDir), "trusted_peers.json"))
@@ -364,10 +352,6 @@ func (c *Config) Validate() {
 		slog.Warn("unknown trust mode, defaulting to open", "mode", c.Security.TrustMode)
 		c.Security.TrustMode = "open"
 	}
-	if c.Files.MaxConcurrentFileProcessing < 1 {
-		slog.Warn("invalid config value, using default", "key", "MaxConcurrentFileProcessing", "value", c.Files.MaxConcurrentFileProcessing, "default", 5)
-		c.Files.MaxConcurrentFileProcessing = 5
-	}
 	if c.Security.NonceSize < 1 {
 		slog.Warn("invalid config value, using default", "key", "NonceSize", "value", c.Security.NonceSize, "default", 16)
 		c.Security.NonceSize = 16
@@ -390,34 +374,6 @@ func (c *Config) Validate() {
 	}
 }
 
-// ValidatePathSafetyCheck checks that state files do not reside inside the
-// ingest directory. Returns a non-empty error message listing offenders.
-func (c *Config) ValidatePathSafetyCheck() string {
-	checks := []struct {
-		label string
-		path  string
-	}{
-		{"IdentityPath (DLOCKSS_IDENTITY_PATH)", c.IdentityPath},
-		{"NodeNamePath", c.NodeNamePath},
-		{"IPFSConfigPath (DLOCKSS_IPFS_CONFIG)", c.IPFSConfigPath},
-		{"ClusterStorePath (DLOCKSS_CLUSTER_STORE)", c.ClusterStorePath},
-		{"TrustStorePath (DLOCKSS_TRUST_STORE)", c.Security.TrustStorePath},
-	}
-	var problems []string
-	for _, ck := range checks {
-		if isInsideDir(ck.path, c.FileWatchFolder) {
-			problems = append(problems, fmt.Sprintf("  %s = %s", ck.label, ck.path))
-		}
-	}
-	if len(problems) == 0 {
-		return ""
-	}
-	return fmt.Sprintf(
-		"the following state paths resolve inside the ingest directory (%s) and would be ingested as data:\n%s\n"+
-			"Set DLOCKSS_DATA_DIR to a dedicated subdirectory (e.g. ./data) or override the conflicting paths.",
-		c.FileWatchFolder, strings.Join(problems, "\n"))
-}
-
 // Log prints all configuration values after calling Validate.
 func (c *Config) Log() {
 	c.Validate()
@@ -430,14 +386,13 @@ func (c *Config) Log() {
 		"ipfs_node", c.IPFSNodeAddress,
 		"api_port", c.APIPort,
 		"wiki_api", c.WikiAPI,
-		"allow_unsigned", c.AllowUnsigned,
 		"bootstrap_timeout", c.BootstrapTimeout,
 		"conn_low_water", c.ConnLowWater,
 		"conn_high_water", c.ConnHighWater,
 		"dht_client", c.DHTClient,
 	)
 	slog.Info("config: paths",
-		"data_dir", c.FileWatchFolder,
+		"data_dir", c.DataDir,
 		"cluster_store", c.ClusterStorePath,
 		"identity", c.IdentityPath,
 		"badbits", c.BadBitsPath,
@@ -469,14 +424,10 @@ func (c *Config) Log() {
 		"import_timeout", c.Files.FileImportTimeout,
 		"dht_provide_timeout", c.Files.DHTProvideTimeout,
 		"max_concurrent_dht_provides", c.Files.MaxConcurrentDHTProvides,
-		"processing_delay", c.Files.FileProcessingDelay,
-		"stability_delay", c.Files.FileStabilityDelay,
-		"max_concurrent", c.Files.MaxConcurrentFileProcessing,
 		"reshard_delay", c.Files.ReshardDelay,
 		"reshard_handoff_delay", c.Files.ReshardHandoffDelay,
 		"pin_ingest", c.Files.PinIngestEnabled,
 		"pin_ingest_interval", c.Files.PinIngestInterval,
-		"pin_ingest_delay", c.Files.PinIngestDelay,
 	)
 	slog.Info("config: orphan",
 		"unpin_grace", c.Orphan.UnpinGracePeriod,
@@ -506,21 +457,4 @@ func (c *Config) Log() {
 	slog.Info("config: storage",
 		"disk_high_water_mark", c.DiskUsageHighWaterMark,
 	)
-}
-
-// isInsideDir reports whether path resolves to a location inside dir.
-func isInsideDir(path, dir string) bool {
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return false
-	}
-	absDir, err := filepath.Abs(dir)
-	if err != nil {
-		return false
-	}
-	rel, err := filepath.Rel(absDir, absPath)
-	if err != nil {
-		return false
-	}
-	return !strings.HasPrefix(rel, "..")
 }

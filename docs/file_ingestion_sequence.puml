@@ -1,8 +1,8 @@
 @startuml File Ingestion Sequence
 
 actor User
-participant "File System" as FS
-participant "File Watcher" as Watcher
+participant "Wiki" as Wiki
+participant "Pin Watcher" as Watcher
 participant "FileProcessor" as FileOps
 participant "StorageManager" as Storage
 participant "ShardManager" as ShardMgr
@@ -13,13 +13,22 @@ participant "DHT" as DHT
 participant "PubSub" as PubSub
 participant "Other Nodes" as Nodes
 
-User -> FS: Drop file into ./data
-FS -> Watcher: fsnotify.Create event
-Watcher -> Watcher: handleWatcherEvent(event)\n(if directory: handleNewDirectory)
-Watcher -> FileOps: enqueue file via processNewFile(path)
+User -> IPFS: ipfs pin add PayloadCID\n(or the wiki pins a file)
+Watcher -> IPFS: RecursivePins()\n(every DLOCKSS_PIN_INGEST_INTERVAL)
+Watcher -> Watcher: new user pin: ingest on the next poll
+Watcher -> FileOps: ingestPinned(PayloadCID)
+opt DLOCKSS_WIKI_API set
+    FileOps -> Wiki: GET /math/v0/signatures/{cid}
+    Wiki --> FileOps: [{key, signature}, ...]
+    FileOps -> FileOps: keep signatures that verify, one per key\n(none: not ingested; asked again after 1h, 1d, 1w, 1m)
+end
+note over User, FileOps
+    An upload (POST /upload) imports the file, checks the key
+    with the wiki (/math/v0/key) and continues here with one signature.
+end note
+note over FileOps: The steps below run once per signature\n(once, unsigned, without DLOCKSS_WIKI_API)
 
-FileOps -> IPFS: Import file (UnixFS)\nPayloadCID
-FileOps -> FileOps: Build ResearchObject (CBOR)\n{meta_ref, ingester_id, payload, size}
+FileOps -> FileOps: Build ResearchObject (CBOR)\n{meta_ref, ingester_id, payload, size,\nuploader, uploader_sig}
 FileOps -> IPFS: key/sign(unsigned manifest)\nsig with the node key
 FileOps -> IPFS: PutDagCBOR(manifest)\nManifestCID
 FileOps -> FileOps: Check BadBits (ManifestCID)

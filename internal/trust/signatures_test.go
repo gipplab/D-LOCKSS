@@ -2,7 +2,6 @@ package trust
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -10,9 +9,8 @@ import (
 	"testing"
 
 	"github.com/ipfs/go-cid"
-	"github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/libp2p/go-libp2p/core/peer"
 
+	"dlockss/internal/testutil"
 	"dlockss/pkg/schema"
 )
 
@@ -23,31 +21,21 @@ const (
 	kuboSig     = "u0UeavBivwyduao91YLSf41jA6XUNhOAMvh9JHLi1L4_DwV98Z5155wkOnkpCFAgFvcfe6XRiqhFFQDTM31kMBw"
 )
 
-// kuboSign signs like 'ipfs key sign' with a new key.
-func kuboSign(t *testing.T, payload cid.Cid) (string, string) {
+// kuboSign signs payload like 'ipfs key sign' with a new key.
+func kuboSign(t *testing.T, payload cid.Cid) wikiSignature {
 	t.Helper()
-	priv, pub, err := crypto.GenerateEd25519Key(rand.Reader)
+	key := testutil.NewKey(t)
+	sig, err := key.SignWithNodeKey(context.Background(), []byte("dlockss-upload "+payload.String()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	id, _ := peer.IDFromPublicKey(pub)
-	sig, err := priv.Sign([]byte(schema.KuboSignPrefix + "dlockss-upload " + payload.String()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return id.String(), "u" + base64.RawURLEncoding.EncodeToString(sig)
-}
-
-type sigEntry struct {
-	Key       string `json:"key"`
-	Signature string `json:"signature"`
+	return wikiSignature{key.ID.String(), "u" + base64.RawURLEncoding.EncodeToString(sig)}
 }
 
 func TestWikiSignatures(t *testing.T) {
 	payload := cid.MustParse(kuboPayload)
-	otherKey, otherSig := kuboSign(t, payload)
-	answer := []sigEntry{
-		{otherKey, otherSig},
+	answer := []wikiSignature{
+		kuboSign(t, payload),
 		{kuboKey, kuboSig},
 		{kuboKey, kuboSig},      // twice
 		{untrustedKey, kuboSig}, // signature of another key
@@ -64,7 +52,7 @@ func TestWikiSignatures(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	got, err := NewWikiSignatures(srv.URL+"/w/rest.php/").Signatures(context.Background(), payload)
+	got, err := NewWiki(srv.URL+"/w/rest.php/").Signatures(context.Background(), payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,10 +74,15 @@ func TestWikiSignatures_NoneAndErrors(t *testing.T) {
 		w.Write([]byte("[]"))
 	}))
 	defer srv.Close()
-	ws := NewWikiSignatures(srv.URL)
+	ws := NewWiki(srv.URL)
 
 	if got, err := ws.Signatures(context.Background(), payload); err != nil || len(got) != 0 {
 		t.Fatalf("an empty list means nobody signed, got %v, %v", got, err)
+	}
+	for _, status = range []int{http.StatusBadRequest, http.StatusNotFound} {
+		if got, err := ws.Signatures(context.Background(), payload); err != nil || len(got) != 0 {
+			t.Fatalf("%d means nobody signed, got %v, %v", status, got, err)
+		}
 	}
 	status = http.StatusBadGateway
 	if _, err := ws.Signatures(context.Background(), payload); err == nil {

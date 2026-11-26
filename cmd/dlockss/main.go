@@ -63,8 +63,9 @@ func main() {
 	}
 	cfg.Log()
 
-	if msg := cfg.ValidatePathSafetyCheck(); msg != "" {
-		log.Fatalf("[Fatal] Unsafe path configuration: %s", msg)
+	// The disk check reads the data directory's filesystem.
+	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+		slog.Warn("cannot create the data directory", "path", cfg.DataDir, "error", err)
 	}
 
 	badBitsFilter, err := badbits.NewFilter(cfg.BadBitsPath)
@@ -167,8 +168,6 @@ func main() {
 		log.Fatalf("[Fatal] Failed to load trust store %s: %v", cfg.Security.TrustStorePath, err)
 	}
 
-	// The cluster store must live outside FileWatchFolder, or the node would
-	// ingest its own database files (see Config.ValidatePathSafetyCheck).
 	dstore, err := leveldb.NewDatastore(cfg.ClusterStorePath, nil)
 	if err != nil {
 		log.Fatalf("[Fatal] Failed to create datastore at %s: %v", cfg.ClusterStorePath, err)
@@ -251,9 +250,12 @@ func main() {
 	clusterMgr.SetShardPeerProvider(shardMgr) // CRDT Peers() and allocations use real shard membership
 	announcePinned = shardMgr.AnnouncePinned
 
+	// With a wiki, the node ingests only signed files and accepts uploads.
+	var wiki *trust.Wiki
 	var signatures fileops.SignatureSource
 	if cfg.WikiAPI != "" {
-		signatures = trust.NewWikiSignatures(cfg.WikiAPI)
+		wiki = trust.NewWiki(cfg.WikiAPI)
+		signatures = wiki
 	}
 	fp := fileops.NewFileProcessor(fileops.FileProcessorConfig{
 		Cfg:        cfg,
@@ -267,29 +269,27 @@ func main() {
 	})
 
 	var upload http.Handler
-	if cfg.WikiAPI != "" {
-		upload = api.UploadHandler(trust.NewWikiKeys(cfg.WikiAPI), fp)
+	if wiki != nil {
+		upload = api.UploadHandler(wiki, fp)
 	}
 	apiServer := api.NewAPIServer(cfg.APIPort, upload)
 	apiServer.Start()
-	go fp.WatchFolder(ctx)
 
-	// The shard manager must run before existing files are scanned, so the
-	// node joins its shard and learns of splits before re-ingesting.
+	// The shard manager must run before pins are ingested, so the node joins
+	// its shard and learns of splits first.
 	shardMgr.Run()
 
-	// The scan waits for the node to settle into its shard (discovery, split
-	// rebroadcast). Re-ingesting replaces legacy manifests that carry
-	// timestamps with deterministic ones.
+	// Pin ingest waits for the node to settle into its shard (discovery,
+	// split rebroadcast).
 	go func() {
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(15 * time.Second):
 		}
-		fp.ScanExistingFiles()
+		fp.LoadManifestIndex()
 		if cfg.Files.PinIngestEnabled {
-			go fp.WatchPins(ctx)
+			fp.WatchPins(ctx)
 		}
 	}()
 

@@ -2,120 +2,15 @@ package fileops
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
-	"strings"
-	"time"
 
 	"github.com/ipfs/go-cid"
 
 	"dlockss/internal/common"
 	"dlockss/pkg/schema"
 )
-
-func (fp *FileProcessor) validateFilePath(path string) bool {
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		slog.Error("failed to resolve absolute path", "path", path, "error", err)
-		return false
-	}
-
-	absWatch, err := filepath.Abs(fp.cfg.FileWatchFolder)
-	if err != nil {
-		slog.Error("failed to resolve watch folder path", "path", fp.cfg.FileWatchFolder, "error", err)
-		return false
-	}
-
-	rel, err := filepath.Rel(absWatch, absPath)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		slog.Warn("rejected path outside watch folder", "path", path)
-		return false
-	}
-
-	if strings.HasSuffix(path, ".tmp") || strings.HasSuffix(path, ".part") || strings.HasSuffix(path, ".crdownload") {
-		return false
-	}
-
-	return true
-}
-
-// processNewFile imports a newly detected file into IPFS, builds a ResearchObject manifest, pins it, and announces it.
-func (fp *FileProcessor) processNewFile(path string) {
-	slog.Info("processing file", "path", path)
-
-	if !fp.shardMgr.IsLocalNodeIngestor() {
-		slog.Warn("node is not an authorized ingestor, skipping file", "path", path)
-		return
-	}
-
-	if !fp.validateFilePath(path) {
-		slog.Warn("file validation failed", "path", path)
-		return
-	}
-
-	if fp.ipfsClient == nil {
-		slog.Error("IPFS client not initialized", "path", path)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(fp.ctx, fp.cfg.Files.FileImportTimeout)
-	defer cancel()
-
-	slog.Debug("importing file to IPFS", "path", path)
-	payloadCID, cleanupPayload, err := fp.importFileToIPFS(ctx, path)
-	if err != nil {
-		slog.Error("failed to import file", "path", path, "error", err)
-		return
-	}
-
-	payloadCIDStr := payloadCID.String()
-	if !fp.claimRecentIngest(payloadCIDStr) {
-		slog.Info("skipping duplicate payload", "payload", payloadCIDStr, "path", path)
-		cleanupPayload()
-		return
-	}
-
-	slog.Debug("building manifest", "path", path, "payload", payloadCIDStr)
-	info, err := os.Stat(path)
-	if err != nil {
-		cleanupPayload()
-		slog.Error("failed to stat file", "path", path, "error", err)
-		return
-	}
-	manifestCID, manifestCIDStr, err := fp.buildAndStoreManifest(ctx, "file://"+filepath.Base(path), uint64(info.Size()), payloadCID, nil, cleanupPayload)
-	if err != nil {
-		slog.Error("failed to build manifest", "path", path, "error", err)
-		return
-	}
-
-	if !fp.checkBadBitsAndPin(ctx, manifestCID, manifestCIDStr, path, cleanupPayload) {
-		slog.Warn("badbits check or pinning failed", "path", path)
-		return
-	}
-
-	fp.trackAndAnnounceFile(manifestCID, manifestCIDStr, payloadCID)
-	slog.Info("file processing completed", "path", path, "manifest", manifestCIDStr, "payload", payloadCIDStr)
-}
-
-// claimRecentIngest records payload as ingested now. It reports false when the
-// payload was already ingested within recentIngestTTL.
-func (fp *FileProcessor) claimRecentIngest(payload string) bool {
-	fp.recentIngestMu.Lock()
-	defer fp.recentIngestMu.Unlock()
-	now := time.Now()
-	if last, seen := fp.recentIngests[payload]; seen && now.Sub(last) < recentIngestTTL {
-		return false
-	}
-	fp.recentIngests[payload] = now
-	for k, t := range fp.recentIngests {
-		if now.Sub(t) > 2*recentIngestTTL {
-			delete(fp.recentIngests, k)
-		}
-	}
-	return true
-}
 
 func (fp *FileProcessor) importFileToIPFS(ctx context.Context, path string) (cid.Cid, func(), error) {
 	payloadCID, err := fp.ipfsClient.ImportFile(ctx, path)
@@ -130,17 +25,25 @@ func (fp *FileProcessor) importFileToIPFS(ctx context.Context, path string) (cid
 	return payloadCID, cleanupPayload, nil
 }
 
-// buildAndStoreManifest signs and stores the manifest for payloadCID. On
-// failure it calls cleanupPayload.
-func (fp *FileProcessor) buildAndStoreManifest(ctx context.Context, metaRef string, size uint64, payloadCID cid.Cid, uploaders []schema.UploaderSignature, cleanupPayload func()) (cid.Cid, string, error) {
+// errNotPinned reports a manifest that is blocked or could not be pinned.
+var errNotPinned = errors.New("blocked or pinning failed")
+
+// ingestManifest makes, pins, and announces the manifest of payloadCID, with
+// the user's signature u unless it is the zero value. On failure it calls
+// cleanupPayload. Uploads and pin ingest both end here.
+func (fp *FileProcessor) ingestManifest(ctx context.Context, metaRef string, size uint64, payloadCID cid.Cid, u schema.UploaderSignature, cleanupPayload func()) (cid.Cid, error) {
 	ro := schema.NewResearchObject(metaRef, fp.shardMgr.NodeID(), payloadCID, size)
-	ro.Uploaders = uploaders
+	ro.Uploader, ro.UploaderSig = u.Key, u.Sig
 	manifestCID, err := fp.storeManifest(ctx, ro)
 	if err != nil {
 		cleanupPayload()
-		return cid.Cid{}, "", err
+		return cid.Undef, err
 	}
-	return manifestCID, manifestCID.String(), nil
+	if !fp.checkBadBitsAndPin(ctx, manifestCID, metaRef, cleanupPayload) {
+		return cid.Undef, errNotPinned
+	}
+	fp.trackAndAnnounceFile(manifestCID, payloadCID)
+	return manifestCID, nil
 }
 
 // storeManifest signs ro and stores it in IPFS, or returns this node's pinned
@@ -185,9 +88,10 @@ func (fp *FileProcessor) signResearchObject(ctx context.Context, ro *schema.Rese
 	return nil
 }
 
-func (fp *FileProcessor) checkBadBitsAndPin(ctx context.Context, manifestCID cid.Cid, manifestCIDStr, path string, cleanupPayload func()) bool {
+func (fp *FileProcessor) checkBadBitsAndPin(ctx context.Context, manifestCID cid.Cid, metaRef string, cleanupPayload func()) bool {
+	manifestCIDStr := manifestCID.String()
 	if fp.badBits.IsBlocked(manifestCIDStr) {
-		slog.Warn("refused to process blocked file", "path", path, "manifest", manifestCIDStr)
+		slog.Warn("refused to process blocked file", "meta_ref", metaRef, "manifest", manifestCIDStr)
 		cleanupPayload()
 		_ = fp.ipfsClient.UnpinRecursive(ctx, manifestCID)
 		return false
@@ -203,7 +107,8 @@ func (fp *FileProcessor) checkBadBitsAndPin(ctx context.Context, manifestCID cid
 	return true
 }
 
-func (fp *FileProcessor) trackAndAnnounceFile(manifestCID cid.Cid, manifestCIDStr string, payloadCID cid.Cid) {
+func (fp *FileProcessor) trackAndAnnounceFile(manifestCID, payloadCID cid.Cid) {
+	manifestCIDStr := manifestCID.String()
 	if !fp.storageMgr.PinFile(manifestCIDStr) {
 		slog.Debug("skipping already tracked or blocked manifest", "manifest", manifestCIDStr)
 		return

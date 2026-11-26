@@ -3,7 +3,6 @@ module dlockss
 go 1.26.0
 
 require (
-	github.com/fsnotify/fsnotify v1.4.9
 	github.com/ipfs-cluster/ipfs-cluster v1.1.5
 	github.com/ipfs/boxo v0.35.2
 	github.com/ipfs/go-cid v0.6.2

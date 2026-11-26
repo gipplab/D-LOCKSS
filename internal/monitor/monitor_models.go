@@ -130,7 +130,7 @@ type Monitor struct {
 	manifestReplication map[string]map[string]time.Time
 	peerShardLastSeen   map[string]map[string]time.Time
 	manifestShard       map[string]string    // manifest CID to the shard it was announced in, preferring descendants
-	manifestUploader    map[string][]string  // manifest CID to its uploaders' keys, empty if it has none
+	manifestUploader    map[string]string    // manifest CID to its uploader's key, "" if it has none
 	lastSplitTime       time.Time            // pruning is suspended for splitGracePeriod after this
 	peerLastSiblingMove map[string]time.Time // peer ID to the time of its last sibling move
 	keywords            *keywords.Store
@@ -206,7 +206,7 @@ func NewMonitor(cfg Config) *Monitor {
 		manifestReplication: make(map[string]map[string]time.Time),
 		peerShardLastSeen:   make(map[string]map[string]time.Time),
 		manifestShard:       make(map[string]string),
-		manifestUploader:    make(map[string][]string),
+		manifestUploader:    make(map[string]string),
 		peerLastSiblingMove: make(map[string]time.Time),
 		keywords:            keywords.NewStore(keywords.Config{}),
 	}
