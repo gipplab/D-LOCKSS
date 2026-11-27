@@ -5,14 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"strings"
 	"time"
 
 	"github.com/ipfs/go-cid"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/peer"
-	ma "github.com/multiformats/go-multiaddr"
 
 	"dlockss/pkg/schema"
 )
@@ -75,24 +73,6 @@ func (m *Monitor) ensureShardSubscriptionLocked(ctx context.Context, shardID str
 	slog.Info("subscribed to shard topic", "shard", shardLabel(shardID))
 }
 
-// resolveIPFromPeer extracts the best public IP address for the given peer
-// from the peerstore's known multiaddrs.
-func (m *Monitor) resolveIPFromPeer(pid peer.ID) string {
-	if m.host == nil || pid == "" {
-		return ""
-	}
-	var ips []string
-	for _, addr := range m.host.Peerstore().Addrs(pid) {
-		if v, err := addr.ValueForProtocol(ma.P_IP4); err == nil {
-			ips = append(ips, v)
-		}
-		if v, err := addr.ValueForProtocol(ma.P_IP6); err == nil {
-			ips = append(ips, v)
-		}
-	}
-	return preferPublicIP(ips)
-}
-
 // parseRole normalises a role string from a heartbeat or join message.
 func parseRole(s string) string {
 	switch role := strings.ToUpper(s); role {
@@ -121,12 +101,11 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 		}
 
 		senderID := msg.GetFrom()
-		ip := m.resolveIPFromPeer(senderID)
 		data := msg.Data
 
 		switch {
 		case hasPrefix(data, "HEARTBEAT:"):
-			m.dispatchHeartbeat(ctx, data, senderID, shardID, ip)
+			m.dispatchHeartbeat(ctx, data, senderID, shardID)
 
 		case hasPrefix(data, "PROBE:"):
 			// Ignore probe messages from other monitors.
@@ -135,25 +114,25 @@ func (m *Monitor) handleShardMessages(ctx context.Context, sub *pubsub.Subscript
 			m.dispatchLeave(ctx, senderID, shardID)
 
 		case hasPrefix(data, "JOIN:"):
-			m.dispatchJoin(ctx, data, senderID, shardID, ip)
+			m.dispatchJoin(ctx, data, senderID, shardID)
 
 		case hasPrefix(data, "PINNED:"):
 			nodeID, ok := m.helpers.Resolve(senderID, nil)
 			if !ok {
 				break
 			}
-			m.handleHeartbeat(ctx, nodeID, senderID, shardID, ip, -1, "", "")
+			m.handleHeartbeat(ctx, nodeID, senderID, shardID, -1, "", "")
 			if manifestCID, err := cid.Decode(string(data[len("PINNED:"):])); err == nil {
 				im := schema.IngestMessage{SignedEnvelope: schema.SignedEnvelope{ManifestCID: manifestCID}, ShardID: shardID}
-				m.handleIngestMessage(ctx, &im, nodeID, senderID, shardID, ip)
+				m.handleIngestMessage(ctx, &im, nodeID, senderID, shardID)
 			}
 
 		default:
 			var im schema.IngestMessage
 			if err := im.UnmarshalCBOR(data); err == nil {
-				m.dispatchIngestMessage(ctx, &im, senderID, shardID, ip)
+				m.dispatchIngestMessage(ctx, &im, senderID, shardID)
 			} else if nodeID, ok := m.helpers.Resolve(senderID, nil); ok {
-				m.handleHeartbeat(ctx, nodeID, senderID, shardID, ip, -1, "", "")
+				m.handleHeartbeat(ctx, nodeID, senderID, shardID, -1, "", "")
 			}
 		}
 	}
@@ -165,7 +144,7 @@ func hasPrefix(data []byte, prefix string) bool {
 
 // dispatchHeartbeat parses a HEARTBEAT message and records it for the node
 // its binding names.
-func (m *Monitor) dispatchHeartbeat(ctx context.Context, data []byte, senderID peer.ID, shardID, ip string) {
+func (m *Monitor) dispatchHeartbeat(ctx context.Context, data []byte, senderID peer.ID, shardID string) {
 	if len(data) > 500 {
 		return
 	}
@@ -178,7 +157,7 @@ func (m *Monitor) dispatchHeartbeat(ctx context.Context, data []byte, senderID p
 	if shardID != "" {
 		slog.Info("heartbeat", "shard", shardID, "author", peerLabel(nodeID.String(), hb.Name), "pinned", hb.Pinned, "role", role)
 	}
-	m.handleHeartbeat(ctx, nodeID, senderID, shardID, ip, hb.Pinned, role, hb.Name)
+	m.handleHeartbeat(ctx, nodeID, senderID, shardID, hb.Pinned, role, hb.Name)
 }
 
 // dispatchLeave handles a LEAVE message. It counts for the sender's node,
@@ -191,21 +170,21 @@ func (m *Monitor) dispatchLeave(ctx context.Context, senderID peer.ID, shardID s
 }
 
 // dispatchJoin parses a JOIN message.
-func (m *Monitor) dispatchJoin(ctx context.Context, data []byte, senderID peer.ID, shardID, ip string) {
+func (m *Monitor) dispatchJoin(ctx context.Context, data []byte, senderID peer.ID, shardID string) {
 	j := schema.ParseJoin(data)
 	nodeID, ok := m.helpers.Resolve(senderID, j.Binding)
 	if !ok {
 		return
 	}
 	role := parseRole(j.Role)
-	if m.handleHeartbeat(ctx, nodeID, senderID, shardID, ip, -1, role, j.Name) {
+	if m.handleHeartbeat(ctx, nodeID, senderID, shardID, -1, role, j.Name) {
 		slog.Info("shard join", "peer", peerLabel(nodeID.String(), j.Name), "shard", shardLabel(shardID), "role", role)
 	}
 }
 
 // dispatchIngestMessage handles a CBOR-encoded IngestMessage, subscribing to its
 // target shard if needed.
-func (m *Monitor) dispatchIngestMessage(ctx context.Context, im *schema.IngestMessage, senderID peer.ID, shardID, ip string) {
+func (m *Monitor) dispatchIngestMessage(ctx context.Context, im *schema.IngestMessage, senderID peer.ID, shardID string) {
 	targetShard := im.ShardID
 	if m.ps != nil {
 		m.mu.RLock()
@@ -219,9 +198,8 @@ func (m *Monitor) dispatchIngestMessage(ctx context.Context, im *schema.IngestMe
 	if !ok {
 		return
 	}
-	m.handleIngestMessage(ctx, im, nodeID, senderID, targetShard, ip)
-	m.ensureMinPinnedForPeer(ctx, nodeID.String(), 1)
-	m.handleHeartbeat(ctx, nodeID, senderID, targetShard, ip, -1, "", "")
+	m.handleIngestMessage(ctx, im, nodeID, senderID, targetShard)
+	m.handleHeartbeat(ctx, nodeID, senderID, targetShard, -1, "", "")
 }
 
 // subscribeToActiveShards runs in the background and periodically subscribes
@@ -288,37 +266,4 @@ func (m *Monitor) resubscribeBootstrap() {
 	for _, shardID := range shardIDsUpToDepth(m.cfg.BootstrapShardDepth) {
 		m.ensureShardSubscription(m.appCtx, shardID)
 	}
-}
-
-func isPrivateIP(ipStr string) bool {
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return false
-	}
-	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-		return true
-	}
-	for _, cidr := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"} {
-		_, block, _ := net.ParseCIDR(cidr)
-		if block.Contains(ip) {
-			return true
-		}
-	}
-	return false
-}
-
-func preferPublicIP(ips []string) string {
-	var fallback string
-	for _, ip := range ips {
-		if ip == "" {
-			continue
-		}
-		if fallback == "" {
-			fallback = ip
-		}
-		if !isPrivateIP(ip) {
-			return ip
-		}
-	}
-	return fallback
 }

@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"dlockss/internal/common"
+
 	"golang.org/x/time/rate"
 )
 
@@ -26,12 +28,14 @@ const (
 	maxRetries      = 3
 	retryCooldown   = 10 * time.Minute
 	batchRetryDelay = time.Minute // shortest indexer pause after a rate limit
-	maxRecentItems  = 30
 )
 
 // CIDSource is the set of known manifest CIDs (implemented by the monitor).
 type CIDSource interface {
 	UniqueCIDList() []string
+	// PayloadOf returns the payload CID of a manifest, if known. A payload
+	// is indexed once, whichever of its manifests comes first.
+	PayloadOf(manifestCID string) (string, bool)
 }
 
 // Store indexes documents and datasets announced on the network and answers
@@ -44,13 +48,11 @@ type Store struct {
 	processed   map[string]bool
 	inflight    map[string]bool
 	failures    map[string]*failureRecord
-	recent      []RecentSearch
+	// donePayloads holds the payloads that are indexed or cannot be.
+	donePayloads map[string]bool
 
-	dailyCount   int
-	dayStart     time.Time
-	totalOK      int
-	totalFail    int
-	totalSkipped int
+	dailyCount int
+	dayStart   time.Time
 
 	cfg        Config
 	keyReady   chan struct{}
@@ -78,31 +80,22 @@ type failureRecord struct {
 	LastTry time.Time `json:"last_try"`
 }
 
-type RecentSearch struct {
-	Keyword     string `json:"keyword"`
-	ResultCount int    `json:"result_count"`
-	Timestamp   int64  `json:"timestamp"`
-}
-
 type KeywordSuggestion struct {
 	Keyword  string `json:"keyword"`
 	CIDCount int    `json:"cid_count"`
 }
 
+// Stats reports the indexer settings and today's request quota.
 type Stats struct {
-	TotalCIDs      int    `json:"total_cids"`
-	Indexed        int    `json:"indexed"`
-	Failed         int    `json:"failed"`
-	Skipped        int    `json:"skipped"`
-	Pending        int    `json:"pending"`
-	UniqueKeywords int    `json:"unique_keywords"`
-	DailyRemaining int    `json:"daily_remaining"`
-	DailyLimit     int    `json:"daily_limit"`
-	Enabled        bool   `json:"enabled"`
-	CanSetKey      bool   `json:"can_set_key"`
-	Provider       string `json:"provider"`
-	Model          string `json:"model"`
-	Gateway        string `json:"gateway"`
+	DailyRemaining int  `json:"daily_remaining"`
+	DailyLimit     int  `json:"daily_limit"`
+	Enabled        bool `json:"enabled"`
+	// SettingsEnabled reports that the dashboard may change the settings
+	// (DLOCKSS_MONITOR_PASSWORD is set).
+	SettingsEnabled bool   `json:"settings_enabled"`
+	Provider        string `json:"provider"`
+	Model           string `json:"model"`
+	Gateway         string `json:"gateway"`
 }
 
 func NewStore(cfg Config) *Store {
@@ -129,16 +122,16 @@ func NewStore(cfg Config) *Store {
 	}
 	cfg = normalizeConfig(cfg)
 	s := &Store{
-		cidKeywords: make(map[string]*CIDKeywordEntry),
-		keywordCIDs: make(map[string]map[string]struct{}),
-		processed:   make(map[string]bool),
-		inflight:    make(map[string]bool),
-		failures:    make(map[string]*failureRecord),
-		recent:      make([]RecentSearch, 0, maxRecentItems),
-		dayStart:    startOfDay(time.Now()),
-		cfg:         cfg,
-		keyReady:    make(chan struct{}),
-		llmLimiter:  newLLMLimiter(cfg.Provider),
+		cidKeywords:  make(map[string]*CIDKeywordEntry),
+		keywordCIDs:  make(map[string]map[string]struct{}),
+		processed:    make(map[string]bool),
+		inflight:     make(map[string]bool),
+		failures:     make(map[string]*failureRecord),
+		donePayloads: make(map[string]bool),
+		dayStart:     startOfDay(time.Now()),
+		cfg:          cfg,
+		keyReady:     make(chan struct{}),
+		llmLimiter:   newLLMLimiter(cfg.Provider),
 	}
 	if cfg.APIKey != "" {
 		s.signalKeyReady()
@@ -184,28 +177,6 @@ func (s *Store) waitLLM() {
 	}
 }
 
-// SetAPIKeyOnce persists the SAIA key to {DataDir}/.api_key and enables indexing.
-// It fails if a key is already set (file, env, or a previous UI save).
-func (s *Store) SetAPIKeyOnce(key string) error {
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return ErrAPIKeyEmpty
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.cfg.APIKey != "" {
-		return ErrAPIKeySet
-	}
-	s.cfg.DataDir = dataDirOrDefault(s.cfg.DataDir)
-	if err := saveAPIKey(s.cfg.DataDir, key); err != nil {
-		return err
-	}
-	s.cfg.APIKey = key
-	s.signalKeyReady()
-	slog.Info("api key saved once", "path", apiKeyPath(s.cfg.DataDir))
-	return nil
-}
-
 func (s *Store) indexPath() string {
 	return filepath.Join(s.cfg.DataDir, indexFileName)
 }
@@ -233,9 +204,11 @@ func (s *Store) loadIndex() {
 	for cid, entry := range entries {
 		s.cidKeywords[cid] = entry
 		s.processed[cid] = true
+		if entry.PayloadCID != "" {
+			s.donePayloads[entry.PayloadCID] = true
+		}
 		s.indexLabels(cid, entry)
 	}
-	s.totalOK = len(entries)
 	slog.Info("loaded keyword index", "entries", len(entries), "keywords", len(s.keywordCIDs))
 }
 
@@ -306,7 +279,6 @@ func (s *Store) saveFailures() {
 // tried again. The caller holds s.mu.
 func (s *Store) resetFailuresLocked() {
 	s.failures = make(map[string]*failureRecord)
-	s.totalFail = 0
 	if s.cfg.DataDir == "" {
 		return
 	}
@@ -316,13 +288,8 @@ func (s *Store) resetFailuresLocked() {
 }
 
 func atomicWrite(path string, data []byte) {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		slog.Error("write temp file", "path", tmp, "error", err)
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		slog.Error("rename file", "path", path, "error", err)
+	if err := common.WriteFileAtomic(path, data); err != nil {
+		slog.Error("write file", "path", path, "error", err)
 	}
 }
 
@@ -338,19 +305,20 @@ func (s *Store) indexLabels(manifestCID string, entry *CIDKeywordEntry) {
 func entryLabels(entry *CIDKeywordEntry) []string {
 	labels := make([]string, 0, len(entry.Keywords)+3)
 	for _, kw := range entry.Keywords {
-		if kw = normalizeKeyword(kw); kw != "" {
+		if kw = NormalizeLabel(kw); kw != "" {
 			labels = append(labels, kw)
 		}
 	}
 	for _, field := range []string{entry.BroadField, entry.SubTopic, entry.ResearchNiche} {
-		if kw := normalizeKeyword(field); kw != "" {
+		if kw := NormalizeLabel(field); kw != "" {
 			labels = append(labels, kw)
 		}
 	}
 	return labels
 }
 
-func normalizeKeyword(s string) string {
+// NormalizeLabel folds a keyword or classification label for matching.
+func NormalizeLabel(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
 }
 
@@ -409,6 +377,9 @@ func (s *Store) Run(ctx context.Context, source CIDSource) {
 	}
 }
 
+// pickNextCID returns the next manifest to index, skipping files that are
+// indexed through another manifest. The source's lock is taken while s.mu
+// is held, never the other way round.
 func (s *Store) pickNextCID(source CIDSource) string {
 	candidates := source.UniqueCIDList()
 	sort.Strings(candidates)
@@ -424,13 +395,11 @@ func (s *Store) pickNextCID(source CIDSource) string {
 		if s.processed[c] || s.inflight[c] {
 			continue
 		}
-		if f, ok := s.failures[c]; ok {
-			if f.Count >= maxRetries {
-				continue
-			}
-			if now.Sub(f.LastTry) < retryCooldown {
-				continue
-			}
+		if f, ok := s.failures[c]; ok && (f.Count >= maxRetries || now.Sub(f.LastTry) < retryCooldown) {
+			continue
+		}
+		if p, ok := source.PayloadOf(c); ok && s.donePayloads[p] {
+			continue
 		}
 		s.inflight[c] = true
 		return c
@@ -454,17 +423,16 @@ func (s *Store) recordFailure(manifestCID string) {
 	}
 	f.Count++
 	f.LastTry = time.Now()
-	s.totalFail++
 	if f.Count >= maxRetries {
 		s.saveFailures()
 	}
 }
 
-func (s *Store) markSkipped(manifestCID string) {
+func (s *Store) markSkipped(manifestCID, payloadCID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.processed[manifestCID] = true
-	s.totalSkipped++
+	s.donePayloads[payloadCID] = true
 }
 
 func (s *Store) resetDayIfNeeded() {

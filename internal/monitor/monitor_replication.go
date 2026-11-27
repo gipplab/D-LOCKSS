@@ -3,48 +3,47 @@ package monitor
 import (
 	"fmt"
 	"log/slog"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
 	"dlockss/internal/common"
 )
 
-// maxReplicationLevel is the top bucket of the replication distribution; it
-// also counts manifests with more replicas.
+// maxReplicationLevel is the top bucket of the copies distribution; it also
+// counts files with more copies.
 const maxReplicationLevel = 10
 
-// replicationSnapshot holds pre-computed state shared across replication computations.
-// Build once with newReplicationSnapshotLocked, then call resolveManifest per manifest.
-// Caller must hold m.mu at least as RLock.
+// replicationSnapshot holds the node state that the copy counts of all
+// files depend on. Build it with newReplicationSnapshotLocked.
 type replicationSnapshot struct {
 	shardPeerCount map[string]int
-	depth          int
-	cutoff         time.Time
-	m              *Monitor
+	// live maps each node that still counts as a holder to its shard: a node
+	// the monitor shows, heard from in its shard within the announce TTL.
+	live  map[string]string
+	depth int
 }
 
 func (m *Monitor) newReplicationSnapshotLocked() replicationSnapshot {
-	spc := make(map[string]int)
-	depth := 0
+	rs := replicationSnapshot{shardPeerCount: make(map[string]int), live: make(map[string]string)}
+	cutoff := time.Now().Add(-replicationAnnounceTTL)
 	for id, node := range m.nodes {
 		if !m.isDisplayableNodeLocked(id, node) {
 			continue
 		}
 		shard := node.EffectiveShard()
-		spc[shard]++
-		depth = max(depth, len(shard))
+		rs.shardPeerCount[shard]++
+		rs.depth = max(rs.depth, len(shard))
+		if seen := m.peerShardLastSeen[id]; seen == nil || !seen[shard].Before(cutoff) {
+			rs.live[id] = shard
+		}
 	}
-	return replicationSnapshot{
-		shardPeerCount: spc,
-		depth:          depth,
-		cutoff:         time.Now().Add(-replicationAnnounceTTL),
-		m:              m,
-	}
+	return rs
 }
 
-// manifestResult holds the resolved replication state for a single manifest.
-type manifestResult struct {
+// fileResult holds the resolved replication state of a file.
+type fileResult struct {
 	count       int
 	maxRep      int
 	targetShard string
@@ -59,32 +58,32 @@ func minReplicas(maxRep int) int {
 	return replicationTarget
 }
 
-// buildShardCounts returns per-shard replica counts for a manifest,
-// filtering out stale peers. Caller must hold m.mu.
-func (rs *replicationSnapshot) buildShardCounts(peers map[string]time.Time) map[string]int {
-	counts := make(map[string]int)
-	for peerID := range peers {
-		node, ok := rs.m.nodes[peerID]
-		if !ok || !rs.m.isDisplayableNodeLocked(peerID, node) {
-			continue
+// payloadShard returns the deepest shard with nodes on the payload's path,
+// the shard whose nodes are responsible for it, as nodes decide it
+// (AmIResponsibleFor).
+func (rs *replicationSnapshot) payloadShard(payload string) (string, bool) {
+	// KeyToStableHex always returns valid hex.
+	bits, _ := common.GetHexBinaryPrefix(common.KeyToStableHex(payload), rs.depth)
+	for d := len(bits); d >= 0; d-- {
+		if rs.shardPeerCount[bits[:d]] > 0 {
+			return bits[:d], true
 		}
-		shard := node.EffectiveShard()
-		if rs.m.peerShardLastSeen[peerID] != nil {
-			if last := rs.m.peerShardLastSeen[peerID][shard]; last.Before(rs.cutoff) {
-				continue
-			}
-		}
-		counts[shard]++
 	}
-	return counts
+	return "", false
 }
 
-// resolveManifest computes the effective replica count and max replication for
-// a manifest. Returns zero count if the manifest should be skipped.
-func (rs *replicationSnapshot) resolveManifest(manifest string, peers map[string]time.Time, shardCounts map[string]int) manifestResult {
-	targetShard := rs.m.manifestShard[manifest]
-	if targetShard == "" || rs.shardPeerCount[targetShard] == 0 {
-		targetShard = effectiveTargetShardForManifest(manifest, rs.depth, rs.shardPeerCount)
+// resolveFile computes the copies and the copy target of a file from the
+// live holders per shard (shardCounts) and the number of all its holders.
+// The target shard follows from the payload when it is known, otherwise from
+// the shard the manifests were announced in (observed). Holders in other
+// shards count only while a split moves nodes between parent and children.
+func (rs *replicationSnapshot) resolveFile(payload, observed string, shardCounts map[string]int, holders int) fileResult {
+	targetShard, fromPayload := "", false
+	if payload != "" {
+		targetShard, fromPayload = rs.payloadShard(payload)
+	}
+	if !fromPayload {
+		targetShard = observed
 	}
 
 	count := shardCounts[targetShard]
@@ -111,31 +110,27 @@ func (rs *replicationSnapshot) resolveManifest(manifest string, peers map[string
 		}
 	}
 
-	// Fallback: use shard with most replicas if target has none.
-	if count == 0 {
-		targetShard = shardWithMostReplicas(shardCounts, rs.shardPeerCount)
-		if targetShard == "" {
-			return manifestResult{}
+	// Without a payload the observed shard is a guess: fall back to the
+	// shard holding most copies.
+	if count == 0 && !fromPayload {
+		if best := shardWithMostReplicas(shardCounts, rs.shardPeerCount); best != "" {
+			targetShard = best
+			count = shardCounts[best]
+			maxRep = rs.shardPeerCount[best]
 		}
-		count = shardCounts[targetShard]
-		maxRep = rs.shardPeerCount[targetShard]
 	}
 
 	if maxRep == 0 {
-		maxRep = len(peers)
+		maxRep = holders
 	}
-	return manifestResult{count: count, maxRep: maxRep, targetShard: targetShard}
-}
-
-// isAtTarget returns true if count is within the replication target range.
-func (mr manifestResult) isAtTarget() bool {
-	return mr.count >= minReplicas(mr.maxRep) && mr.count <= mr.maxRep
+	return fileResult{count: count, maxRep: maxRep, targetShard: targetShard}
 }
 
 func (m *Monitor) runReplicationCleanup() {
 	ticker := time.NewTicker(replicationCleanupEvery)
 	defer ticker.Stop()
 	for range ticker.C {
+		m.PruneStaleNodes()
 		m.pruneExpiredReplicas()
 		m.logReplicationSnapshot()
 	}
@@ -159,47 +154,24 @@ func (m *Monitor) pruneExpiredReplicas() {
 }
 
 func (m *Monitor) logReplicationSnapshot() {
-	dist, avgLevel, filesAtTarget := m.getReplicationStats()
-	byShard := m.getReplicationByShard()
-	membership := m.getShardMembership()
-	var totalFiles int
-	for _, c := range dist {
-		totalFiles += c
+	s := m.snapshot()
+	nodesPerShard := make(map[string][]string)
+	behind := 0
+	for _, n := range s.nodes {
+		if n.Status == nodeOffline {
+			continue
+		}
+		nodesPerShard[n.Shard] = append(nodesPerShard[n.Shard], peerLabel(n.ID, n.Name))
+		if n.Status == nodeBehind {
+			behind++
+		}
 	}
-	shardIDs := make([]string, 0, len(membership))
-	totalNodes := 0
-	for s, peers := range membership {
-		shardIDs = append(shardIDs, s)
-		totalNodes += len(peers)
-	}
-	sort.Strings(shardIDs)
 	var b strings.Builder
-	for _, shard := range shardIDs {
-		peers := membership[shard]
-		fmt.Fprintf(&b, " %s: %d nodes [%s] %d files at target;", shardLabel(shard), len(peers), strings.Join(peers, ","), byShard[shard])
+	for _, id := range slices.Sorted(maps.Keys(nodesPerShard)) {
+		fmt.Fprintf(&b, " %s: %d nodes [%s];", shardLabel(id), len(nodesPerShard[id]), strings.Join(nodesPerShard[id], ","))
 	}
-	slog.Info("replication snapshot", "total_nodes", totalNodes, "total_manifests", totalFiles, "total_at_target", filesAtTarget, "avg_replication", fmt.Sprintf("%.2f", avgLevel), "shards", strings.TrimSpace(b.String()))
-	if filesAtTarget == 0 && totalFiles > 0 && totalNodes > 0 {
-		slog.Warn("total at target is zero", "replication_announce_ttl", replicationAnnounceTTL)
-	}
-	if totalFiles == 0 && totalNodes > 0 {
-		m.mu.RLock()
-		knownManifests := len(m.manifestReplication)
-		m.mu.RUnlock()
-		if knownManifests == 0 {
-			slog.Warn("no manifests tracked", "hint", "monitor may have started after nodes pinned; replication stats need PINNED/IngestMessage")
-		}
-	}
-}
-
-func effectiveTargetShardForManifest(manifestCIDStr string, depth int, shardPeerCount map[string]int) string {
-	for d := depth; d >= 0; d-- {
-		shard, err := common.TargetShardForPayload(manifestCIDStr, d)
-		if err == nil && shardPeerCount[shard] > 0 {
-			return shard
-		}
-	}
-	return ""
+	slog.Info("replication snapshot", "files", s.health.Total, "at_target", s.health.AtTarget, "below", s.health.Below,
+		"critical", s.health.Critical, "target", s.target, "nodes_behind", behind, "shards", strings.TrimSpace(b.String()))
 }
 
 func shardWithMostReplicas(shardCounts map[string]int, shardPeerCount map[string]int) string {
@@ -222,83 +194,4 @@ func sumDescendantReplicasAndNodes(manifestShardCounts map[string]int, shardPeer
 		}
 	}
 	return totalReplicas, totalNodes
-}
-
-func (m *Monitor) getReplicationStats() (distribution [maxReplicationLevel + 1]int, avgLevel float64, filesAtTarget int) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	rs := m.newReplicationSnapshotLocked()
-	var totalReplication, manifestCount int
-
-	for c, peers := range m.manifestReplication {
-		if len(peers) == 0 {
-			continue
-		}
-		mr := rs.resolveManifest(c, peers, rs.buildShardCounts(peers))
-		if mr.count == 0 {
-			continue
-		}
-		manifestCount++
-		totalReplication += mr.count
-		distribution[min(mr.count, maxReplicationLevel)]++
-		if mr.isAtTarget() {
-			filesAtTarget++
-		}
-	}
-	if manifestCount > 0 {
-		avgLevel = float64(totalReplication) / float64(manifestCount)
-	}
-	return distribution, avgLevel, filesAtTarget
-}
-
-func (m *Monitor) getReplicationCIDsByLevel(level int) []cidEntry {
-	if level < 0 || level > maxReplicationLevel {
-		return nil
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	rs := m.newReplicationSnapshotLocked()
-	var result []cidEntry
-
-	for c, peers := range m.manifestReplication {
-		if len(peers) == 0 {
-			continue
-		}
-		mr := rs.resolveManifest(c, peers, rs.buildShardCounts(peers))
-		if mr.count > 0 && min(mr.count, maxReplicationLevel) == level {
-			result = append(result, cidEntry{CID: c, Shard: shardLabel(m.manifestShard[c]), Replicas: mr.count})
-		}
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].CID < result[j].CID })
-	return result
-}
-
-func (m *Monitor) getReplicationByShard() map[string]int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	rs := m.newReplicationSnapshotLocked()
-	filesAtTargetPerShard := make(map[string]int)
-	for c, peers := range m.manifestReplication {
-		if len(peers) == 0 {
-			continue
-		}
-		shardCounts := rs.buildShardCounts(peers)
-		mr := rs.resolveManifest(c, peers, shardCounts)
-		if mr.count == 0 || mr.maxRep == 0 || !mr.isAtTarget() {
-			continue
-		}
-		// A target shard emptied by a split is credited to the child holding
-		// the most replicas.
-		attributeShard := mr.targetShard
-		if rs.shardPeerCount[attributeShard] == 0 {
-			if best := shardWithMostReplicas(shardCounts, rs.shardPeerCount); best != "" {
-				attributeShard = best
-			}
-		}
-		filesAtTargetPerShard[attributeShard]++
-	}
-	return filesAtTargetPerShard
 }

@@ -41,18 +41,26 @@ func (m *Monitor) PruneStaleNodes() {
 		m.treeDirty = true
 		m.pruneOrphanedSplitEvents()
 	}
+	for id, lost := range m.lostNodes {
+		if now.Sub(lost.LastSeen) > lostNodeTTL {
+			delete(m.lostNodes, id)
+		}
+	}
 	m.pruneOldSplitEvents(now)
 }
 
-// forgetNodeLocked removes node id and everything recorded for it.
+// forgetNodeLocked removes node id and everything recorded for it, keeping
+// only its name, shard and last message to list it as offline.
 func (m *Monitor) forgetNodeLocked(id string) {
-	if ns, ok := m.nodes[id]; ok && ns.HelperID != "" {
+	if ns, ok := m.nodes[id]; ok {
 		if helper, err := peer.Decode(ns.HelperID); err == nil {
 			m.helpers.Forget(helper)
 		}
+		if m.isDisplayableNodeLocked(id, ns) {
+			m.lostNodes[id] = lostNode{Name: ns.NodeName, Shard: ns.EffectiveShard(), LastSeen: ns.LastSeen}
+		}
 	}
 	delete(m.nodes, id)
-	delete(m.nodeFiles, id)
 	delete(m.peerShardLastSeen, id)
 	delete(m.peerLastSiblingMove, id)
 	for manifest, peers := range m.manifestReplication {
@@ -162,22 +170,6 @@ func (m *Monitor) pruneStaleAnnouncements(cutoff time.Time) {
 	for c, lastSeen := range m.uniqueCIDs {
 		if lastSeen.Before(cutoff) {
 			delete(m.uniqueCIDs, c)
-			delete(m.manifestUploader, c)
-		}
-	}
-	for nodeID, files := range m.nodeFiles {
-		for fileCID, lastSeen := range files {
-			if !lastSeen.Before(cutoff) {
-				continue
-			}
-			delete(files, fileCID)
-			if node, ok := m.nodes[nodeID]; ok && node.announcedFiles != nil {
-				delete(node.announcedFiles, fileCID)
-				node.KnownFiles = len(node.announcedFiles)
-			}
-		}
-		if len(files) == 0 {
-			delete(m.nodeFiles, nodeID)
 		}
 	}
 }

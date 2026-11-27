@@ -32,7 +32,7 @@ mkdir -p data
 ./dlockss
 ```
 
-Optional: build the monitor dashboard with `go build -o dlockss-monitor ./cmd/dlockss-monitor` (see [README](README.md)). If no API key is set, the dashboard lets you save one exactly once (`pdftotext` required for indexing).
+Optional: build the monitor dashboard with `go build -o dlockss-monitor ./cmd/dlockss-monitor` (see [README](README.md)). To change the indexer's API key in the dashboard, start it with `DLOCKSS_MONITOR_PASSWORD` set (`pdftotext` required for indexing PDFs).
 
 ## Verify It's Working
 

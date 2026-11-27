@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>D-LOCKSS Monitor</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<div class="container">
+  <header class="top">
+    <div>
+      <h1>D-LOCKSS Monitor</h1>
+      <div class="muted small" id="topic"></div>
+    </div>
+    <div class="live" id="live" role="status" aria-live="polite" title="Connecting"><span class="sr-only">Connecting</span></div>
+  </header>
+
+  <section class="panel" aria-labelledby="health-h">
+    <h2 id="health-h" class="sr-only">Health</h2>
+    <div class="health-line" id="health-line">Waiting for the network...</div>
+    <div class="bar" id="health-bar" role="img"></div>
+    <div class="nodes-line" id="nodes-line"></div>
+    <div class="muted small" id="warming" hidden>The monitor started a few minutes ago and nodes are still announcing their files, so copy counts may still rise.</div>
+  </section>
+
+  <section class="panel">
+    <form id="find-form" class="find" role="search" autocomplete="off">
+      <label class="sr-only" for="find-input">Find a file, node, uploader or topic</label>
+      <div class="find-wrap">
+        <input id="find-input" type="search" placeholder="File CID, peer ID or topic">
+        <ul id="suggest" class="suggest" role="listbox" hidden></ul>
+      </div>
+      <button type="submit">Find</button>
+      <button type="button" id="browse-toggle" aria-expanded="false" aria-controls="browse">Browse</button>
+    </form>
+    <div id="browse" class="browse" hidden>
+      <div class="panel-head">
+        <p class="muted small" id="index-line"></p>
+        <button type="button" id="settings-open">Settings</button>
+      </div>
+      <div class="chips" id="fields"></div>
+    </div>
+  </section>
+
+  <section class="panel" id="view" hidden aria-live="polite">
+    <div class="view-head">
+      <h2 id="view-title"></h2>
+      <button type="button" id="view-close">Close</button>
+    </div>
+    <div id="view-body"></div>
+  </section>
+
+  <section class="panel" aria-labelledby="nodes-h">
+    <h2 id="nodes-h">Nodes</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Node</th><th>Status</th><th>Files of its shard</th><th class="shard-col">Shard</th><th>Last seen</th><th>Uptime</th></tr></thead>
+        <tbody id="node-rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <details class="panel" id="internals">
+    <summary>Network internals</summary>
+    <h3>Copies per file</h3>
+    <div class="histogram" id="histogram"></div>
+    <h3>Shards</h3>
+    <div class="tree-chart" id="shard-tree"></div>
+    <p class="small"><a href="/api/payload-cids-export">Export the file CIDs</a></p>
+  </details>
+</div>
+
+<dialog id="settings">
+  <form method="dialog">
+    <h2>Indexer settings</h2>
+    <p class="small" id="settings-help"></p>
+    <label>Password<input type="password" id="set-password" autocomplete="off"></label>
+    <label>API
+      <select id="set-provider">
+        <option value="google">Google AI Studio</option>
+        <option value="saia">SAIA</option>
+      </select>
+    </label>
+    <label id="set-base-row">API base<input type="text" id="set-base" placeholder="https://chat-ai.academiccloud.de/v1"></label>
+    <label>API key<input type="password" id="set-key" placeholder="Leave empty to keep the current key" autocomplete="off"></label>
+    <label>IPFS gateway<input type="text" id="set-gateway" placeholder="http://ipfs:8080"></label>
+    <p class="error small" id="set-error"></p>
+    <div class="buttons">
+      <button type="button" id="settings-save">Save</button>
+      <button type="button" id="settings-cancel">Cancel</button>
+    </div>
+  </form>
+</dialog>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

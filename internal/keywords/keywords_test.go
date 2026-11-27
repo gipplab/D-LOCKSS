@@ -85,30 +85,50 @@ func TestStatsDisabledWithoutKey(t *testing.T) {
 	if s.Enabled() {
 		t.Fatal("empty key should disable indexing")
 	}
-	st := s.GetStats(10)
-	if st.Enabled || !st.CanSetKey {
-		t.Fatalf("stats = %+v, want enabled=false can_set_key=true", st)
+	st := s.GetStats()
+	if st.Enabled || st.SettingsEnabled {
+		t.Fatalf("stats = %+v, want enabled=false settings_enabled=false", st)
+	}
+}
+
+func TestApplySettingsNeedsPasswordFromEnv(t *testing.T) {
+	s := NewStore(Config{DataDir: t.TempDir()})
+	if err := s.ApplySettings("", "google", "first-key", "", ""); !errors.Is(err, ErrSettingsDisabled) {
+		t.Fatalf("without DLOCKSS_MONITOR_PASSWORD settings must be off, got %v", err)
+	}
+	if s.Enabled() {
+		t.Fatal("a refused save must not set a key")
+	}
+	t.Setenv("DLOCKSS_MONITOR_PASSWORD", "pw")
+	if got := ConfigFromEnv().Password; got != "pw" {
+		t.Fatalf("ConfigFromEnv password = %q", got)
 	}
 }
 
 func TestApplySettingsPasswordAndGoogle(t *testing.T) {
 	dir := t.TempDir()
-	s := NewStore(Config{DataDir: dir})
-	if err := s.ApplySettings("", "google", "first-key", "", ""); err != nil {
+	s := NewStore(Config{DataDir: dir, Password: "pw"})
+	if !s.GetStats().SettingsEnabled {
+		t.Fatal("with a password the settings can be changed")
+	}
+	if err := s.ApplySettings("", "google", "first-key", "", ""); !errors.Is(err, ErrSettingsAuth) {
+		t.Fatalf("missing password = %v", err)
+	}
+	if err := s.ApplySettings("pw", "google", "first-key", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.GetStats(0).Gateway; got != DefaultGateway {
+	if got := s.GetStats().Gateway; got != DefaultGateway {
 		t.Fatalf("default gateway = %q", got)
 	}
-	if err := s.ApplySettings("wrong", "google", "next-key", "", "http://ipfs:8081"); !errors.Is(err, ErrSettingsAuth) {
-		t.Fatalf("wrong password = %v", err)
+	if err := s.ApplySettings("first-key", "google", "next-key", "", "http://ipfs:8081"); !errors.Is(err, ErrSettingsAuth) {
+		t.Fatalf("the api key is no password, got %v", err)
 	}
-	if err := s.ApplySettings("first-key", "google", "next-key", "", "http://ipfs:8081"); err != nil {
+	if err := s.ApplySettings("pw", "google", "next-key", "", "http://ipfs:8081"); err != nil {
 		t.Fatal(err)
 	}
 	s2 := NewStore(Config{DataDir: dir})
-	st := s2.GetStats(0)
-	if st.CanSetKey || st.Provider != ProviderGoogle || st.Model != GoogleModel || st.DailyLimit != googleDailyCap || st.Gateway != "http://ipfs:8081" {
+	st := s2.GetStats()
+	if st.SettingsEnabled || st.Provider != ProviderGoogle || st.Model != GoogleModel || st.DailyLimit != googleDailyCap || st.Gateway != "http://ipfs:8081" {
 		t.Fatalf("reloaded stats = %+v", st)
 	}
 	if got := LoadAPIKey(dir); got != "next-key" {
@@ -118,25 +138,25 @@ func TestApplySettingsPasswordAndGoogle(t *testing.T) {
 
 func TestApplySettingsRetriesFailedCIDs(t *testing.T) {
 	dir := t.TempDir()
-	s := NewStore(Config{DataDir: dir, APIKey: "old-key"})
+	s := NewStore(Config{DataDir: dir, APIKey: "old-key", Password: "pw"})
 	for i := 0; i < maxRetries; i++ {
 		s.recordFailure("cid-a")
 	}
 	s.noteRateLimit(time.Minute)
 
-	reloaded := NewStore(Config{DataDir: dir, APIKey: "old-key"})
+	reloaded := NewStore(Config{DataDir: dir, APIKey: "old-key", Password: "pw"})
 	if got := reloaded.pickNextCID(staticCIDs{"cid-a"}); got != "" {
 		t.Fatalf("a permanent failure survives a restart, picked %q", got)
 	}
 
-	if err := reloaded.ApplySettings("old-key", "google", "new-key", "", ""); err != nil {
+	if err := reloaded.ApplySettings("pw", "google", "new-key", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if got := reloaded.pickNextCID(staticCIDs{"cid-a"}); got != "cid-a" {
 		t.Fatalf("after new settings the failed cid must be retried, picked %q", got)
 	}
-	if st := reloaded.GetStats(1); st.Failed != 0 || st.Pending != 1 {
-		t.Fatalf("stats after reset = %+v", st)
+	if v := reloaded.View(); len(v.Failed) != 0 {
+		t.Fatalf("failed after reset = %v", v.Failed)
 	}
 	if got := NewStore(Config{DataDir: dir}).pickNextCID(staticCIDs{"cid-a"}); got != "cid-a" {
 		t.Fatalf("the reset must be persisted, picked %q", got)
@@ -189,28 +209,7 @@ func TestGeminiResponseText(t *testing.T) {
 	}
 }
 
-func TestSetAPIKeyOnce(t *testing.T) {
-	dir := t.TempDir()
-	s := NewStore(Config{DataDir: dir})
-	if err := s.SetAPIKeyOnce("  secret-key  "); err != nil {
-		t.Fatal(err)
-	}
-	if !s.Enabled() {
-		t.Fatal("expected enabled after set")
-	}
-	if err := s.SetAPIKeyOnce("another"); !errors.Is(err, ErrAPIKeySet) {
-		t.Fatalf("second set = %v, want ErrAPIKeySet", err)
-	}
-	if got := LoadAPIKey(dir); got != "secret-key" {
-		t.Fatalf("persisted key = %q", got)
-	}
-	s2 := NewStore(Config{DataDir: dir})
-	if !s2.Enabled() || s2.GetStats(0).CanSetKey {
-		t.Fatal("reloaded store should already have the key")
-	}
-}
-
-func TestSuggestAndRecent(t *testing.T) {
+func TestSuggest(t *testing.T) {
 	s := NewStore(Config{DataDir: t.TempDir()})
 	s.storeEntry("cid-a", "pay-a", "file://a.pdf", &extractionResult{
 		Title: "T", BroadField: "Computer Science", Keywords: []string{"transformer"},
@@ -219,11 +218,52 @@ func TestSuggestAndRecent(t *testing.T) {
 	if len(sugs) == 0 || sugs[0].Keyword != "transformer" {
 		t.Fatalf("suggest = %+v", sugs)
 	}
-	s.RecordSearch("transformer", 1)
-	recent := s.GetRecentSearches()
-	if len(recent) != 1 || recent[0].Keyword != "transformer" {
-		t.Fatalf("recent = %+v", recent)
+}
+
+func TestView(t *testing.T) {
+	s := NewStore(Config{DataDir: t.TempDir()})
+	s.storeEntry("cid-a", "pay-a", "", &extractionResult{Title: "T"})
+	s.markSkipped("cid-b", "pay-b")
+	for i := 0; i < maxRetries; i++ {
+		s.recordFailure("cid-c")
 	}
+	s.recordFailure("cid-d")
+	v := s.View()
+	if v.Entries["cid-a"] == nil || v.Entries["cid-a"].Title != "T" || len(v.Entries) != 1 {
+		t.Fatalf("entries = %+v", v.Entries)
+	}
+	if !v.Skipped["cid-b"] || len(v.Skipped) != 1 {
+		t.Fatalf("skipped = %+v", v.Skipped)
+	}
+	if !v.Failed["cid-c"] || len(v.Failed) != 1 {
+		t.Fatalf("failed = %+v, want only the file that failed %d times", v.Failed, maxRetries)
+	}
+}
+
+func TestPickNextCIDIndexesAPayloadOnce(t *testing.T) {
+	s := NewStore(Config{DataDir: t.TempDir(), APIKey: "k"})
+	s.storeEntry("cid-a", "pay-1", "", &extractionResult{Title: "T"})
+	s.markSkipped("cid-b", "pay-2")
+	src := payloadCIDs{"cid-a": "pay-1", "cid-a2": "pay-1", "cid-b2": "pay-2", "cid-c": "pay-3"}
+	if got := s.pickNextCID(src); got != "cid-c" {
+		t.Fatalf("another manifest of an indexed or skipped payload must not be indexed again, picked %q", got)
+	}
+}
+
+// payloadCIDs maps manifests to their payloads.
+type payloadCIDs map[string]string
+
+func (p payloadCIDs) UniqueCIDList() []string {
+	out := make([]string, 0, len(p))
+	for c := range p {
+		out = append(out, c)
+	}
+	return out
+}
+
+func (p payloadCIDs) PayloadOf(c string) (string, bool) {
+	v, ok := p[c]
+	return v, ok
 }
 
 func TestRateLimitWaitBackoff(t *testing.T) {
@@ -253,6 +293,8 @@ func TestGatewayRateLimitPausesIndexer(t *testing.T) {
 type staticCIDs []string
 
 func (s staticCIDs) UniqueCIDList() []string { return append([]string(nil), s...) }
+
+func (staticCIDs) PayloadOf(string) (string, bool) { return "", false }
 
 func TestPersistRoundTrip(t *testing.T) {
 	dir := t.TempDir()

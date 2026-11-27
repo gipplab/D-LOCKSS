@@ -3,7 +3,6 @@ package keywords
 import (
 	"sort"
 	"strings"
-	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -24,20 +23,6 @@ func (s *Store) Gateway() string {
 		return DefaultGateway
 	}
 	return strings.TrimSuffix(s.cfg.Gateway, "/")
-}
-
-// Lookup returns a locally indexed entry without hitting a gateway.
-func (s *Store) Lookup(manifestCID string) (CIDKeywordEntry, bool) {
-	if s == nil || manifestCID == "" {
-		return CIDKeywordEntry{}, false
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	e, ok := s.cidKeywords[manifestCID]
-	if !ok || e == nil || e.PayloadCID == "" {
-		return CIDKeywordEntry{}, false
-	}
-	return *e, true
 }
 
 func (s *Store) Search(query string) []CIDKeywordEntry {
@@ -113,63 +98,50 @@ func (s *Store) Suggest(prefix string) []KeywordSuggestion {
 	return suggestions
 }
 
-func (s *Store) RecordSearch(keyword string, resultCount int) {
-	if resultCount == 0 {
-		return
+// IndexView is what the indexer knows about each manifest.
+type IndexView struct {
+	// Entries holds the indexed manifests. They are shared with the store,
+	// which never changes an entry once stored.
+	Entries map[string]*CIDKeywordEntry
+	// Skipped holds manifests whose content cannot be indexed.
+	Skipped map[string]bool
+	// Failed holds manifests that failed too often to be tried again.
+	Failed map[string]bool
+}
+
+// View returns the indexer's state per manifest.
+func (s *Store) View() IndexView {
+	v := IndexView{Entries: map[string]*CIDKeywordEntry{}, Skipped: map[string]bool{}, Failed: map[string]bool{}}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for c, e := range s.cidKeywords {
+		v.Entries[c] = e
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for i, sr := range s.recent {
-		if strings.EqualFold(sr.Keyword, keyword) {
-			s.recent = append(s.recent[:i], s.recent[i+1:]...)
-			break
+	for c := range s.processed {
+		if _, ok := s.cidKeywords[c]; !ok {
+			v.Skipped[c] = true
 		}
 	}
-	s.recent = append(s.recent, RecentSearch{
-		Keyword:     strings.ToLower(keyword),
-		ResultCount: resultCount,
-		Timestamp:   time.Now().Unix(),
-	})
-	if len(s.recent) > maxRecentItems {
-		s.recent = s.recent[len(s.recent)-maxRecentItems:]
-	}
-}
-
-func (s *Store) GetRecentSearches() []RecentSearch {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	result := make([]RecentSearch, len(s.recent))
-	for i, sr := range s.recent {
-		result[len(s.recent)-1-i] = sr
-	}
-	return result
-}
-
-func (s *Store) GetStats(totalUniqueCIDs int) Stats {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	permanentFails := 0
-	for _, f := range s.failures {
+	for c, f := range s.failures {
 		if f.Count >= maxRetries {
-			permanentFails++
+			v.Failed[c] = true
 		}
 	}
+	return v
+}
+
+func (s *Store) GetStats() Stats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	limit := s.requestCap()
 	return Stats{
-		TotalCIDs:      totalUniqueCIDs,
-		Indexed:        s.totalOK,
-		Failed:         s.totalFail + permanentFails,
-		Skipped:        s.totalSkipped,
-		Pending:        max(totalUniqueCIDs-s.totalOK-s.totalSkipped-permanentFails, 0),
-		UniqueKeywords: len(s.keywordCIDs),
-		DailyRemaining: max(limit-s.dailyCount, 0),
-		DailyLimit:     limit,
-		Enabled:        s.cfg.APIKey != "",
-		CanSetKey:      s.cfg.APIKey == "",
-		Provider:       s.cfg.Provider,
-		Model:          s.cfg.Model,
-		Gateway:        s.cfg.Gateway,
+		DailyRemaining:  max(limit-s.dailyCount, 0),
+		DailyLimit:      limit,
+		Enabled:         s.cfg.APIKey != "",
+		SettingsEnabled: s.cfg.Password != "",
+		Provider:        s.cfg.Provider,
+		Model:           s.cfg.Model,
+		Gateway:         s.cfg.Gateway,
 	}
 }
 

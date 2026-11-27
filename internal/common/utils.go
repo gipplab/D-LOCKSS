@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"dlockss/pkg/ipfs"
@@ -12,6 +14,19 @@ import (
 
 	"github.com/ipfs/go-cid"
 )
+
+// WriteFileAtomic replaces path with data, readable by the owner only. It
+// writes a temporary file first, so readers never see a partial file.
+func WriteFileAtomic(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
 
 // GetBinaryPrefix returns the first depth bits of SHA-256(s) as a string of
 // '0' and '1', most significant bit first.

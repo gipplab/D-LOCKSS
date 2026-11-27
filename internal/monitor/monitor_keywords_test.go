@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"reflect"
 	"sort"
 	"testing"
@@ -29,81 +27,36 @@ func TestUniqueCIDList(t *testing.T) {
 	}
 }
 
-func TestKeywordStatsDisabled(t *testing.T) {
-	m := NewMonitor(DefaultConfig())
-	req := httptest.NewRequest(http.MethodGet, "/api/keyword-stats", nil)
-	rec := httptest.NewRecorder()
-	m.handleKeywordStats(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status %d", rec.Code)
-	}
-	var st keywords.Stats
-	if err := json.NewDecoder(rec.Body).Decode(&st); err != nil {
-		t.Fatal(err)
-	}
-	if st.Enabled || !st.CanSetKey {
-		t.Fatalf("stats = %+v", st)
-	}
-}
-
-func TestKeywordAPIKeyOnce(t *testing.T) {
-	m := NewMonitor(DefaultConfig())
-	m.SetKeywords(keywords.NewStore(keywords.Config{DataDir: t.TempDir()}))
-
-	post := func(key string) *httptest.ResponseRecorder {
-		body, _ := json.Marshal(map[string]string{"api_key": key})
+func TestKeywordSettingsNeedPassword(t *testing.T) {
+	post := func(m *Monitor, password, key string) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(map[string]string{"password": password, "provider": "google", "api_key": key})
 		req := httptest.NewRequest(http.MethodPost, "/api/keyword-api-key", bytes.NewReader(body))
 		rec := httptest.NewRecorder()
 		m.handleKeywordAPIKey(rec, req)
 		return rec
 	}
-	if rec := post("once-only"); rec.Code != http.StatusOK {
-		t.Fatalf("first save status %d body %s", rec.Code, rec.Body.String())
-	}
-	if rec := post("second"); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("second save status %d, want 401", rec.Code)
-	}
-	body, _ := json.Marshal(map[string]string{
-		"password": "once-only",
-		"provider": "google",
-		"api_key":  "google-key",
-	})
-	req := httptest.NewRequest(http.MethodPost, "/api/keyword-api-key", bytes.NewReader(body))
-	rec := httptest.NewRecorder()
-	m.handleKeywordAPIKey(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("update status %d body %s", rec.Code, rec.Body.String())
-	}
-}
 
-func TestManifestPayloadUsesLocalIndex(t *testing.T) {
-	dir := t.TempDir()
-	idx := map[string]*keywords.CIDKeywordEntry{
-		"bafy-manifest": {ManifestCID: "bafy-manifest", PayloadCID: "bafy-payload", MetaRef: "paper.pdf"},
-	}
-	data, err := json.Marshal(idx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "keyword_index.json"), data, 0o600); err != nil {
-		t.Fatal(err)
+	off := NewMonitor(DefaultConfig())
+	off.SetKeywords(keywords.NewStore(keywords.Config{DataDir: t.TempDir()}))
+	if rec := post(off, "", "key"); rec.Code != http.StatusForbidden {
+		t.Fatalf("without DLOCKSS_MONITOR_PASSWORD settings are off, got %d %s", rec.Code, rec.Body.String())
 	}
 
 	m := NewMonitor(DefaultConfig())
-	m.SetKeywords(keywords.NewStore(keywords.Config{DataDir: dir, Gateway: "http://127.0.0.1:9"}))
-
-	req := httptest.NewRequest(http.MethodGet, "/api/manifest-payload?cid=bafy-manifest", nil)
-	rec := httptest.NewRecorder()
-	m.handleManifestPayload(rec, req)
+	m.SetKeywords(keywords.NewStore(keywords.Config{DataDir: t.TempDir(), Password: "pw"}))
+	if rec := post(m, "wrong", "key"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong password status %d, want 401", rec.Code)
+	}
+	rec := post(m, "pw", "google-key")
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status %d body %s", rec.Code, rec.Body.String())
+		t.Fatalf("save status %d body %s", rec.Code, rec.Body.String())
 	}
 	var got map[string]interface{}
-	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
-		t.Fatal(err)
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil || got["enabled"] != true || got["provider"] != "google" {
+		t.Fatalf("answer = %v, %v", got, err)
 	}
-	if got["payload_cid"] != "bafy-payload" {
-		t.Fatalf("payload_cid = %v", got["payload_cid"])
+	if rec := post(m, "google-key", "other"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("the api key is no password, got %d", rec.Code)
 	}
 }
 

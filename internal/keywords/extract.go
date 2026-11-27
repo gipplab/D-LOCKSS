@@ -90,7 +90,7 @@ func (s *Store) processCID(manifestCID string) {
 	c, err := s.loadContent(payloadCID, itemName(metaRef))
 	if errors.Is(err, errUnsupported) {
 		slog.Info("skipping content that cannot be indexed", "manifest", manifestCID, "meta_ref", metaRef, "reason", err)
-		s.markSkipped(manifestCID)
+		s.markSkipped(manifestCID, payloadCID)
 		return
 	}
 	if s.handleFetchErr(manifestCID, err) {
@@ -128,11 +128,12 @@ func (s *Store) storeEntry(manifestCID, payloadCID, metaRef string, result *extr
 		Keywords:      result.Keywords,
 		IndexedAt:     time.Now(),
 	}
+	// Entries are never changed once stored, so View can share them.
 	s.cidKeywords[manifestCID] = entry
 	s.indexLabels(manifestCID, entry)
 	s.processed[manifestCID] = true
+	s.donePayloads[payloadCID] = true
 	delete(s.failures, manifestCID)
-	s.totalOK++
 	s.mu.Unlock()
 	s.saveIndex()
 	slog.Info("indexed", "manifest", manifestCID, "title", entry.Title, "keywords", len(entry.Keywords))
@@ -157,19 +158,37 @@ func (s *Store) gatewayGet(ipfsPath string, timeout time.Duration) (*http.Respon
 	return nil, fmt.Errorf("gateway status: %s", resp.Status)
 }
 
-func (s *Store) resolveManifest(manifestCID string) (payloadCID, metaRef string, err error) {
+// FetchManifestBlock reads a manifest's block through the gateway.
+func (s *Store) FetchManifestBlock(manifestCID string) ([]byte, error) {
 	resp, err := s.gatewayGet(gatewayPath(manifestCID), manifestFetchTimeout)
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	block, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", "", fmt.Errorf("read body: %w", err)
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+	return block, nil
+}
+
+// FetchManifest reads a manifest through the gateway.
+func (s *Store) FetchManifest(manifestCID string) (*schema.ResearchObject, error) {
+	block, err := s.FetchManifestBlock(manifestCID)
+	if err != nil {
+		return nil, err
 	}
 	var ro schema.ResearchObject
 	if err := ro.UnmarshalCBOR(block); err != nil {
-		return "", "", fmt.Errorf("unmarshal CBOR: %w", err)
+		return nil, fmt.Errorf("unmarshal CBOR: %w", err)
+	}
+	return &ro, nil
+}
+
+func (s *Store) resolveManifest(manifestCID string) (payloadCID, metaRef string, err error) {
+	ro, err := s.FetchManifest(manifestCID)
+	if err != nil {
+		return "", "", err
 	}
 	if !ro.Payload.Defined() {
 		return "", "", errors.New("manifest has no payload CID")

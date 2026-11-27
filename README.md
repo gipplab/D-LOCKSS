@@ -277,9 +277,20 @@ go build -o dlockss-monitor ./cmd/dlockss-monitor
 ```
 Open http://localhost:8080. The `-topic` and `-prefix` flags override the `DLOCKSS_TOPIC_NAME` and `DLOCKSS_PUBSUB_TOPIC_PREFIX` environment variables respectively. The topic is fixed at startup (the dashboard displays it read-only).
 
-Keyword search is optional. The dashboard **SETTINGS** button chooses the provider and API key. The first key you save is the password for later changes: settings asks for the API key currently in use. Google AI Studio uses `gemini-2.5-flash-lite` (the stable Gemini model with the highest free-tier daily quota, about 1,000 requests per day). Settings are stored in `~/.dlockss-monitor/llm_settings.json`. You can also set a key before start:
+The dashboard shows, from top to bottom:
+
+*   **Health**: how many files the network holds, how many have their target number of copies, how many are below it, and how many are critical (one copy or none), plus which nodes are behind, silent or offline. A file is a payload; the manifests that point to it (one per ingesting node and user signature) count as one file. The target is `MinPeersPerShard` capped at the number of nodes in the file's shard. Each number opens the list of those files.
+*   **Find**: a file CID opens the file, a peer ID opens the node or the files that uploader signed, other text searches the indexer's titles, fields and keywords. **Browse**, next to it, lists the indexed files by broad field and subtopic, shows how far indexing has come, and holds the indexer **SETTINGS**.
+*   **Nodes**: per node its status and how many of its shard's files it announces.
+*   **File view**: **Open file** loads the file through the monitor's gateway. **Details**, next to it, shows its copies, the nodes holding it, its verified uploaders and its manifests; **Inspect** opens a manifest as JSON.
+*   **Network internals** (collapsed): copies per file and the shard tree.
+
+The page polls one small summary every 5 s while it is visible; lists are fetched in pages when opened. For the first six minutes after the monitor starts, nodes are still announcing their files, so no node is marked behind. The monitor reads every announced manifest once and keeps what it says (payload, ingester, verified uploader) in `manifest_catalog.json` in its data directory.
+
+Keyword search is optional. The dashboard **SETTINGS** button changes the provider, API key and gateway; it needs the password set in `DLOCKSS_MONITOR_PASSWORD` on the monitor host. Without that variable the settings can only be changed on the host. Google AI Studio uses `gemini-2.5-flash-lite` (the stable Gemini model with the highest free-tier daily quota, about 1,000 requests per day). Settings are stored in `~/.dlockss-monitor/llm_settings.json`. A file with several manifests is indexed once. You can also set a key before start:
 
 ```bash
+export DLOCKSS_MONITOR_PASSWORD="..."  # allows changing the settings in the dashboard
 # ~/.dlockss-monitor/.api_key  (preferred), or ./.api_key, or:
 export SAIA_API_KEY="..."
 # optional:
@@ -302,7 +313,7 @@ Keywords are generated once per item at index time and searched locally. The ind
 
 Images, audio, video, archives, other binaries, and files over 20 MB that need a full download (PDF and office formats) are skipped.
 
-The monitor displays each node's **name** (if configured via `DLOCKSS_NODE_NAME`), falling back to the Kubo node ID. Names propagate via HEARTBEAT/JOIN messages and appear in the node table, charts, and shard modals. Client-side aliases (EDIT button) override server-side names. The helper ID is shown as detail; Identify dials the helper.
+The monitor displays each node's **name** (if configured via `DLOCKSS_NODE_NAME`), falling back to the Kubo node ID. Names propagate via HEARTBEAT/JOIN messages. The helper ID is shown in the node view; Identify dials the helper. A node the monitor stops hearing from stays listed as offline for 24 hours.
 
 The monitor bootstrap-subscribes to all shards up to depth 6 (127 shards) so it can see nodes even when started late. Set `DLOCKSS_MONITOR_BOOTSTRAP_SHARD_DEPTH` (0–12) to tune.
 

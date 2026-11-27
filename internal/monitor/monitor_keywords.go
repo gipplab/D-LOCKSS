@@ -9,34 +9,6 @@ import (
 	"dlockss/internal/keywords"
 )
 
-func (m *Monitor) handleKeywordSearch(w http.ResponseWriter, r *http.Request) {
-	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	if query == "" {
-		writeJSON(w, map[string]interface{}{"results": []struct{}{}, "count": 0})
-		return
-	}
-	results := m.keywords.Search(query)
-
-	type enrichedResult struct {
-		keywords.CIDKeywordEntry
-		Shard    string `json:"shard"`
-		Replicas int    `json:"replicas"`
-	}
-	m.mu.RLock()
-	enriched := make([]enrichedResult, 0, len(results))
-	for _, res := range results {
-		enriched = append(enriched, enrichedResult{
-			CIDKeywordEntry: res,
-			Shard:           m.manifestShard[res.ManifestCID],
-			Replicas:        len(m.manifestReplication[res.ManifestCID]),
-		})
-	}
-	m.mu.RUnlock()
-
-	m.keywords.RecordSearch(query, len(enriched))
-	writeJSON(w, map[string]interface{}{"query": query, "results": enriched, "count": len(enriched)})
-}
-
 func (m *Monitor) handleKeywordSuggest(w http.ResponseWriter, r *http.Request) {
 	suggestions := m.keywords.Suggest(strings.TrimSpace(r.URL.Query().Get("q")))
 	if suggestions == nil {
@@ -45,21 +17,8 @@ func (m *Monitor) handleKeywordSuggest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{"suggestions": suggestions})
 }
 
-func (m *Monitor) handleRecentSearches(w http.ResponseWriter, _ *http.Request) {
-	recent := m.keywords.GetRecentSearches()
-	if recent == nil {
-		recent = []keywords.RecentSearch{}
-	}
-	writeJSON(w, map[string]interface{}{"searches": recent})
-}
-
-func (m *Monitor) handleKeywordStats(w http.ResponseWriter, _ *http.Request) {
-	m.mu.RLock()
-	totalCIDs := len(m.uniqueCIDs)
-	m.mu.RUnlock()
-	writeJSON(w, m.keywords.GetStats(totalCIDs))
-}
-
+// handleKeywordAPIKey changes the indexer settings. It needs the password
+// from DLOCKSS_MONITOR_PASSWORD.
 func (m *Monitor) handleKeywordAPIKey(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSONError(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -76,26 +35,16 @@ func (m *Monitor) handleKeywordAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, "invalid json", http.StatusBadRequest)
 		return
 	}
-	err := m.keywords.ApplySettings(body.Password, body.Provider, body.APIKey, body.APIBase, body.Gateway)
-	switch {
-	case errors.Is(err, keywords.ErrAPIKeyEmpty):
-		writeJSONError(w, "api key is empty", http.StatusBadRequest)
+	switch err := m.keywords.ApplySettings(body.Password, body.Provider, body.APIKey, body.APIBase, body.Gateway); {
+	case err == nil:
+		writeJSON(w, m.keywords.GetStats())
+	case errors.Is(err, keywords.ErrSettingsDisabled):
+		writeJSONError(w, err.Error(), http.StatusForbidden)
 	case errors.Is(err, keywords.ErrSettingsAuth):
-		writeJSONError(w, "password must be the API key currently in use", http.StatusUnauthorized)
-	case errors.Is(err, keywords.ErrUnknownProvider):
-		writeJSONError(w, "unknown provider", http.StatusBadRequest)
-	case errors.Is(err, keywords.ErrBadGateway):
-		writeJSONError(w, "gateway must be an http or https URL", http.StatusBadRequest)
-	case err != nil:
-		writeJSONError(w, "failed to save settings", http.StatusInternalServerError)
+		writeJSONError(w, err.Error(), http.StatusUnauthorized)
+	case errors.Is(err, keywords.ErrAPIKeyEmpty), errors.Is(err, keywords.ErrUnknownProvider), errors.Is(err, keywords.ErrBadGateway):
+		writeJSONError(w, err.Error(), http.StatusBadRequest)
 	default:
-		st := m.keywords.GetStats(0)
-		writeJSON(w, map[string]interface{}{
-			"enabled":     true,
-			"can_set_key": false,
-			"provider":    st.Provider,
-			"model":       st.Model,
-			"gateway":     st.Gateway,
-		})
+		writeJSONError(w, "failed to save settings", http.StatusInternalServerError)
 	}
 }

@@ -28,9 +28,11 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	m := monitor.NewMonitor(monitorConfig(*topicFlag, *prefixFlag))
-
 	kwCfg := keywords.ConfigFromEnv()
+	cfg := monitorConfig(*topicFlag, *prefixFlag)
+	cfg.DataDir = kwCfg.DataDir
+	m := monitor.NewMonitor(cfg)
+
 	if kwCfg.APIKey != "" {
 		slog.Info("keyword indexing configured", "model", kwCfg.Model, "data_dir", kwCfg.DataDir)
 	}
@@ -55,8 +57,7 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	go m.RunStatusLogger(ctx)
-	go m.RunUploaderIndex(ctx)
+	go m.RunCatalog(ctx)
 
 	go func() {
 		slog.Info("monitor started", "url", fmt.Sprintf("http://localhost:%d", monitor.WebUIPort), "peer_id", h.ID().String())

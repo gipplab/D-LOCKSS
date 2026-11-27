@@ -10,15 +10,17 @@ import (
 	"strings"
 	"time"
 
+	"dlockss/internal/common"
+
 	"golang.org/x/time/rate"
 )
 
 var (
-	ErrAPIKeyEmpty     = errors.New("api key is empty")
-	ErrAPIKeySet       = errors.New("api key already set")
-	ErrSettingsAuth    = errors.New("settings password does not match the current api key")
-	ErrUnknownProvider = errors.New("unknown provider")
-	ErrBadGateway      = errors.New("gateway must be an http or https URL")
+	ErrAPIKeyEmpty      = errors.New("api key is empty")
+	ErrSettingsDisabled = errors.New("settings are off: set DLOCKSS_MONITOR_PASSWORD on the monitor host")
+	ErrSettingsAuth     = errors.New("wrong password")
+	ErrUnknownProvider  = errors.New("unknown provider")
+	ErrBadGateway       = errors.New("gateway must be an http or https URL")
 )
 
 const (
@@ -46,6 +48,10 @@ type Config struct {
 	Model    string
 	Gateway  string
 	DataDir  string
+	// Password allows changing the settings in the dashboard
+	// (DLOCKSS_MONITOR_PASSWORD). Without it they cannot be changed there.
+	// It is never saved.
+	Password string
 }
 
 type savedSettings struct {
@@ -89,6 +95,7 @@ func dataDirOrDefault(dir string) string {
 func ConfigFromEnv() Config {
 	cfg := DefaultConfig()
 	cfg.DataDir = DefaultDataDir()
+	cfg.Password = os.Getenv("DLOCKSS_MONITOR_PASSWORD")
 	if v := os.Getenv("DLOCKSS_IPFS_GATEWAY"); v != "" {
 		cfg.Gateway = v
 	}
@@ -217,8 +224,8 @@ func saveSettings(dataDir string, cfg Config) error {
 	return saveAPIKey(dataDir, cfg.APIKey)
 }
 
-// ApplySettings saves the provider and API key. The first save needs no
-// password. Later saves must pass the API key that is currently in use.
+// ApplySettings saves the provider and API key. It needs the password from
+// DLOCKSS_MONITOR_PASSWORD; without one set, settings cannot be changed.
 func (s *Store) ApplySettings(password, provider, apiKey, apiBase, gateway string) error {
 	apiKey = strings.TrimSpace(apiKey)
 	provider = normalizeProvider(provider)
@@ -231,7 +238,10 @@ func (s *Store) ApplySettings(password, provider, apiKey, apiBase, gateway strin
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.cfg.APIKey != "" && subtle.ConstantTimeCompare([]byte(password), []byte(s.cfg.APIKey)) != 1 {
+	if s.cfg.Password == "" {
+		return ErrSettingsDisabled
+	}
+	if subtle.ConstantTimeCompare([]byte(password), []byte(s.cfg.Password)) != 1 {
 		return ErrSettingsAuth
 	}
 	if apiKey == "" {
@@ -284,24 +294,10 @@ func LoadAPIKey(dirs ...string) string {
 	return strings.TrimSpace(os.Getenv("SAIA_API_KEY"))
 }
 
-func apiKeyPath(dataDir string) string {
-	return filepath.Join(dataDirOrDefault(dataDir), apiKeyFileName)
-}
-
 func saveAPIKey(dataDir, key string) error {
 	return writePrivateFile(dataDir, apiKeyFileName, []byte(key+"\n"))
 }
 
-// writePrivateFile replaces dataDir/name atomically with an owner-only file.
 func writePrivateFile(dataDir, name string, data []byte) error {
-	dataDir = dataDirOrDefault(dataDir)
-	if err := os.MkdirAll(dataDir, 0o700); err != nil {
-		return err
-	}
-	path := filepath.Join(dataDir, name)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return common.WriteFileAtomic(filepath.Join(dataDirOrDefault(dataDir), name), data)
 }

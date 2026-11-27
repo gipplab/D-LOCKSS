@@ -4,7 +4,6 @@ package monitor
 import (
 	"context"
 	"fmt"
-	"sort"
 	"sync"
 	"time"
 
@@ -52,6 +51,9 @@ type Config struct {
 	BootstrapShardDepth int
 	PubsubTopicPrefix   string
 	TopicName           string
+	// DataDir keeps the manifest catalog across restarts; "" keeps it in
+	// memory only.
+	DataDir string
 }
 
 func DefaultConfig() Config {
@@ -63,40 +65,19 @@ func DefaultConfig() Config {
 	}
 }
 
-// StatusResponse defines the JSON structure for monitor node views.
-type StatusResponse struct {
-	PeerID        string        `json:"peer_id"`
-	Version       string        `json:"version"`
-	CurrentShard  string        `json:"current_shard"`
-	Role          string        `json:"role,omitempty"`
-	PeersInShard  int           `json:"peers_in_shard"`
-	Storage       StorageStatus `json:"storage"`
-	UptimeSeconds float64       `json:"uptime_seconds"`
-}
-
-type StorageStatus struct {
-	PinnedFiles   int `json:"pinned_files"`
-	PinnedInShard int `json:"pinned_in_shard,omitempty"`
-	KnownFiles    int `json:"known_files"`
-}
-
 type nodeState struct {
-	PeerID         string              `json:"peer_id"`
-	HelperID       string              `json:"helper_id,omitempty"`
-	NodeName       string              `json:"node_name,omitempty"`
-	CurrentShard   string              `json:"current_shard"`
-	Role           string              `json:"role,omitempty"`
-	PinnedFiles    int                 `json:"pinned_files"`
-	KnownFiles     int                 `json:"known_files"`
-	LastSeen       time.Time           `json:"last_seen"`
-	ShardHistory   []ShardHistoryEntry `json:"shard_history"`
-	IPAddress      string              `json:"ip_address"`
-	announcedFiles map[string]time.Time
+	PeerID       string
+	HelperID     string
+	NodeName     string
+	CurrentShard string
+	Role         string
+	LastSeen     time.Time
+	ShardHistory []ShardHistoryEntry
 }
 
 type ShardHistoryEntry struct {
-	ShardID   string    `json:"shard_id"`
-	FirstSeen time.Time `json:"first_seen"`
+	ShardID   string
+	FirstSeen time.Time
 }
 
 type ShardSplitEvent struct {
@@ -126,14 +107,20 @@ type Monitor struct {
 	shardTopics         map[string]*shardSub
 	ps                  *pubsub.PubSub
 	host                host.Host
-	nodeFiles           map[string]map[string]time.Time
 	manifestReplication map[string]map[string]time.Time
 	peerShardLastSeen   map[string]map[string]time.Time
 	manifestShard       map[string]string    // manifest CID to the shard it was announced in, preferring descendants
-	manifestUploader    map[string]string    // manifest CID to its uploader's key, "" if it has none
 	lastSplitTime       time.Time            // pruning is suspended for splitGracePeriod after this
 	peerLastSiblingMove map[string]time.Time // peer ID to the time of its last sibling move
+	lostNodes           map[string]lostNode  // nodes the monitor stopped hearing from, shown as offline
+	started             time.Time
 	keywords            *keywords.Store
+	catalog             *manifestCatalog
+
+	// snap is the network view the API serves, rebuilt at most every
+	// snapshotTTL.
+	snapMu sync.Mutex
+	snap   *netSnapshot
 }
 
 func (n *nodeState) EffectiveShard() string {
@@ -179,21 +166,6 @@ func (m *Monitor) shardTopic(shardID string) string {
 	return fmt.Sprintf("%s-%s-shard-%s", m.cfg.PubsubTopicPrefix, m.cfg.TopicName, shardID)
 }
 
-type cidEntry struct {
-	CID      string `json:"cid"`
-	Shard    string `json:"shard"`
-	Replicas int    `json:"replicas"`
-}
-
-func (m *Monitor) buildCIDEntriesLocked(cids map[string]time.Time) []cidEntry {
-	entries := make([]cidEntry, 0, len(cids))
-	for c := range cids {
-		entries = append(entries, cidEntry{CID: c, Shard: m.manifestShard[c], Replicas: len(m.manifestReplication[c])})
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].CID < entries[j].CID })
-	return entries
-}
-
 func NewMonitor(cfg Config) *Monitor {
 	m := &Monitor{
 		cfg:                 cfg,
@@ -202,13 +174,14 @@ func NewMonitor(cfg Config) *Monitor {
 		splitEvents:         make([]ShardSplitEvent, 0, 100),
 		uniqueCIDs:          make(map[string]time.Time),
 		shardTopics:         make(map[string]*shardSub),
-		nodeFiles:           make(map[string]map[string]time.Time),
 		manifestReplication: make(map[string]map[string]time.Time),
 		peerShardLastSeen:   make(map[string]map[string]time.Time),
 		manifestShard:       make(map[string]string),
-		manifestUploader:    make(map[string]string),
 		peerLastSiblingMove: make(map[string]time.Time),
+		lostNodes:           make(map[string]lostNode),
+		started:             time.Now(),
 		keywords:            keywords.NewStore(keywords.Config{}),
+		catalog:             newManifestCatalog(cfg.DataDir),
 	}
 	go m.runReplicationCleanup()
 	return m
