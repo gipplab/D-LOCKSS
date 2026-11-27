@@ -214,7 +214,7 @@ Cluster data is advertised to the **public IPFS DHT** (manifest and payload when
 2.  **Custodial Node** joins target shard (ShardManager.JoinShard + ClusterManager.JoinShard).
 3.  **Custodial Node** pins the file to the target shard's cluster (PinToShard) and publishes **IngestMessage** to the target shard topic.
 4.  **Responsible nodes** in the target shard receive IngestMessage; if responsible they Pin to cluster and AnnouncePinned. CRDT syncs; LocalPinTracker on each allocated peer pins locally.
-5.  Custodial node remains in the target shard as a "tourist." There is no automatic unpin when replication count is sufficient; the node may leave the target shard later (e.g. reshard or shutdown).
+5.  Once the target shard holds enough copies, the custodial node releases its copy: it stops tracking the file and unpins manifest and payload to free space. For a pin-ingested file the payload pin is the user's (e.g. the wiki's upload), so that pin goes too.
 
 ---
 

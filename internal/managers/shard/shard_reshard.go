@@ -86,16 +86,7 @@ func (sm *ShardManager) RunReshardPass(oldShard, newShard string) {
 			if err := sm.clusterMgr.Unpin(sm.ctx, oldShard, manifestCID); err != nil {
 				slog.Error("reshard: unpin from old shard failed", "manifest", key, "error", err)
 			}
-			if err := sm.ipfsClient.UnpinRecursive(sm.ctx, manifestCID); err != nil {
-				slog.Error("reshard: IPFS unpin failed", "manifest", key, "error", err)
-			}
-			// The reprovide loop pins the payload separately; without this the
-			// node keeps a copy of every range it ever belonged to.
-			if payloadCID, err := cid.Decode(payloadCIDStr); err == nil && payloadCIDStr != key {
-				if err := sm.ipfsClient.UnpinRecursive(sm.ctx, payloadCID); err != nil {
-					slog.Debug("reshard: payload unpin failed", "payload", payloadCIDStr, "error", err)
-				}
-			}
+			sm.dropLocalCopy("reshard", key, payloadCIDStr)
 			sm.storageMgr.UnpinFile(key)
 		}
 

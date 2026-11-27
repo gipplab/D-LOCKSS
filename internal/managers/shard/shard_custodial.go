@@ -230,20 +230,30 @@ func (sm *ShardManager) reannounceToOwnShard(key string) bool {
 }
 
 func (sm *ShardManager) releaseCustodialCopy(key, payloadCIDStr string) {
+	slog.Info("custodial: releasing copy, responsible shard holds min copies", "manifest", key)
+	sm.dropLocalCopy("custodial", key, payloadCIDStr)
+	sm.storageMgr.UnpinFile(key)
+}
+
+// dropLocalCopy removes the Kubo pins of a file that this node no longer
+// holds for a shard, to free the space: the manifest, and the payload,
+// which has its own pin (see pinAndProvidePayload) that would otherwise
+// keep a copy of every range the node ever held and look like a user pin
+// to pin ingest. For a file this node ingested from a pin, the payload pin
+// is the user's, e.g. the wiki's upload, and goes too.
+func (sm *ShardManager) dropLocalCopy(reason, key, payloadCIDStr string) {
 	manifestCID, err := cid.Decode(key)
 	if err != nil {
 		return
 	}
-	slog.Info("custodial: releasing copy, responsible shard holds min copies", "manifest", key)
 	if err := sm.ipfsClient.UnpinRecursive(sm.ctx, manifestCID); err != nil {
-		slog.Debug("custodial: manifest unpin failed", "manifest", key, "error", err)
+		slog.Warn(reason+": manifest unpin failed", "manifest", key, "error", err)
 	}
-	if payloadCID, err := cid.Decode(payloadCIDStr); err == nil {
+	if payloadCID, err := cid.Decode(payloadCIDStr); err == nil && payloadCIDStr != key {
 		if err := sm.ipfsClient.UnpinRecursive(sm.ctx, payloadCID); err != nil {
-			slog.Debug("custodial: payload unpin failed", "payload", payloadCIDStr, "error", err)
+			slog.Debug(reason+": payload unpin failed", "payload", payloadCIDStr, "error", err)
 		}
 	}
-	sm.storageMgr.UnpinFile(key)
 }
 
 func (sm *ShardManager) reinjectCustodial(key, payloadCIDStr string) bool {

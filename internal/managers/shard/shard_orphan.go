@@ -87,20 +87,12 @@ func (sm *ShardManager) orphanHandoffOrUnpin(key, targetChild, currentShard stri
 	}
 
 	slog.Info("orphan unpin", "manifest", key, "child", targetChild)
-	payloadCIDStr, payloadErr := common.GetPayloadCIDForShardAssignment(sm.ctx, sm.ipfsClient, key)
+	// On error the lookup returns key, and dropLocalCopy leaves the payload.
+	payloadCIDStr, _ := common.GetPayloadCIDForShardAssignment(sm.ctx, sm.ipfsClient, key)
 	if err := sm.clusterMgr.Unpin(sm.ctx, currentShard, manifestCID); err != nil {
 		slog.Error("orphan unpin: cluster unpin failed", "manifest", key, "error", err)
 	}
-	if err := sm.ipfsClient.UnpinRecursive(sm.ctx, manifestCID); err != nil {
-		slog.Error("orphan unpin: IPFS unpin failed", "manifest", key, "error", err)
-	}
-	// The payload has its own pin; left behind it would look like a user pin
-	// to pin ingest.
-	if payloadCID, err := cid.Decode(payloadCIDStr); payloadErr == nil && err == nil && payloadCIDStr != key {
-		if err := sm.ipfsClient.UnpinRecursive(sm.ctx, payloadCID); err != nil {
-			slog.Debug("orphan unpin: payload unpin failed", "payload", payloadCIDStr, "error", err)
-		}
-	}
+	sm.dropLocalCopy("orphan unpin", key, payloadCIDStr)
 	sm.storageMgr.UnpinFile(key)
 	sm.mu.Lock()
 	delete(sm.orphanHandoffSent[key], targetChild)

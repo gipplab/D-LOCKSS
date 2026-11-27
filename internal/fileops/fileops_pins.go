@@ -264,8 +264,9 @@ func (w *pinWatcher) classify(ctx context.Context, c cid.Cid, name string) pinCl
 // user pinned in Kubo. With a signature source (DLOCKSS_WIKI_API) it makes
 // one per valid signature whose key is not in have, and none for a file
 // that nobody signed; without one, a single manifest without a signature.
-// The user's pin is never removed. It returns how many manifests it made;
-// an error means the attempt should be repeated later.
+// Ingest leaves the user's pin; a later hand-off to the file's shard
+// removes it to free space. It returns how many manifests it made; an
+// error means the attempt should be repeated later.
 func (fp *FileProcessor) ingestPinned(ctx context.Context, payloadCID cid.Cid, name string, have map[peer.ID]bool) (int, error) {
 	payloadCIDStr := payloadCID.String()
 	sigs := []schema.UploaderSignature{{}}
